@@ -1,0 +1,2 @@
+module PureScript.CoreFn where
+

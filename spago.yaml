@@ -1,0 +1,14 @@
+package:
+  name: purvasm
+  dependencies:
+    - console
+    - debug
+    - effect
+    - prelude
+  test:
+    main: Test.Main
+    dependencies: []
+workspace:
+  package_set:
+    registry: 48.7.0
+  extra_packages: {}
