@@ -40,8 +40,8 @@ instance Show ELambda where
   show elambda = genericShow elambda
 
 data Primitive
-  = PGetGlobal String String
-  | PSetGlobal String String
+  = PGetGlobal ModuleName Ident
+  | PSetGlobal ModuleName Ident
   | PMakeBlock Tag
   | PGetField Int
   | PSetField Int

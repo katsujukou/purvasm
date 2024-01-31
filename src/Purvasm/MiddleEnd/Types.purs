@@ -18,3 +18,8 @@ newtype Ident = Ident String
 
 instance Show Ident where
   show (Ident ident) = "(Ident " <> ident <> ")"
+
+newtype Global a = Global
+  { mod :: ModuleName
+  , it :: a
+  }

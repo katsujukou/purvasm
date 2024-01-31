@@ -7,11 +7,11 @@ import Control.Monad.Rec.Class as MonadRec
 import Control.Monad.State (StateT, execStateT, get, modify_)
 import Data.Array as Array
 import Data.Generic.Rep (class Generic)
-import Data.List (List(..), (!!))
-import Data.List as List
+import Data.List (List(..), (!!), (:))
+import Data.Map (Map)
+import Data.Map as Map
 import Data.Maybe (Maybe(..))
 import Data.Show.Generic (genericShow)
-import Data.Tuple.Nested (type (/\), (/\))
 import Effect (Effect)
 import Effect.Aff (Aff, launchAff_)
 import Effect.Class.Console (logShow)
@@ -29,26 +29,23 @@ program :: Module
 program = Module
   { name: ModuleName "Sample"
   , decls:
-      [ { name: Ident "f"
+      [ { name: Ident "add"
         , lambda:
-            ELFunction 1
-              ( ELlet
-                  [ ELFunction 1
-                      ( ELPrim (P_add_i32) [ ELVar (Var 0), ELConst (SCAtom (ACInt 1)) ]
-                      )
+            ELFunction 2
+              ( ELPrim
+                  (P_add_i32)
+                  [ ELVar (Var 1)
+                  , ELVar (Var 0)
                   ]
-                  ( ELApply
-                      (ELVar (Var 0))
-                      [ ELVar (Var 1)
-                      ]
-                  )
               )
         }
-      , { name: Ident "main"
+      , { name: Ident "inc"
         , lambda:
-            ELApply
-              (ELPrim (PGetGlobal "Sample" "f") [])
-              [ ELConst (SCAtom (ACInt 42)) ]
+            ( ELApply
+                (ELPrim (PGetGlobal (ModuleName "Sample") (Ident "add")) [])
+                [ ELConst (SCAtom (ACInt 1))
+                ]
+            )
         }
       ]
   }
@@ -58,50 +55,46 @@ main = launchAff_ do
   Console.log "\x1b[1;32mpurvasm-v2 simulator\x1b[0m\n"
   objectCodeFile <- compileModule program
   logShow objectCodeFile
-  sf <- execute objectCodeFile "main" Undefined
+  sf <- execute objectCodeFile "add" Undefined
   Console.log "\n\x1b[1;34m[final state]\x1b[0m"
   Console.log (describe sf)
 
+type Env = Array Value
+
+type CodeAddr = Int
+type Closure = { ofs :: CodeAddr, env :: List Value }
+
 data Value
   = Const StructuredConstant
-  | Ofs Int
+  | Ofs CodeAddr
+  | Clos CodeAddr Env
+  | Epsilon
   | Undefined
 
 derive instance Generic Value _
 instance Show Value where
-  show = genericShow
+  show v = genericShow v
 
 type MachineState =
-  { program :: Array (B.Ident /\ CodeBlock)
-  , cp :: CodePointer
-  , acc :: Value
-  , argStack :: List Value
-  , env :: List Value
+  { prg :: Map B.Ident CodeBlock -- object file
+  , pgc :: CodeAddr -- program counter
+  , acc :: Value -- accumulator
+  , arg :: List Value -- arguments stack
+  , env :: List Value -- environment stack
+  , ret :: List Value -- return stack
   }
 
 describe :: MachineState -> String
-describe { cp, acc, argStack, env } =
-  " [\x1b[33mENV\x1b[0m] = " <> show (Array.fromFoldable env)
-    <> ("\n [\x1b[33mACC\x1b[0m] = " <> show acc)
-    <> ("\n [\x1b[33mASP\x1b[0m] = " <> show (Array.fromFoldable argStack))
-    <> ("\n [\x1b[33mPGC\x1b[0m] = " <> show cp)
-    <> "\n"
-
-data Offset = Toplevel | Closures
-
-instance Show Offset where
-  show Toplevel = "Toplevel"
-  show _ = "Closures"
-
-type CodePointer =
-  { ident :: B.Ident
-  , ofs :: Offset
-  , index :: Int
-  }
+describe state = "[\x1b[33mACC\x1b[0m] = " <> show state.acc
+  <> ("\n [\x1b[33mARG\x1b[0m] = " <> show (Array.fromFoldable state.arg))
+  <> ("\n [\x1b[33mENV\x1b[0m] = " <> show state.env)
+  <> ("\n [\x1b[33mRET\x1b[0m] = " <> show state.ret)
+  <> ("\n [\x1b[33mPGC\x1b[0m] = " <> show state.pgc)
+  <> "\n"
 
 type Simulator a = StateT MachineState Aff a
 
-execute :: ObjectFile -> String -> Value -> Aff MachineState
+execute :: ObjectFile -> Aff MachineState
 execute (ObjectFile { phrases }) entryPoint ini = do
   let
     entry =
@@ -109,14 +102,15 @@ execute (ObjectFile { phrases }) entryPoint ini = do
       , ofs: Toplevel
       , index: 0
       }
-  execStateT eval (initialState phrases ini entry)
+  execStateT eval (initialState (Map.fromFoldable phrases) ini entry)
 
   where
   initialState pg acc cp =
     { program: pg
     , acc
+    , asp: 0
     , argStack: Nil
-    , env: Nil
+    , env: []
     , cp
     }
 
@@ -126,21 +120,46 @@ execute (ObjectFile { phrases }) entryPoint ini = do
   step _ = do
     inst <- fetchCode
     case inst of
+      KQuote sc -> do
+        loadAcc (Const sc)
+        continue
+      -- KGetGlobal _ ident -> do
+      --   pg <- get <#> _.program
+      --   case Map.lookup ident pg of
+      --     Nothing -> throwError (error $ "Unknown ident" <> show ident)
+      --     Just code -> do
+      --       loadAcc (CodePointer )
+      KPush -> do
+        acc >>= push
+        continue
       KPushMark -> do
-        proceedIndex
-        pure $ MonadRec.Loop unit
+        push Epsilon
+        continue
       _ -> pure $ MonadRec.Done unit
+
+  loop = pure (MonadRec.Loop unit)
+
+  continue = proceedIndex *> loop
 
   proceedIndex :: Simulator Unit
   proceedIndex = do
     modify_ \st -> st { cp = st.cp { index = st.cp.index + 1 } }
 
+  acc :: Simulator Value
+  acc = get >>= _.acc >>> pure
+
+  loadAcc :: Value -> Simulator Unit
+  loadAcc acc = modify_ \st -> st { acc = acc }
+
+  push :: Value -> Simulator Unit
+  push v = modify_ \st -> st { argStack = v : st.argStack }
+
   fetchCode :: Simulator Instruction
   fetchCode = do
-    state <- get
+    state@{ cp } <- get
     let
       mbInst =
-        case Array.findMap (\(ident /\ ph) -> if ident == state.cp.ident then Just ph else Nothing) state.program of
+        case Map.lookup cp.ident state.program of
           Nothing -> unsafeCrashWith "Unknown ident"
           Just { closures, toplevel }
             | Toplevel <- state.cp.ofs -> toplevel !! state.cp.index

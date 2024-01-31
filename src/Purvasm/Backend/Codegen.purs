@@ -1,9 +1,10 @@
 module Purvasm.Backend.Codegen where
 
 import Prelude
+import Prim hiding (Function)
 
-import Control.Monad.Reader (ReaderT, runReaderT)
-import Control.Monad.State (State, evalState, get, modify_, runState)
+import Control.Monad.Reader (ReaderT, ask, asks, runReaderT)
+import Control.Monad.State (State, StateT, evalState, evalStateT, get, modify_, runState)
 import Control.Parallel (parSequence)
 import Data.Array (length, (..))
 import Data.Array as Array
@@ -13,26 +14,35 @@ import Data.List as L
 import Data.Maybe (Maybe(..))
 import Data.Tuple.Nested ((/\))
 import Effect.Aff (Aff)
+import Effect.Aff.AVar (AVar)
+import Effect.Aff.AVar as AVar
+import Effect.Aff.Class (liftAff)
+import Effect.Ref (Ref)
+import Effect.Ref as Ref
 import Partial.Unsafe (unsafeCrashWith)
-import Purvasm.Backend.Instruction (BackendCode, Instruction(..))
-import Purvasm.Backend.ObjectFile (ObjectFile(..))
-import Purvasm.Backend.Translate (translIdent, translModuleName)
-import Purvasm.Backend.Types (Label(..), ModuleName)
-import Purvasm.MiddleEnd.Syntax (ELambda(..), Primitive(..))
-import Purvasm.MiddleEnd.Syntax as ME
-import Purvasm.MiddleEnd.Types (Arity, Var(..))
+import Purvasm.Backend.Types (CodeBlock, Ident(..), Instruction(..), Label(..), ModuleName, ObjectFile(..), SymbolDesc, SymbolType(..))
+import Purvasm.MiddleEnd (Arity, ELambda(..), Primitive(..), Var(..))
+import Purvasm.MiddleEnd as ME
+import Safe.Coerce (coerce)
+
+type SymbolsManagerState =
+  { tbl :: Array SymbolDesc
+  , dataOfs :: Int
+  , textOfs :: Int
+  }
 
 type CodegenEnv =
   { moduleName :: ModuleName
+  , symMngr :: AVar SymbolsManagerState
   }
 
 type CodegenState =
   { stack :: List { label :: Label, arity :: Arity, function :: ELambda }
   , nextLabel :: Int
-  -- , code :: Array BackendCode
+  -- , code :: Array CodeBlock
   }
 
-type Codegen a = ReaderT CodegenEnv (State CodegenState) a
+type Codegen a = ReaderT CodegenEnv (StateT CodegenState Aff) a
 
 newLabel :: Codegen Label
 newLabel = do
@@ -47,35 +57,21 @@ addToCompile arity function = do
   modify_ (\st -> st { stack = L.Cons newEntry st.stack })
   pure label
 
--- register :: BackendCode -> Codegen Unit
--- register code = do
---   modify_ (\st -> st { code = Array.cons code st.code })
+typeOfPhrase :: ELambda -> SymbolType
+typeOfPhrase = case _ of
+  ELVar _ -> unsafeCrashWith "Impossible: toplevel phrase is ELVar."
+  ELFunction arity _ -> Function arity
+  _ -> Value
 
--- compileModule :: Module -> CodegenState
--- compileModule (Module m@{ name: moduleName }) =
---   let
---     env = { moduleName }
---     initialState = { stack: Nil, nextLabel: 0, code: [] }
---   in
---     runState (runReaderT (tailRecM go (m.decls /\ [])) env) initialState
---   where
---   go (decls /\ compiled) = case Array.uncons decls of
---     Nothing -> do
---       { stack } <- get
---       case stack of
---         L.Nil -> pure (MonadRec.Done unit)
---         c : rest -> do
---           modify_ (\st -> st { stack = rest })
---           pure $ MonadRec.Loop [ c ]
---     Just { head: { lambda }, tail: rest } -> do
---       compileLambda Nil lambda
---       pure $ MonadRec.Loop rest
-
-compileLambda :: ELambda -> Codegen { toplevel :: BackendCode, closures :: BackendCode }
-compileLambda lambda = do
-  toplevel <- compileExpr Nothing (L.singleton (Kbranch (Label 0))) lambda
-  closures <- compileRest Nil
-  pure { toplevel, closures }
+compileToplevelPhrase :: Ident -> ELambda -> Codegen { ident :: Ident, typ :: SymbolType, datasec :: CodeBlock, textsec :: CodeBlock }
+compileToplevelPhrase ident lambda = do
+  { moduleName } <- ask
+  let
+    cont = L.singleton $ KSetGlobal moduleName ident
+    typ = typeOfPhrase lambda
+  datasec <- compileExpr Nothing cont lambda
+  textsec <- compileRest Nil
+  pure { ident, typ, datasec, textsec }
   where
   compileRest code = do
     get >>= \{ stack } -> case stack of
@@ -85,12 +81,16 @@ compileLambda lambda = do
             modify_ (\st -> st { stack = rest })
             compiled <- compileExpr Nothing (KReturn : code) function
             compileRest (KLabel label : KStartFun : compiled)
-        | otherwise -> unsafeCrashWith "Oops!"
+        | otherwise -> do
+            modify_ (\st -> st { stack = rest })
+            compiled <- compileExpr Nothing (KReturn : code) function
+            compileRest $
+              KLabel label : KStartFun :
+                (Array.foldr (\_ -> (KGrab : _)) compiled (1 .. (arity - 1)))
 
-compileExpr :: Maybe Label -> BackendCode -> ELambda -> Codegen BackendCode
+compileExpr :: Maybe Label -> CodeBlock -> ELambda -> Codegen CodeBlock
 compileExpr handler = go
   where
-  -- go :: (BackendCode -> BackendCode) -> BackendCode -> ELambda -> Codegen (MonadRec.Step _ BackendCode)
   go cont = case _ of
     ELConst cst -> pure (KQuote cst : cont)
     ELVar (Var n) -> pure (KAccess n : cont)
@@ -122,12 +122,14 @@ compileExpr handler = go
       c2 <- go c1 body
       compArgs c2 args
     ELPrim (PGetGlobal modname ident) _ ->
-      pure (KGetGlobal modname ident : cont)
+      pure (KGetGlobal (translModuleName modname) (translIdent ident) : cont)
+    ELPrim (PSetGlobal modname ident) _ ->
+      pure (KSetGlobal (translModuleName modname) (translIdent ident) : cont)
     ELPrim p exprList -> do
       compileExprList (Kprim p : cont) exprList
     _ -> unsafeCrashWith "Not implemented!"
 
-  compileExprList :: BackendCode -> Array ELambda -> Codegen BackendCode
+  compileExprList :: CodeBlock -> Array ELambda -> Codegen CodeBlock
   compileExprList cont = Array.uncons >>> case _ of
     Nothing -> pure cont
     Just { head, tail }
@@ -138,23 +140,55 @@ compileExpr handler = go
 
 compileModule :: ME.Module -> Aff ObjectFile
 compileModule (ME.Module m@{ decls }) = do
+  symMngr <- AVar.new { tbl: [], dataOfs: 0, textOfs: 0 }
   let
     moduleName = translModuleName m.name
-    env = { moduleName }
+    env = { moduleName, symMngr }
+
   phrases <- parSequence
-    ( decls <#> \({ name, lambda }) -> do
+    ( decls <#> \({ name, lambda: bound }) -> do
         let
+          toplevelSymbol = translIdent name
           initialState =
             { stack: L.Nil
             , nextLabel: 0
             }
-          compiled = flip evalState initialState $
-            runReaderT (compileLambda lambda) env
-        pure $ (translIdent name) /\ compiled
+        { typ, datasec, textsec } <- flip evalStateT initialState $
+          runReaderT (compileToplevelPhrase toplevelSymbol bound) env
+        -- tbl <- AVar.take symTbl
+        -- AVar.put (Array.snoc tbl {}) symTbl
+        pure
+          { symbol: toplevelSymbol
+          , datasec
+          , textsec
+          }
     )
-  pure (ObjectFile { name: moduleName, phrases })
 
-isTail :: BackendCode -> Boolean
+  -- generate object code file
+  pure $ ObjectFile $
+    { head:
+        { name: moduleName
+        , pursVersion: "0.15.14"
+        , version: "0.1.0"
+        }
+    , symbols: []
+    , datasec: []
+    , textsec: []
+    }
+
+pushNewSymbol :: Ident -> SymbolType -> Codegen Unit
+pushNewSymbol name typ = do
+  env <- ask
+  symMngr <- liftAff $ AVar.take env.symMngr
+  pure unit
+
+translIdent :: ME.Ident -> Ident
+translIdent = coerce
+
+translModuleName :: ME.ModuleName -> ModuleName
+translModuleName = coerce
+
+isTail :: CodeBlock -> Boolean
 isTail = case _ of
   KReturn : _ -> true
   _ -> false
