@@ -43,6 +43,7 @@ workspace:
         - newtype
         - node-buffer
         - node-event-emitter
+        - node-path
         - node-process
         - node-streams
         - nonempty
@@ -77,6 +78,7 @@ workspace:
         - console
         - debug
         - effect
+        - node-path
         - prelude
       test_dependencies: []
       build_plan:
@@ -107,6 +109,7 @@ workspace:
         - lists
         - maybe
         - newtype
+        - node-path
         - nonempty
         - numbers
         - ordered-collections
@@ -998,6 +1001,12 @@ packages:
       - nullable
       - prelude
       - unsafe-coerce
+  node-path:
+    type: registry
+    version: 5.0.0
+    integrity: sha256-pd82nQ+2l5UThzaxPdKttgDt7xlsgIDLpPG0yxDEdyE=
+    dependencies:
+      - effect
   node-process:
     type: registry
     version: 11.2.0

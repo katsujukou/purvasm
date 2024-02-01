@@ -1,7 +1,9 @@
 module Purvasm.MiddleEnd
-  ( module ReExport
+  ( module ReExports
   ) where
 
-import Purvasm.MiddleEnd.Types (Arity, Global(..), Ident(..), ModuleName(..), Var(..)) as ReExport
-import Purvasm.MiddleEnd.Syntax (ELambda(..), Module(..), Primitive(..)) as ReExport
+import Purvasm.MiddleEnd.Types (Var(..)) as ReExports
+import Purvasm.MiddleEnd.Syntax (ELambda(..), Module(..)) as ReExports
+import Purvasm.Primitives (Primitive(..)) as ReExports
+import Purvasm.Types (Arity, Global(..), Ident(..), ModuleName(..)) as ReExports
 -- import Purvasm.MiddleEnd.Translate ()

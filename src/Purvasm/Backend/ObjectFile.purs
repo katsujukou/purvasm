@@ -2,19 +2,23 @@ module Purvasm.Backend.ObjectFile where
 
 import Prelude
 
-import Control.Monad.Reader (ReaderT)
-import Data.Array as Array
 import Data.Generic.Rep (class Generic)
 import Data.Newtype (class Newtype)
 import Data.Show.Generic (genericShow)
-import Data.Tuple.Nested (type (/\), (/\))
-import Purvasm.Backend.Instruction (BackendCode)
-import Purvasm.Backend.Types (Ident, ModuleName)
+import Purvasm.Backend.Instruction (CodeBlock)
+import Purvasm.Backend.Types (Ident, ModuleName, GlobalName)
 
--- writeCode :: ObjectFile -> Ident -> BackendCode -> BackendCode -> ObjectFile
--- writeCode (ObjectFile obj) ident toplevel closures = ObjectFile $
---   obj { phrases = Array.cons (ident /\ { toplevel, closures }) obj.phrases }
+-- The type of toplevel symbol.
+data SymbolType
+  = Value
+  | Function Int -- arity
+  | EffValue
 
+derive instance Generic SymbolType _
+instance Show SymbolType where
+  show = genericShow
+
+-- symbol descriptor
 type SymbolDesc =
   { name :: Ident
   , typ :: SymbolType
@@ -22,4 +26,21 @@ type SymbolDesc =
   , textOfs :: Int
   }
 
-type SymbolsManager = ReaderT ()
+type ObjectHeader =
+  { version :: String
+  , pursVersion :: String
+  , name :: ModuleName
+  }
+
+newtype ObjectFile = ObjectFile
+  { head :: ObjectHeader
+  , symbols :: Array SymbolDesc
+  , textsec :: Array CodeBlock
+  , datasec :: Array CodeBlock
+  , refsec :: Array GlobalName
+  }
+
+derive instance Newtype ObjectFile _
+instance Show ObjectFile where
+  show (ObjectFile obj) = "(ObjectFile " <> show obj <> ")"
+

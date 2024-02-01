@@ -3,32 +3,34 @@ module Purvasm.Backend.Codegen where
 import Prelude
 import Prim hiding (Function)
 
-import Control.Monad.Reader (ReaderT, ask, asks, runReaderT)
-import Control.Monad.State (State, StateT, evalState, evalStateT, get, modify_, runState)
+import Control.Monad.Reader (ReaderT, ask, runReaderT)
+import Control.Monad.State (StateT, evalStateT, get, modify_)
 import Control.Parallel (parSequence)
 import Data.Array (length, (..))
 import Data.Array as Array
-import Data.Identity (Identity(..))
 import Data.List (List(..), (:))
 import Data.List as L
+import Data.Map (Map)
+import Data.Map as Map
 import Data.Maybe (Maybe(..))
-import Data.Tuple.Nested ((/\))
+import Data.Tuple (fst, snd)
+import Data.Tuple.Nested (type (/\), (/\))
 import Effect.Aff (Aff)
 import Effect.Aff.AVar (AVar)
 import Effect.Aff.AVar as AVar
 import Effect.Aff.Class (liftAff)
-import Effect.Ref (Ref)
-import Effect.Ref as Ref
 import Partial.Unsafe (unsafeCrashWith)
-import Purvasm.Backend.Types (CodeBlock, Ident(..), Instruction(..), Label(..), ModuleName, ObjectFile(..), SymbolDesc, SymbolType(..))
-import Purvasm.MiddleEnd (Arity, ELambda(..), Primitive(..), Var(..))
+import Purvasm.Backend.Instruction (CodeBlock, Instruction(..))
+import Purvasm.Backend.ObjectFile (ObjectFile(..), SymbolDesc, SymbolType(..))
+import Purvasm.Backend.Types (Arity, Ident, Label(..), ModuleName, Primitive(..), mkGlobalName)
+import Purvasm.MiddleEnd (ELambda(..), Var(..))
 import Purvasm.MiddleEnd as ME
 import Safe.Coerce (coerce)
 
 type SymbolsManagerState =
-  { tbl :: Array SymbolDesc
-  , dataOfs :: Int
-  , textOfs :: Int
+  { tbl :: Map Ident SymbolDesc
+  , dataNext :: Int
+  , textNext :: Int
   }
 
 type CodegenEnv =
@@ -63,15 +65,16 @@ typeOfPhrase = case _ of
   ELFunction arity _ -> Function arity
   _ -> Value
 
-compileToplevelPhrase :: Ident -> ELambda -> Codegen { ident :: Ident, typ :: SymbolType, datasec :: CodeBlock, textsec :: CodeBlock }
+compileToplevelPhrase :: Ident -> ELambda -> Codegen (CodeBlock /\ CodeBlock)
 compileToplevelPhrase ident lambda = do
   { moduleName } <- ask
   let
-    cont = L.singleton $ KSetGlobal moduleName ident
+    cont = L.singleton $ KSetGlobal (mkGlobalName moduleName ident)
     typ = typeOfPhrase lambda
   datasec <- compileExpr Nothing cont lambda
   textsec <- compileRest Nil
-  pure { ident, typ, datasec, textsec }
+  pushNewSymbol ident typ (L.length textsec > 0)
+  pure $ datasec /\ textsec
   where
   compileRest code = do
     get >>= \{ stack } -> case stack of
@@ -121,10 +124,10 @@ compileExpr handler = go
             go (KLet : compiledArgs) head
       c2 <- go c1 body
       compArgs c2 args
-    ELPrim (PGetGlobal modname ident) _ ->
-      pure (KGetGlobal (translModuleName modname) (translIdent ident) : cont)
-    ELPrim (PSetGlobal modname ident) _ ->
-      pure (KSetGlobal (translModuleName modname) (translIdent ident) : cont)
+    ELPrim (PGetGlobal globalName) _ ->
+      pure (KGetGlobal globalName : cont)
+    ELPrim (PSetGlobal globalName) _ ->
+      pure (KSetGlobal globalName : cont)
     ELPrim p exprList -> do
       compileExprList (Kprim p : cont) exprList
     _ -> unsafeCrashWith "Not implemented!"
@@ -140,7 +143,7 @@ compileExpr handler = go
 
 compileModule :: ME.Module -> Aff ObjectFile
 compileModule (ME.Module m@{ decls }) = do
-  symMngr <- AVar.new { tbl: [], dataOfs: 0, textOfs: 0 }
+  symMngr <- AVar.new { tbl: Map.empty, dataNext: 0, textNext: 0 }
   let
     moduleName = translModuleName m.name
     env = { moduleName, symMngr }
@@ -153,16 +156,11 @@ compileModule (ME.Module m@{ decls }) = do
             { stack: L.Nil
             , nextLabel: 0
             }
-        { typ, datasec, textsec } <- flip evalStateT initialState $
+        flip evalStateT initialState $
           runReaderT (compileToplevelPhrase toplevelSymbol bound) env
-        -- tbl <- AVar.take symTbl
-        -- AVar.put (Array.snoc tbl {}) symTbl
-        pure
-          { symbol: toplevelSymbol
-          , datasec
-          , textsec
-          }
     )
+
+  symbols <- AVar.take symMngr <#> _.tbl
 
   -- generate object code file
   pure $ ObjectFile $
@@ -171,16 +169,31 @@ compileModule (ME.Module m@{ decls }) = do
         , pursVersion: "0.15.14"
         , version: "0.1.0"
         }
-    , symbols: []
-    , datasec: []
-    , textsec: []
+    , symbols: Array.fromFoldable (Map.values symbols)
+    , datasec: map fst phrases
+    , textsec: map snd phrases # Array.filter ((_ > 0) <<< L.length)
+    , refsec: []
     }
 
-pushNewSymbol :: Ident -> SymbolType -> Codegen Unit
-pushNewSymbol name typ = do
+pushNewSymbol :: Ident -> SymbolType -> Boolean -> Codegen Unit
+pushNewSymbol name typ hasText = do
   env <- ask
-  symMngr <- liftAff $ AVar.take env.symMngr
-  pure unit
+  liftAff do
+    symMngr <- liftAff (AVar.take env.symMngr)
+    let
+      newEntry =
+        { name
+        , typ
+        , dataOfs: symMngr.dataNext
+        , textOfs: if hasText then symMngr.textNext else -1
+        }
+    env.symMngr # AVar.put
+      ( symMngr
+          { tbl = Map.insert name newEntry symMngr.tbl
+          , dataNext = symMngr.dataNext + 1
+          , textNext = symMngr.textNext + if hasText then 1 else 0
+          }
+      )
 
 translIdent :: ME.Ident -> Ident
 translIdent = coerce

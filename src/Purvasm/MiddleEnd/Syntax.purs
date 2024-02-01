@@ -8,8 +8,9 @@ import Prelude
 import Data.Generic.Rep (class Generic)
 import Data.Newtype (class Newtype)
 import Data.Show.Generic (genericShow)
-import Purvasm.MiddleEnd.Types (Arity, Ident, ModuleName, Var)
-import Purvasm.Types (StructuredConstant, Tag)
+import Purvasm.MiddleEnd.Types (Var)
+import Purvasm.Primitives (Primitive)
+import Purvasm.Types (Arity, Ident, ModuleName, StructuredConstant)
 
 newtype Module = Module
   { name :: ModuleName
@@ -38,18 +39,3 @@ data ELambda
 derive instance Generic ELambda _
 instance Show ELambda where
   show elambda = genericShow elambda
-
-data Primitive
-  = PGetGlobal ModuleName Ident
-  | PSetGlobal ModuleName Ident
-  | PMakeBlock Tag
-  | PGetField Int
-  | PSetField Int
-  | PLookupField String
-  | PCall String
-  -- Arithmetic operations
-  | P_add_i32
-
-derive instance Generic Primitive _
-instance Show Primitive where
-  show = genericShow

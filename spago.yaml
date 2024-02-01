@@ -5,6 +5,7 @@ package:
     - console
     - debug
     - effect
+    - node-path
     - prelude
   test:
     main: Test.Main
