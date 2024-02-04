@@ -22,6 +22,8 @@ data Expr a
   | ExprGlobal a GlobalName
   | ExprAbs a (Array Ident) (Expr a)
   | ExprApp a (Expr a) (Array (Expr a))
+  | ExprLet a (Array (Tuple Ident (Expr a))) (Expr a)
+  | ExprLetRec a (Array (Tuple Ident (Expr a))) (Expr a)
   | ExprAccess a (Expr a) String
   | ExprUpdate a (Expr a) (Array (Tuple String (Expr a)))
   | ExprLookup a (Expr a) String
