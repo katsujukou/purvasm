@@ -6,9 +6,15 @@ workspace:
         - console
         - optparse
         - purvasm
+        - purvasm-compiler
       test_dependencies: []
       build_plan:
         - aff
+        - ansi
+        - argonaut
+        - argonaut-codecs
+        - argonaut-core
+        - argonaut-traversals
         - arraybuffer-types
         - arrays
         - avar
@@ -21,6 +27,7 @@ workspace:
         - datetime
         - debug
         - distributive
+        - dodo-printer
         - effect
         - either
         - enums
@@ -37,16 +44,21 @@ workspace:
         - identity
         - integers
         - invariant
+        - js-date
+        - language-cst-parser
         - lazy
         - lists
         - maybe
         - newtype
         - node-buffer
         - node-event-emitter
+        - node-fs
+        - node-glob-basic
         - node-path
         - node-process
         - node-streams
         - nonempty
+        - now
         - nullable
         - numbers
         - open-memoize
@@ -58,9 +70,13 @@ workspace:
         - posix-types
         - prelude
         - profunctor
+        - profunctor-lenses
         - psci-support
         - purvasm
+        - purvasm-compiler
+        - record
         - refs
+        - run
         - safe-coerce
         - st
         - strings
@@ -71,9 +87,11 @@ workspace:
         - typelevel-prelude
         - unfoldable
         - unsafe-coerce
+        - variant
     purvasm:
       path: ./
       dependencies:
+        - argonaut
         - avar
         - console
         - debug
@@ -83,6 +101,10 @@ workspace:
       test_dependencies: []
       build_plan:
         - aff
+        - argonaut
+        - argonaut-codecs
+        - argonaut-core
+        - argonaut-traversals
         - arrays
         - avar
         - bifunctors
@@ -99,6 +121,7 @@ workspace:
         - exceptions
         - exists
         - foldable-traversable
+        - foreign-object
         - functions
         - functors
         - gen
@@ -118,15 +141,108 @@ workspace:
         - partial
         - prelude
         - profunctor
+        - profunctor-lenses
+        - record
         - refs
         - safe-coerce
         - st
+        - strings
         - tailrec
         - transformers
         - tuples
         - type-equality
+        - typelevel-prelude
         - unfoldable
         - unsafe-coerce
+    purvasm-compiler:
+      path: compiler
+      dependencies:
+        - dodo-printer
+        - language-cst-parser
+        - node-glob-basic
+        - purvasm
+        - run
+      test_dependencies: []
+      build_plan:
+        - aff
+        - ansi
+        - argonaut
+        - argonaut-codecs
+        - argonaut-core
+        - argonaut-traversals
+        - arraybuffer-types
+        - arrays
+        - avar
+        - bifunctors
+        - catenable-lists
+        - console
+        - const
+        - contravariant
+        - control
+        - datetime
+        - debug
+        - distributive
+        - dodo-printer
+        - effect
+        - either
+        - enums
+        - exceptions
+        - exists
+        - foldable-traversable
+        - foreign
+        - foreign-object
+        - free
+        - functions
+        - functors
+        - gen
+        - identity
+        - integers
+        - invariant
+        - js-date
+        - language-cst-parser
+        - lazy
+        - lists
+        - maybe
+        - newtype
+        - node-buffer
+        - node-event-emitter
+        - node-fs
+        - node-glob-basic
+        - node-path
+        - node-process
+        - node-streams
+        - nonempty
+        - now
+        - nullable
+        - numbers
+        - ordered-collections
+        - orders
+        - parallel
+        - partial
+        - posix-types
+        - prelude
+        - profunctor
+        - profunctor-lenses
+        - purvasm
+        - record
+        - refs
+        - run
+        - safe-coerce
+        - st
+        - strings
+        - tailrec
+        - transformers
+        - tuples
+        - type-equality
+        - typelevel-prelude
+        - unfoldable
+        - unsafe-coerce
+        - variant
+    purvasm-linker:
+      path: linker
+      dependencies: []
+      test_dependencies: []
+      build_plan: []
   package_set:
     address:
       registry: 48.7.0
@@ -605,7 +721,65 @@ workspace:
       yoga-tree: 1.0.0
       z3: 0.0.2
       zipperarray: 2.0.0
-  extra_packages: {}
+  extra_packages:
+    dodo-printer:
+      repo: https://github.com/natefaubion/purescript-dodo-printer.git
+      version: v2.2.1
+      dependencies:
+        - aff
+        - ansi
+        - arrays
+        - avar
+        - console
+        - control
+        - effect
+        - either
+        - exceptions
+        - foldable-traversable
+        - integers
+        - lists
+        - maybe
+        - newtype
+        - parallel
+        - partial
+        - posix-types
+        - prelude
+        - safe-coerce
+        - strings
+        - tuples
+    language-cst-parser:
+      repo: https://github.com/natefaubion/purescript-language-cst-parser.git
+      version: v0.13.0
+      dependencies:
+        - arrays
+        - console
+        - const
+        - control
+        - effect
+        - either
+        - enums
+        - foldable-traversable
+        - free
+        - functions
+        - functors
+        - identity
+        - integers
+        - lazy
+        - lists
+        - maybe
+        - newtype
+        - node-process
+        - numbers
+        - ordered-collections
+        - partial
+        - prelude
+        - st
+        - strings
+        - transformers
+        - tuples
+        - typelevel-prelude
+        - unfoldable
+        - unsafe-coerce
 packages:
   aff:
     type: registry
@@ -629,6 +803,62 @@ packages:
       - tailrec
       - transformers
       - unsafe-coerce
+  ansi:
+    type: registry
+    version: 7.0.0
+    integrity: sha256-ZMB6HD+q9CXvn9fRCmJ8dvuDrOVHcjombL3oNOerVnE=
+    dependencies:
+      - foldable-traversable
+      - lists
+      - strings
+  argonaut:
+    type: registry
+    version: 9.0.0
+    integrity: sha256-9sHzkzcFkaMUa9+3FjIybJDYnHtY4Jp4zHOJ84qPTXo=
+    dependencies:
+      - argonaut-codecs
+      - argonaut-core
+      - argonaut-traversals
+  argonaut-codecs:
+    type: registry
+    version: 9.1.0
+    integrity: sha256-N6efXByUeg848ompEqJfVvZuZPfdRYDGlTDFn0G0Oh8=
+    dependencies:
+      - argonaut-core
+      - arrays
+      - effect
+      - foreign-object
+      - identity
+      - integers
+      - maybe
+      - nonempty
+      - ordered-collections
+      - prelude
+      - record
+  argonaut-core:
+    type: registry
+    version: 7.0.0
+    integrity: sha256-RC82GfAjItydxrO24cdX373KHVZiLqybu19b5X8u7B4=
+    dependencies:
+      - arrays
+      - control
+      - either
+      - foreign-object
+      - functions
+      - gen
+      - maybe
+      - nonempty
+      - prelude
+      - strings
+      - tailrec
+  argonaut-traversals:
+    type: registry
+    version: 10.0.0
+    integrity: sha256-9nSfqR70rjiNWVVsCoK+jrm9dmyZTx89IKNYO6uNUIk=
+    dependencies:
+      - argonaut-codecs
+      - argonaut-core
+      - profunctor-lenses
   arraybuffer-types:
     type: registry
     version: 3.0.2
@@ -756,6 +986,32 @@ packages:
       - prelude
       - tuples
       - type-equality
+  dodo-printer:
+    type: git
+    url: https://github.com/natefaubion/purescript-dodo-printer.git
+    rev: 831c5c963a57ca4bfd62f96335267d7d0785851d
+    dependencies:
+      - aff
+      - ansi
+      - arrays
+      - avar
+      - console
+      - control
+      - effect
+      - either
+      - exceptions
+      - foldable-traversable
+      - integers
+      - lists
+      - maybe
+      - newtype
+      - parallel
+      - partial
+      - posix-types
+      - prelude
+      - safe-coerce
+      - strings
+      - tuples
   effect:
     type: registry
     version: 4.0.0
@@ -936,6 +1192,51 @@ packages:
     dependencies:
       - control
       - prelude
+  js-date:
+    type: registry
+    version: 8.0.0
+    integrity: sha256-6TVF4DWg5JL+jRAsoMssYw8rgOVALMUHT1CuNZt8NRo=
+    dependencies:
+      - datetime
+      - effect
+      - exceptions
+      - foreign
+      - integers
+      - now
+  language-cst-parser:
+    type: git
+    url: https://github.com/natefaubion/purescript-language-cst-parser.git
+    rev: 5621f2e9fa1a0df5930b95b26f922fa94c494e80
+    dependencies:
+      - arrays
+      - console
+      - const
+      - control
+      - effect
+      - either
+      - enums
+      - foldable-traversable
+      - free
+      - functions
+      - functors
+      - identity
+      - integers
+      - lazy
+      - lists
+      - maybe
+      - newtype
+      - node-process
+      - numbers
+      - ordered-collections
+      - partial
+      - prelude
+      - st
+      - strings
+      - transformers
+      - tuples
+      - typelevel-prelude
+      - unfoldable
+      - unsafe-coerce
   lazy:
     type: registry
     version: 6.0.0
@@ -1001,6 +1302,48 @@ packages:
       - nullable
       - prelude
       - unsafe-coerce
+  node-fs:
+    type: registry
+    version: 9.1.0
+    integrity: sha256-TzhvGdrwcM0bazDvrWSqh+M/H8GKYf1Na6aGm2Qg4+c=
+    dependencies:
+      - datetime
+      - effect
+      - either
+      - enums
+      - exceptions
+      - functions
+      - integers
+      - js-date
+      - maybe
+      - node-buffer
+      - node-path
+      - node-streams
+      - nullable
+      - partial
+      - prelude
+      - strings
+      - unsafe-coerce
+  node-glob-basic:
+    type: registry
+    version: 1.3.0
+    integrity: sha256-FxkCAquut+6As+HZp2QWjuWVVMpHDGceJdcSRfqWb3s=
+    dependencies:
+      - aff
+      - effect
+      - either
+      - foldable-traversable
+      - lists
+      - maybe
+      - node-fs
+      - node-path
+      - node-process
+      - ordered-collections
+      - parallel
+      - prelude
+      - refs
+      - strings
+      - tuples
   node-path:
     type: registry
     version: 5.0.0
@@ -1045,6 +1388,13 @@ packages:
       - prelude
       - tuples
       - unfoldable
+  now:
+    type: registry
+    version: 6.0.0
+    integrity: sha256-xZ7x37ZMREfs6GCDw/h+FaKHV/3sPWmtqBZRGTxybQY=
+    dependencies:
+      - datetime
+      - effect
   nullable:
     type: registry
     version: 6.0.0
@@ -1181,6 +1531,31 @@ packages:
       - newtype
       - prelude
       - tuples
+  profunctor-lenses:
+    type: registry
+    version: 8.0.0
+    integrity: sha256-K7f29rHRHgVSb2Y/PaSKtfYPriP6n87BJNO7EhsZHas=
+    dependencies:
+      - arrays
+      - bifunctors
+      - const
+      - control
+      - distributive
+      - either
+      - foldable-traversable
+      - foreign-object
+      - functors
+      - identity
+      - lists
+      - maybe
+      - newtype
+      - ordered-collections
+      - partial
+      - prelude
+      - profunctor
+      - record
+      - transformers
+      - tuples
   psci-support:
     type: registry
     version: 6.0.0
@@ -1189,6 +1564,14 @@ packages:
       - console
       - effect
       - prelude
+  record:
+    type: registry
+    version: 4.0.0
+    integrity: sha256-Za5U85bTRJEfGK5Sk4hM41oXy84YQI0I8TL3WUn1Qzg=
+    dependencies:
+      - functions
+      - prelude
+      - unsafe-coerce
   refs:
     type: registry
     version: 6.0.0
@@ -1196,6 +1579,25 @@ packages:
     dependencies:
       - effect
       - prelude
+  run:
+    type: registry
+    version: 5.0.0
+    integrity: sha256-uCCGBqPXOSTnQoVzQUoCcEYyGvi+dWZp+lLsxtNG6+U=
+    dependencies:
+      - aff
+      - effect
+      - either
+      - free
+      - maybe
+      - newtype
+      - prelude
+      - profunctor
+      - tailrec
+      - tuples
+      - type-equality
+      - typelevel-prelude
+      - unsafe-coerce
+      - variant
   safe-coerce:
     type: registry
     version: 2.0.0
@@ -1299,3 +1701,16 @@ packages:
     version: 6.0.0
     integrity: sha256-IqIYW4Vkevn8sI+6aUwRGvd87tVL36BBeOr0cGAE7t0=
     dependencies: []
+  variant:
+    type: registry
+    version: 8.0.0
+    integrity: sha256-SR//zQDg2dnbB8ZHslcxieUkCeNlbMToapvmh9onTtw=
+    dependencies:
+      - enums
+      - lists
+      - maybe
+      - partial
+      - prelude
+      - record
+      - tuples
+      - unsafe-coerce

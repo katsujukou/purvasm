@@ -44,3 +44,6 @@ derive instance Newtype ObjectFile _
 instance Show ObjectFile where
   show (ObjectFile obj) = "(ObjectFile " <> show obj <> ")"
 
+newtype PmiFile = PmiFile
+  {
+  }

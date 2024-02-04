@@ -2,15 +2,29 @@ module Purvasm.Types where
 
 import Prelude
 
+import Data.Array as Array
 import Data.Generic.Rep (class Generic)
+import Data.Maybe (Maybe(..))
 import Data.Newtype (class Newtype)
 import Data.Show.Generic (genericShow)
+import Data.String (Pattern(..), split)
+import Data.String.Regex (test) as Re
+import Data.String.Regex.Flags (unicode) as Re
+import Data.String.Regex.Unsafe (unsafeRegex) as Re
 
 newtype ModuleName = ModuleName String
 
-derive instance Newtype ModuleName _
+derive newtype instance Eq ModuleName
+derive newtype instance Ord ModuleName
 instance Show ModuleName where
   show (ModuleName modname) = "(ModuleName " <> modname <> ")"
+
+parseModuleName :: String -> Maybe ModuleName
+parseModuleName str = split (Pattern ".") str
+  # Array.all (Re.test regex)
+  # if _ then Just (ModuleName str) else Nothing
+  where
+  regex = Re.unsafeRegex """^[A-Z][a-zA-Z0-9]*$""" Re.unicode
 
 newtype Ident = Ident String
 
@@ -21,6 +35,8 @@ instance Show Ident where
   show (Ident ident) = "(Ident " <> ident <> ")"
 
 type Arity = Int
+
+type ConstructorTag = Int
 
 newtype Global a = Global
   { mod :: ModuleName

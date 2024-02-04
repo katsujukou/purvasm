@@ -4,3 +4,4 @@ package:
     - console
     - optparse
     - purvasm
+    - purvasm-compiler

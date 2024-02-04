@@ -1,0 +1,8 @@
+package:
+  name: purvasm-compiler
+  dependencies:
+    - dodo-printer
+    - language-cst-parser
+    - node-glob-basic
+    - purvasm
+    - run

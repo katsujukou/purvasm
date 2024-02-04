@@ -1,6 +1,7 @@
 package:
   name: purvasm
   dependencies:
+    - argonaut
     - avar
     - console
     - debug
@@ -13,4 +14,62 @@ package:
 workspace:
   package_set:
     registry: 48.7.0
-  extra_packages: {}
+  extra_packages:
+    dodo-printer:
+      repo: https://github.com/natefaubion/purescript-dodo-printer.git
+      version: v2.2.1
+      dependencies:
+        - aff
+        - ansi
+        - arrays
+        - avar
+        - console
+        - control
+        - effect
+        - either
+        - exceptions
+        - foldable-traversable
+        - integers
+        - lists
+        - maybe
+        - newtype
+        - parallel
+        - partial
+        - posix-types
+        - prelude
+        - safe-coerce
+        - strings
+        - tuples
+    language-cst-parser:
+      repo: https://github.com/natefaubion/purescript-language-cst-parser.git
+      version: v0.13.0
+      dependencies:
+        - arrays
+        - console
+        - const
+        - control
+        - effect
+        - either
+        - enums
+        - foldable-traversable
+        - free
+        - functions
+        - functors
+        - identity
+        - integers
+        - lazy
+        - lists
+        - maybe
+        - newtype
+        - node-process
+        - numbers
+        - ordered-collections
+        - partial
+        - prelude
+        - st
+        - strings
+        - transformers
+        - tuples
+        - typelevel-prelude
+        - unfoldable
+        - unsafe-coerce
