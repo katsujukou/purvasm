@@ -38,20 +38,6 @@ type Arity = Int
 
 type ConstructorTag = Int
 
-newtype Global a = Global
-  { mod :: ModuleName
-  , name :: Ident
-  , desc :: a
-  }
-
-instance Show a => Show (Global a) where
-  show (Global desc) = "(Global " <> show desc <> ")"
-
-type GlobalName = Global Unit
-
-mkGlobalName :: ModuleName -> Ident -> GlobalName
-mkGlobalName mod name = Global { mod, name, desc: unit }
-
 data StructuredConstant
   = SCAtom AtomicConstant
   | SCBlock BlockTag (Array StructuredConstant)

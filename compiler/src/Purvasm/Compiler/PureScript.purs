@@ -4,14 +4,15 @@ import Prelude
 
 import Control.Monad.Rec.Class (tailRecM)
 import Data.Argonaut (parseJson, printJsonDecodeError)
-import Data.Array (elem, fold)
+import Data.Array (elem, fold, foldl, foldr)
 import Data.Array as Array
 import Data.Either (Either(..))
+import Data.Foldable (for_)
+import Data.Graph (topsort)
 import Data.Graph as G
+import Data.Set (Set)
 import Data.Set as S
 import Data.Set as Set
-import Data.String (Pattern(..), Replacement(..))
-import Data.String as Str
 import Data.Tuple.Nested (type (/\), (/\))
 import Effect.Aff.AVar (AVar)
 import Effect.Aff.AVar as AVar
@@ -23,16 +24,34 @@ import PureScript.CST.Types (ModuleHeader(..))
 import PureScript.CST.Types as CST
 import PureScript.CoreFn as CF
 import PureScript.CoreFn.Json as CFJ
-import Purvasm.Compiler.Effects.FS (FS, readTextFile)
+import PureScript.ExternsFile (ExternsFile)
+import PureScript.ExternsFile.Decoder.Class (decoder)
+import PureScript.ExternsFile.Decoder.Monad (describeError, runDecoder)
+import Purvasm.Compiler.Effects.FS (FS, readCborFile, readTextFile)
 import Purvasm.Compiler.Effects.Log (LOG)
+import Purvasm.Compiler.Effects.Log as Log
 import Purvasm.Compiler.Effects.Par (PAR)
 import Purvasm.Compiler.Effects.Par as Par
 import Purvasm.DependencyGraph (ModuleGraph)
+import Purvasm.Global (GlobalEnv)
+import Purvasm.Global as Global
 import Purvasm.Types (ModuleName(..))
-import Run (AFF, EFFECT, Run, Step(..))
+import Run (EFFECT, Run, Step(..), AFF)
 import Run as Run
+import Run.Except (EXCEPT)
+import Run.Except as Except
 import Safe.Coerce (coerce)
 import Type.Row (type (+))
+
+data ModuleArtifact = CorefnJson | ExternsCbor
+
+artifactFileName :: ModuleArtifact -> String
+artifactFileName = case _ of
+  CorefnJson -> "corefn.json"
+  ExternsCbor -> "externs.cbor"
+
+moduleArtifactPath :: FilePath -> ModuleName -> ModuleArtifact -> FilePath
+moduleArtifactPath outdir (ModuleName modname) art = Path.concat [ outdir, modname, artifactFileName art ]
 
 -- | Read module name from source file by parsing module header using `purescript-language-cst-parser`.
 sourceModuleName :: forall r. FilePath -> Run (EFFECT + FS + r) ModuleName
@@ -49,7 +68,7 @@ sourceModuleName file = do
         pure (ModuleName modname)
     _ -> Run.liftEffect $ Exn.throw ("Failed to read module name from source file in " <> file <> ".")
 
-buildModuleGraph :: forall r. Array ModuleName -> Run (LOG + PAR (EFFECT + AFF + FS + ()) + FS + AFF + EFFECT + r) (ModuleGraph /\ Int)
+buildModuleGraph :: forall r r'. Array ModuleName -> Run (LOG + PAR (EFFECT + AFF + FS + r) + FS + AFF + EFFECT + r') (ModuleGraph /\ Int)
 buildModuleGraph rootModules = do
   avar <- Run.liftAff (AVar.new { graph: G.empty, done: S.empty })
   cnt <- tailRecM go (avar /\ rootModules)
@@ -113,12 +132,29 @@ buildModuleGraph rootModules = do
     , "Prim.TypeError"
     ]
 
-data ModuleArtifact = CorefnJson | ExternsCbor
+openExternsCbor :: forall r. FilePath -> ModuleName -> Run (AFF + FS + EXCEPT String + LOG + r) ExternsFile
+openExternsCbor outdir modname = do
+  let
+    externsFilePath = moduleArtifactPath outdir modname ExternsCbor
+  f <- readCborFile externsFilePath
+  case runDecoder (decoder @ExternsFile) f of
+    Left err -> do
+      Log.error "Failed to decode externs.cbor"
+      Except.throw (describeError err)
+    Right ext -> pure ext
 
-artifactFileName :: ModuleArtifact -> String
-artifactFileName = case _ of
-  CorefnJson -> "corefn.json"
-  ExternsCbor -> "externs.cbor"
-
-moduleArtifactPath :: FilePath -> ModuleName -> ModuleArtifact -> FilePath
-moduleArtifactPath outdir (ModuleName modname) art = Path.concat [ outdir, modname, artifactFileName art ]
+makeExternsEnv :: forall r' r. Array (Set ModuleName) -> Run (AFF + PAR (FS + EXCEPT String + AFF + LOG + r) + r') GlobalEnv
+makeExternsEnv sortedGraph = do
+  aEnv <- Run.liftAff (AVar.new Global.emptyEnv)
+  for_ sortedGraph \moduleSet -> do
+    -- moduleSet` contains those modules of same depdendency level,
+    -- so we can safely collect declarations from externs and add 
+    -- them in env in paralle. 
+    exts <- Par.all
+      ( moduleSet # Array.fromFoldable <#> \mod -> do
+          openExternsCbor "output" mod
+      )
+    Run.liftAff do
+      env <- AVar.take aEnv
+      AVar.put (foldr Global.applyExternsToEnv env exts) aEnv
+  pure Global.emptyEnv

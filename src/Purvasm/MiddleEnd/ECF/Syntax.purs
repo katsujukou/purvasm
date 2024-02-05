@@ -3,7 +3,8 @@ module Purvasm.MiddleEnd.ECF.Syntax where
 import Prelude
 
 import Data.Tuple (Tuple)
-import Purvasm.Types (Arity, GlobalName, Ident(..), ModuleName(..), ConstructorTag)
+import Purvasm.Global (GlobalName)
+import Purvasm.Types (Arity, Ident(..), ModuleName(..), ConstructorTag)
 
 newtype Module a = Module
   { name :: ModuleName

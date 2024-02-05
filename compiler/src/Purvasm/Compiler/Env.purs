@@ -2,4 +2,8 @@ module Purvasm.Compiler.Env where
 
 import Prelude
 
-type CompileEnv = {}
+import Purvasm.Global (GlobalEnv)
+
+type CompileEnv =
+  { global :: GlobalEnv
+  }

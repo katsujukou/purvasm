@@ -5,8 +5,9 @@ module Purvasm.Backend.Types
 
 import Prelude
 
+import Purvasm.Global (GlobalName(..), mkGlobalName) as ReExports
 import Purvasm.Primitives (Primitive(..)) as ReExports
-import Purvasm.Types (Arity, AtomicConstant(..), GlobalName, mkGlobalName, Ident(..), ModuleName(..), StructuredConstant(..), BlockTag(..)) as ReExports
+import Purvasm.Types (Arity, AtomicConstant(..), Ident(..), ModuleName(..), StructuredConstant(..), BlockTag(..)) as ReExports
 
 newtype Label = Label Int
 

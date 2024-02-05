@@ -3,7 +3,8 @@ module Purvasm.Compiler.Effects.FS where
 import Prelude
 
 import Data.Array as Array
-import Data.Set (Set)
+import Foreign (Foreign)
+import Node.Cbor as Cbor
 import Node.Encoding (Encoding(..))
 import Node.FS.Aff as FS
 import Node.Glob.Basic as Glob
@@ -16,6 +17,7 @@ import Type.Row (type (+))
 data Fs a
   = ExpandGlob FilePath String (Array FilePath -> a)
   | ReadTextFile FilePath (String -> a)
+  | ReadCborFile FilePath (Foreign -> a)
 
 derive instance Functor Fs
 
@@ -30,6 +32,9 @@ expandGlob cwd glob = Run.lift _fs (ExpandGlob cwd glob identity)
 readTextFile :: forall r. FilePath -> Run (FS + r) String
 readTextFile file = Run.lift _fs (ReadTextFile file identity)
 
+readCborFile :: forall r. FilePath -> Run (FS + r) Foreign
+readCborFile file = Run.lift _fs (ReadCborFile file identity)
+
 interpret :: forall a r. (Fs ~> Run r) -> Run (FS + r) a -> Run r a
 interpret handler = Run.interpret (Run.on _fs handler Run.send)
 
@@ -42,3 +47,7 @@ handleNode = case _ of
   ReadTextFile file reply -> do
     content <- Run.liftAff (FS.readTextFile UTF8 file)
     pure (reply content)
+  ReadCborFile file reply -> do
+    f <- Run.liftAff do
+      Cbor.decodeFirst =<< FS.readFile file
+    pure (reply f)

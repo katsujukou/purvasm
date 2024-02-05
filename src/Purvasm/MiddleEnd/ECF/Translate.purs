@@ -4,12 +4,27 @@ module Purvasm.MiddleEnd.ECF.Translate where
 
 import Prelude
 
+import Data.Maybe (Maybe(..))
 import PureScript.CoreFn as CF
+import Purvasm.Global (mkGlobalName)
 import Purvasm.MiddleEnd.ECF.Syntax (Expr(..))
-import Purvasm.Types (Ident(..))
+import Purvasm.Types (Ident(..), ModuleName(..))
+import Safe.Coerce (coerce)
 
 type CorefnExpr = CF.Expr CF.Ann
 
-translateExpr :: CorefnExpr -> Expr Unit
+-- | Note that return type is not `Expr a` but `Array (Expr a)`,
+-- | for some cases declaration in corefn modules can be splitted into
+-- | sevaral toplevel phrases or excluded. 
+translateExpr :: CorefnExpr -> Array (Expr Unit)
 translateExpr = case _ of
-  _ -> ExprVar unit (Ident "x")
+  CF.ExprVar _ (CF.Qualified qual (CF.Ident ident))
+    | Just (CF.ModuleName modname) <- qual -> [ ExprGlobal unit (mkGlobalName (ModuleName modname) (Ident ident)) ]
+    | otherwise -> [ ExprVar unit (Ident ident) ]
+  _ -> [ ExprVar unit (Ident "x") ]
+
+translModuleName :: CF.ModuleName -> ModuleName
+translModuleName = coerce
+
+translIdent :: CF.Ident -> Ident
+translIdent = coerce

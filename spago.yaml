@@ -6,6 +6,8 @@ package:
     - console
     - debug
     - effect
+    - fmt
+    - js-promise-aff
     - node-path
     - prelude
   test:

@@ -4,7 +4,7 @@ import Prelude
 
 import Control.Monad.Rec.Class (Step(..), tailRecM)
 import Data.Array as Array
-import Data.Either (Either(..))
+import Data.Either (Either(..), either)
 import Data.Generic.Rep (class Generic)
 import Data.Graph as G
 import Data.Show.Generic (genericShow)
@@ -23,7 +23,7 @@ import Purvasm.Compiler.Effects.Par (PAR)
 import Purvasm.Compiler.Effects.Par as Par
 import Purvasm.Compiler.Env (CompileEnv)
 import Purvasm.Compiler.Metrics (Metrics)
-import Purvasm.Compiler.PureScript (buildModuleGraph, sourceModuleName)
+import Purvasm.Compiler.PureScript (buildModuleGraph, makeExternsEnv, sourceModuleName)
 import Purvasm.Compiler.Types (LogVerbosity)
 import Purvasm.DependencyGraph (ModuleGraph)
 import Purvasm.Types (ModuleName)
@@ -32,6 +32,7 @@ import Run as Run
 import Run.Except (EXCEPT)
 import Run.Except as Except
 import Type.Row (type (+))
+import Unsafe.Coerce (unsafeCoerce)
 
 data CompInput
   = InpFilePath FilePath
@@ -43,34 +44,23 @@ instance Show CompInput where
 
 -- | Descriptor of each compilation step.
 data CompileStep
-  =
-    -- | List all modules to compile.
-    Initial CompInput
-  -- | From the list of input modules, resolve all transitive dependencies and make build plan.
+  = Initial CompInput
+  -- ^ List all modules to compile.    
   | ModulesResolved ModuleGraph
+  -- ^ From the list of input modules, resolve all transitive dependencies and make build plan.
   | EnvSetup CompileEnv
+  -- ^ Make build env adding information from externs files. 
   | Finish Metrics
 
 derive instance Generic CompileStep _
 instance Show CompileStep where
   show = genericShow
 
--- type CompileSyncEffects r =
---   ( EXCEPT String
---       + FS
---       + LOG
---       + AFF
---       + EFFECT
---       + r
---   )
-
--- type CompileEffects r = (CompileSyncEffects + PAR (CompileSyncEffects r) + r)
-
 -- | The compilation pass.
 nextStep
   :: forall r
    . CompileStep
-  -> Run (EXCEPT String + FS + LOG + (PAR (AFF + EFFECT + FS + ())) + AFF + EFFECT + r) (Step CompileStep Unit)
+  -> Run (EXCEPT String + FS + LOG + AFF + EFFECT + PAR (FS + LOG + EXCEPT String + AFF + EFFECT + ()) + r) (Step CompileStep Unit)
 nextStep = case _ of
   -- From `CompInput`, resolve the path to input modules according to following scheme:
   --  - If `CompInput` is given with `InpFilePath`, all `*.purs` source files
@@ -97,15 +87,17 @@ nextStep = case _ of
       Log.info "Resolving dependencies..."
       graph /\ size <- buildModuleGraph modules
       Log.info $ "Resolved. We have " <> show size <> " modules to build."
-      Log.debug $ show (G.topsort graph)
       pure $ Loop $ ModulesResolved graph
   -- 
-  ModulesResolved modules -> do
+  ModulesResolved graph -> do
     Log.debug "=============================="
     Log.debug "Entered step: ModulesResolved"
     Log.debug "Make build env..."
-
-    pure (Loop $ EnvSetup {})
+    let sorted = G.topsort graph
+    glEnv <- makeExternsEnv sorted
+    pure $ Loop $ EnvSetup
+      { global: glEnv
+      }
 
   EnvSetup env -> do
     Log.debug "EnvSetup"
@@ -125,11 +117,15 @@ compile :: Options -> CompInput -> Aff Unit
 compile opts inp = do
   let
     run = tailRecM nextStep (Initial inp)
+
     interpretPar r = r
-      # Par.interpretAff
+      # Par.interpretExceptAff
           ( FS.interpret FS.handleNode
+              >>> Log.interpret (Log.handleTerminal opts.verbosity)
+              >>> Except.runExcept
               >>> Run.runBaseAff'
           )
+      # Except.runExcept
 
   result <- run
     # Log.interpret (Log.handleTerminal opts.verbosity)

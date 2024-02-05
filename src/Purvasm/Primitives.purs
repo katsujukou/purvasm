@@ -4,7 +4,8 @@ import Prelude
 
 import Data.Generic.Rep (class Generic)
 import Data.Show.Generic (genericShow)
-import Purvasm.Types (BlockTag, GlobalName)
+import Purvasm.Types (BlockTag)
+import Purvasm.Global (GlobalName)
 
 data Primitive
   = PGetGlobal GlobalName

@@ -34,6 +34,7 @@ workspace:
         - exceptions
         - exists
         - exitcodes
+        - fmt
         - foldable-traversable
         - foreign
         - foreign-object
@@ -45,6 +46,8 @@ workspace:
         - integers
         - invariant
         - js-date
+        - js-promise
+        - js-promise-aff
         - language-cst-parser
         - lazy
         - lists
@@ -96,6 +99,8 @@ workspace:
         - console
         - debug
         - effect
+        - fmt
+        - js-promise-aff
         - node-path
         - prelude
       test_dependencies: []
@@ -120,7 +125,9 @@ workspace:
         - enums
         - exceptions
         - exists
+        - fmt
         - foldable-traversable
+        - foreign
         - foreign-object
         - functions
         - functors
@@ -128,6 +135,8 @@ workspace:
         - identity
         - integers
         - invariant
+        - js-promise
+        - js-promise-aff
         - lazy
         - lists
         - maybe
@@ -188,6 +197,7 @@ workspace:
         - enums
         - exceptions
         - exists
+        - fmt
         - foldable-traversable
         - foreign
         - foreign-object
@@ -199,6 +209,8 @@ workspace:
         - integers
         - invariant
         - js-date
+        - js-promise
+        - js-promise-aff
         - language-cst-parser
         - lazy
         - lists
@@ -1063,6 +1075,19 @@ packages:
     integrity: sha256-4wxViTbyOoyKJ/WaRGI6+hZmgMKI5Miv16lSwefiLSM=
     dependencies:
       - enums
+  fmt:
+    type: registry
+    version: 0.2.1
+    integrity: sha256-/XsiC/mVJq+VhiuXZRHYo3xOvO69MYr2D4FiY+KfK58=
+    dependencies:
+      - arrays
+      - foldable-traversable
+      - prelude
+      - record
+      - strings
+      - tuples
+      - type-equality
+      - typelevel-prelude
   foldable-traversable:
     type: registry
     version: 6.0.0
@@ -1203,6 +1228,25 @@ packages:
       - foreign
       - integers
       - now
+  js-promise:
+    type: registry
+    version: 1.0.0
+    integrity: sha256-kXNo5g9RJgPdrTuKRe5oG2kBIwPp+j5VDPDplqZBJzQ=
+    dependencies:
+      - effect
+      - exceptions
+      - foldable-traversable
+      - functions
+      - maybe
+      - prelude
+  js-promise-aff:
+    type: registry
+    version: 1.0.0
+    integrity: sha256-s9kml9Ei74hKlMMg41yyZp4GkbmYUwaH+gBWWrdhwec=
+    dependencies:
+      - aff
+      - foreign
+      - js-promise
   language-cst-parser:
     type: git
     url: https://github.com/natefaubion/purescript-language-cst-parser.git
