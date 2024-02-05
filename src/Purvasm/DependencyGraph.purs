@@ -1,6 +1,10 @@
-module Purvasm.DependencyGraph where
+module Purvasm.DependencyGraph
+  ( ModuleGraph
+  , module ReExports
+  ) where
 
-import Data.Graph (Graph)
+import Data.HashGraph (HashGraph)
+import Data.HashGraph (addVertices, topsort) as ReExports
 import Purvasm.Types (ModuleName)
 
-type ModuleGraph = Graph ModuleName
+type ModuleGraph = HashGraph ModuleName

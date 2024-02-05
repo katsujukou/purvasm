@@ -89,6 +89,7 @@ workspace:
         - type-equality
         - typelevel-prelude
         - unfoldable
+        - unordered-collections
         - unsafe-coerce
         - variant
     purvasm:
@@ -103,6 +104,7 @@ workspace:
         - js-promise-aff
         - node-path
         - prelude
+        - unordered-collections
       test_dependencies: []
       build_plan:
         - aff
@@ -162,6 +164,7 @@ workspace:
         - type-equality
         - typelevel-prelude
         - unfoldable
+        - unordered-collections
         - unsafe-coerce
     purvasm-compiler:
       path: compiler
@@ -248,6 +251,7 @@ workspace:
         - type-equality
         - typelevel-prelude
         - unfoldable
+        - unordered-collections
         - unsafe-coerce
         - variant
     purvasm-linker:
@@ -1740,6 +1744,21 @@ packages:
       - partial
       - prelude
       - tuples
+  unordered-collections:
+    type: registry
+    version: 3.0.1
+    integrity: sha256-vhQls+yxpDhaIH2vTkmP04pWo7iX+KP0a+d4UoF72cE=
+    dependencies:
+      - arrays
+      - enums
+      - functions
+      - integers
+      - lists
+      - prelude
+      - record
+      - tuples
+      - typelevel-prelude
+      - unfoldable
   unsafe-coerce:
     type: registry
     version: 6.0.0

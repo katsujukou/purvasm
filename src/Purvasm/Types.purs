@@ -4,6 +4,7 @@ import Prelude
 
 import Data.Array as Array
 import Data.Generic.Rep (class Generic)
+import Data.Hashable (class Hashable)
 import Data.Maybe (Maybe(..))
 import Data.Newtype (class Newtype)
 import Data.Show.Generic (genericShow)
@@ -16,6 +17,8 @@ newtype ModuleName = ModuleName String
 
 derive newtype instance Eq ModuleName
 derive newtype instance Ord ModuleName
+derive newtype instance Hashable ModuleName
+
 instance Show ModuleName where
   show (ModuleName modname) = "(ModuleName " <> modname <> ")"
 

@@ -3,11 +3,11 @@ module Purvasm.Global where
 import Prelude
 
 import Data.Generic.Rep (class Generic)
-import Data.Map (Map)
-import Data.Map as Map
+import Data.HashMap (HashMap)
+import Data.HashMap as HashMap
 import Data.Newtype (class Newtype)
 import Data.Show.Generic (genericShow)
-import PureScript.ExternsFile (ExternsFile(..))
+import PureScript.ExternsFile (ExternsFile)
 import Purvasm.Types (Arity, ConstructorTag, Ident, ModuleName)
 
 newtype GlobalName = GlobalName { modname :: ModuleName, ident :: Ident }
@@ -22,9 +22,9 @@ mkGlobalName :: ModuleName -> Ident -> GlobalName
 mkGlobalName modname ident = GlobalName { modname, ident }
 
 newtype GlobalEnv = GlobalEnv
-  { valueDecls :: Map GlobalName ValueDesc
-  , constructorDecls :: Map GlobalName ConstructorDesc
-  , typeclassDecls :: Map GlobalName TypeclassDesc
+  { valueDecls :: HashMap GlobalName ValueDesc
+  , constructorDecls :: HashMap GlobalName ConstructorDesc
+  , typeclassDecls :: HashMap GlobalName TypeclassDesc
   }
 
 instance Show GlobalEnv where
@@ -32,9 +32,9 @@ instance Show GlobalEnv where
 
 emptyEnv :: GlobalEnv
 emptyEnv = GlobalEnv
-  { valueDecls: Map.empty
-  , constructorDecls: Map.empty
-  , typeclassDecls: Map.empty
+  { valueDecls: HashMap.empty
+  , constructorDecls: HashMap.empty
+  , typeclassDecls: HashMap.empty
   }
 
 derive instance Newtype GlobalEnv _

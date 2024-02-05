@@ -10,6 +10,7 @@ import Data.Either (Either(..))
 import Data.Foldable (for_)
 import Data.Graph (topsort)
 import Data.Graph as G
+import Data.HashGraph as HG
 import Data.Set (Set)
 import Data.Set as S
 import Data.Set as Set
@@ -70,7 +71,7 @@ sourceModuleName file = do
 
 buildModuleGraph :: forall r r'. Array ModuleName -> Run (LOG + PAR (EFFECT + AFF + FS + r) + FS + AFF + EFFECT + r') (ModuleGraph /\ Int)
 buildModuleGraph rootModules = do
-  avar <- Run.liftAff (AVar.new { graph: G.empty, done: S.empty })
+  avar <- Run.liftAff (AVar.new { graph: HG.empty, done: S.empty })
   cnt <- tailRecM go (avar /\ rootModules)
   graph <- Run.liftAff (AVar.take avar <#> _.graph)
   pure (graph /\ cnt)
@@ -104,8 +105,8 @@ buildModuleGraph rootModules = do
               let
                 next = cur
                   { graph = cur.graph
-                      # G.addVertices (Set.fromFoldable imports)
-                      # G.addVertexWithOutgoingEdges m (Set.fromFoldable imports)
+                      # HG.addVertices imports
+                      # HG.addVertexWithOutgoingEdges m imports
                   , done = Set.insert m cur.done
                   }
               AVar.put next avar

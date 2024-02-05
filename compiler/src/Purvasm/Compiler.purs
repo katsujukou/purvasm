@@ -25,7 +25,8 @@ import Purvasm.Compiler.Env (CompileEnv)
 import Purvasm.Compiler.Metrics (Metrics)
 import Purvasm.Compiler.PureScript (buildModuleGraph, makeExternsEnv, sourceModuleName)
 import Purvasm.Compiler.Types (LogVerbosity)
-import Purvasm.DependencyGraph (ModuleGraph)
+import Purvasm.DependencyGraph (ModuleGraph, topsort)
+import Purvasm.Global as Global
 import Purvasm.Types (ModuleName)
 import Run (AFF, Run, EFFECT)
 import Run as Run
@@ -88,15 +89,17 @@ nextStep = case _ of
       graph /\ size <- buildModuleGraph modules
       Log.info $ "Resolved. We have " <> show size <> " modules to build."
       pure $ Loop $ ModulesResolved graph
-  -- 
+  -- From list of modules to compile passed from previous step, make build plan.
+  -- First, We group and order these modules by ensuring they have the same dependencies 
+  -- and arranging them accordingly..
   ModulesResolved graph -> do
     Log.debug "=============================="
     Log.debug "Entered step: ModulesResolved"
     Log.debug "Make build env..."
-    let sorted = G.topsort graph
-    glEnv <- makeExternsEnv sorted
+    let sorted = topsort graph
+    -- glEnv <- makeExternsEnv sorted
     pure $ Loop $ EnvSetup
-      { global: glEnv
+      { global: Global.emptyEnv
       }
 
   EnvSetup env -> do
