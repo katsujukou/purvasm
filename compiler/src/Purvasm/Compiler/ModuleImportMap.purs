@@ -7,15 +7,11 @@ module Purvasm.Compiler.ModuleImportMap
   , nodes
   ) where
 
-import Prelude
-
-import Data.Array as Array
 import Data.HashMap (HashMap)
 import Data.HashMap as HashMap
 import PureScript.CoreFn as CF
 import PureScript.CoreFn.Json as CFJ
 import Purvasm.Types (ModuleName)
-import Safe.Coerce (coerce)
 import Data.HashMap (filter, member) as ReExports
 
 type ModuleImportMap = HashMap ModuleName (CFJ.PartialModule CF.Ann)

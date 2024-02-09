@@ -14,14 +14,17 @@ import Data.Lazy as L
 import Data.Maybe (Maybe(..))
 import Effect.AVar (AVar)
 import Effect.Aff.AVar as AVar
+import Fmt (fmt)
 import PureScript.CoreFn as CF
 import PureScript.CoreFn.Json (PartialModule(..), fullModule)
 import PureScript.CoreFn.Json as CFJ
 import Purvasm.Compiler.Compile (UnitaryCompileResult, UnitaryCompileResultDesc(..), compileModule)
 import Purvasm.Compiler.Effects.Log (LOG)
+import Purvasm.Compiler.Effects.Log as Log
 import Purvasm.Compiler.Effects.Par (PAR)
 import Purvasm.Compiler.Effects.Par as Par
 import Purvasm.Compiler.ModuleImportMap (ModuleImportMap, filter, modules)
+import Purvasm.Compiler.Types (prettyPrintIndex)
 import Purvasm.Global (GlobalEnv)
 import Purvasm.Global as Global
 import Run (Run, AFF)
@@ -96,8 +99,13 @@ batchCompile = loop 1
                 , desc: UCompFailed $ printJsonDecodeError err
                 }
             Right module_ -> do
+              Log.info $
+                fmt @"{idx} Compiling {modname}"
+                  { idx: prettyPrintIndex (idxTpl { current = idx + 1 })
+                  , modname: "\x1b[1;33m" <> coerce name <> "\x1b[0m"
+                  }
+
               compileModule
-                (idxTpl { current = idx + 1 })
                 (extendGlobalEnv plan.globals)
                 module_
       )
