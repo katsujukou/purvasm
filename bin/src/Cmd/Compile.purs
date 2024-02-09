@@ -8,8 +8,8 @@ import Effect.Aff (Aff, error, throwError)
 import Node.Path (FilePath)
 import Options.Applicative (strArgument, switch)
 import Options.Applicative as Opts
-import Purvasm.Compiler (CompInput(..), compile)
-import Purvasm.Compiler.Types (LogVerbosity)
+import Purvasm.Compiler (compile)
+import Purvasm.Compiler.Types (CompInput(..), LogVerbosity)
 import Purvasm.Types (parseModuleName)
 
 type Options =

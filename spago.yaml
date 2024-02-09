@@ -8,12 +8,14 @@ package:
     - effect
     - fmt
     - js-promise-aff
+    - node-buffer
     - node-path
     - prelude
     - unordered-collections
   test:
     main: Test.Main
-    dependencies: []
+    dependencies:
+      - spec
 workspace:
   package_set:
     registry: 48.7.0

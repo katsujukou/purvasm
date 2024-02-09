@@ -4,10 +4,7 @@ import Prelude
 
 import Control.Monad.Rec.Class (Step(..), tailRecM)
 import Data.Array as Array
-import Data.Either (Either(..), either)
-import Data.Generic.Rep (class Generic)
-import Data.Graph as G
-import Data.Show.Generic (genericShow)
+import Data.Either (Either(..))
 import Data.String as Str
 import Data.Tuple.Nested ((/\))
 import Effect.Aff (Aff)
@@ -15,47 +12,37 @@ import Effect.Class.Console as Console
 import Node.Path (FilePath)
 import Node.Path as Path
 import Node.Process as Process
+import PureScript.CoreFn (importName)
+import PureScript.CoreFn.Json as CFJ
+import Purvasm.Backend.PmoFile (PmoFile)
+import Purvasm.Compiler.BatchCompile (BuildPlan, batchCompile, initBuildPlan)
 import Purvasm.Compiler.Effects.FS (FS, expandGlob)
 import Purvasm.Compiler.Effects.FS as FS
 import Purvasm.Compiler.Effects.Log (LOG)
 import Purvasm.Compiler.Effects.Log as Log
 import Purvasm.Compiler.Effects.Par (PAR)
 import Purvasm.Compiler.Effects.Par as Par
-import Purvasm.Compiler.Env (CompileEnv)
 import Purvasm.Compiler.Metrics (Metrics)
-import Purvasm.Compiler.PureScript (buildModuleGraph, makeExternsEnv, sourceModuleName)
-import Purvasm.Compiler.Types (LogVerbosity)
-import Purvasm.DependencyGraph (ModuleGraph, topsort)
-import Purvasm.Global as Global
-import Purvasm.Types (ModuleName)
+import Purvasm.Compiler.ModuleImportMap (ModuleImportMap)
+import Purvasm.Compiler.PureScript (mkModuleImportMap, sourceModuleName)
+import Purvasm.Compiler.Types (CompInput(..), LogVerbosity)
 import Run (AFF, Run, EFFECT)
 import Run as Run
 import Run.Except (EXCEPT)
 import Run.Except as Except
 import Type.Row (type (+))
-import Unsafe.Coerce (unsafeCoerce)
 
-data CompInput
-  = InpFilePath FilePath
-  | InpModule ModuleName
-
-derive instance Generic CompInput _
-instance Show CompInput where
-  show = genericShow
-
--- | Descriptor of each compilation step.
+-- | Descriptor of batch compilation steps.
 data CompileStep
   = Initial CompInput
-  -- ^ List all modules to compile.    
-  | ModulesResolved ModuleGraph
+  -- ^ List all modules to compile.
+  | ModulesResolved ModuleImportMap
   -- ^ From the list of input modules, resolve all transitive dependencies and make build plan.
-  | EnvSetup CompileEnv
-  -- ^ Make build env adding information from externs files. 
+  | BuildPlanCreated BuildPlan
+  -- ^ From the build plan, run compile pass for each compilation unit 
+  | AllModulesCompiled (Array PmoFile)
+  -- ^ Link all the object code files, with resolving global symbol reference, and finally emit executable. 
   | Finish Metrics
-
-derive instance Generic CompileStep _
-instance Show CompileStep where
-  show = genericShow
 
 -- | The compilation pass.
 nextStep
@@ -86,28 +73,25 @@ nextStep = case _ of
           -- For each purs source file, parse module header and read module name in parallel. 
           Par.all $ sourceModuleName <$> files
       Log.info "Resolving dependencies..."
-      graph /\ size <- buildModuleGraph modules
+      importMap /\ size <- mkModuleImportMap modules
       Log.info $ "Resolved. We have " <> show size <> " modules to build."
-      pure $ Loop $ ModulesResolved graph
+      let moduleImports (CFJ.PartialModule { imports }) = importName <$> imports
+      Log.debug "module import map is:"
+      Log.debug $ show (map moduleImports importMap)
+      pure $ Loop $ ModulesResolved importMap
   -- From list of modules to compile passed from previous step, make build plan.
   -- First, We group and order these modules by ensuring they have the same dependencies 
   -- and arranging them accordingly..
-  ModulesResolved graph -> do
+  ModulesResolved importMap -> do
     Log.debug "=============================="
     Log.debug "Entered step: ModulesResolved"
-    Log.debug "Make build env..."
-    let sorted = topsort graph
+    Log.debug "Make build plan..."
+    _ <- initBuildPlan importMap >>= batchCompile
+
     -- glEnv <- makeExternsEnv sorted
-    pure $ Loop $ EnvSetup
-      { global: Global.emptyEnv
-      }
+    pure $ Loop $ Finish {}
 
-  EnvSetup env -> do
-    Log.debug "EnvSetup"
-    Log.info $ show env
-    pure (Loop $ Finish {})
-
-  Finish {} -> do
+  _ -> do
     Log.debug "Finish"
     pure (Done unit)
 

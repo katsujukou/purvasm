@@ -2,24 +2,16 @@ module Purvasm.Compiler.PureScript where
 
 import Prelude
 
-import Control.Monad.Rec.Class (tailRecM)
 import Data.Argonaut (parseJson, printJsonDecodeError)
-import Data.Array (elem, fold, foldl, foldr)
+import Data.Array (elem, fold, foldr, nub)
 import Data.Array as Array
 import Data.Either (Either(..))
 import Data.Foldable (for_)
-import Data.Graph (topsort)
-import Data.Graph as G
-import Data.HashGraph as HG
+import Data.HashMap as HashMap
 import Data.Set (Set)
-import Data.Set as S
-import Data.Set as Set
 import Data.Tuple.Nested (type (/\), (/\))
-import Effect.Aff.AVar (AVar)
 import Effect.Aff.AVar as AVar
 import Effect.Exception as Exn
-import Node.Path (FilePath)
-import Node.Path as Path
 import PureScript.CST (PartialModule(..), RecoveredParserResult(..), parsePartialModule)
 import PureScript.CST.Types (ModuleHeader(..))
 import PureScript.CST.Types as CST
@@ -28,16 +20,17 @@ import PureScript.CoreFn.Json as CFJ
 import PureScript.ExternsFile (ExternsFile)
 import PureScript.ExternsFile.Decoder.Class (decoder)
 import PureScript.ExternsFile.Decoder.Monad (describeError, runDecoder)
-import Purvasm.Compiler.Effects.FS (FS, readCborFile, readTextFile)
+import Purvasm.Compiler.Effects.FS (FS, FilePath, concatPaths, readCborFile, readTextFile)
+import Purvasm.Compiler.Effects.FS as FS
 import Purvasm.Compiler.Effects.Log (LOG)
 import Purvasm.Compiler.Effects.Log as Log
 import Purvasm.Compiler.Effects.Par (PAR)
 import Purvasm.Compiler.Effects.Par as Par
-import Purvasm.DependencyGraph (ModuleGraph)
+import Purvasm.Compiler.ModuleImportMap (ModuleImportMap)
 import Purvasm.Global (GlobalEnv)
 import Purvasm.Global as Global
 import Purvasm.Types (ModuleName(..))
-import Run (EFFECT, Run, Step(..), AFF)
+import Run (AFF, EFFECT, Run)
 import Run as Run
 import Run.Except (EXCEPT)
 import Run.Except as Except
@@ -51,8 +44,8 @@ artifactFileName = case _ of
   CorefnJson -> "corefn.json"
   ExternsCbor -> "externs.cbor"
 
-moduleArtifactPath :: FilePath -> ModuleName -> ModuleArtifact -> FilePath
-moduleArtifactPath outdir (ModuleName modname) art = Path.concat [ outdir, modname, artifactFileName art ]
+moduleArtifactPath :: forall r. FilePath -> ModuleName -> ModuleArtifact -> Run (FS + r) FilePath
+moduleArtifactPath outdir (ModuleName modname) art = concatPaths [ outdir, modname, artifactFileName art ]
 
 -- | Read module name from source file by parsing module header using `purescript-language-cst-parser`.
 sourceModuleName :: forall r. FilePath -> Run (EFFECT + FS + r) ModuleName
@@ -69,74 +62,70 @@ sourceModuleName file = do
         pure (ModuleName modname)
     _ -> Run.liftEffect $ Exn.throw ("Failed to read module name from source file in " <> file <> ".")
 
-buildModuleGraph :: forall r r'. Array ModuleName -> Run (LOG + PAR (EFFECT + AFF + FS + r) + FS + AFF + EFFECT + r') (ModuleGraph /\ Int)
-buildModuleGraph rootModules = do
-  avar <- Run.liftAff (AVar.new { graph: HG.empty, done: S.empty })
-  cnt <- tailRecM go (avar /\ rootModules)
-  graph <- Run.liftAff (AVar.take avar <#> _.graph)
-  pure (graph /\ cnt)
+openPartialModule :: forall r. ModuleName -> Run (LOG + EXCEPT String + FS + r) (CFJ.PartialModule CF.Ann)
+openPartialModule m = do
+  filepath <- moduleArtifactPath "output" m CorefnJson
+  json <- FS.readTextFile filepath
+  case json # parseJson >>= CFJ.runJsonDecode CFJ.decodePartialModule of
+    Left err -> do
+      Log.error $ printJsonDecodeError err
+      Except.throw $ "Failed to decode corefn.json of module " <> coerce m <> "."
+    Right pm -> pure pm
+
+mkModuleImportMap :: forall r r'. Array ModuleName -> Run (LOG + PAR (LOG + FS + EXCEPT String + AFF + r') + AFF + r) (ModuleImportMap /\ Int)
+mkModuleImportMap roots = do
+  avar <- Run.liftAff $ AVar.new HashMap.empty
+  cnt <- go (avar /\ roots)
+  importMap <- Run.liftAff (AVar.take avar)
+  pure (importMap /\ cnt)
   where
-  go (avar /\ modules) = do
-    next <- fold <$>
-      ( Par.all $
-          modules <#> \m -> do
-            addDepsToGraphForSingleModule avar m
+  go (avar /\ []) = do
+    Run.liftAff (AVar.read avar) >>= HashMap.size >>> pure
+
+  go (avar /\ importers) = do
+    next <- nub <<< fold <$> Par.all
+      ( importers <#> \m -> do
+          (CFJ.PartialModule pm') <- openPartialModule m
+          let
+            pm = pm'
+              { imports = pm'.imports
+                  # Array.filter
+                      ( \(CF.Import _ name) ->
+                          -- exclude prim modules
+                          name `not <<< elem` primModules
+                            -- exclude the importing module itself
+                            && name /= pm'.name
+                      )
+              }
+            pModule = CFJ.PartialModule pm
+          Run.liftAff do
+            importMap <- AVar.take avar
+            avar # AVar.put
+              (HashMap.insert m pModule importMap)
+            pure $ listImportedModules pModule
       )
-    if Array.null next then Run.liftAff (AVar.read avar <#> _.done >>> Set.size) >>= Done >>> pure
-    else pure $ Loop (avar /\ next)
+    go (avar /\ next)
 
-  addDepsToGraphForSingleModule :: AVar _ -> ModuleName -> Run _ (Array ModuleName)
-  addDepsToGraphForSingleModule avar m = do
-    { done } <- Run.liftAff $ AVar.read avar
-    if m `Set.member` done then pure []
-    else do
-      let corefnPath = moduleArtifactPath "output" m CorefnJson
-      readTextFile corefnPath
-        <#> (parseJson >=> CFJ.decodeModule)
-        >>= case _ of
-          Left e -> Run.liftEffect $ Exn.throw $
-            ("Failed to decode corefn.json (" <> show corefnPath <> ").\n")
-              <> "Error description: \n"
-              <> printJsonDecodeError e
-          Right cfm -> do
-            let imports = listImportedModules cfm
-            Run.liftAff do
-              cur <- AVar.take avar
-              let
-                next = cur
-                  { graph = cur.graph
-                      # HG.addVertices imports
-                      # HG.addVertexWithOutgoingEdges m imports
-                  , done = Set.insert m cur.done
-                  }
-              AVar.put next avar
-            pure imports
-
-  listImportedModules :: forall a. CF.Module a -> Array ModuleName
-  listImportedModules (CF.Module m) = m.imports
+  listImportedModules :: forall a. CFJ.PartialModule a -> Array ModuleName
+  listImportedModules (CFJ.PartialModule m) = m.imports
     <#> (CF.importName >>> coerce)
-    -- exclude prim modules
-    # Array.filter (not <<< isPrimModule)
-    -- exclude the importing module itself
-    # Array.filter (_ /= coerce m.name)
 
-  isPrimModule :: ModuleName -> Boolean
-  isPrimModule (ModuleName m) = m `elem`
-    [ "Prim"
-    , "Prim.Boolean"
-    , "Prim.Coerce"
-    , "Prim.Ordering"
-    , "Prim.Row"
-    , "Prim.RowList"
-    , "Prim.Symbol"
-    , "Prim.Int"
-    , "Prim.TypeError"
-    ]
+primModules :: Array CF.ModuleName
+primModules = CF.ModuleName <$>
+  [ "Prim"
+  , "Prim.Boolean"
+  , "Prim.Coerce"
+  , "Prim.Ordering"
+  , "Prim.Row"
+  , "Prim.RowList"
+  , "Prim.Symbol"
+  , "Prim.Int"
+  , "Prim.TypeError"
+  ]
 
 openExternsCbor :: forall r. FilePath -> ModuleName -> Run (AFF + FS + EXCEPT String + LOG + r) ExternsFile
 openExternsCbor outdir modname = do
-  let
-    externsFilePath = moduleArtifactPath outdir modname ExternsCbor
+  externsFilePath <- moduleArtifactPath outdir modname ExternsCbor
   f <- readCborFile externsFilePath
   case runDecoder (decoder @ExternsFile) f of
     Left err -> do

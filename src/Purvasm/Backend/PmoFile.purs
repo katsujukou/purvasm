@@ -1,4 +1,4 @@
-module Purvasm.Backend.ObjectFile where
+module Purvasm.Backend.PmoFile where
 
 import Prelude
 
@@ -32,7 +32,7 @@ type ObjectHeader =
   , name :: ModuleName
   }
 
-newtype ObjectFile = ObjectFile
+newtype PmoFile = PmoFile
   { head :: ObjectHeader
   , symbols :: Array SymbolDesc
   , textsec :: Array CodeBlock
@@ -40,9 +40,12 @@ newtype ObjectFile = ObjectFile
   , refsec :: Array GlobalName
   }
 
-derive instance Newtype ObjectFile _
-instance Show ObjectFile where
-  show (ObjectFile obj) = "(ObjectFile " <> show obj <> ")"
+derive instance Newtype PmoFile _
+instance Show PmoFile where
+  show (PmoFile obj) = "(PmoFile " <> show obj <> ")"
+
+moduleName :: PmoFile -> ModuleName
+moduleName (PmoFile { head }) = head.name
 
 newtype PmiFile = PmiFile
   {

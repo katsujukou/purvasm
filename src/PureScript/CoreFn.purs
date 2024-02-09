@@ -52,20 +52,8 @@ unQualified (Qualified _ a) = a
 qualifiedModuleName :: forall a. Qualified a -> Maybe ModuleName
 qualifiedModuleName (Qualified mn _) = mn
 
-type SourcePos =
-  { line :: Int
-  , column :: Int
-  }
-
-type SourceSpan =
-  { path :: String
-  , start :: SourcePos
-  , end :: SourcePos
-  }
-
 newtype Ann = Ann
-  { span :: SourceSpan
-  , meta :: Maybe Meta
+  { meta :: Maybe Meta
   }
 
 instance Show Ann where
@@ -95,24 +83,11 @@ derive instance Generic ConstructorType _
 instance Show ConstructorType where
   show = genericShow
 
-data Comment
-  = LineComment String
-  | BlockComment String
-
-derive instance Generic Comment _
-instance Show Comment where
-  show = genericShow
-
 newtype Module a = Module
   { name :: ModuleName
-  , path :: String
-  , span :: SourceSpan
   , imports :: Array (Import a)
-  , exports :: Array Ident
-  , reExports :: Array ReExport
   , decls :: Array (Bind a)
   , foreign :: Array Ident
-  , comments :: Array Comment
   }
 
 instance Show a => Show (Module a) where
@@ -262,12 +237,8 @@ instance Show a => Show (Binder a) where
 
 emptyAnn :: Ann
 emptyAnn = Ann
-  { span: emptySpan
-  , meta: Nothing
+  { meta: Nothing
   }
-
-emptySpan :: SourceSpan
-emptySpan = { path: "<internal>", start: zero, end: zero }
 
 exprAnn :: forall a. Expr a -> a
 exprAnn = case _ of

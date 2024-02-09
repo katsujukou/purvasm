@@ -21,7 +21,7 @@ import Effect.Aff.AVar as AVar
 import Effect.Aff.Class (liftAff)
 import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.Backend.Instruction (CodeBlock, Instruction(..))
-import Purvasm.Backend.ObjectFile (ObjectFile(..), SymbolDesc, SymbolType(..))
+import Purvasm.Backend.PmoFile (PmoFile(..), SymbolDesc, SymbolType(..))
 import Purvasm.Backend.Types (Arity, Ident, Label(..), ModuleName, Primitive(..), mkGlobalName)
 import Purvasm.MiddleEnd (ELambda(..), Var(..))
 import Purvasm.MiddleEnd as ME
@@ -141,7 +141,7 @@ compileExpr handler = go
           c' <- go cont head
           compileExprList (KPush : c') tail
 
-compileModule :: ME.Module -> Aff ObjectFile
+compileModule :: ME.Module -> Aff PmoFile
 compileModule (ME.Module m@{ decls }) = do
   symMngr <- AVar.new { tbl: Map.empty, dataNext: 0, textNext: 0 }
   let
@@ -163,7 +163,7 @@ compileModule (ME.Module m@{ decls }) = do
   symbols <- AVar.take symMngr <#> _.tbl
 
   -- generate object code file
-  pure $ ObjectFile $
+  pure $ PmoFile $
     { head:
         { name: moduleName
         , pursVersion: "0.15.14"

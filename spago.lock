@@ -38,6 +38,7 @@ workspace:
         - foldable-traversable
         - foreign
         - foreign-object
+        - fork
         - free
         - functions
         - functors
@@ -52,6 +53,7 @@ workspace:
         - lazy
         - lists
         - maybe
+        - mmorph
         - newtype
         - node-buffer
         - node-event-emitter
@@ -70,6 +72,7 @@ workspace:
         - orders
         - parallel
         - partial
+        - pipes
         - posix-types
         - prelude
         - profunctor
@@ -81,6 +84,7 @@ workspace:
         - refs
         - run
         - safe-coerce
+        - spec
         - st
         - strings
         - tailrec
@@ -102,19 +106,24 @@ workspace:
         - effect
         - fmt
         - js-promise-aff
+        - node-buffer
         - node-path
         - prelude
         - unordered-collections
-      test_dependencies: []
+      test_dependencies:
+        - spec
       build_plan:
         - aff
+        - ansi
         - argonaut
         - argonaut-codecs
         - argonaut-core
         - argonaut-traversals
+        - arraybuffer-types
         - arrays
         - avar
         - bifunctors
+        - catenable-lists
         - console
         - const
         - contravariant
@@ -131,6 +140,8 @@ workspace:
         - foldable-traversable
         - foreign
         - foreign-object
+        - fork
+        - free
         - functions
         - functors
         - gen
@@ -142,20 +153,26 @@ workspace:
         - lazy
         - lists
         - maybe
+        - mmorph
         - newtype
+        - node-buffer
         - node-path
         - nonempty
+        - now
+        - nullable
         - numbers
         - ordered-collections
         - orders
         - parallel
         - partial
+        - pipes
         - prelude
         - profunctor
         - profunctor-lenses
         - record
         - refs
         - safe-coerce
+        - spec
         - st
         - strings
         - tailrec
@@ -204,6 +221,7 @@ workspace:
         - foldable-traversable
         - foreign
         - foreign-object
+        - fork
         - free
         - functions
         - functors
@@ -218,6 +236,7 @@ workspace:
         - lazy
         - lists
         - maybe
+        - mmorph
         - newtype
         - node-buffer
         - node-event-emitter
@@ -234,6 +253,7 @@ workspace:
         - orders
         - parallel
         - partial
+        - pipes
         - posix-types
         - prelude
         - profunctor
@@ -243,6 +263,7 @@ workspace:
         - refs
         - run
         - safe-coerce
+        - spec
         - st
         - strings
         - tailrec
@@ -1139,6 +1160,12 @@ packages:
       - tuples
       - typelevel-prelude
       - unfoldable
+  fork:
+    type: registry
+    version: 6.0.0
+    integrity: sha256-X7u0SuCvFbLbzuNEKLBNuWjmcroqMqit4xEzpQwAP7E=
+    dependencies:
+      - aff
   free:
     type: registry
     version: 7.1.0
@@ -1320,6 +1347,14 @@ packages:
       - invariant
       - newtype
       - prelude
+  mmorph:
+    type: registry
+    version: 7.0.0
+    integrity: sha256-urZlZNNqGeQFe5D/ClHlR8QgGBNHTMFPtJ5S5IpflTQ=
+    dependencies:
+      - free
+      - functors
+      - transformers
   newtype:
     type: registry
     version: 5.0.0
@@ -1554,6 +1589,18 @@ packages:
     version: 4.0.0
     integrity: sha256-fwXerld6Xw1VkReh8yeQsdtLVrjfGiVuC5bA1Wyo/J4=
     dependencies: []
+  pipes:
+    type: registry
+    version: 8.0.0
+    integrity: sha256-kvfqGM4cPA/wCcBHbp5psouFw5dZGvku2462x7ZBwSY=
+    dependencies:
+      - aff
+      - lists
+      - mmorph
+      - prelude
+      - tailrec
+      - transformers
+      - tuples
   posix-types:
     type: registry
     version: 6.0.0
@@ -1652,6 +1699,39 @@ packages:
     integrity: sha256-a1ibQkiUcbODbLE/WAq7Ttbbh9ex+x33VCQ7GngKudU=
     dependencies:
       - unsafe-coerce
+  spec:
+    type: registry
+    version: 7.5.5
+    integrity: sha256-HdyBH7Ys1/m2SdTq3u2u9LdQ4cGeaohWeEMYay2mHdU=
+    dependencies:
+      - aff
+      - ansi
+      - arrays
+      - avar
+      - bifunctors
+      - control
+      - datetime
+      - debug
+      - effect
+      - either
+      - exceptions
+      - foldable-traversable
+      - fork
+      - identity
+      - integers
+      - lists
+      - maybe
+      - newtype
+      - now
+      - ordered-collections
+      - parallel
+      - pipes
+      - prelude
+      - refs
+      - strings
+      - tailrec
+      - transformers
+      - tuples
   st:
     type: registry
     version: 6.2.0
