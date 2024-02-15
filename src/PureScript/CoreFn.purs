@@ -66,6 +66,9 @@ data Meta
   | IsForeign
   | IsWhere
   | IsSyntheticApp
+  -- The following items are not part of the original CoreFn's Meta
+  | IsRecursBindGrp (Array Ident)
+  | IsRecursBindGrpMember
 
 derive instance eqMeta :: Eq Meta
 derive instance ordMeta :: Ord Meta

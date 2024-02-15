@@ -57,7 +57,7 @@ handleTerminal verbosity = case _ of
   Log level message next -> do
     let
       printed = Dodo.print Ansi.ansiGraphics Dodo.twoSpaces $ case level of
-        Debug -> Ansi.foreground Ansi.BrightBlack message
+        Debug -> Ansi.foreground Ansi.Cyan message
         Info -> message
         Warn -> Ansi.foreground Ansi.Yellow (Dodo.text "[WARNING] ") <> message
         Error -> Ansi.foreground Ansi.Red (Dodo.text "[ERROR] ") <> message

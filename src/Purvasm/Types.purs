@@ -34,6 +34,7 @@ newtype Ident = Ident String
 derive instance Eq Ident
 derive instance Ord Ident
 derive instance Newtype Ident _
+derive newtype instance Hashable Ident
 instance Show Ident where
   show (Ident ident) = "(Ident " <> ident <> ")"
 

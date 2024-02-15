@@ -3,12 +3,10 @@ module Purvasm.Compiler.PureScript where
 import Prelude
 
 import Data.Argonaut (parseJson, printJsonDecodeError)
-import Data.Array (elem, fold, foldr, nub)
+import Data.Array (elem, fold, nub)
 import Data.Array as Array
 import Data.Either (Either(..))
-import Data.Foldable (for_)
 import Data.HashMap as HashMap
-import Data.Set (Set)
 import Data.Tuple.Nested (type (/\), (/\))
 import Effect.Aff.AVar as AVar
 import Effect.Exception as Exn
@@ -27,8 +25,6 @@ import Purvasm.Compiler.Effects.Log as Log
 import Purvasm.Compiler.Effects.Par (PAR)
 import Purvasm.Compiler.Effects.Par as Par
 import Purvasm.Compiler.ModuleImportMap (ModuleImportMap)
-import Purvasm.Global (GlobalEnv)
-import Purvasm.Global as Global
 import Purvasm.Types (ModuleName(..))
 import Run (AFF, EFFECT, Run)
 import Run as Run
@@ -123,7 +119,7 @@ primModules = CF.ModuleName <$>
   , "Prim.TypeError"
   ]
 
-openExternsCbor :: forall r. FilePath -> ModuleName -> Run (AFF + FS + EXCEPT String + LOG + r) ExternsFile
+openExternsCbor :: forall r. FilePath -> ModuleName -> Run (FS + EXCEPT String + LOG + r) ExternsFile
 openExternsCbor outdir modname = do
   externsFilePath <- moduleArtifactPath outdir modname ExternsCbor
   f <- readCborFile externsFilePath
@@ -133,18 +129,18 @@ openExternsCbor outdir modname = do
       Except.throw (describeError err)
     Right ext -> pure ext
 
-makeExternsEnv :: forall r' r. Array (Set ModuleName) -> Run (AFF + PAR (FS + EXCEPT String + AFF + LOG + r) + r') GlobalEnv
-makeExternsEnv sortedGraph = do
-  aEnv <- Run.liftAff (AVar.new Global.emptyEnv)
-  for_ sortedGraph \moduleSet -> do
-    -- moduleSet` contains those modules of same depdendency level,
-    -- so we can safely collect declarations from externs and add 
-    -- them in env in paralle. 
-    exts <- Par.all
-      ( moduleSet # Array.fromFoldable <#> \mod -> do
-          openExternsCbor "output" mod
-      )
-    Run.liftAff do
-      env <- AVar.take aEnv
-      AVar.put (foldr Global.applyExternsToEnv env exts) aEnv
-  pure Global.emptyEnv
+-- makeExternsEnv :: forall r' r. Array (Set ModuleName) -> Run (AFF + PAR (FS + EXCEPT String + AFF + LOG + r) + r') GlobalEnv
+-- makeExternsEnv sortedGraph = do
+--   aEnv <- Run.liftAff (AVar.new Global.emptyEnv)
+--   for_ sortedGraph \moduleSet -> do
+--     -- moduleSet` contains those modules of same depdendency level,
+--     -- so we can safely collect declarations from externs and add 
+--     -- them in env in paralle. 
+--     exts <- Par.all
+--       ( moduleSet # Array.fromFoldable <#> \mod -> do
+--           openExternsCbor "output" mod
+--       )
+--     Run.liftAff do
+--       env <- AVar.take aEnv
+--       AVar.put (foldr Global.applyExternsToEnv env exts) aEnv
+--   pure Global.emptyEnv

@@ -141,8 +141,8 @@ compileExpr handler = go
           c' <- go cont head
           compileExprList (KPush : c') tail
 
-compileModule :: ME.Module -> Aff PmoFile
-compileModule (ME.Module m@{ decls }) = do
+compileModule :: ME.Program -> Aff PmoFile
+compileModule (ME.Program m@{ decls }) = do
   symMngr <- AVar.new { tbl: Map.empty, dataNext: 0, textNext: 0 }
   let
     moduleName = translModuleName m.name

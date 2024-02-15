@@ -1,5 +1,6 @@
 module Purvasm.Compiler.BatchCompile
-  ( BuildPlan
+  ( BatchCompileEffects
+  , BuildPlan
   , batchCompile
   , initBuildPlan
   ) where
@@ -12,23 +13,20 @@ import Data.Array as Array
 import Data.Either (Either(..))
 import Data.Lazy as L
 import Data.Maybe (Maybe(..))
-import Effect.AVar (AVar)
-import Effect.Aff.AVar as AVar
 import Fmt (fmt)
 import PureScript.CoreFn as CF
 import PureScript.CoreFn.Json (PartialModule(..), fullModule)
 import PureScript.CoreFn.Json as CFJ
-import Purvasm.Compiler.Compile (UnitaryCompileResult, UnitaryCompileResultDesc(..), compileModule)
+import Purvasm.Compiler.Compile (UnitaryCompileResult, UnitaryCompileResultDesc(..), CompileEffects, compileModule)
+import Purvasm.Compiler.Effects.FS (FS)
 import Purvasm.Compiler.Effects.Log (LOG)
 import Purvasm.Compiler.Effects.Log as Log
 import Purvasm.Compiler.Effects.Par (PAR)
 import Purvasm.Compiler.Effects.Par as Par
 import Purvasm.Compiler.ModuleImportMap (ModuleImportMap, filter, modules)
 import Purvasm.Compiler.Types (prettyPrintIndex)
-import Purvasm.Global (GlobalEnv)
-import Purvasm.Global as Global
-import Run (Run, AFF)
-import Run as Run
+import Run (AFF, Run, EFFECT)
+import Run.Except (EXCEPT)
 import Safe.Coerce (coerce)
 import Type.Row (type (+))
 
@@ -37,13 +35,12 @@ type BuildStage =
   }
 
 newtype BuildPlan = BuildPlan
-  { globals :: AVar GlobalEnv
-  , currentStage :: BuildStage
+  { currentStage :: BuildStage
   , nextStage :: L.Lazy (BuildPlan)
   }
 
-mkBuildPlan :: AVar GlobalEnv -> ModuleImportMap -> BuildPlan
-mkBuildPlan genv importMap = do
+mkBuildPlan :: ModuleImportMap -> BuildPlan
+mkBuildPlan importMap = do
   let
     targetModules = modules $ filter nullImports importMap
     currentStage = { jobs: targetModules }
@@ -52,9 +49,8 @@ mkBuildPlan genv importMap = do
       (filter (not <<< nullImports) importMap)
       targetModules
   BuildPlan
-    { globals: genv
-    , currentStage
-    , nextStage: L.defer \_ -> mkBuildPlan genv nextMap
+    { currentStage
+    , nextStage: L.defer \_ -> mkBuildPlan nextMap
     }
   where
   nullImports :: CFJ.PartialModule CF.Ann -> Boolean
@@ -66,12 +62,12 @@ mkBuildPlan genv importMap = do
   isn't :: CF.Import CF.Ann -> CF.ModuleName -> Boolean
   isn't (CF.Import _ name) modname = name /= coerce modname
 
-initBuildPlan :: forall r. ModuleImportMap -> Run (AFF + r) BuildPlan
-initBuildPlan importMap = Run.liftAff do
-  globals <- AVar.new (Global.emptyEnv)
-  pure $ mkBuildPlan globals importMap
+type BatchCompileEffects r = LOG + FS + EXCEPT String + PAR (CompileEffects + AFF + EFFECT + ()) + EFFECT + AFF + r
 
-batchCompile :: forall r' r. BuildPlan -> Run (PAR (LOG + AFF + r') + LOG + AFF + r) (Array UnitaryCompileResult)
+initBuildPlan :: forall r. ModuleImportMap -> Run (AFF + r) BuildPlan
+initBuildPlan importMap = pure $ mkBuildPlan importMap
+
+batchCompile :: forall r. BuildPlan -> Run (BatchCompileEffects r) (Array UnitaryCompileResult)
 batchCompile = loop 1
   where
   loop stg bp = do
@@ -105,9 +101,7 @@ batchCompile = loop 1
                   , modname: "\x1b[1;33m" <> coerce name <> "\x1b[0m"
                   }
 
-              compileModule
-                (extendGlobalEnv plan.globals)
-                module_
+              compileModule module_
       )
 
     case partitionResults results of
@@ -115,10 +109,6 @@ batchCompile = loop 1
         | Array.length failed > 0 -> pure $ Left failed
         | otherwise -> do
             pure $ Right (L.force plan.nextStage)
-
-  extendGlobalEnv avar f = Run.liftAff do
-    genv <- AVar.take avar
-    AVar.put (f genv) avar
 
   partitionResults = go [] [] []
     where

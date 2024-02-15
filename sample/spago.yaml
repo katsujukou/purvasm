@@ -1,0 +1,6 @@
+package:
+  name: sample
+  dependencies:
+    - effect
+    - console
+    - prelude

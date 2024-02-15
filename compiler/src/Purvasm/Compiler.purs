@@ -8,29 +8,26 @@ import Data.Either (Either(..))
 import Data.String as Str
 import Data.Tuple.Nested ((/\))
 import Effect.Aff (Aff)
+import Effect.Aff.AVar as AVar
 import Effect.Class.Console as Console
 import Node.Path (FilePath)
 import Node.Path as Path
 import Node.Process as Process
-import PureScript.CoreFn (importName)
-import PureScript.CoreFn.Json as CFJ
 import Purvasm.Backend.PmoFile (PmoFile)
-import Purvasm.Compiler.BatchCompile (BuildPlan, batchCompile, initBuildPlan)
-import Purvasm.Compiler.Effects.FS (FS, expandGlob)
+import Purvasm.Compiler.BatchCompile (BatchCompileEffects, BuildPlan, batchCompile, initBuildPlan)
+import Purvasm.Compiler.Effects.FS (expandGlob)
 import Purvasm.Compiler.Effects.FS as FS
-import Purvasm.Compiler.Effects.Log (LOG)
 import Purvasm.Compiler.Effects.Log as Log
-import Purvasm.Compiler.Effects.Par (PAR)
 import Purvasm.Compiler.Effects.Par as Par
+import Purvasm.Compiler.Effects.WEnv as WEnv
 import Purvasm.Compiler.Metrics (Metrics)
 import Purvasm.Compiler.ModuleImportMap (ModuleImportMap)
 import Purvasm.Compiler.PureScript (mkModuleImportMap, sourceModuleName)
 import Purvasm.Compiler.Types (CompInput(..), LogVerbosity)
-import Run (AFF, Run, EFFECT)
+import Purvasm.Global as Global
+import Run (Run)
 import Run as Run
-import Run.Except (EXCEPT)
 import Run.Except as Except
-import Type.Row (type (+))
 
 -- | Descriptor of batch compilation steps.
 data CompileStep
@@ -46,9 +43,8 @@ data CompileStep
 
 -- | The compilation pass.
 nextStep
-  :: forall r
-   . CompileStep
-  -> Run (EXCEPT String + FS + LOG + AFF + EFFECT + PAR (FS + LOG + EXCEPT String + AFF + EFFECT + ()) + r) (Step CompileStep Unit)
+  :: CompileStep
+  -> Run (BatchCompileEffects ()) (Step CompileStep Unit)
 nextStep = case _ of
   -- From `CompInput`, resolve the path to input modules according to following scheme:
   --  - If `CompInput` is given with `InpFilePath`, all `*.purs` source files
@@ -75,9 +71,9 @@ nextStep = case _ of
       Log.info "Resolving dependencies..."
       importMap /\ size <- mkModuleImportMap modules
       Log.info $ "Resolved. We have " <> show size <> " modules to build."
-      let moduleImports (CFJ.PartialModule { imports }) = importName <$> imports
-      Log.debug "module import map is:"
-      Log.debug $ show (map moduleImports importMap)
+      -- let moduleImports (CFJ.PartialModule { imports }) = importName <$> imports
+      -- Log.debug "module import map is:"
+      -- Log.debug $ show (map moduleImports importMap)
       pure $ Loop $ ModulesResolved importMap
   -- From list of modules to compile passed from previous step, make build plan.
   -- First, We group and order these modules by ensuring they have the same dependencies 
@@ -102,6 +98,7 @@ type Options =
 
 compile :: Options -> CompInput -> Aff Unit
 compile opts inp = do
+  genv <- AVar.new (Global.emptyEnv)
   let
     run = tailRecM nextStep (Initial inp)
 
@@ -109,16 +106,18 @@ compile opts inp = do
       # Par.interpretExceptAff
           ( FS.interpret FS.handleNode
               >>> Log.interpret (Log.handleTerminal opts.verbosity)
+              >>> WEnv.interpret (WEnv.avarHandler genv)
               >>> Except.runExcept
               >>> Run.runBaseAff'
           )
-      # Except.runExcept
+  -- # Except.runExcept
 
   result <- run
-    # Log.interpret (Log.handleTerminal opts.verbosity)
-    # FS.interpret FS.handleNode
-    # Except.runExcept
     # interpretPar
+    # FS.interpret FS.handleNode
+    # Log.interpret (Log.handleTerminal opts.verbosity)
+    -- # WEnv.interpret (avarHandler genv)
+    # Except.runExcept
     # Run.runBaseAff'
 
   case result of

@@ -2,13 +2,23 @@ module Purvasm.Compiler.Compile where
 
 import Prelude
 
+import Data.Traversable (for)
 import PureScript.CoreFn as CF
 import Purvasm.Backend.PmoFile (PmoFile(..))
+import Purvasm.Compiler.Effects.FS (FS)
 import Purvasm.Compiler.Effects.Log (LOG)
+import Purvasm.Compiler.Effects.Log as Log
+import Purvasm.Compiler.Effects.WEnv (WENV)
+import Purvasm.Compiler.Effects.WEnv as WEnv
+import Purvasm.Compiler.PureScript (openExternsCbor)
+import Purvasm.ECore.Syntax (Ann(..), Expr, Module(..)) as ECore
 import Purvasm.Global (GlobalEnv)
-import Purvasm.MiddleEnd.ECF.Translate (translModuleName)
+import Purvasm.Global as Global
+import Purvasm.MiddleEnd (translateModuleName, translateIdent)
+import Purvasm.MiddleEnd as ME
 import Purvasm.Types (ModuleName)
-import Run (AFF, Run)
+import Run (Run)
+import Run.Except (EXCEPT)
 import Safe.Coerce (coerce)
 import Spago.Generated.BuildInfo (pursVersion)
 import Type.Row (type (+))
@@ -25,37 +35,44 @@ data UnitaryCompileResultDesc
 
 data UnitaryCompileStep
   = Initial (CF.Module CF.Ann)
-  | Translated ModuleName
+  | Translated (ECore.Module ECore.Ann)
   | Transformed ModuleName
   | Optimized ModuleName
   | Linearized ModuleName
   | Assembled PmoFile
 
-nextStep :: forall r. UnitaryCompileStep -> Run r UnitaryCompileStep
+type CompileEffects r = (LOG + FS + WENV GlobalEnv + EXCEPT String + r)
+
+nextStep
+  :: forall r
+   . UnitaryCompileStep
+  -> Run (CompileEffects r) UnitaryCompileStep
 nextStep = case _ of
-  Initial (CF.Module cfModule) -> do
-    pure $ Translated (coerce cfModule.name)
-  Translated mname -> pure $ Transformed mname
+  Initial cfm@(CF.Module cfModule) -> do
+    -- Apply externs declarations to global env. 
+    genv <- do
+      WEnv.update (Global.applyCorefnEnv cfm)
+    -- translate CoreFn module and pass it in to next stage.
+    Log.debug $ show genv
+    pure $ Translated $ ME.translateCoreFn genv cfm
+
+  Translated (ECore.Module ecModule) -> do
+    Log.debug $ show ecModule
+    pure $ Transformed ecModule.name
+
   Transformed mname -> pure $ Optimized mname
   Optimized mname -> pure $ Linearized mname
   Linearized mname -> pure (Assembled (emptyPmoFile mname))
   Assembled pmoFile -> pure $ Assembled pmoFile
 
 compileModule
-  :: forall r' r
-   . ((GlobalEnv -> GlobalEnv) -> Run (AFF + r') Unit)
-  -> CF.Module CF.Ann
-  -> Run (LOG + r) UnitaryCompileResult
-compileModule (extendGlobal) cfModule@(CF.Module { name }) = do
-  -- Log.info $
-  --   fmt @"{idx} Compiling {modname}"
-  --     { idx: prettyPrintIndex idx
-  --     , modname: "\x1b[1m" <> coerce name <> "\x1b[0m"
-  --     }
-
-  loop (Initial cfModule)
+  :: forall r
+   . CF.Module CF.Ann
+  -> Run (CompileEffects r) UnitaryCompileResult
+compileModule cfModule@(CF.Module { name }) = loop (Initial cfModule)
   where
-  name' = translModuleName name
+  name' = translateModuleName name
+
   loop step = do
     nextStep step >>= case _ of
       Assembled pmoFile -> do

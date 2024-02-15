@@ -10,6 +10,8 @@ import Data.Traversable (sequence)
 import Data.Tuple (Tuple(..))
 import Effect.Aff (Aff)
 import Effect.Aff.AVar as AVar
+import Prim.Row (class Nub, class Union)
+import Prim.Row as Row
 import Run (AFF, Run)
 import Run as Run
 import Run.Except (EXCEPT)
@@ -33,10 +35,10 @@ _par = Proxy
 all :: forall r r' a. Array (Run r a) -> Run (PAR r + r') (Array a)
 all workers = Run.lift _par $ All $ mkExists (AllX $ Tuple workers identity)
 
-interpret :: forall r r' a. (Par r ~> Run r') -> Run (PAR r + r') a -> Run r' a
+interpret :: forall p r a. (Par p ~> Run r) -> Run (PAR p + r) a -> Run r a
 interpret handler = Run.interpret (Run.on _par handler Run.send)
 
-interpretAff :: forall r r'. (Run r ~> Aff) -> Run (PAR r + AFF + r') ~> Run (AFF + r')
+interpretAff :: forall p r. (Run r ~> Aff) -> Run (PAR r + AFF + p) ~> Run (AFF + p)
 interpretAff affHandler = interpret (runParAff affHandler)
 
 interpretExceptAff :: forall r r' e. (forall a. Run r a -> Aff (Either e a)) -> Run (PAR r + AFF + EXCEPT e + r') ~> Run (AFF + EXCEPT e + r')

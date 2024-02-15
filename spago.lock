@@ -280,6 +280,17 @@ workspace:
       dependencies: []
       test_dependencies: []
       build_plan: []
+    sample:
+      path: sample
+      dependencies:
+        - console
+        - effect
+        - prelude
+      test_dependencies: []
+      build_plan:
+        - console
+        - effect
+        - prelude
   package_set:
     address:
       registry: 48.7.0
