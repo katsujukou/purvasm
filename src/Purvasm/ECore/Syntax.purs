@@ -50,6 +50,7 @@ data Expr a
   | ExprLookup a (Expr a) String
   | ExprGetField a Int (Expr a)
   | ExprSetField a Int (Expr a) (Expr a)
+  | ExprGetSize a (Expr a)
   -- Get constructor tag
   | ExprCase a (Array (Expr a)) (Array (CaseAlternative a))
   -- if-then-else
@@ -200,6 +201,7 @@ exprAnn = case _ of
   ExprLookup a _ _ -> a
   ExprGetField a _ _ -> a
   ExprSetField a _ _ _ -> a
+  ExprGetSize a _ -> a
   ExprCase a _ _ -> a
   ExprIf a _ _ _ -> a
   ExprStaticFail a -> a

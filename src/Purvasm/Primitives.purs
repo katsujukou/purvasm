@@ -13,6 +13,7 @@ data Primitive
   | PSetGlobal GlobalName
   | PMakeBlock BlockTag
   | PMakeArray
+  | PBlockSize
   | PGetField Int
   | PSetField Int
   | PGetRecordField String

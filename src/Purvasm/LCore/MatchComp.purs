@@ -14,9 +14,12 @@ import Data.Show.Generic (genericShow)
 import Data.Traversable (traverse)
 import Data.Tuple (Tuple)
 import Data.Tuple.Nested (type (/\), (/\))
+import Effect.Console (logShow)
+import Effect.Unsafe (unsafePerformEffect)
 import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.ECore.Syntax as ECF
-import Purvasm.Types (AtomicConstant, ConstructorTag)
+import Purvasm.Primitives (Primitive(..))
+import Purvasm.Types (AtomicConstant(..), ConstructorTag)
 
 type Expr = ECF.Expr ECF.Ann
 
@@ -51,6 +54,11 @@ alwaysMatch = case _ of
   ECF.PatAliase _ pat -> alwaysMatch pat
   _ -> false
 
+data MatrixType
+  = TMatArray
+  | TMatRecord
+  | TMatRegular
+
 decomposePatternMatch :: PatternMatching -> DecisionTree
 decomposePatternMatch pm =
   case splitPatternMatch pm of
@@ -70,6 +78,7 @@ decomposePatternMatch pm =
       Just { action: act0 }, Nothing -> MatchLeaf act0
       Just _, Just pmHead ->
         let
+          tmat = matrixType pmMatrix
           -- split horizontally  
           { init: nonVars, rest } =
             Array.span
@@ -81,8 +90,15 @@ decomposePatternMatch pm =
             # \{ left, right } ->
                 case left, right of
                   subMatching, [] ->
-                    Conditional pmHead $
-                      ((rmap decomposePatternMatch) <$> subMatching)
+                    -- When left-most pattern is array pattern, modify case head to
+                    -- match against the length of array.
+                    let
+                      pmHead' = case tmat of
+                        TMatArray -> ECF.ExprGetSize ECF.emptyAnn pmHead
+                        _ -> pmHead
+                    in
+                      Conditional pmHead' $
+                        ((rmap decomposePatternMatch) <$> subMatching)
                   [], subMatching ->
                     JumpThru pmHead $
                       ((rmap decomposePatternMatch) <$> subMatching)
@@ -129,6 +145,14 @@ reducePatternMatch (PatternMatching { pmHeads, pmMatrix }) = leftMostCol
           subMatrix = subMatchMatrix lnIndices pmMatrix
         in
           case pat of
+            ECF.PatArray pats
+              | Just pmHead <- Array.head pmHeads -> Left $ (ACInt $ Array.length pats) /\
+                  ( PatternMatching
+                      { pmHeads: (mapWithIndex (\i _ -> ECF.ExprGetField ECF.emptyAnn i pmHead) pats)
+                          <> Array.drop 1 pmHeads
+                      , pmMatrix: subMatrix
+                      }
+                  )
             ECF.PatLiteral lit -> Left $ lit /\
               ( PatternMatching
                   { pmHeads: Array.drop 1 pmHeads
@@ -157,18 +181,19 @@ reducePatternMatch (PatternMatching { pmHeads, pmMatrix }) = leftMostCol
   subMatchMatrix :: Array (Int /\ Array ECF.Pattern) -> _ -> _
   subMatchMatrix indices matrix = traverse (selectLines matrix) indices
     # case _ of
-        Nothing -> unsafeCrashWith "decomposePatternMatch: Impossible!"
+        Nothing -> unsafeCrashWith "subMatchMatrix: Impossible!"
         Just lines -> lines
     where
-    selectLines mat (ln /\ subPats) = do
+    selectLines mat (ln /\ _) = do
       matLine <- mat !! ln
+      let subPats = matLine.pats # Array.head >>> maybe [] subPatterns
       pure $ matLine { pats = subPats <> Array.drop 1 matLine.pats }
 
 groupBySameToplevelSymbol
   :: Array ECF.Pattern
   -> Array
        ( Tuple
-           -- left representative pattern of group
+           -- The representative pattern of group
            ECF.Pattern
            -- the indices of lines grouped w.r.t. the left-most pattern.
            -- paired with the sub-patterns expanded.
@@ -181,13 +206,13 @@ groupBySameToplevelSymbol = go [] <<< mapWithIndex (/\)
     Just { head: i0 /\ pat0, tail } -> tail
       <#>
         ( \(i /\ pat) ->
-            if sameToplevelSymbol pat0 pat then Left (i /\ subPats pat0)
+            if sameToplevelSymbol pat0 pat then Left (i /\ subPatterns pat0)
             else Right (i /\ pat)
         )
       # partitionEither
       # \{ left, right } ->
           let
-            acc' = Array.cons (pat0 /\ ([ i0 /\ subPats pat0 ] <> left)) acc
+            acc' = Array.cons (pat0 /\ ([ i0 /\ subPatterns pat0 ] <> left)) acc
           in
             go acc' right
 
@@ -197,11 +222,21 @@ groupBySameToplevelSymbol = go [] <<< mapWithIndex (/\)
     ECF.PatArray pats1, ECF.PatArray pats2 -> Array.length pats1 == Array.length pats2
     _, _ -> false
 
-  subPats :: ECF.Pattern -> Array ECF.Pattern
-  subPats = case _ of
-    ECF.PatConstruct _ pats -> pats
-    ECF.PatAliase _ pat -> subPats pat
-    _ -> []
+subPatterns :: ECF.Pattern -> Array ECF.Pattern
+subPatterns = case _ of
+  ECF.PatConstruct _ pats -> pats
+  ECF.PatAliase _ pat -> subPatterns pat
+  ECF.PatArray pats -> pats
+  _ -> []
+
+matrixType :: Array PatternMatrix -> MatrixType
+matrixType matrix = matrix
+  # Array.head
+  >>= (_.pats >>> Array.head)
+  # case _ of
+      Just (ECF.PatArray _) -> TMatArray
+      Just (ECF.PatRecord _) -> TMatRecord
+      _ -> TMatRegular
 
 partitionEither :: forall a b. Array (Either a b) -> { left :: Array a, right :: Array b }
 partitionEither = go [] []

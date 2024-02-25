@@ -202,6 +202,8 @@ translateExpr ident = go
                     pure $ LCPrim (PGetField i) [ trExp ]
               _ -> pure $ LCPrim (PGetRecordField prop) [ trExp ]
     -- Misc.
+    ECF.ExprGetField _ i exp -> LCPrim (PGetField i) <<< Array.singleton <$> goRec exp
+    ECF.ExprGetSize _ exp -> LCPrim PBlockSize <<< Array.singleton <$> goRec exp
     ECF.ExprStaticFail _ -> pure LCStaticFail
     ECF.ExprstaticHandle _ e1 e2 -> LCStaticHandle <$> (goRec e1) <*> (goRec e2)
     ECF.ExprNone -> pure LCNone
@@ -256,11 +258,14 @@ translateExpr ident = go
 occurrenceOfPat :: Occurrunce -> ECF.Pattern -> Array (Ident /\ Occurrunce)
 occurrenceOfPat o = case _ of
   ECF.PatVar var -> [ var /\ o ]
-  ECF.PatConstruct _ subpats -> subpats
+  ECF.PatAliase s pat -> [ s /\ o ] <> occurrenceOfPat o pat
+  ECF.PatConstruct _ subpats -> occurrenceOfSubPats subpats
+  ECF.PatArray subpats -> occurrenceOfSubPats subpats
+  _ -> []
+  where
+  occurrenceOfSubPats subpats = subpats
     # mapWithIndex (\i pat -> occurrenceOfPat (i : o) pat)
     # join
-  ECF.PatAliase s pat -> [ s /\ o ] <> occurrenceOfPat o pat
-  _ -> []
 
 immediateExpr :: ECF.Expr ECF.Ann -> Boolean
 immediateExpr = case _ of
