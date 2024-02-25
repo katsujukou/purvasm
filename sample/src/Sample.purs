@@ -1,39 +1,70 @@
-module Sample where
+module Sample
+  ( Maybe(..)
+  , ap
+  , apply
+  , bind
+  , class Applicative
+  , class Apply
+  , class Bind
+  , class Functor
+  , class Monad
+  , class Traversable
+  , liftM1
+  , map
+  , pure
+  , traverse
+  ) where
 
-import Prelude
+data Maybe a = Nothing | Just a
 
-even :: Int -> Boolean
-even n
-  | n == 0 = true
-  | otherwise = odd (n - 1)
+class Functor f where
+  map :: forall a b. (a -> b) -> f a -> f b
 
-odd :: Int -> Boolean
-odd n = even (n - 1)
+class Functor f <= Apply f where
+  apply :: forall a b. f (a -> b) -> f a -> f b
 
--- import Data.Boolean (otherwise)
+infixl 4 apply as <*>
 
--- data Foo = Foo Int | FooBar Bar
--- data Bar = BarFoo Foo
--- newtype A a = A String
+class Apply f <= Applicative f where
+  pure :: forall a. a -> f a
 
--- class X a where
---   x :: a
+class (Apply m) <= Bind m where
+  bind :: forall a b. m a -> (a -> m b) -> m b
 
--- class X a <= Y a where
---   y :: a
+infixl 1 bind as >>=
 
--- ya :: forall a. Y a => a
--- ya = y
+class (Applicative m, Bind m) <= Monad m
 
--- instance X Char where
---   x = 'a'
+ap :: forall m a b. Monad m => m (a -> b) -> m a -> m b
+ap mf ma = do
+  f <- mf
+  a <- ma
+  pure (f a)
 
--- instance X Int where
---   x = if isZero ya then 114 else 514
+liftM1 :: forall f a b. Applicative f => (a -> b) -> f a -> f b
+liftM1 f fa = pure f <*> fa
 
--- instance Y Int where
---   y = 0
+instance Functor Maybe where
+  map = liftM1
 
--- isZero :: Int -> Boolean
--- isZero 0 = true
--- isZero _ = false
+instance Apply Maybe where
+  apply = case _, _ of
+    Nothing, _ -> Nothing
+    _, Nothing -> Nothing
+    Just f, Just a -> Just (f a)
+
+instance Applicative Maybe where
+  pure = Just
+
+instance Bind Maybe where
+  bind Nothing _ = Nothing
+  bind (Just a) f = f a
+
+instance Monad Maybe
+
+class Functor t <= Traversable t where
+  traverse :: forall m a b. Applicative m => (a -> m b) -> t a -> m (t b)
+
+instance Traversable Maybe where
+  traverse _ Nothing = pure Nothing
+  traverse f (Just a) = map Just (f a)

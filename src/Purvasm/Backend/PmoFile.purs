@@ -3,10 +3,12 @@ module Purvasm.Backend.PmoFile where
 import Prelude
 
 import Data.Generic.Rep (class Generic)
+import Data.HashMap (HashMap)
 import Data.Newtype (class Newtype)
 import Data.Show.Generic (genericShow)
 import Purvasm.Backend.Instruction (CodeBlock)
-import Purvasm.Backend.Types (Ident, ModuleName, GlobalName)
+import Purvasm.Backend.Types (GlobalName, Ident, ModuleName)
+import Purvasm.Types (RecordId)
 
 -- The type of toplevel symbol.
 data SymbolType
@@ -47,6 +49,29 @@ instance Show PmoFile where
 moduleName :: PmoFile -> ModuleName
 moduleName (PmoFile { head }) = head.name
 
-newtype PmiFile = PmiFile
-  {
+data PType
+  = PTUnknown
+  | PTTypeclassInstance GlobalName
+  | PTRecord RecordId
+
+derive instance Generic PType _
+instance Show PType where
+  show = genericShow
+
+newtype FuncSig = FuncSig
+  { args :: Array PType
+  , return :: PType
   }
+
+instance Show FuncSig where
+  show (FuncSig sig) = "(FuncSig " <> show sig <> ")"
+
+newtype PmiFile = PmiFile
+  { head :: ObjectHeader
+  , typeclasses :: HashMap Ident (Array Ident)
+  , records :: HashMap RecordId (Array String)
+  , functions :: HashMap Ident FuncSig
+  }
+
+instance Show PmiFile where
+  show (PmiFile pmi) = "(PmiFile " <> show pmi <> ")"

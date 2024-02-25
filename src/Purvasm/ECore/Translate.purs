@@ -80,7 +80,7 @@ translateCoreFn genv (CF.Module cfModule) = do
           Binding (identOfGlobalName typeclassName) (ExprTypeclass emptyAnn members) /\ []
 
       -- Typeclass instance. We promoto each method implementation function 
-      -- from record property to toplevel phrase.
+      -- from record property to toplevel phrase. 
       | Just typeclassInst <- Analyser.typeclassInstanceOfExpr expr
       , Just typeclassName <- globalNameOfQualifiedVar typeclassInst.typeclass -> do
           let
