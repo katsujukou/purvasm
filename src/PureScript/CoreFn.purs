@@ -67,6 +67,7 @@ data Meta
   | IsWhere
   | IsSyntheticApp
   -- The following items are not part of the original CoreFn's Meta
+  | IsTypeclassMember (Qualified ProperName) Ident
   | IsRecursBindGrp (Array Ident)
   | IsRecursBindGrpMember
 

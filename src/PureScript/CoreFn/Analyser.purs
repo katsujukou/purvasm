@@ -2,7 +2,7 @@ module PureScript.CoreFn.Analyser where
 
 import Prelude
 
-import Data.Array (fold, foldMap)
+import Data.Array (fold, foldMap, sort)
 import Data.Array as Array
 import Data.Maybe (Maybe(..))
 import Data.String as Str
@@ -13,14 +13,52 @@ import PureScript.CoreFn (propValue)
 import PureScript.CoreFn as CF
 import PureScript.CoreFn.Utils (typeClassConstructorRegex)
 
+collectRecordTypes :: CF.Expr CF.Ann -> Array (Array String)
+collectRecordTypes = case _ of
+  CF.ExprLit _ lit
+    | CF.LitArray exps <- lit -> foldMap collectRecordTypes exps
+    | CF.LitRecord props <- lit -> fold
+        [ props
+            # foldMap (CF.propValue >>> collectRecordTypes)
+        , [ sort $ CF.propKey <$> props ]
+        ]
+  CF.ExprAbs _ _ exp -> collectRecordTypes exp
+  CF.ExprApp _ e1 e2 -> foldMap collectRecordTypes [ e1, e2 ]
+  CF.ExprAccessor _ exp _ -> collectRecordTypes exp
+  CF.ExprUpdate _ exp _ -> collectRecordTypes exp
+  CF.ExprLet _ binds exp ->
+    let
+      recordTypesInBinding (CF.Binding _ _ e) = collectRecordTypes e
+    in
+      fold
+        [ binds
+            <#> case _ of
+              CF.NonRec b -> recordTypesInBinding b
+              CF.Rec bs -> foldMap recordTypesInBinding bs
+            # fold
+        , collectRecordTypes exp
+        ]
+  CF.ExprCase _ caseHeads caseAlts ->
+    let
+      recordTypesInCaseAlt (CF.CaseAlternative _ caseGuard) = case caseGuard of
+        CF.Unconditional exp -> collectRecordTypes exp
+        CF.Guarded guards ->
+          guards # foldMap (\(CF.Guard g e) -> collectRecordTypes g <> collectRecordTypes e)
+    in
+      fold
+        [ foldMap collectRecordTypes caseHeads
+        , foldMap recordTypesInCaseAlt caseAlts
+        ]
+  _ -> []
+
 type TypeclassInstance =
-  { typeclass :: CF.Qualified CF.Ident
+  { typeclass :: CF.Qualified CF.ProperName
   , members :: Array (CF.Ident /\ CF.Expr CF.Ann)
   }
 
 classify
   :: Array (CF.Bind CF.Ann)
-  -> { normal :: Array (Tuple CF.Ident (CF.Expr CF.Ann))
+  -> { plain :: Array (Tuple CF.Ident (CF.Expr CF.Ann))
      , constructors :: Array (Tuple CF.Ident (CF.Expr CF.Ann))
      , newtypeConstructors :: Array (Tuple CF.Ident (CF.Expr CF.Ann))
      , typeclassConstructors :: Array (Tuple CF.Ident (CF.Expr CF.Ann))
@@ -29,7 +67,7 @@ classify
 classify = foldMap (go1 initial)
   where
   initial =
-    { normal: []
+    { plain: []
     , constructors: []
     , newtypeConstructors: []
     , typeclassConstructors: []
@@ -40,18 +78,23 @@ classify = foldMap (go1 initial)
     CF.NonRec binding -> go2 accu binding
     CF.Rec bindings -> foldMap (go2 accu) bindings
 
-  go2 accu (CF.Binding ann ident@(CF.Ident id) expr) = case expr of
+  go2 accu (CF.Binding _ ident@(CF.Ident id) expr) = case expr of
     CF.ExprConstructor _ _ _ _ -> accu { constructors = Array.cons (ident /\ expr) accu.constructors }
     CF.ExprAbs ann' _ _
       | CF.Ann { meta: Just CF.IsNewtype } <- ann' ->
-          if Re.test typeClassConstructorRegex id then accu { typeclassConstructors = Array.cons (ident /\ expr) accu.typeclassConstructors }
+          if Re.test typeClassConstructorRegex id then
+            let
+              typclsCtors = Array.cons (ident /\ expr) accu.typeclassConstructors
+              plain = Array.cons (ident /\ expr) accu.plain
+            in
+              accu { typeclassConstructors = typclsCtors, plain = plain }
           else accu { newtypeConstructors = Array.cons (ident /\ expr) accu.newtypeConstructors }
     CF.ExprApp _ abs _
       | CF.ExprVar (CF.Ann { meta: Just CF.IsNewtype }) var <- abs
       , CF.Qualified qual (CF.Ident name) <- var
       , Re.test typeClassConstructorRegex name ->
           accu { typeclassInstances = Array.cons (ident /\ expr) accu.typeclassInstances }
-    _ -> accu
+    _ -> accu { plain = Array.cons (ident /\ expr) accu.plain }
 
 typeclassInstanceOfExpr :: CF.Expr CF.Ann -> Maybe TypeclassInstance
 typeclassInstanceOfExpr = case _ of
@@ -64,7 +107,7 @@ typeclassInstanceOfExpr = case _ of
           clsName = Str.replace (Str.Pattern "$Dict") (Str.Replacement "") typeclassDict
         in
           Just
-            { typeclass: CF.Qualified (Just moduleName) (CF.Ident clsName)
+            { typeclass: CF.Qualified (Just moduleName) (CF.ProperName clsName)
             , members: props <#> \(CF.Prop id exp) -> CF.Ident id /\ exp
             }
   _ -> Nothing

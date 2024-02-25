@@ -2,20 +2,17 @@ module Purvasm.ECore.Syntax where
 
 import Prelude
 
-import Data.Either (Either)
 import Data.Foldable (class Foldable)
 import Data.Generic.Rep (class Generic)
-import Data.HashMap (HashMap)
-import Data.HashMap as HM
 import Data.List (List)
 import Data.List as L
 import Data.Maybe (Maybe(..))
 import Data.Show.Generic (genericShow)
 import Data.Traversable (class Traversable)
 import Data.Tuple (Tuple)
-import Data.Tuple.Nested (type (/\), (/\))
-import Purvasm.Global (ConstructorDesc, GlobalName(..))
-import Purvasm.Types (Arity, ConstructorTag, Ident, ModuleName)
+import Data.Tuple.Nested (type (/\))
+import Purvasm.Global (ConstructorDesc, GlobalName)
+import Purvasm.Types (AtomicConstant, Ident, ModuleName, RecordId)
 
 newtype Module a = Module
   { name :: ModuleName
@@ -24,14 +21,6 @@ newtype Module a = Module
 
 instance Show a => Show (Module a) where
   show (Module m) = "(Module " <> show m <> ")"
-
-data Bind a
-  = NonRec (Binding a)
-  | Rec (Array (Binding a))
-
-derive instance Generic (Bind a) _
-instance Show a => Show (Bind a) where
-  show = genericShow
 
 data Binding a = Binding Ident (Expr a)
 
@@ -44,8 +33,9 @@ data Expr a
   | ExprVar a Ident
   | ExprGlobal a GlobalName
   | ExprArray a (Array (Expr a))
-  | ExprRecord a (Array (Prop (Expr a)))
-  | ExprTypeclassInstance a GlobalName (Maybe (Array (Prop (Expr a))))
+  | ExprRecord a RecordId (Array (Prop (Expr a)))
+  | ExprTypeclass a (Array (Ident /\ Maybe GlobalName))
+  | ExprTypeclassInstance a GlobalName (Maybe (Array GlobalName))
   | ExprAbs a (Array Ident) (Expr a)
   | ExprApp a (Expr a) (Array (Expr a))
   | ExprLet a (Array (Tuple Ident (Expr a))) (Expr a)
@@ -61,7 +51,6 @@ data Expr a
   | ExprGetField a Int (Expr a)
   | ExprSetField a Int (Expr a) (Expr a)
   -- Get constructor tag
-  | ExprTag a (Expr a)
   | ExprCase a (Array (Expr a)) (Array (CaseAlternative a))
   -- if-then-else
   | ExprIf a (Expr a) (Expr a) (Expr a)
@@ -86,7 +75,7 @@ instance Show a => Show (CaseAlternative a) where
 data Pattern
   = PatWildcard
   | PatVar Ident
-  | PatLiteral AtomicLiteral
+  | PatLiteral AtomicConstant
   | PatArray (Array Pattern)
   | PatRecord (Array (Prop Pattern))
   | PatConstruct ConstructorDesc (Array Pattern)
@@ -101,28 +90,16 @@ data LiteralType
   | TRecord
 
 data Literal
-  = LitAtomic AtomicLiteral
+  = LitAtomic AtomicConstant
   | LitStruct StructuredLiteral
 
 derive instance Generic Literal _
 instance Show Literal where
   show l = genericShow l
 
-data AtomicLiteral
-  = LitInt Int
-  | LitBoolean Boolean
-  | LitChar Char
-  | LitString String
-  | LitNumber Number
-  | LitUnit
-
-derive instance Generic AtomicLiteral _
-instance Show AtomicLiteral where
-  show al = genericShow al
-
 data StructuredLiteral
   = LitArray (Array Literal)
-  | LitRecord (Array (Prop Literal))
+  | LitRecord RecordId (Array (Prop Literal))
   | LitConstructor ConstructorDesc (Array Literal)
 
 derive instance Generic StructuredLiteral _
@@ -138,16 +115,22 @@ derive instance Generic (Prop a) _
 instance Show a => Show (Prop a) where
   show = genericShow
 
+propKey :: forall a. Prop a -> String
+propKey (Prop k _) = k
+
+propValue :: forall a. Prop a -> a
+propValue (Prop _ v) = v
+
 newtype Ann = Ann
   { meta :: Maybe Meta
-  -- , context :: List Context
+  , context :: List Context
   -- , vars :: VariableTable
   }
 
 instance Show Ann where
   show (Ann ann) = "(Ann " <> show ann <> ")"
 
-data Meta = IsTypeclasssDict GlobalName
+data Meta = IsTypeclassDict GlobalName
 
 derive instance Generic Meta _
 instance Show Meta where
@@ -165,24 +148,19 @@ instance Show Meta where
 -- instance Show VarDesc where
 --   show = genericShow
 
--- type Occurrunce = List (Either Int String)
+data Context
+  = ToplevelPhrase GlobalName
+  | AppFunc
+  | AppArg (Maybe GlobalName) Int
+  | CtorArg GlobalName Int
+  | RecordUpdateExpr
+  | RecordUpdateUpdator String
+  | CaseHead
+  | CaseAction
 
--- data Context
---   = FuncBody (Array (Ident /\ VarDesc))
---   | LetBinder (Array (Ident /\ VarDesc))
---   | LetBody (Array (Ident /\ VarDesc))
---   | AppFunc
---   | AppArg Int
---   | ConstructorArg Int
---   | ArrayElement
---   | RecordProp String
---   | CaseExpr
---   | CaseHead
---   | CaseAction (Array (Ident /\ VarDesc))
-
--- derive instance Generic Context _
--- instance Show Context where
---   show = genericShow
+derive instance Generic Context _
+instance Show Context where
+  show = genericShow
 
 -- data FuncType = Anonymous | Var Ident | Global GlobalName
 
@@ -193,18 +171,37 @@ instance Show Meta where
 emptyAnn :: Ann
 emptyAnn = Ann
   { meta: Nothing
-  -- , context: L.Nil
+  , context: L.Nil
   -- , vars: HM.empty
   }
 
--- addVar :: Ident -> VarDesc -> Ann -> Ann
--- addVar ident desc (Ann ann) = Ann (ann { vars = HM.insert ident desc ann.vars })
+addContext :: Context -> Ann -> Ann
+addContext ctx (Ann ann) = Ann $ ann { context = L.Cons ctx ann.context }
 
--- contextOfAnn :: Ann -> List Context
--- contextOfAnn (Ann { context }) = context
+setMeta :: Meta -> Ann -> Ann
+setMeta meta (Ann ann) = Ann (ann { meta = Just meta })
 
--- addContext :: Context -> Ann -> Ann
--- addContext ctx (Ann ann) = Ann (ann { context = L.Cons ctx ann.context })
-
--- setContext :: List Context -> Ann -> Ann
--- setContext ctx (Ann ann) = Ann (ann { context = ctx })
+exprAnn :: Expr Ann -> Ann
+exprAnn = case _ of
+  ExprLit a _ -> a
+  ExprVar a _ -> a
+  ExprGlobal a _ -> a
+  ExprRecord a _ _ -> a
+  ExprArray a _ -> a
+  ExprTypeclass a _ -> a
+  ExprTypeclassInstance a _ _ -> a
+  ExprAbs a _ _ -> a
+  ExprApp a _ _ -> a
+  ExprLet a _ _ -> a
+  ExprLetRec a _ _ -> a
+  ExprConstruct a _ _ -> a
+  ExprAccess a _ _ -> a
+  ExprUpdate a _ _ -> a
+  ExprLookup a _ _ -> a
+  ExprGetField a _ _ -> a
+  ExprSetField a _ _ _ -> a
+  ExprCase a _ _ -> a
+  ExprIf a _ _ _ -> a
+  ExprStaticFail a -> a
+  ExprstaticHandle a _ _ -> a
+  ExprNone -> emptyAnn

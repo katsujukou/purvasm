@@ -6,31 +6,26 @@ import Prelude
 
 import Control.Monad.ST as ST
 import Control.Monad.ST.Internal as STRef
-import Data.Array (foldl, foldr)
+import Data.Array (foldl, foldr, mapWithIndex)
 import Data.Array as Array
 import Data.Array.ST as STArray
 import Data.List ((:))
 import Data.List as L
 import Data.Maybe (Maybe(..))
-import Data.String (joinWith)
 import Data.String as Str
 import Data.String.Regex as Re
 import Data.String.Regex.Flags (unicode)
 import Data.String.Regex.Unsafe (unsafeRegex)
 import Data.Traversable (traverse)
-import Data.Tuple (Tuple(..))
+import Data.Tuple (Tuple(..), fst)
 import Data.Tuple.Nested (type (/\), (/\))
-import Effect.Console (logShow)
-import Effect.Unsafe (unsafePerformEffect)
 import Partial.Unsafe (unsafeCrashWith)
 import PureScript.CoreFn as CF
 import PureScript.CoreFn.Analyser as Analyser
-import PureScript.CoreFn.Utils (typeClassConstructorRegex)
-import Purvasm.ECore.Syntax (Ann, AtomicLiteral(..), Binding(..), CaseAlternative(..), Expr(..), Literal(..), Module(..), Pattern(..), Prop(..), StructuredLiteral(..), emptyAnn)
-import Purvasm.ECore.Transform (unsafeSubstitute)
-import Purvasm.Global (GlobalEnv, GlobalName, lookupConstructor, lookupTypeclass, mkGlobalName)
+import Purvasm.ECore.Syntax (Ann(..), Binding(..), CaseAlternative(..), Context(..), Expr(..), Literal(..), Meta(..), Module(..), Pattern(..), Prop(..), StructuredLiteral(..), addContext, emptyAnn, exprAnn, setMeta)
+import Purvasm.Global (GlobalEnv, GlobalName, ValueDesc(..), globalNameOfQualifiedVar, identOfGlobalName, lookupConstructor, lookupTypeclass, mkGlobalName)
 import Purvasm.Global as Global
-import Purvasm.Types (Ident(..), ModuleName(..))
+import Purvasm.Types (AtomicConstant(..), Ident(..), ModuleName(..), toIdent)
 import Safe.Coerce (coerce)
 
 type CorefnExpr = CF.Expr CF.Ann
@@ -65,116 +60,106 @@ translateCoreFn genv (CF.Module cfModule) = do
 
   translDecl :: CF.Bind CF.Ann -> (Binding Ann /\ Array (CF.Bind CF.Ann))
   translDecl = case _ of
-    CF.NonRec (CF.Binding a (CF.Ident ident) expr)
-      -- Typeclass constructor is not needed to be contained in compiled module,
-      -- so we omit it by returning ExprNone construction.
+    CF.NonRec binding -> translDeclBind binding
+    CF.Rec bindings -> case Array.uncons bindings of
+      Nothing -> unsafeCrashWith "translDecl: Impossible!"
+      Just { head, tail } ->
+        let
+          trBinding /\ rest = translDeclBind head
+        in
+          trBinding /\ if Array.null tail then rest else [ CF.Rec tail ] <> rest
+
+  translDeclBind :: CF.Binding CF.Ann -> (Binding Ann) /\ (Array (CF.Bind CF.Ann))
+  translDeclBind = case _ of
+    CF.Binding a (CF.Ident ident) expr
+      -- Typeclass declaration.
       | CF.Ann { meta: Just CF.IsTypeClassConstructor } <- a
-      , Re.test typeClassConstructorRegex ident ->
-          Binding (coerce ident) ExprNone /\ []
+      , typeclassCtorName <- mkGlobalName (tenv.moduleName) (Ident ident)
+      , Just { desc: ValTypeclass typeclassName } <- Global.lookupValue typeclassCtorName tenv.global
+      , Just { members } <- Global.lookupTypeclass typeclassName tenv.global ->
+          Binding (identOfGlobalName typeclassName) (ExprTypeclass emptyAnn members) /\ []
+
       -- Typeclass instance. We promoto each method implementation function 
       -- from record property to toplevel phrase.
-      -- | Just typeclassInst <- Analyser.typeclassInstanceOfExpr expr -> do
-      --     let
-      --       methods = typeclassInst.members <#>
-      --         \((CF.Ident method) /\ impl) -> CF.NonRec $
-      --           CF.Binding CF.emptyAnn (CF.Ident $ ident <> "$" <> method) impl
-      --       methodRefs = typeclassInst.members <#>
-      --         \((CF.Ident method) /\ _) 
-      --           -- we trap the case memebr identifier is like constraining typeclass name. 
-      --           -- | Re.test (unsafeRegex """^[A-Z]""" unicode) method  
-      --           | otherwise -> do
-      --       instance_ = CF.ExprLit CF.emptyAnn $
-      --         CF.LitRecord methodRefs
-      --         _ = unsafePerformEffect (logShow methods)
-      --     Binding (coerce ident) ExprNone /\ methods
-      | otherwise ->
-          (Binding (coerce ident) (translateExpr tenv (Ident ident) emptyAnn expr)) /\ []
-    -- recursive binding groups is translated into single `let rec` construction,
-    -- and each toplevel phrase in original CoreFn module is translated into 
-    -- accessor to the grouped expression.
-    -- For e.g.
-    -- ```purs
-    -- odd :: Int -> Boolean
-    -- odd n = even (n - 1)
-    --
-    -- even :: Int -> Boolean
-    -- even n = odd (n - 1)
-    -- ```
-    -- is translated into things such as:
-    -- ```
-    -- odd_even_RecBindGrp = 
-    --   let
-    --     odd n = even (n - 1)
-    --     even n = odd (n - 1)
-    --   in 
-    --     { even, odd }
-    -- odd = odd_even_RecBindGrp.odd
-    -- even = odd_even_RecBindGrp.even
-    -- ``` 
-    CF.Rec bindings ->
-      let
-        idents = (coerce <<< CF.bindingIdent) <$> bindings
-        bindGrpIdent = Ident $ "$pvsm_RecBindGrp__" <> (joinWith "_" idents)
-        bindGrpMembers = bindings <#> \(CF.Binding _ ident _) ->
+      | Just typeclassInst <- Analyser.typeclassInstanceOfExpr expr
+      , Just typeclassName <- globalNameOfQualifiedVar typeclassInst.typeclass -> do
           let
-            expr = CF.ExprAccessor
-              CF.emptyAnn
-              (mkRecursBindGroupVar bindGrpIdent (coerce idents))
-              (coerce ident)
+            methods = typeclassInst.members
+              # Array.filter (\((CF.Ident method) /\ _) -> not $ Re.test (unsafeRegex """^[A-Z]""" unicode) method)
+              <#> \(methodIdent@(CF.Ident method) /\ impl) ->
+                let
+                  -- このmetaはimplにつけないといけないのでは？
+                  meta = CF.IsTypeclassMember typeclassInst.typeclass methodIdent
+                in
+                  CF.NonRec $
+                    CF.Binding
+                      (CF.Ann { meta: Just meta })
+                      (CF.Ident $ ident <> "$" <> method)
+                      impl
+            -- References to the typeclass method implementation.
+            -- Instead of including closure in record, we list the function pointers
+            -- referrencing to the function body in the static section.
+            methodRefs = typeclassInst.members <#> case _ of
+              CF.Ident method /\ impl
+                -- we trap the case memebr identifier is like constraining typeclass name. 
+                | Re.test (unsafeRegex """^[A-Z]""" unicode) method
+                , CF.ExprAbs _ _ (CF.ExprVar _ (CF.Qualified (Just modname) id)) <- impl ->
+                    mkGlobalName (coerce modname) (coerce id)
+                | otherwise -> mkGlobalName tenv.moduleName (Ident $ ident <> "$" <> method)
+            instance_ = ExprTypeclassInstance emptyAnn typeclassName (Just methodRefs)
+          Binding (coerce ident) instance_ /\ methods
+
+      | otherwise ->
+          let
+            ident' = coerce ident
+            ann = emptyAnn # addContext (ToplevelPhrase $ mkGlobalName tenv.moduleName ident')
           in
-            CF.NonRec (CF.Binding CF.emptyAnn ident expr)
-
-        bindGrpExpr = CF.ExprLet
-          CF.emptyAnn
-          [ CF.Rec bindings ]
-          (mkBindGrpRecord $ coerce idents)
-
-        recGrpExp = translateExpr tenv bindGrpIdent emptyAnn bindGrpExpr
-
-        -- rename all recursive binding group members' identifier
-        -- with unquyalified one.
-        renameRecMembers = flip
-          (foldr (\ident -> unsafeSubstitute (Ident ident) ExprNone))
-          idents
-      in
-        Binding bindGrpIdent (renameRecMembers recGrpExp) /\ bindGrpMembers
-
-  mkRecursBindGroupVar ident members =
-    let
-      varAnn = CF.Ann { meta: Just $ CF.IsRecursBindGrp members }
-    in
-      CF.ExprVar
-        varAnn
-        (CF.Qualified (Just cfModule.name) (coerce ident))
-
-  mkBindGrpRecord idents =
-    CF.ExprLit
-      (CF.Ann { meta: Just $ CF.IsRecursBindGrp idents })
-      ( CF.LitRecord
-          ( idents <#> \id ->
-              CF.Prop (coerce id) (CF.ExprVar CF.emptyAnn (CF.Qualified Nothing (CF.Ident $ coerce id)))
-          )
-      )
+            (Binding ident' (translateExpr tenv (Ident ident) ann expr)) /\ []
 
 translateExpr :: TranslEnv -> Ident -> Ann -> CorefnExpr -> Expr Ann
 translateExpr { moduleName, global } ident = transl
   where
   transl ann = case _ of
     exprLit@(CF.ExprLit _ lit)
-      | Just constLit <- exprConstantLiteral exprLit -> ExprLit ann constLit
+      | Just constLit <- exprConstantLiteral global exprLit -> ExprLit ann constLit
       | otherwise -> case lit of
           CF.LitArray lits -> ExprArray ann (transl ann <$> lits)
-          CF.LitRecord props -> ExprRecord ann $
-            (\(CF.Prop prop a) -> Prop prop $ transl ann a) <$> props
+          CF.LitRecord _ -- props
+
+            -- | props' <- CF.propKey <$> props
+            -- , Just recId <- Global.lookupRecordType props' global ->
+            --     ExprRecord ann recId $ (map (transl ann) <<< translProp) <$>
+            --       (Array.sortBy (compare `on` CF.propKey) props)
+            | otherwise ->
+                unsafeCrashWith "translExpr: Unknown record type!"
           _ -> unsafeCrashWith "translateExpr: Literal in ExprArray"
     CF.ExprVar _ var -> translExprVar ann var
-    CF.ExprAccessor _ expr prop -> ExprAccess ann (transl ann expr) prop
-    CF.ExprUpdate _ expr updates -> ExprUpdate ann (transl ann expr) $
-      map (\(CF.Prop p e) -> p /\ transl ann e) updates
+    CF.ExprAccessor _ expr prop ->
+      let
+        trExp = transl ann expr
+        trAnn = exprAnn trExp
+      in
+        case trAnn of
+          Ann { meta: Just (IsTypeclassDict clsname) }
+            | Just typeclass <- Global.lookupTypeclass clsname global
+            , Just (_ /\ mbConstraint) <- Array.find (fst >>> (_ == Ident prop)) typeclass.members
+            , Just constraint <- mbConstraint ->
+                let
+                  ann' = setMeta (IsTypeclassDict constraint) ann
+                in
+                  ExprAccess ann' trExp prop
+          _ -> ExprAccess ann trExp prop
+    CF.ExprUpdate _ expr updates -> ExprUpdate ann (transl (addContext RecordUpdateExpr ann) expr) $
+      map (\(CF.Prop p e) -> p /\ transl (addContext (RecordUpdateUpdator p) ann) e) updates
 
-    CF.ExprAbs _ arg body -> translExprAbs ann (L.singleton arg) body
+    CF.ExprAbs ann' arg body
+      | CF.Ann { meta: Just (CF.IsTypeclassMember cls member) } <- ann'
+      , Just val <- Global.lookupValue (mkGlobalName moduleName $ toIdent member) global -> do
+          unsafeCrashWith "Ho!"
+      | otherwise -> translExprAbs ann (L.singleton arg) body
     CF.ExprApp _ func arg
-      | CF.ExprVar (CF.Ann { meta: Just CF.IsNewtype }) _ <- func -> transl ann arg
+      | CF.ExprVar varAnn varName <- func
+      , CF.Ann { meta: Just CF.IsNewtype } <- varAnn -> transl ann arg
       | otherwise -> translExprApp ann [ arg ] func
     CF.ExprLet _ binds body -> translExprLet ann binds body
     CF.ExprConstructor _ typ (CF.Ident ctor) args
@@ -182,26 +167,41 @@ translateExpr { moduleName, global } ident = transl
       , globalName' <- mkGlobalName moduleName (Ident ctor')
       , Just x <- lookupTypeclass globalName' global -> unsafeCrashWith "FO!"
       | otherwise -> translConstructor ann typ (coerce ctor) args
-    -- We trap the special case: the case destructuring against typeclass constructor:
-    CF.ExprCase _ [ _ ] [ caseAlt ]
-      | CF.CaseAlternative [ binder ] act <- caseAlt
+    -- We trap the special case: the case destructuring against 
+    -- typeclass constructor:
+    CF.ExprCase _ [ caseHead ] [ caseAlt ]
+      | CF.ExprVar _ (CF.Qualified _ headVar) <- caseHead
+      , CF.CaseAlternative [ binder ] act <- caseAlt
+      , CF.Unconditional actExpr <- act
       , CF.BinderConstructor (CF.Ann { meta: Just CF.IsNewtype }) _ ctor [ arg ] <- binder
       , CF.BinderVar _ var <- arg
-      , Just (Global.ValTypeclass clsName) <-
+      , Just { desc: Global.ValTypeclass clsName } <-
           Global.globalNameOfQualifiedVar ctor
             >>= flip Global.lookupValue global
-      , Just typeclass <- Global.lookupTypeclass clsName global
-      , CF.Unconditional actExp <- act -> do
+      , Just typeclass <- Global.lookupTypeclass clsName global ->
           let
-            substDict = unsafeSubstitute (coerce var) (ExprTypeclassInstance ann clsName Nothing)
-          substDict $ transl ann actExp
+            casHeadAnn = ann # addContext CaseHead # setMeta (IsTypeclassDict clsName)
+            casActAnn = ann # addContext CaseAction
+          in
+            ExprCase ann
+              [ ExprVar casHeadAnn (coerce headVar) ]
+              [ CaseAlternative
+                  { patterns: [ PatVar (coerce var) ]
+                  , action: transl casActAnn actExpr
+                  }
+              ]
+    -- Translating case expression.
     CF.ExprCase _ caseExprs caseAlts -> translExprCase ann caseExprs caseAlts
+
   translExprVar ann (CF.Qualified qual (CF.Ident ident')) = case qual of
     Just (CF.ModuleName modname) ->
       let
         gloname = mkGlobalName (ModuleName modname) (Ident ident')
+        ann' = case Global.lookupValue gloname global of
+          Just { desc: ValTypeclassInstance clsname } -> setMeta (IsTypeclassDict clsname) ann
+          _ -> ann
       in
-        ExprGlobal ann gloname
+        ExprGlobal ann' gloname
     _ -> ExprVar ann (Ident ident')
 
   translExprAbs ann args = case _ of
@@ -211,17 +211,31 @@ translateExpr { moduleName, global } ident = transl
         argIdents = coerce $ L.foldl (flip Array.cons) [] args
       ExprAbs ann argIdents (transl ann expr)
 
-  translExprApp ann args = case _ of
-    CF.ExprApp _ f arg -> translExprApp ann (Array.cons arg args) f
-    expr
-      | CF.ExprVar _ (CF.Qualified (Just (CF.ModuleName mn)) (CF.Ident id)) <- expr
-      , Just desc <- Global.lookupConstructor (mkGlobalName (coerce mn) (coerce id)) global
-      , desc.arity == Array.length args ->
-          let
-            ctorArgs = transl ann <$> args
-          in
-            ExprConstruct emptyAnn desc ctorArgs
-      | otherwise -> ExprApp emptyAnn (transl ann expr) (transl ann <$> args)
+  translExprApp ann = go
+    where
+    go args = case _ of
+      CF.ExprApp _ f arg -> translExprApp ann (Array.cons arg args) f
+      expr ->
+        case globalNameOfExprVar expr of
+          Just funcName
+            | Just desc <- Global.lookupConstructor funcName global
+            , desc.arity == Array.length args ->
+                let
+                  mkAnn :: Int -> Ann -> Ann
+                  mkAnn = addContext <<< CtorArg funcName
+                  ctorArgs = mapWithIndex (\i arg -> transl (mkAnn i ann) arg) args
+                in
+                  ExprConstruct emptyAnn desc ctorArgs
+          -- | Just typeclass <-
+          --     Global.lookupTypeclassValue funcName global ->
+          --     unsafeCrashWith "Fo!"
+          mbFuncName ->
+            let
+              mkAnn :: Int -> Ann -> Ann
+              mkAnn = addContext <<< AppArg mbFuncName
+            in
+              ExprApp emptyAnn (transl (addContext AppFunc ann) expr) $
+                mapWithIndex (\i -> transl (mkAnn i ann)) args
 
   translConstructor ann _ ctor args =
     let
@@ -260,7 +274,7 @@ translateExpr { moduleName, global } ident = transl
       in
         ExprLet ann trBinds (transl ann body)
     where
-    translLetBind ann' (CF.Binding _ id b) = Tuple (coerce id) (transl ann b)
+    translLetBind ann' (CF.Binding _ id b) = Tuple (coerce id) (transl ann' b)
 
   translExprCase ann caseExprs caseAlts =
     ExprCase
@@ -306,13 +320,13 @@ translateExpr { moduleName, global } ident = transl
 
   -- _ -> unsafeCrashWith "translCaseBinder: Impossible!"
 
-  binderLiteral :: CF.Literal (CF.Binder _) -> Maybe AtomicLiteral
+  binderLiteral :: CF.Literal (CF.Binder _) -> Maybe AtomicConstant
   binderLiteral = case _ of
-    CF.LitInt i -> Just $ LitInt i
-    CF.LitBoolean b -> Just $ LitBoolean b
-    CF.LitChar c -> Just $ LitChar c
-    CF.LitNumber n -> Just $ LitNumber n
-    CF.LitString s -> Just $ LitString s
+    CF.LitInt i -> Just $ ACInt i
+    CF.LitBoolean b -> Just $ ACBool b
+    CF.LitChar c -> Just $ ACChar c
+    CF.LitNumber n -> Just $ ACNumber n
+    CF.LitString s -> Just $ ACString s
     _ -> Nothing
 
 -- CF.LitArray lits -> ExprLit unit $ LitStruct (LitArray $ map translateExpr lits)
@@ -323,17 +337,23 @@ globalNameOfExprVar = case _ of
     Just $ mkGlobalName (coerce mn) (coerce id)
   _ -> Nothing
 
-exprConstantLiteral :: CF.Expr CF.Ann -> Maybe Literal
-exprConstantLiteral = case _ of
-  CF.ExprLit _ lit -> case lit of
-    CF.LitInt i -> Just (LitAtomic (LitInt i))
-    CF.LitChar c -> Just (LitAtomic (LitChar c))
-    CF.LitBoolean b -> Just (LitAtomic (LitBoolean b))
-    CF.LitNumber n -> Just (LitAtomic (LitNumber n))
-    CF.LitString s -> Just (LitAtomic (LitString s))
-    CF.LitArray lits -> LitStruct <<< LitArray <$> traverse exprConstantLiteral lits
-    CF.LitRecord props -> LitStruct <<< LitRecord <$> traverse (traverse exprConstantLiteral <<< translProp) props
-  _ -> Nothing
+exprConstantLiteral :: GlobalEnv -> CF.Expr CF.Ann -> Maybe Literal
+exprConstantLiteral _ {-genv-} = go
+  where
+  go = case _ of
+    CF.ExprLit _ lit -> case lit of
+      CF.LitInt i -> Just (LitAtomic (ACInt i))
+      CF.LitChar c -> Just (LitAtomic (ACChar c))
+      CF.LitBoolean b -> Just (LitAtomic (ACBool b))
+      CF.LitNumber n -> Just (LitAtomic (ACNumber n))
+      CF.LitString s -> Just (LitAtomic (ACString s))
+      CF.LitArray lits -> LitStruct <<< LitArray <$> traverse go lits
+      CF.LitRecord _ -- props
+
+        --   | Just recId <- Global.lookupRecordType (CF.propKey <$> props) genv ->
+        --       LitStruct <<< LitRecord recId <$> traverse (traverse go <<< translProp) (Array.sortBy (compare `on` CF.propKey) props)
+        | otherwise -> unsafeCrashWith "exprConstLiteral: Unknown record type!"
+    _ -> Nothing
 
 translModuleName :: CF.ModuleName -> ModuleName
 translModuleName = coerce

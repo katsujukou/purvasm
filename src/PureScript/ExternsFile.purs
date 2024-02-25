@@ -8,6 +8,7 @@ module PureScript.ExternsFile
   , Fixity(..)
   , ImportDeclarationType(..)
   , Precedence
+  , identOfExternsDeclaration
   , module Ext
   ) where
 
@@ -25,9 +26,10 @@ import PureScript.ExternsFile.Declarations (DeclarationRef(..)) as Ext
 import PureScript.ExternsFile.Decoder.Class (class Decode)
 import PureScript.ExternsFile.Decoder.Generic (genericDecoder)
 import PureScript.ExternsFile.Fmt (ShowRecordLikeConfig)
-import PureScript.ExternsFile.Names (Ident, Qualified, ModuleName, ProperName, NameSource, OpName)
+import PureScript.ExternsFile.Names (Ident(..), ModuleName, NameSource, OpName, ProperName(..), Qualified)
 import PureScript.ExternsFile.SourcePos (SourceSpan)
 import PureScript.ExternsFile.Types (ChainId, DataDeclType, FunctionalDependency, SourceConstraint, SourceType, TypeKind)
+import Purvasm.Types as P
 
 data ExternsFile = ExternsFile
   -- efVersion
@@ -241,3 +243,14 @@ derive instance Generic ExternsDeclaration _
 
 instance Decode ExternsDeclaration where
   decoder = genericDecoder
+
+identOfExternsDeclaration :: ExternsDeclaration -> P.Ident
+identOfExternsDeclaration = case _ of
+  EDType pn _ _ -> properNameIdent pn
+  EDTypeSynonym pn _ _ -> properNameIdent pn
+  EDDataConstructor pn _ _ _ _ -> properNameIdent pn
+  EDClass pn _ _ _ _ _ -> properNameIdent pn
+  EDInstance _ (Ident ident) _ _ _ _ _ _ _ _ -> P.Ident ident
+  EDValue (Ident ident) _ -> P.Ident ident
+  where
+  properNameIdent (ProperName ident) = P.Ident ident
