@@ -24,7 +24,7 @@ import Purvasm.LCore.Env (LocalSymbolTable(..), TranslEnv, VariableDesc(..), ext
 import Purvasm.LCore.MatchComp (PatternMatching(..))
 import Purvasm.LCore.MatchComp as MatchComp
 import Purvasm.LCore.Syntax (LCore(..))
-import Purvasm.LCore.Types (Var(..), Occurrunce)
+import Purvasm.LCore.Types (FieldPos(..), Occurrunce, Var(..))
 import Purvasm.Primitives (Primitive(..))
 import Purvasm.Types (BlockTag(..), Ident(..), StructuredConstant(..))
 
@@ -92,8 +92,14 @@ translateExpr ident = go
     ECF.ExprLit _ lit -> LCConst <$> (constantOfLiteral lit)
     ECF.ExprVar _ var -> searchVar var >>= case _ of
       Nothing -> unsafeCrashWith $ "translateExpr: Unknown variable!" <> show var
-      Just (i /\ desc /\ occur) -> pure $
-        L.foldr (\o lambda -> LCPrim (PGetField o) [ lambda ]) (LCVar desc $ Var i) occur
+      Just (i /\ desc /\ occur) ->
+        let
+          accessorPrim = case _ of
+            PosIndex n -> PGetField n
+            PosProp p -> PGetRecordField p
+        in
+          pure $
+            L.foldr (\o lambda -> LCPrim (accessorPrim o) [ lambda ]) (LCVar desc $ Var i) occur
     ECF.ExprGlobal _ gname -> do
       { globals } <- get
       case Global.lookupConstructor gname globals of
@@ -261,10 +267,14 @@ occurrenceOfPat o = case _ of
   ECF.PatAliase s pat -> [ s /\ o ] <> occurrenceOfPat o pat
   ECF.PatConstruct _ subpats -> occurrenceOfSubPats subpats
   ECF.PatArray subpats -> occurrenceOfSubPats subpats
+  ECF.PatRecord subpats -> occurrenceOfRecordSubpats subpats
   _ -> []
   where
   occurrenceOfSubPats subpats = subpats
-    # mapWithIndex (\i pat -> occurrenceOfPat (i : o) pat)
+    # mapWithIndex (\i pat -> occurrenceOfPat (PosIndex i : o) pat)
+    # join
+  occurrenceOfRecordSubpats subpats = subpats
+    <#> (\(ECF.Prop prop pat) -> occurrenceOfPat (PosProp prop : o) pat)
     # join
 
 immediateExpr :: ECF.Expr ECF.Ann -> Boolean

@@ -27,7 +27,7 @@ type TranslEnv =
 
 type Variable =
   { desc :: VariableDesc
-  , occur :: List Int
+  , occur :: Occurrunce
   }
 
 data VariableDesc

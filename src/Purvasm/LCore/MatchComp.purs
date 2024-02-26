@@ -4,19 +4,20 @@ module Purvasm.LCore.MatchComp where
 
 import Prelude
 
-import Data.Array (mapWithIndex, (!!))
+import Data.Array (fold, mapWithIndex, (!!))
 import Data.Array as Array
+import Data.Array.Partial as ArrayP
 import Data.Bifunctor (rmap)
 import Data.Either (Either(..))
 import Data.Generic.Rep (class Generic)
-import Data.Maybe (Maybe(..), maybe)
+import Data.Maybe (Maybe(..), fromMaybe, maybe)
 import Data.Show.Generic (genericShow)
 import Data.Traversable (traverse)
 import Data.Tuple (Tuple)
 import Data.Tuple.Nested (type (/\), (/\))
 import Effect.Console (logShow)
 import Effect.Unsafe (unsafePerformEffect)
-import Partial.Unsafe (unsafeCrashWith)
+import Partial.Unsafe (unsafeCrashWith, unsafePartial)
 import Purvasm.ECore.Syntax as ECF
 import Purvasm.Primitives (Primitive(..))
 import Purvasm.Types (AtomicConstant(..), ConstructorTag)
@@ -61,7 +62,7 @@ data MatrixType
 
 decomposePatternMatch :: PatternMatching -> DecisionTree
 decomposePatternMatch pm =
-  case splitPatternMatch pm of
+  case splitPatternMatch $ desugarRecordPattern pm of
     Left leaf -> leaf
     Right (vars /\ nonVars)
       | failedMatch nonVars -> decomposePatternMatch vars
@@ -72,6 +73,7 @@ decomposePatternMatch pm =
             (reduceMatrix nonVars)
   where
   failedMatch (PatternMatching { pmMatrix }) = Array.null pmMatrix
+
   reduceMatrix (PatternMatching { pmHeads, pmMatrix }) =
     case Array.head pmMatrix, Array.head pmHeads of
       Nothing, _ -> MatchFail
@@ -112,6 +114,47 @@ decomposePatternMatch pm =
     | MatchFail <- l = r
     | MatchFail <- r = l
     | otherwise = MatchTry l r
+
+desugarRecordPattern :: PatternMatching -> PatternMatching
+desugarRecordPattern pm@(PatternMatching { pmHeads, pmMatrix }) =
+  let
+    propPats = pmMatrix
+      <#>
+        ( \{ pats } ->
+            case Array.head pats of
+              Nothing -> []
+              Just pat -> recordSubPatterns pat
+        )
+    props = Array.nub <<< map ECF.propKey <<< join $ propPats
+  in
+    if Array.null props then pm
+    else
+      let
+        pmHeads' = case Array.uncons pmHeads of
+          Nothing -> unsafeCrashWith "desugarRecordPattern: Impossible!"
+          Just { head, tail } ->
+            let
+              expandedHead = props <#> (\p -> ECF.ExprAccess ECF.emptyAnn head p)
+            in
+              expandedHead <> tail
+        pmMatrix' = pmMatrix
+          # mapWithIndex
+              ( \i { pats, action } -> unsafePartial $
+                  let
+                    expandedPats :: Array ECF.Pattern
+                    expandedPats = props
+                      <#>
+                        ( \prop -> (propPats !! i)
+                            >>= Array.find (ECF.propKey >>> (_ == prop))
+                            # maybe ECF.PatWildcard ECF.propValue
+                        )
+                  in
+                    { pats: expandedPats <> Array.drop 1 pats
+                    , action
+                    }
+              )
+      in
+        PatternMatching { pmHeads: pmHeads', pmMatrix: pmMatrix' }
 
 splitPatternMatch :: PatternMatching -> Either DecisionTree (PatternMatching /\ PatternMatching)
 splitPatternMatch (PatternMatching { pmHeads, pmMatrix }) =
@@ -227,6 +270,11 @@ subPatterns = case _ of
   ECF.PatConstruct _ pats -> pats
   ECF.PatAliase _ pat -> subPatterns pat
   ECF.PatArray pats -> pats
+  _ -> []
+
+recordSubPatterns = case _ of
+  ECF.PatRecord pats -> pats
+  ECF.PatAliase _ p -> recordSubPatterns p
   _ -> []
 
 matrixType :: Array PatternMatrix -> MatrixType
