@@ -25,13 +25,13 @@ module Purvasm.Global
 
 import Prelude
 
+import Control.Alt ((<|>))
 import Data.Array (foldr)
 import Data.Array as Array
 import Data.Generic.Rep (class Generic)
 import Data.HashMap (HashMap)
 import Data.HashMap as HM
-import Data.HashMap as HashMap
-import Data.Maybe (Maybe(..))
+import Data.Maybe (Maybe(..), maybe)
 import Data.Newtype (class Newtype)
 import Data.Set (Set)
 import Data.Set as Set
@@ -41,8 +41,11 @@ import Data.String.Regex as Re
 import Data.String.Regex.Flags (unicode)
 import Data.String.Regex.Unsafe (unsafeRegex)
 import Data.Traversable (foldMap, foldl)
-import Data.Tuple (uncurry)
+import Data.Tuple (fst, uncurry)
 import Data.Tuple.Nested (type (/\), (/\))
+import Effect.Console (logShow)
+import Effect.Unsafe (unsafePerformEffect)
+import Partial.Unsafe (unsafeCrashWith)
 import PureScript.CoreFn as CF
 import PureScript.CoreFn.Analyser (typeclassInstanceOfExpr)
 import PureScript.CoreFn.Analyser as Analyser
@@ -50,9 +53,9 @@ import PureScript.CoreFn.Utils (typeClassConstructorRegex)
 import PureScript.ExternsFile (ExternsDeclaration(..), ExternsFile(..)) as Ext
 import PureScript.ExternsFile (identOfExternsDeclaration)
 import PureScript.ExternsFile.Names (ProperName(..), Qualified(..), QualifiedBy(..)) as Ext
-import PureScript.ExternsFile.Types (Constraint(..), Type(..)) as Ext
+import PureScript.ExternsFile.Types (Constraint(..), Type(..), SourceConstraint) as Ext
 import Purvasm.Types (Global(..), GlobalName, mkGlobal) as ReExports
-import Purvasm.Types (class IsIdent, Arity, ConstructorTag, Global(..), GlobalName, Ident(..), ModuleName, RecordId, RecordSig, mkGlobal, toIdent)
+import Purvasm.Types (class IsIdent, Arity, ConstructorTag, Global(..), GlobalName, Ident(..), ModuleName(..), RecordId(..), RecordSig(..), RecordTypeDesc, mkGlobal, toIdent)
 import Safe.Coerce (coerce)
 
 -- newtype GlobalName = GlobalName { modname :: ModuleName, ident :: Ident }
@@ -84,8 +87,8 @@ lookupTypeclassValue name genv = lookupValue name genv >>= case _ of
 lookupConstructor :: GlobalName -> GlobalEnv -> Maybe ConstructorDesc
 lookupConstructor ctorName (GlobalEnv genv) = HM.lookup ctorName genv.constructorDecls
 
-lookupRecordType :: RecordId -> GlobalEnv -> Maybe RecordSig
-lookupRecordType recId (GlobalEnv genv) = HM.lookup recId genv.recordTypes
+lookupRecordType :: RecordId -> GlobalEnv -> Maybe RecordTypeDesc
+lookupRecordType recordId (GlobalEnv genv) = HM.lookup recordId genv.recordTypes
 
 insertConstructor :: GlobalName -> ConstructorDesc -> GlobalEnv -> GlobalEnv
 insertConstructor ctorName desc (GlobalEnv genv) = GlobalEnv $ genv
@@ -106,7 +109,7 @@ newtype GlobalEnv = GlobalEnv
   { valueDecls :: HashMap GlobalName Value
   , constructorDecls :: HashMap GlobalName ConstructorDesc
   , typeclassDecls :: HashMap GlobalName TypeclassDesc
-  , recordTypes :: HashMap RecordId RecordSig
+  , recordTypes :: HashMap RecordId RecordTypeDesc
   }
 
 instance Show GlobalEnv where
@@ -114,16 +117,16 @@ instance Show GlobalEnv where
 
 emptyEnv :: GlobalEnv
 emptyEnv = GlobalEnv
-  { valueDecls: HashMap.empty
-  , constructorDecls: HashMap.empty
-  , typeclassDecls: HashMap.empty
-  , recordTypes: HashMap.empty
+  { valueDecls: HM.empty
+  , constructorDecls: HM.empty
+  , typeclassDecls: HM.empty
+  , recordTypes: HM.empty
   }
 
 derive instance Newtype GlobalEnv _
 
 type Value =
-  { constraints :: Array GlobalName
+  { constraints :: Array (Maybe GlobalName)
   , desc :: ValueDesc
   , source :: Set ValueSource
   }
@@ -162,19 +165,19 @@ type TypeclassDesc =
 
 type PrimDesc = {}
 
-setConstraints :: ValueSource -> GlobalName -> Array GlobalName -> GlobalEnv -> GlobalEnv
+setConstraints :: ValueSource -> GlobalName -> Array (Maybe GlobalName) -> GlobalEnv -> GlobalEnv
 setConstraints src ident constraints genv = insertValue ident value genv
   where
   value = case lookupValue ident genv of
-    Nothing -> { desc: ValPlain, constraints, source: Set.singleton src }
+    Nothing -> { desc: ValPlain, constraints: constraints, source: Set.singleton src }
     Just v -> v { constraints = constraints, source = Set.insert src v.source }
 
 applyCorefnEnv :: CF.Module CF.Ann -> GlobalEnv -> GlobalEnv
 applyCorefnEnv (CF.Module cfm@{ decls }) =
   flip (foldr (uncurry insertTypeclassInstance)) classified.typeclassInstances
-    >>> flip (foldr (uncurry insertTypeclass')) classified.typeclassInstances
     >>> flip (foldr (uncurry insertConstructor')) classified.constructors
     >>> flip (foldr (uncurry insertNewtypeConstructor)) classified.newtypeConstructors
+    >>> flip (foldr insertTypeclassConstructor) (fst <$> classified.typeclassConstructors)
     >>> flip (foldr (uncurry insertAnyValue)) classified.plain
   where
   moduleName :: ModuleName
@@ -219,55 +222,44 @@ applyCorefnEnv (CF.Module cfm@{ decls }) =
     in
       insertConstructor globalIdent constr genv
 
-  insertTypeclass' :: CF.Ident -> (CF.Expr CF.Ann) -> GlobalEnv -> GlobalEnv
-  insertTypeclass' _ (CF.ExprApp _ abs mems) genv
-    | CF.ExprVar (CF.Ann { meta: Just CF.IsNewtype }) var <- abs
-    , Just gloname <- globalNameOfQualifiedVar var
-    , CF.ExprLit _ (CF.LitRecord memberProps) <- mems
-    , Ident clsname <- identOfGlobalName gloname
-    , cls <- Str.replace (Str.Pattern "$Dict") (Str.Replacement "") clsname
-    , typeclassName <- renameIdent gloname (Ident cls)
-    , Nothing <- lookupTypeclass typeclassName genv =
-        let
-          mkMember (CF.Prop ident impl) =
-            let
-              mbConstraint =
-                if not (Re.test (unsafeRegex """^[A-Z]""" unicode) ident) then Nothing
-                else case impl of
-                  CF.ExprAbs _ _ body
-                    | CF.ExprVar _ qual <- body
-                    , Just constraintInstName <- globalNameOfQualifiedVar qual
-                    , Just (ValTypeclassInstance constraintClass) <- _.desc <$> lookupValue constraintInstName genv -> Just constraintClass
-                  _ -> Nothing
-            in
-              Ident ident /\ mbConstraint
-          typeclass =
-            { members: memberProps <#> mkMember
-            }
-        in
-          genv
-            # insertTypeclass typeclassName typeclass
-                >>> insertValue gloname
-                  { desc: ValTypeclass typeclassName
-                  , source: Set.singleton Corefn
-                  , constraints: []
-                  }
-  insertTypeclass' _ _ genv = genv
+  insertTypeclassConstructor :: CF.Ident -> GlobalEnv -> GlobalEnv
+  insertTypeclassConstructor (CF.Ident ident) =
+    let
+      typeclassCtor = mkGlobalName moduleName $ Ident ident
+      className = Ident $ Str.replace (Str.Pattern "$Dict") (Str.Replacement "") ident
+    in
+      insertValue typeclassCtor
+        { desc: ValTypeclass $ mkGlobalName moduleName className
+        , constraints: []
+        , source: Set.singleton Corefn
+        }
 
   insertTypeclassInstance :: CF.Ident -> (CF.Expr CF.Ann) -> GlobalEnv -> GlobalEnv
-  insertTypeclassInstance (CF.Ident ident) expr genv
-    | Just clsInstance <- typeclassInstanceOfExpr expr
-    , CF.Qualified (Just modname) (CF.ProperName clsname) <- clsInstance.typeclass =
-        let
-          typeclassName = mkGlobalName (coerce modname) (Ident clsname)
-        in
-          genv #
-            insertValue (qualify (Ident ident))
-              { desc: ValTypeclassInstance typeclassName
-              , source: Set.singleton Corefn
-              , constraints: []
-              }
-  insertTypeclassInstance _ _ genv = genv
+  insertTypeclassInstance (CF.Ident ident) expr genv =
+    case typeclassInstanceOfExpr expr of
+      Just instance_
+        | Just className <- globalNameOfQualifiedVar instance_.typeclass ->
+            let
+              globalIdent = mkGlobalName moduleName (coerce ident)
+              constraints = map (globalNameOfQualifiedVar =<< _) instance_.constraints
+              genv' = case lookupTypeclass className genv of
+                Just _ -> genv
+                Nothing -> genv # insertTypeclass className
+                  { members: ((_ /\ Nothing) <<< coerce <<< fst) <$> instance_.members
+                  }
+            in
+              case lookupValue globalIdent genv' of
+                Nothing -> genv' # insertValue globalIdent
+                  { desc: ValTypeclassInstance className
+                  , constraints
+                  , source: Set.singleton Corefn
+                  }
+                Just val -> genv' # insertValue globalIdent
+                  { desc: ValTypeclassInstance className
+                  , constraints: Array.zipWith (<|>) val.constraints constraints
+                  , source: Set.insert Corefn val.source
+                  }
+      _ -> unsafeCrashWith "insertTypeclassInstance: Impossible!"
 
   insertAnyValue :: CF.Ident -> CF.Expr CF.Ann -> GlobalEnv -> GlobalEnv
   insertAnyValue (CF.Ident ident) expr genv =
@@ -299,37 +291,30 @@ applyCorefnEnv (CF.Module cfm@{ decls }) =
                   Nothing -> genv #
                     insertValue globalIdent
                       { desc: ValTypeclassMember globalClass
-                      , constraints: [ globalClass ]
+                      , constraints: [ Just globalClass ]
                       , source: Set.singleton Corefn
                       }
         _ ->
           case lookupValue globalIdent genv of
-            Just val -> genv #
-              insertValue globalIdent
-                ( val
-                    { desc = ValPlain
-                    , source = Set.insert Corefn val.source
-                    }
-                )
-            Nothing -> genv #
-              insertValue globalIdent
-                { desc: ValPlain
-                , constraints: []
-                , source: Set.singleton Corefn
-                }
+            Just val -> genv
+              # insertValue globalIdent
+                  ( val
+                      { desc = ValPlain
+                      , source = Set.insert Corefn val.source
+                      }
+                  )
+            Nothing -> genv
+              # insertValue globalIdent
+                  { desc: ValPlain
+                  , constraints: []
+                  , source: Set.singleton Corefn
+                  }
 
-  -- # insertRecordType' expr
-
-  -- insertRecordType' :: CF.Expr CF.Ann -> GlobalEnv -> GlobalEnv
-  -- insertRecordType' expr (GlobalEnv genv) =
+  -- insertRecordType recordSig (GlobalEnv genv'@{ recordTypes }) =
   --   let
-  --     recordTypes' = Analyser.collectRecordTypes expr
-  --       # foldr (\props -> snd <<< createNewRecordType props) genv.recordTypes
+  --     recordId = RecordId Nothing recordSig
   --   in
-  --     GlobalEnv $
-  --       genv
-  --         { recordTypes = spy "rectypes" recordTypes'
-  --         }
+  --     GlobalEnv (genv' { recordTypes = HashSet.insert recordId recordTypes })
 
   qualify :: Ident -> GlobalName
   qualify = Global <<< { modname: coerce cfm.name, ident: _, it: unit }
@@ -355,11 +340,33 @@ externsEnv (Ext.ExternsFile _ modname _ _ _ _ extDecls _) genv =
 
     addValue :: Ext.ExternsDeclaration -> GlobalEnv -> GlobalEnv
     addValue = case _ of
+      Ext.EDInstance cls _ _ _ _ constrs _ _ _ _
+        | Ext.Qualified (Ext.ByModuleName mn) (Ext.ProperName clsName) <- cls
+        , classIdent <- mkGlobalName (coerce mn) (Ident clsName) ->
+            let
+              constraints = constrs
+                # maybe
+                    []
+                    ( map case _ of
+                        Ext.Constraint _ constraintClsName _ _ _
+                          | Ext.Qualified (Ext.ByModuleName mn') (Ext.ProperName cls') <- constraintClsName ->
+                              mkGlobalName (coerce mn') (Ident cls')
+                        _ -> unsafeCrashWith "addValue: BySourcePos"
+                    )
+                # Array.reverse
+            in
+              insertTypeclassInstanceValue classIdent (Just <$> constraints)
       Ext.EDValue _ _ -> insertPlainValue globalIdent
       _ -> identity
 
     insertPlainValue :: GlobalName -> GlobalEnv -> GlobalEnv
     insertPlainValue name = insertValue name { desc: ValPlain, constraints: [], source: Set.singleton ExternsFile }
+
+    insertTypeclassInstanceValue clsName constraints = insertValue globalIdent
+      { desc: ValTypeclassInstance clsName
+      , constraints
+      , source: Set.singleton ExternsFile
+      }
 
     applyConstraints :: Ext.ExternsDeclaration -> GlobalEnv -> GlobalEnv
     applyConstraints = case _ of
@@ -381,6 +388,6 @@ externsEnv (Ext.ExternsFile _ modname _ _ _ _ extDecls _) genv =
         , Ext.Qualified (Ext.ByModuleName mn) (Ext.ProperName name) <- typeclass -> do
             let
               typeclassName = mkGlobalName (coerce mn) (Ident name)
-            go (Array.cons typeclassName constrs) t
-      _ -> Array.reverse constrs
+            go (Array.snoc constrs (Just typeclassName)) t
+      _ -> constrs
 

@@ -35,7 +35,7 @@ data Expr a
   | ExprArray a (Array (Expr a))
   | ExprRecord a RecordId (Array (Prop (Expr a)))
   | ExprTypeclass a (Array (Ident /\ Maybe GlobalName))
-  | ExprTypeclassInstance a GlobalName (Maybe (Array GlobalName))
+  | ExprTypeclassInstance a GlobalName (Array (Expr a))
   | ExprAbs a (Array Ident) (Expr a)
   | ExprApp a (Expr a) (Array (Expr a))
   | ExprLet a (Array (Tuple Ident (Expr a))) (Expr a)
@@ -154,6 +154,9 @@ data Context
   | AppFunc
   | AppArg (Maybe GlobalName) Int
   | CtorArg GlobalName Int
+  | TypeClassCtorArg GlobalName
+  | TypeclassInstanceDecl GlobalName
+  | TypeclassMemberImpl Ident
   | RecordUpdateExpr
   | RecordUpdateUpdator String
   | CaseHead

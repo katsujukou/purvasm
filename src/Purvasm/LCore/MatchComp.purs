@@ -4,22 +4,18 @@ module Purvasm.LCore.MatchComp where
 
 import Prelude
 
-import Data.Array (fold, mapWithIndex, (!!))
+import Data.Array (mapWithIndex, (!!))
 import Data.Array as Array
-import Data.Array.Partial as ArrayP
 import Data.Bifunctor (rmap)
 import Data.Either (Either(..))
 import Data.Generic.Rep (class Generic)
-import Data.Maybe (Maybe(..), fromMaybe, maybe)
+import Data.Maybe (Maybe(..), maybe)
 import Data.Show.Generic (genericShow)
 import Data.Traversable (traverse)
 import Data.Tuple (Tuple)
 import Data.Tuple.Nested (type (/\), (/\))
-import Effect.Console (logShow)
-import Effect.Unsafe (unsafePerformEffect)
 import Partial.Unsafe (unsafeCrashWith, unsafePartial)
 import Purvasm.ECore.Syntax as ECF
-import Purvasm.Primitives (Primitive(..))
 import Purvasm.Types (AtomicConstant(..), ConstructorTag)
 
 type Expr = ECF.Expr ECF.Ann
@@ -272,6 +268,7 @@ subPatterns = case _ of
   ECF.PatArray pats -> pats
   _ -> []
 
+recordSubPatterns :: ECF.Pattern -> Array (ECF.Prop ECF.Pattern)
 recordSubPatterns = case _ of
   ECF.PatRecord pats -> pats
   ECF.PatAliase _ p -> recordSubPatterns p

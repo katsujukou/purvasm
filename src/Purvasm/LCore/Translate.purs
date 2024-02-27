@@ -10,7 +10,7 @@ import Data.List ((:))
 import Data.List as L
 import Data.Maybe (Maybe(..), fromMaybe, isNothing, maybe)
 import Data.String as Str
-import Data.Traversable (for, for_, sequence, traverse)
+import Data.Traversable (class Traversable, for, for_, sequence, traverse)
 import Data.Tuple (fst, snd)
 import Data.Tuple.Nested (type (/\), (/\))
 import Effect.Console (logShow)
@@ -61,6 +61,11 @@ update f = TranslM \tenv -> (f tenv) /\ unit
 put :: TranslEnv -> TranslM Unit
 put tenv = update (const tenv)
 
+eachWithCurrentEnv :: forall t a b. Traversable t => (a -> TranslM b) -> t a -> TranslM (t b)
+eachWithCurrentEnv f ta = do
+  tenv <- get
+  traverse (\a -> put tenv *> f a) ta
+
 putStatic :: Ident -> ECF.Expr ECF.Ann -> TranslM Unit
 putStatic ident expr = update (\tenv -> tenv { static = Array.cons (ident /\ expr) tenv.static })
 
@@ -106,19 +111,22 @@ translateExpr ident = go
         Just desc
           | desc.arity == 0 -> pure $ LCPrim (PMakeBlock (TConstr desc.tag)) []
         _ -> pure $ LCPrim (PGetGlobal gname) []
-    ECF.ExprArray _ exprs -> LCPrim (PMakeBlock TArray) <$> (traverse goRec exprs)
+    ECF.ExprArray _ exprs -> LCPrim (PMakeBlock TArray)
+      <$> (eachWithCurrentEnv goRec exprs)
 
     -- Record and Typeclass instances
     ECF.ExprRecord _ recId _ -> LCPrim (PMakeBlock $ TRecord recId) <$> pure []
     -- Typeclass related should be static.
     exp@(ECF.ExprTypeclass _ _) -> putStatic ident exp $> LCNone
     -- Typeclass instance is static iff all members are static
-    exp@(ECF.ExprTypeclassInstance _ _ _) -> putStatic ident exp $> LCNone
+    ECF.ExprTypeclassInstance _ clsName members -> LCPrim (PMakeBlock (TDict clsName))
+      <$> eachWithCurrentEnv goRec members
     -- Constructor. If every argument is constant, translate to blok constant. 
     ECF.ExprConstruct _ desc args -> do
       sequence <$> (traverse constantOfExpr args) >>= case _ of
         Just constArgs -> pure $ LCConst $ SCBlock (TConstr desc.tag) constArgs
-        _ -> LCPrim (PMakeBlock (TConstr desc.tag)) <$> traverse goRec args
+        _ -> LCPrim (PMakeBlock (TConstr desc.tag))
+          <$> eachWithCurrentEnv goRec args
 
     -- Let and Letrec.
     ECF.ExprLet _ binds body ->
@@ -139,7 +147,7 @@ translateExpr ident = go
       forWithIndex_ params \i param -> do
         let
           desc =
-            if isToplevel then (constraints !! i) # maybe VarUnknown VarTypeclass
+            if isToplevel then (constraints !! i) # join # maybe VarUnknown VarTypeclass
             else VarUnknown
         update (extendByNewVar param desc)
       LCFunction (Array.length params) <$> goRec body

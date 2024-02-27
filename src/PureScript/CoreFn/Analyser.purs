@@ -13,22 +13,22 @@ import PureScript.CoreFn (propValue)
 import PureScript.CoreFn as CF
 import PureScript.CoreFn.Utils (typeClassConstructorRegex)
 
-collectRecordTypes :: CF.Expr CF.Ann -> Array (Array String)
-collectRecordTypes = case _ of
+collectRecordSignatures :: CF.Expr CF.Ann -> Array (Array String)
+collectRecordSignatures = case _ of
   CF.ExprLit _ lit
-    | CF.LitArray exps <- lit -> foldMap collectRecordTypes exps
+    | CF.LitArray exps <- lit -> foldMap collectRecordSignatures exps
     | CF.LitRecord props <- lit -> fold
         [ props
-            # foldMap (CF.propValue >>> collectRecordTypes)
+            # foldMap (CF.propValue >>> collectRecordSignatures)
         , [ sort $ CF.propKey <$> props ]
         ]
-  CF.ExprAbs _ _ exp -> collectRecordTypes exp
-  CF.ExprApp _ e1 e2 -> foldMap collectRecordTypes [ e1, e2 ]
-  CF.ExprAccessor _ exp _ -> collectRecordTypes exp
-  CF.ExprUpdate _ exp _ -> collectRecordTypes exp
+  CF.ExprAbs _ _ exp -> collectRecordSignatures exp
+  CF.ExprApp _ e1 e2 -> foldMap collectRecordSignatures [ e1, e2 ]
+  CF.ExprAccessor _ exp _ -> collectRecordSignatures exp
+  CF.ExprUpdate _ exp updators -> collectRecordSignatures exp <> foldMap (CF.propValue >>> collectRecordSignatures) updators
   CF.ExprLet _ binds exp ->
     let
-      recordTypesInBinding (CF.Binding _ _ e) = collectRecordTypes e
+      recordTypesInBinding (CF.Binding _ _ e) = collectRecordSignatures e
     in
       fold
         [ binds
@@ -36,17 +36,17 @@ collectRecordTypes = case _ of
               CF.NonRec b -> recordTypesInBinding b
               CF.Rec bs -> foldMap recordTypesInBinding bs
             # fold
-        , collectRecordTypes exp
+        , collectRecordSignatures exp
         ]
   CF.ExprCase _ caseHeads caseAlts ->
     let
       recordTypesInCaseAlt (CF.CaseAlternative _ caseGuard) = case caseGuard of
-        CF.Unconditional exp -> collectRecordTypes exp
+        CF.Unconditional exp -> collectRecordSignatures exp
         CF.Guarded guards ->
-          guards # foldMap (\(CF.Guard g e) -> collectRecordTypes g <> collectRecordTypes e)
+          guards # foldMap (\(CF.Guard g e) -> collectRecordSignatures g <> collectRecordSignatures e)
     in
       fold
-        [ foldMap collectRecordTypes caseHeads
+        [ foldMap collectRecordSignatures caseHeads
         , foldMap recordTypesInCaseAlt caseAlts
         ]
   _ -> []
@@ -54,6 +54,7 @@ collectRecordTypes = case _ of
 type TypeclassInstance =
   { typeclass :: CF.Qualified CF.ProperName
   , members :: Array (CF.Ident /\ CF.Expr CF.Ann)
+  , constraints :: Array (Maybe (CF.Qualified CF.ProperName))
   }
 
 classify
@@ -89,28 +90,31 @@ classify = foldMap (go1 initial)
             in
               accu { typeclassConstructors = typclsCtors, plain = plain }
           else accu { newtypeConstructors = Array.cons (ident /\ expr) accu.newtypeConstructors }
-    CF.ExprApp _ abs _
-      | CF.ExprVar (CF.Ann { meta: Just CF.IsNewtype }) var <- abs
-      , CF.Qualified qual (CF.Ident name) <- var
-      , Re.test typeClassConstructorRegex name ->
+    _
+      | Just _ <- typeclassInstanceOfExpr expr ->
           accu { typeclassInstances = Array.cons (ident /\ expr) accu.typeclassInstances }
-    _ -> accu { plain = Array.cons (ident /\ expr) accu.plain }
+      | otherwise -> accu { plain = Array.cons (ident /\ expr) accu.plain }
 
 typeclassInstanceOfExpr :: CF.Expr CF.Ann -> Maybe TypeclassInstance
-typeclassInstanceOfExpr = case _ of
-  CF.ExprApp _ abs arg
-    | CF.ExprVar (CF.Ann { meta: Just CF.IsNewtype }) absVar <- abs
-    , CF.Qualified (Just moduleName) (CF.Ident typeclassDict) <- absVar
-    , Re.test typeClassConstructorRegex typeclassDict
-    , CF.ExprLit _ (CF.LitRecord props) <- arg ->
-        let
-          clsName = Str.replace (Str.Pattern "$Dict") (Str.Replacement "") typeclassDict
-        in
-          Just
-            { typeclass: CF.Qualified (Just moduleName) (CF.ProperName clsName)
-            , members: props <#> \(CF.Prop id exp) -> CF.Ident id /\ exp
-            }
-  _ -> Nothing
+typeclassInstanceOfExpr = go []
+  where
+  go constraints = case _ of
+    CF.ExprApp _ abs arg
+      | CF.ExprVar (CF.Ann { meta: Just CF.IsNewtype }) absVar <- abs
+      , CF.Qualified (Just moduleName) (CF.Ident typeclassDict) <- absVar
+      , Re.test typeClassConstructorRegex typeclassDict
+      , CF.ExprLit _ (CF.LitRecord props) <- arg ->
+          let
+            clsName = Str.replace (Str.Pattern "$Dict") (Str.Replacement "") typeclassDict
+          in
+            Just
+              { typeclass: CF.Qualified (Just moduleName) (CF.ProperName clsName)
+              , members: props <#> \(CF.Prop id exp) -> CF.Ident id /\ exp
+              , constraints
+              }
+    CF.ExprAbs _ _ body -> go (Array.cons Nothing constraints) body
+    CF.ExprLet _ _ body -> go constraints body
+    _ -> Nothing
 
 freeVars :: CF.Expr CF.Ann -> Array CF.Ident
 freeVars = case _ of

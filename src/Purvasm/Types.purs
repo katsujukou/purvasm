@@ -8,7 +8,8 @@ module Purvasm.Types
   , Ident(..)
   , ModuleName(..)
   , RecordId(..)
-  , RecordSig
+  , RecordSig(..)
+  , RecordTypeDesc(..)
   , StaticRef(..)
   , StaticValue(..)
   , StructuredConstant(..)
@@ -16,7 +17,6 @@ module Purvasm.Types
   , mkGlobal
   , offsetOfProp
   , parseModuleName
-  , succ
   , toIdent
   ) where
 
@@ -89,7 +89,7 @@ data BlockTag
   | TNumber
   | TArray
   | TClass
-  | TDict
+  | TDict GlobalName
   | TRecord RecordId
   | TNumberArray
   | TClosure
@@ -113,7 +113,7 @@ derive instance Generic AtomicConstant _
 instance Show AtomicConstant where
   show = genericShow
 
-data RecordId = RecordId ModuleName Int
+data RecordId = RecordId (Maybe ModuleName) RecordSig
 
 derive instance Eq RecordId
 derive instance Generic RecordId _
@@ -122,9 +122,6 @@ instance Hashable RecordId where
 
 instance Show RecordId where
   show = genericShow
-
-succ :: RecordId -> RecordId
-succ (RecordId modname id) = RecordId modname (id + 1)
 
 newtype RecordSig = RecordSig (Array String)
 
@@ -136,6 +133,12 @@ derive newtype instance Hashable RecordSig
 
 offsetOfProp :: String -> RecordSig -> Maybe Int
 offsetOfProp prop (RecordSig sig) = Array.findIndex (_ == prop) sig
+
+data RecordTypeDesc = RTDict GlobalName | RTPlain
+
+derive instance Generic RecordTypeDesc _
+instance Show RecordTypeDesc where
+  show = genericShow
 
 newtype Global a = Global
   { modname :: ModuleName
