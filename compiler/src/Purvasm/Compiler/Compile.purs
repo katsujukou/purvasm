@@ -21,6 +21,7 @@ import Purvasm.ECore.Transform (transformModule) as ECore
 import Purvasm.Global (GlobalEnv)
 import Purvasm.Global as Global
 import Purvasm.LCore.Env (LocalSymbolTable(..))
+import Purvasm.LCore.Syntax (Program(..)) as LCore
 import Purvasm.LCore.Translate as LCore
 import Purvasm.MiddleEnd (translateModuleName)
 import Purvasm.MiddleEnd as ME
@@ -46,8 +47,9 @@ data UnitaryCompileStep
   = Initial (CF.Module CF.Ann)
   | Translated (ECore.Module ECore.Ann)
   | Transformed (ECore.Module ECore.Ann)
-  | Optimized ModuleName
-  | Linearized ModuleName
+  | Lowered LCore.Program
+  | Optimized LCore.Program
+  | Linearized PmoFile
   | Assembled PmoFile
 
 type CompileEffects r = (LOG + FS + WENV GlobalEnv + EXCEPT String + r)
@@ -63,7 +65,6 @@ nextStep = case _ of
     _ <- WEnv.update (Global.externsEnv exts)
     -- Apply corefn to global env
     genv <- WEnv.update (Global.applyCorefnEnv cfm)
-    Log.debug $ show genv
     -- translate CoreFn module and pass it in to next stage.
     pure $ Translated $ ME.translateCoreFn genv cfm
 
@@ -72,28 +73,15 @@ nextStep = case _ of
     pure $ Transformed $
       ECore.transformModule ecModule
 
-  Transformed (ECore.Module ecModule) -> do
-    for_ ecModule.decls \(ECore.Binding id exp) -> do
-      genv <- WEnv.read
-      let
-        _ = unsafePerformEffect do
-          log $ "[" <> show id <> "]"
-          logShow
-            $ snd
-            $ LCore.runTransl
-                { moduleName: ecModule.name
-                , locals: Tnull
-                , globals: genv
-                , static: []
-                , fresh: 0
-                , isToplevel: true
-                }
-            $
-              LCore.translateExpr id exp
-      pure unit
-    pure $ Optimized ecModule.name
-  Optimized mname -> pure $ Linearized mname
-  Linearized mname -> pure (Assembled (emptyPmoFile mname))
+  Transformed ecModule -> do
+    genv <- WEnv.read
+    let
+      lcProgram = LCore.translateProgram genv ecModule
+    Log.info (show lcProgram)
+    pure $ Lowered lcProgram
+  Lowered lcProgram -> pure $ Optimized lcProgram
+  Optimized (LCore.Program { name }) -> pure $ Linearized (emptyPmoFile name)
+  Linearized pmoFile -> pure (Assembled pmoFile)
   Assembled pmoFile -> pure $ Assembled pmoFile
 
 compileModule

@@ -2,8 +2,9 @@ module Purvasm.LCore.Translate where
 
 import Prelude
 
-import Data.Array (mapWithIndex, (!!))
+import Data.Array (catMaybes, mapWithIndex, (!!))
 import Data.Array as Array
+import Data.Either (Either(..))
 import Data.FoldableWithIndex (forWithIndex_)
 import Data.HashMap as HM
 import Data.List ((:))
@@ -13,6 +14,7 @@ import Data.String as Str
 import Data.Traversable (class Traversable, for, for_, sequence, traverse)
 import Data.Tuple (fst, snd)
 import Data.Tuple.Nested (type (/\), (/\))
+import Data.Unfoldable (unfoldr)
 import Effect.Console (logShow)
 import Effect.Unsafe (unsafePerformEffect)
 import Partial.Unsafe (unsafeCrashWith, unsafePartial)
@@ -20,9 +22,9 @@ import Purvasm.ECore.Syntax as ECF
 import Purvasm.Global (GlobalEnv, ValueDesc(..), mkGlobalName)
 import Purvasm.Global as Global
 import Purvasm.LCore.Env (LocalSymbolTable(..), TranslEnv, VariableDesc(..), extendByNewVar)
-import Purvasm.LCore.MatchComp (PatternMatching(..))
+import Purvasm.LCore.MatchComp (PatternMatching(..), partitionEither)
 import Purvasm.LCore.MatchComp as MatchComp
-import Purvasm.LCore.Syntax (LCore(..))
+import Purvasm.LCore.Syntax (LCore(..), Program(..))
 import Purvasm.LCore.Types (FieldPos(..), Occurrunce, Var(..))
 import Purvasm.Primitives (Primitive(..))
 import Purvasm.Types (BlockTag(..), Ident(..), RecordSig(..), StructuredConstant(..))
@@ -85,6 +87,49 @@ runTransl :: forall a. TranslEnv -> TranslM a -> TranslEnv /\ a
 runTransl tenv (TranslM k) = k tenv
 
 type Translate a = ECF.Expr ECF.Ann -> TranslM a
+
+translateProgram :: GlobalEnv -> ECF.Module ECF.Ann -> Program
+translateProgram genv (ECF.Module ecfModule@{ name: moduleName }) = do
+  let
+    decls = ecfModule.decls <#> \(ECF.Binding ident expr) ->
+      let
+        tenv =
+          { moduleName: ecfModule.name
+          , locals: Tnull
+          , globals: genv
+          , static: []
+          , fresh: 0
+          , isToplevel: true
+          }
+        _ /\ lambda = runTransl tenv (translateExpr ident expr)
+      in
+        case lambda of
+          LCNone -> Nothing
+          _ -> Just { name: ident, lambda }
+
+    { left: foreigns, right: foreignDelcs } = partitionEither $
+      ecfModule.foreigns <#> \foreign_ ->
+        let
+          gloname = mkGlobalName moduleName foreign_
+        in
+          case Global.lookupValue gloname genv of
+            Just val
+              | ValPrim { prim, arity } <- val.desc ->
+                  Right $ { name: foreign_, lambda: mkPrimDecl prim arity }
+            _ -> Left foreign_
+  Program $
+    { name: moduleName
+    , decls: foreignDelcs <> catMaybes decls
+    , foreigns
+    }
+  where
+  mkPrimDecl prim = case _ of
+    0 -> LCPrim prim []
+    arity -> LCFunction arity $
+      LCPrim prim (unfoldr unfoldArg 0)
+  unfoldArg n
+    | n > 0 = Just $ (LCVar VarUnknown (Var n)) /\ (n - 1)
+    | otherwise = Nothing
 
 translateExpr :: Ident -> Translate LCore
 translateExpr ident = go
@@ -327,7 +372,7 @@ extendEnvByBind name occur exp tenv = tenv { locals = extendEnv tenv.locals }
   where
   extendEnv locals =
     case exp of
-      ECF.ExprGlobal _ boundTo -> unsafeCrashWith "Ho!"
+      ECF.ExprGlobal _ _ -> unsafeCrashWith "Ho!"
       ECF.ExprVar _ var -> bindNewName name var locals
       _ -> Tenv VarUnknown (HM.insert name L.Nil HM.empty) locals
 

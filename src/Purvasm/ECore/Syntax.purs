@@ -12,11 +12,12 @@ import Data.Traversable (class Traversable)
 import Data.Tuple (Tuple)
 import Data.Tuple.Nested (type (/\))
 import Purvasm.Global (ConstructorDesc, GlobalName)
-import Purvasm.Types (AtomicConstant, Ident, ModuleName, RecordId)
+import Purvasm.Types (AtomicConstant, Ident, ModuleName)
 
 newtype Module a = Module
   { name :: ModuleName
   , decls :: Array (Binding a)
+  , foreigns :: Array Ident
   }
 
 instance Show a => Show (Module a) where

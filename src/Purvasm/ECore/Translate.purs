@@ -35,10 +35,12 @@ type TranslEnv =
 translateCoreFn :: GlobalEnv -> CF.Module CF.Ann -> Module Ann
 translateCoreFn genv (CF.Module cfModule) = do
   let
+    foreigns = toIdent <$> cfModule.foreign
     decls = loop [] [] cfModule.decls
   Module
     { name: coerce cfModule.name
     , decls
+    , foreigns
     }
   where
   tenv =

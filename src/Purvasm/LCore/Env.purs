@@ -5,7 +5,6 @@ import Prelude
 import Data.Generic.Rep (class Generic)
 import Data.HashMap (HashMap)
 import Data.HashMap as HM
-import Data.List (List)
 import Data.List as L
 import Data.Maybe (Maybe(..))
 import Data.Show.Generic (genericShow)
