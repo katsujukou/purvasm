@@ -33,7 +33,7 @@ data Expr a
   | ExprVar a Ident
   | ExprGlobal a GlobalName
   | ExprArray a (Array (Expr a))
-  | ExprRecord a RecordId (Array (Prop (Expr a)))
+  | ExprRecord a (Array (Prop (Expr a)))
   | ExprTypeclass a (Array (Ident /\ Maybe GlobalName))
   | ExprTypeclassInstance a GlobalName (Array (Expr a))
   | ExprAbs a (Array Ident) (Expr a)
@@ -57,6 +57,8 @@ data Expr a
   | ExprIf a (Expr a) (Expr a) (Expr a)
   | ExprStaticFail a
   | ExprstaticHandle a (Expr a) (Expr a)
+  -- null pointer
+  | ExprNil a
   -- indicate that given expression should be omitted 
   | ExprNone
 
@@ -100,7 +102,7 @@ instance Show Literal where
 
 data StructuredLiteral
   = LitArray (Array Literal)
-  | LitRecord RecordId (Array (Prop Literal))
+  | LitRecord (Array (Prop Literal))
   | LitConstructor ConstructorDesc (Array Literal)
 
 derive instance Generic StructuredLiteral _
@@ -152,11 +154,12 @@ instance Show Meta where
 data Context
   = ToplevelPhrase GlobalName
   | AppFunc
-  | AppArg (Maybe GlobalName) Int
+  | AppArg Int
   | CtorArg GlobalName Int
   | TypeClassCtorArg GlobalName
   | TypeclassInstanceDecl GlobalName
   | TypeclassMemberImpl Ident
+  | RecordProp String
   | RecordUpdateExpr
   | RecordUpdateUpdator String
   | CaseHead
@@ -190,7 +193,7 @@ exprAnn = case _ of
   ExprLit a _ -> a
   ExprVar a _ -> a
   ExprGlobal a _ -> a
-  ExprRecord a _ _ -> a
+  ExprRecord a _ -> a
   ExprArray a _ -> a
   ExprTypeclass a _ -> a
   ExprTypeclassInstance a _ _ -> a
@@ -209,4 +212,5 @@ exprAnn = case _ of
   ExprIf a _ _ _ -> a
   ExprStaticFail a -> a
   ExprstaticHandle a _ _ -> a
+  ExprNil a -> a
   ExprNone -> emptyAnn

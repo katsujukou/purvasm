@@ -15,6 +15,7 @@ module Purvasm.Types
   , StructuredConstant(..)
   , class IsIdent
   , mkGlobal
+  , mkGlobalName
   , offsetOfProp
   , parseModuleName
   , toIdent
@@ -159,6 +160,9 @@ mkGlobal :: forall a. ModuleName -> Ident -> a -> Global a
 mkGlobal modname ident it = Global { modname, ident, it }
 
 type GlobalName = Global Unit
+
+mkGlobalName :: ModuleName -> Ident -> GlobalName
+mkGlobalName modname ident = mkGlobal modname ident unit
 
 data StaticValue
   = SConst StructuredConstant

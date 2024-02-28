@@ -29,7 +29,8 @@ type Declaration =
   }
 
 data LCore
-  = LCConst StructuredConstant
+  = LCNil
+  | LCConst StructuredConstant
   | LCStatic (Array StaticValue)
   | LCVar VariableDesc Var
   | LCFunction Arity LCore

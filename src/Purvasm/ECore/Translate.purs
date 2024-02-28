@@ -13,23 +13,16 @@ import Data.List ((:))
 import Data.List as L
 import Data.Maybe (Maybe(..))
 import Data.String as Str
-import Data.String.Regex as Re
-import Data.String.Regex.Flags (unicode)
-import Data.String.Regex.Unsafe (unsafeRegex)
 import Data.Traversable (traverse)
 import Data.Tuple (Tuple(..), fst)
 import Data.Tuple.Nested (type (/\), (/\))
-import Effect.Console (logShow)
-import Effect.Exception (error)
-import Effect.Exception as Exn
-import Effect.Unsafe (unsafePerformEffect)
 import Partial.Unsafe (unsafeCrashWith)
 import PureScript.CoreFn as CF
-import PureScript.CoreFn.Analyser as Analyser
+import Purvasm.Global.SpecialGlobal (glo_Prim_undefined)
 import Purvasm.ECore.Syntax (Ann(..), Binding(..), CaseAlternative(..), Context(..), Expr(..), Literal(..), Meta(..), Module(..), Pattern(..), Prop(..), StructuredLiteral(..), addContext, emptyAnn, exprAnn, setMeta)
 import Purvasm.Global (GlobalEnv, GlobalName, ValueDesc(..), globalNameOfQualifiedVar, identOfGlobalName, lookupConstructor, lookupTypeclass, mkGlobalName)
 import Purvasm.Global as Global
-import Purvasm.Types (AtomicConstant(..), Ident(..), ModuleName(..), RecordSig(..), toIdent)
+import Purvasm.Types (AtomicConstant(..), Ident(..), ModuleName(..), toIdent)
 import Safe.Coerce (coerce)
 
 type CorefnExpr = CF.Expr CF.Ann
@@ -116,11 +109,9 @@ translateExpr { moduleName, global } ident = transl
                       )
             | otherwise -> do
                 let
-                  _ = unsafePerformEffect do
-                    logShow ident
-                    logShow exprLit
-                    logShow ann
-                unsafeCrashWith "Record"
+                  trProps = props <#> \(CF.Prop p exp) ->
+                    Prop p (transl (addContext (RecordProp p) ann) exp)
+                ExprRecord ann trProps
           _ -> unsafeCrashWith "translateExpr: Literal in ExprArray is impossible!"
     CF.ExprVar _ var -> translExprVar ann var
     CF.ExprAccessor _ expr prop ->
@@ -141,22 +132,20 @@ translateExpr { moduleName, global } ident = transl
     CF.ExprUpdate _ expr updates -> ExprUpdate ann (transl (addContext RecordUpdateExpr ann) expr) $
       map (\(CF.Prop p e) -> p /\ transl (addContext (RecordUpdateUpdator p) ann) e) updates
 
-    CF.ExprAbs ann' arg body
-      | CF.Ann { meta: Just (CF.IsTypeclassMember cls member) } <- ann'
-      , Just val <- Global.lookupValue (mkGlobalName moduleName $ toIdent member) global -> do
-          unsafeCrashWith "Ho!"
-      | otherwise -> translExprAbs ann (L.singleton arg) body
+    CF.ExprAbs _ arg body -> translExprAbs ann (L.singleton arg) body
 
     CF.ExprApp _ func arg
       | CF.ExprVar varAnn varName <- func
       , CF.Ann { meta: Just CF.IsNewtype } <- varAnn ->
-          case globalNameOfQualifiedVar varName >>= flip Global.lookupValue global of
-            Nothing -> unsafeCrashWith $ "translExpr: Unknown global! " <> show varName
-            Just val
-              | { desc: ValTypeclass clsName } <- val ->
+          case globalNameOfQualifiedVar varName of
+            Nothing -> unsafeCrashWith "translExpr: unqualified newtype constructor is impossible!"
+            Just ctorName
+              | Just val <- Global.lookupValue ctorName global
+              , { desc: ValTypeclass clsName } <- val ->
                   transl (addContext (TypeClassCtorArg clsName) ann) arg
               | otherwise -> transl ann arg
-      | otherwise -> translExprApp ann [ arg ] func
+      | otherwise ->
+          translExprApp ann [ arg ] func
 
     CF.ExprLet _ binds body -> translExprLet ann binds body
     CF.ExprConstructor _ typ (CF.Ident ctor) args
@@ -190,49 +179,50 @@ translateExpr { moduleName, global } ident = transl
     -- Translating case expression.
     CF.ExprCase _ caseExprs caseAlts -> translExprCase ann caseExprs caseAlts
 
-  translExprVar ann (CF.Qualified qual (CF.Ident ident')) = case qual of
-    Just (CF.ModuleName modname) ->
-      let
-        gloname = mkGlobalName (ModuleName modname) (Ident ident')
-        ann' = case Global.lookupValue gloname global of
-          Just { desc: ValTypeclassInstance clsname } -> setMeta (IsTypeclassDict clsname) ann
-          _ -> ann
-      in
-        ExprGlobal ann' gloname
-    _ -> ExprVar ann (Ident ident')
+  translExprVar ann qual@(CF.Qualified _ ident') = case globalNameOfQualifiedVar qual of
+    Just gloname
+      | gloname == glo_Prim_undefined ->
+          ExprNil ann
+      | otherwise ->
+          let
+            ann' = case Global.lookupValue gloname global of
+              Just { desc: ValTypeclassInstance clsname } -> setMeta (IsTypeclassDict clsname) ann
+              _ -> ann
+          in
+            ExprGlobal ann' gloname
+    Nothing ->
+      ExprVar ann (toIdent ident')
 
-  translExprAbs ann args = case _ of
-    CF.ExprAbs _ arg body -> translExprAbs ann (arg : args) body
-    expr -> do
-      let
-        argIdents = coerce $ L.foldl (flip Array.cons) [] args
-      ExprAbs ann argIdents (transl ann expr)
+  translExprAbs ann args = go args
+    where
+    go args' = case _ of
+      CF.ExprAbs _ arg body -> go (arg : args') body
+      expr -> do
+        let
+          argIdents = coerce $ L.foldl (flip Array.cons) [] args'
+        ExprAbs ann argIdents (transl ann expr)
 
   translExprApp ann = go
     where
     go args = case _ of
       CF.ExprApp _ f arg -> translExprApp ann (Array.cons arg args) f
-      expr ->
-        case globalNameOfExprVar expr of
-          Just funcName
-            | Just desc <- Global.lookupConstructor funcName global
-            , desc.arity == Array.length args ->
-                let
-                  mkAnn :: Int -> Ann -> Ann
-                  mkAnn = addContext <<< CtorArg funcName
-                  ctorArgs = mapWithIndex (\i arg -> transl (mkAnn i ann) arg) args
-                in
-                  ExprConstruct emptyAnn desc ctorArgs
-          -- | Just typeclass <-
-          --     Global.lookupTypeclassValue funcName global ->
-          --     unsafeCrashWith "Fo!"
-          mbFuncName ->
+      CF.ExprVar _ varName
+        | Just gloname <- globalNameOfQualifiedVar varName
+        , Just desc <- Global.lookupConstructor gloname global
+        , desc.arity == Array.length args ->
             let
               mkAnn :: Int -> Ann -> Ann
-              mkAnn = addContext <<< AppArg mbFuncName
+              mkAnn = addContext <<< CtorArg gloname
+              ctorArgs = mapWithIndex (\i arg -> transl (mkAnn i ann) arg) args
             in
-              ExprApp emptyAnn (transl (addContext AppFunc ann) expr) $
-                mapWithIndex (\i -> transl (mkAnn i ann)) args
+              ExprConstruct emptyAnn desc ctorArgs
+      exp ->
+        let
+          mkAnn :: Int -> Ann -> Ann
+          mkAnn = addContext <<< AppArg
+        in
+          ExprApp emptyAnn (transl (addContext AppFunc ann) exp) $
+            mapWithIndex (\i -> transl (mkAnn i ann)) args
 
   translConstructor ann _ ctor args =
     let

@@ -15,8 +15,7 @@ import Data.Tuple (fst, snd)
 import Data.Tuple.Nested (type (/\), (/\))
 import Effect.Console (logShow)
 import Effect.Unsafe (unsafePerformEffect)
-import Partial.Unsafe (unsafeCrashWith)
-import Purvasm.ECore.SpecialGlobal (glo_Prim_undefined)
+import Partial.Unsafe (unsafeCrashWith, unsafePartial)
 import Purvasm.ECore.Syntax as ECF
 import Purvasm.Global (GlobalEnv, ValueDesc(..), mkGlobalName)
 import Purvasm.Global as Global
@@ -26,7 +25,7 @@ import Purvasm.LCore.MatchComp as MatchComp
 import Purvasm.LCore.Syntax (LCore(..))
 import Purvasm.LCore.Types (FieldPos(..), Occurrunce, Var(..))
 import Purvasm.Primitives (Primitive(..))
-import Purvasm.Types (BlockTag(..), Ident(..), StructuredConstant(..))
+import Purvasm.Types (BlockTag(..), Ident(..), RecordSig(..), StructuredConstant(..))
 
 newtype TranslM a = TranslM (TranslEnv -> TranslEnv /\ a)
 
@@ -115,7 +114,14 @@ translateExpr ident = go
       <$> (eachWithCurrentEnv goRec exprs)
 
     -- Record and Typeclass instances
-    ECF.ExprRecord _ recId _ -> LCPrim (PMakeBlock $ TRecord recId) <$> pure []
+    ECF.ExprRecord _ props -> do
+      { globals } <- get
+      let
+        recordSig = RecordSig (ECF.propKey <$> props)
+      case Global.lookupRecordType Nothing recordSig globals of
+        Nothing -> unsafeCrashWith $ "translateExpr: Unknown record type: " <> show recordSig <> show ident
+        Just recordId -> LCPrim (PMakeBlock $ TRecord recordId)
+          <$> eachWithCurrentEnv goRec (ECF.propValue <$> props)
     -- Typeclass related should be static.
     exp@(ECF.ExprTypeclass _ _) -> putStatic ident exp $> LCNone
     -- Typeclass instance is static iff all members are static
@@ -165,17 +171,11 @@ translateExpr ident = go
               $ maybe [] _.constraints
               $ Global.lookupValue globalIdent globals
 
-    ECF.ExprApp _ func args
-      | [ ECF.ExprGlobal _ argname ] <- args
-      , argname == glo_Prim_undefined -> do
-          { globals } <- get
-          trFunc <- goRec func
-          -- 制約付きtypeclass instanceにおける制約クラスのインスタンスへの
-          -- 参照である場合は、undefinedのAppを取り除く
-          case typeclassOfLCoreExpr globals trFunc of
-            Just _ -> pure trFunc
-            _ -> unsafeCrashWith "Unknown Prim.undefiend"
-      | otherwise -> LCApply <$> (goRec func) <*> (traverse goRec args)
+    ECF.ExprApp _ func args -> do
+      spine <- eachWithCurrentEnv goRec $ Array.cons func args
+      case Array.uncons spine of
+        Just { head, tail } -> pure $ LCApply head tail
+        _ -> unsafeCrashWith "translateExpr: Impossible"
     -- Pattern matching compilation
     ECF.ExprCase _ casHeads casAlts -> do
       mbBinds <- for casHeads \exp -> do
@@ -221,6 +221,10 @@ translateExpr ident = go
     ECF.ExprStaticFail _ -> pure LCStaticFail
     ECF.ExprstaticHandle _ e1 e2 -> LCStaticHandle <$> (goRec e1) <*> (goRec e2)
     ECF.ExprNone -> pure LCNone
+    ECF.ExprNil _ -> pure LCNil
+    ECF.ExprIf _ cond ifSo notSo -> unsafePartial do
+      [ trCond, trSo, trNot ] <- eachWithCurrentEnv goRec [ cond, ifSo, notSo ]
+      pure $ LCifthenelse trCond trSo trNot
     exp -> unsafeCrashWith $ "Not Implemented!" <> show exp
 
   translExprCase :: Array (ECF.Expr ECF.Ann) -> Array (ECF.CaseAlternative ECF.Ann) -> _
@@ -343,7 +347,13 @@ constantOfLiteral = case _ of
   ECF.LitAtomic ac -> pure $ SCAtom ac
   ECF.LitStruct sl -> case sl of
     ECF.LitArray lits -> SCBlock TArray <$> (traverse constantOfLiteral lits)
-    ECF.LitRecord recId props -> SCBlock (TRecord recId) <$> pure [] -- traverse constantOfLiteral props
+    ECF.LitRecord props -> do
+      { globals } <- get
+      let recordSig = RecordSig (ECF.propKey <$> props)
+      case Global.lookupRecordType Nothing recordSig globals of
+        Nothing -> unsafeCrashWith "constantOfLiteral: Unknown record type!"
+        Just recordId ->
+          SCBlock (TRecord recordId) <$> traverse (ECF.propValue >>> constantOfLiteral) props
     ECF.LitConstructor desc args -> SCBlock (TConstr desc.tag) <$> traverse constantOfLiteral args
 
 typeclassOfLCoreExpr :: GlobalEnv -> LCore -> Maybe (Global.GlobalName /\ Global.TypeclassDesc)
