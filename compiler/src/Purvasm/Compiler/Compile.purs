@@ -9,6 +9,7 @@ import Effect.Console (log, logShow)
 import Effect.Unsafe (unsafePerformEffect)
 import PureScript.CoreFn as CF
 import PureScript.ExternsFile (ExternsFile(..))
+import Purvasm.Backend as Backend
 import Purvasm.Backend.PmoFile (PmoFile(..))
 import Purvasm.Compiler.Effects.FS (FS)
 import Purvasm.Compiler.Effects.Log (LOG)
@@ -31,6 +32,7 @@ import Run as Run
 import Run.Except (EXCEPT)
 import Safe.Coerce (coerce)
 import Spago.Generated.BuildInfo (pursVersion)
+import Spago.Generated.BuildInfo as Spago
 import Type.Row (type (+))
 
 type UnitaryCompileResult =
@@ -80,8 +82,15 @@ nextStep = case _ of
     Log.info (show lcProgram)
     pure $ Lowered lcProgram
   Lowered lcProgram -> pure $ Optimized lcProgram
-  Optimized (LCore.Program { name }) -> pure $ Linearized (emptyPmoFile name)
-  Linearized pmoFile -> pure (Assembled pmoFile)
+  Optimized lcProgram@(LCore.Program { name }) -> do
+    let
+      header =
+        { name
+        , pursVersion: Spago.pursVersion
+        , version: "0.1.0"
+        }
+    pmoFile <- Backend.compileProgram header lcProgram
+    pure $ (Assembled pmoFile)
   Assembled pmoFile -> pure $ Assembled pmoFile
 
 compileModule
