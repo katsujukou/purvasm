@@ -15,6 +15,7 @@ import Data.Traversable (traverse)
 import Data.Tuple (Tuple)
 import Data.Tuple.Nested (type (/\), (/\))
 import Partial.Unsafe (unsafeCrashWith, unsafePartial)
+import Purvasm.ECore.Syntax (Pattern(..))
 import Purvasm.ECore.Syntax as ECF
 import Purvasm.Types (AtomicConstant(..), ConstructorTag)
 
@@ -58,7 +59,7 @@ data MatrixType
 
 decomposePatternMatch :: PatternMatching -> DecisionTree
 decomposePatternMatch pm =
-  case splitPatternMatch $ desugarRecordPattern pm of
+  case splitPatternMatch $ desugarRecordPattern $ elaseAliasPattern pm of
     Left leaf -> leaf
     Right (vars /\ nonVars)
       | failedMatch nonVars -> decomposePatternMatch vars
@@ -110,6 +111,20 @@ decomposePatternMatch pm =
     | MatchFail <- l = r
     | MatchFail <- r = l
     | otherwise = MatchTry l r
+
+elaseAliasPattern :: PatternMatching -> PatternMatching
+elaseAliasPattern pm@(PatternMatching { pmHeads, pmMatrix }) =
+  let
+    pmMatrix' = pmMatrix <#> \{ pats, action } -> { pats: erase <$> pats, action }
+  in
+    PatternMatching { pmHeads, pmMatrix: pmMatrix' }
+  where
+  erase = case _ of
+    PatAliase _ pat -> erase pat
+    PatArray pats -> PatArray $ erase <$> pats
+    PatRecord pats -> PatRecord $ map erase <$> pats
+    PatConstruct desc pats -> PatConstruct desc $ erase <$> pats
+    pat -> pat
 
 desugarRecordPattern :: PatternMatching -> PatternMatching
 desugarRecordPattern pm@(PatternMatching { pmHeads, pmMatrix }) =
@@ -209,7 +224,7 @@ reducePatternMatch (PatternMatching { pmHeads, pmMatrix }) = leftMostCol
                           , pmMatrix: subMatrix
                           }
                       )
-            _ -> unsafeCrashWith "reducePatternMatching: Impossible!"
+            _ -> unsafeCrashWith ("reducePatternMatching: Impossible! " <> show pat)
 
     )
   where
