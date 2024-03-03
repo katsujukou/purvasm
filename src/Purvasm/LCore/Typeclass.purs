@@ -14,12 +14,23 @@ import Purvasm.Types (BlockTag(..), GlobalName)
 
 overrideInstance :: GlobalEnv -> GlobalName -> GlobalName -> Maybe LCore
 overrideInstance genv className ident =
-  if ident == SpecialGlobal._Data_Ord_ordInt then mkOrdImpl P_lt_i32 P_equ_i32
-  else if ident == SpecialGlobal._Data_Ord_ordNum then mkOrdImpl P_lt_f64 P_equ_f64
+  if ident == SpecialGlobal._Data_Eq_eqInt then mkEqImpl P_equ_i32
+  else if ident == SpecialGlobal._Data_Eq_eqBoolean then mkEqImpl P_equ_i32
+  else if ident == SpecialGlobal._Data_Eq_eqNumber then mkEqImpl P_equ_f64
+  else if ident == SpecialGlobal._Data_Ord_ordInt then mkOrdImpl P_lt_i32 P_equ_i32 SpecialGlobal._Data_Eq_eqInt
+  else if ident == SpecialGlobal._Data_Ord_ordBoolean then mkOrdImpl P_lt_i32 P_equ_i32 SpecialGlobal._Data_Eq_eqBoolean
+  else if ident == SpecialGlobal._Data_Ord_ordNum then mkOrdImpl P_lt_f64 P_equ_f64 SpecialGlobal._Data_Eq_eqNumber
   else Nothing
 
   where
-  mkOrdImpl p_lt p_equ = do
+
+  mkEqImpl p_equ = Just do
+    LCPrim (PMakeBlock $ TDict className)
+      [ LCFunction 2
+          (LCPrim p_equ [ LCVar VarUnknown (Var 1), LCVar VarUnknown (Var 0) ])
+      ]
+
+  mkOrdImpl p_lt p_equ eqImpl = do
     lt <- mkLT
     gt <- mkGT
     eq <- mkEQ
@@ -33,6 +44,7 @@ overrideInstance genv className ident =
                 eq
                 gt
             )
+      , LCFunction 1 $ LCPrim (PGetGlobal eqImpl) []
       ]
 
   mkLT :: _ LCore

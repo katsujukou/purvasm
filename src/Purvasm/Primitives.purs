@@ -17,6 +17,11 @@ data Primitive
   | PSetField Int
   | PGetRecordField String
   | PLookupField String
+  -- Logical operations 
+  | P_lnot
+  | P_land
+  | P_lor
+  | P_lxor
   -- Numeric comparison & arithmetic operations
   | P_add_i32
   | P_mul_i32

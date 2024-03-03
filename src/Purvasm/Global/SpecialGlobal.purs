@@ -1,6 +1,6 @@
 module Purvasm.Global.SpecialGlobal where
 
-import Purvasm.Types (GlobalName, Ident(..), ModuleName(..))
+import Purvasm.Types (Ident(..), ModuleName(..), GlobalName)
 import Purvasm.Types (mkGlobalName) as T
 
 mkGlobalName :: String -> String -> GlobalName
@@ -12,8 +12,20 @@ _Data_Unit_unit = mkGlobalName "Data.Unit" "unit"
 _Prim_undefined :: GlobalName
 _Prim_undefined = mkGlobalName "Prim" "undefined"
 
+_Data_Eq_eqInt :: GlobalName
+_Data_Eq_eqInt = mkGlobalName "Data.Eq" "eqInt"
+
+_Data_Eq_eqBoolean :: GlobalName
+_Data_Eq_eqBoolean = mkGlobalName "Data.Eq" "eqBoolean"
+
+_Data_Eq_eqNumber :: GlobalName
+_Data_Eq_eqNumber = mkGlobalName "Data.Eq" "eqNumber"
+
 _Data_Ord_ordInt :: GlobalName
 _Data_Ord_ordInt = mkGlobalName "Data.Ord" "ordInt"
+
+_Data_Ord_ordBoolean :: GlobalName
+_Data_Ord_ordBoolean = mkGlobalName "Data.Ord" "ordBoolean"
 
 _Data_Ord_ordNum :: GlobalName
 _Data_Ord_ordNum = mkGlobalName "Data.Ord" "ordNum"
@@ -26,6 +38,12 @@ _Data_Ordering_EQ = mkGlobalName "Data.Ordering" "EQ"
 
 _Data_Ordering_GT :: GlobalName
 _Data_Ordering_GT = mkGlobalName "Data.Ordering" "GT"
+
+_Data_HeytingAlgebra_boolConj :: GlobalName
+_Data_HeytingAlgebra_boolConj = mkGlobalName "Data.HeytingAlgebra" "boolConj"
+
+_Data_HeytingAlgebra_boolDisj :: GlobalName
+_Data_HeytingAlgebra_boolDisj = mkGlobalName "Data.HeytingAlgebra" "boolDisj"
 
 _Data_Boolean_otherwise :: GlobalName
 _Data_Boolean_otherwise = mkGlobalName "Data.Boolean" "otherwise"

@@ -42,7 +42,6 @@ import Data.String.Regex as Re
 import Data.Traversable (foldMap, foldl)
 import Data.Tuple (fst, snd, uncurry)
 import Data.Tuple.Nested (type (/\), (/\))
-import Debug (spy)
 import Partial.Unsafe (unsafeCrashWith)
 import PureScript.CoreFn as CF
 import PureScript.CoreFn.Analyser (typeclassInstanceOfExpr)
@@ -55,7 +54,7 @@ import PureScript.ExternsFile.Types (Constraint(..), Type(..)) as Ext
 import Purvasm.Global.SpecialGlobal as SpecialGlobal
 import Purvasm.Primitives (Primitive(..))
 import Purvasm.Types (Global(..), GlobalName, mkGlobal, mkGlobalName) as ReExports
-import Purvasm.Types (class IsIdent, Arity, ConstructorTag, Global(..), GlobalName, Ident(..), ModuleName, RecordId(..), RecordSig(..), mkGlobalName, mkRecordSig, toIdent)
+import Purvasm.Types (class IsIdent, Arity, ConstructorTag, Global(..), GlobalName, Ident(..), ModuleName, RecordId(..), RecordSig, mkGlobalName, mkRecordSig, toIdent)
 import Safe.Coerce (coerce)
 
 globalNameOfQualifiedVar :: forall name. IsIdent name => CF.Qualified name -> Maybe GlobalName
@@ -282,7 +281,8 @@ applyCorefnEnv (CF.Module cfm@{ decls }) =
           | gloname == SpecialGlobal._Data_Semiring_intAdd -> Just { prim: P_add_i32, arity: 2 }
           | gloname == SpecialGlobal._Data_Semiring_intMul -> Just { prim: P_mul_i32, arity: 2 }
           | gloname == SpecialGlobal._Data_Ring_intSub -> Just { prim: P_sub_i32, arity: 2 }
-          -- | gloname == SpecialGlobal._Data_
+          | gloname == SpecialGlobal._Data_HeytingAlgebra_boolConj -> Just { prim: P_land, arity: 2 }
+          | gloname == SpecialGlobal._Data_HeytingAlgebra_boolDisj -> Just { prim: P_lor, arity: 2 }
           | otherwise -> Nothing
     in
       case prim of

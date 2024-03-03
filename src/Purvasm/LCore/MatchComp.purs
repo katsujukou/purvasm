@@ -113,7 +113,7 @@ decomposePatternMatch pm =
     | otherwise = MatchTry l r
 
 elaseAliasPattern :: PatternMatching -> PatternMatching
-elaseAliasPattern pm@(PatternMatching { pmHeads, pmMatrix }) =
+elaseAliasPattern (PatternMatching { pmHeads, pmMatrix }) =
   let
     pmMatrix' = pmMatrix <#> \{ pats, action } -> { pats: erase <$> pats, action }
   in

@@ -31,7 +31,7 @@ import Purvasm.LCore.Syntax (LCore(..), Program(..))
 import Purvasm.LCore.Typeclass (overrideInstance)
 import Purvasm.LCore.Types (FieldPos(..), Occurrunce, Var(..))
 import Purvasm.Primitives (Primitive(..))
-import Purvasm.Types (BlockTag(..), Ident(..), RecordSig(..), StructuredConstant(..), mkRecordSig)
+import Purvasm.Types (BlockTag(..), Ident(..), StructuredConstant(..), mkRecordSig)
 
 newtype TranslM a = TranslM (TranslEnv -> TranslEnv /\ a)
 
@@ -170,7 +170,7 @@ translateExpr ident = go
 
     -- Record and Typeclass instances
     ECF.ExprRecord _ props -> do
-      { globals: globals@(GlobalEnv { recordTypes }), moduleName } <- get
+      { globals: globals@(GlobalEnv { recordTypes }) } <- get
       let
         recordSig = mkRecordSig (ECF.propKey <$> props)
       case Global.lookupRecordType Nothing recordSig globals of
