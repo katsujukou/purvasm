@@ -16,18 +16,22 @@ import Data.Tuple (fst, snd)
 import Data.Tuple.Nested (type (/\), (/\))
 import Data.Unfoldable (unfoldr)
 import Effect.Console (logShow)
+import Effect.Exception (throw)
 import Effect.Unsafe (unsafePerformEffect)
 import Partial.Unsafe (unsafeCrashWith, unsafePartial)
 import Purvasm.ECore.Syntax as ECF
-import Purvasm.Global (GlobalEnv, ValueDesc(..), mkGlobalName)
+import Purvasm.Global (GlobalEnv(..), ValueDesc(..), mkGlobalName)
 import Purvasm.Global as Global
+import Purvasm.LCore.Arrange (arrangeDecls)
 import Purvasm.LCore.Env (LocalSymbolTable(..), TranslEnv, VariableDesc(..), extendByNewVar)
+import Purvasm.LCore.Foreign (overrideForeign)
 import Purvasm.LCore.MatchComp (PatternMatching(..), partitionEither)
 import Purvasm.LCore.MatchComp as MatchComp
 import Purvasm.LCore.Syntax (LCore(..), Program(..))
+import Purvasm.LCore.Typeclass (overrideInstance)
 import Purvasm.LCore.Types (FieldPos(..), Occurrunce, Var(..))
 import Purvasm.Primitives (Primitive(..))
-import Purvasm.Types (BlockTag(..), Ident(..), RecordSig(..), StructuredConstant(..))
+import Purvasm.Types (BlockTag(..), Ident(..), RecordSig(..), StructuredConstant(..), mkRecordSig)
 
 newtype TranslM a = TranslM (TranslEnv -> TranslEnv /\ a)
 
@@ -116,19 +120,25 @@ translateProgram genv (ECF.Module ecfModule@{ name: moduleName }) = do
             Just val
               | ValPrim { prim, arity } <- val.desc ->
                   Right $ { name: foreign_, lambda: mkPrimDecl prim arity }
-            _ -> Left foreign_
-  Program $
-    { name: moduleName
-    , decls: foreignDelcs <> catMaybes decls
-    , foreigns
-    }
+            _ -> overrideForeign genv gloname
+              # maybe (Left foreign_) ({ name: foreign_, lambda: _ } >>> Right)
+
+    unarrangedProgram =
+      Program $
+        { name: moduleName
+        , static: []
+        , decls: foreignDelcs <> catMaybes decls
+        , foreigns
+        }
+
+  arrangeDecls unarrangedProgram
   where
   mkPrimDecl prim = case _ of
     0 -> LCPrim prim []
     arity -> LCFunction arity $
-      LCPrim prim (unfoldr unfoldArg 0)
+      LCPrim prim (unfoldr unfoldArg arity)
   unfoldArg n
-    | n > 0 = Just $ (LCVar VarUnknown (Var n)) /\ (n - 1)
+    | n > 0 = Just $ (LCVar VarUnknown (Var (n - 1))) /\ (n - 1)
     | otherwise = Nothing
 
 translateExpr :: Ident -> Translate LCore
@@ -160,18 +170,24 @@ translateExpr ident = go
 
     -- Record and Typeclass instances
     ECF.ExprRecord _ props -> do
-      { globals } <- get
+      { globals: globals@(GlobalEnv { recordTypes }), moduleName } <- get
       let
-        recordSig = RecordSig (ECF.propKey <$> props)
+        recordSig = mkRecordSig (ECF.propKey <$> props)
       case Global.lookupRecordType Nothing recordSig globals of
-        Nothing -> unsafeCrashWith $ "translateExpr: Unknown record type: " <> show recordSig <> show ident
+        Nothing -> unsafePerformEffect do
+          logShow $ recordTypes
+          throw $ "translateExpr: Unknown record type: " <> "\n" <> show recordTypes
         Just recordId -> LCPrim (PMakeBlock $ TRecord recordId)
           <$> eachWithCurrentEnv goRec (ECF.propValue <$> props)
     -- Typeclass related should be static.
     exp@(ECF.ExprTypeclass _ _) -> putStatic ident exp $> LCNone
     -- Typeclass instance is static iff all members are static
-    ECF.ExprTypeclassInstance _ clsName members -> LCPrim (PMakeBlock (TDict clsName))
-      <$> eachWithCurrentEnv goRec members
+    ECF.ExprTypeclassInstance _ clsName members -> do
+      { moduleName, globals } <- get
+      case overrideInstance globals clsName (mkGlobalName moduleName ident) of
+        Just impl -> pure impl
+        _ -> LCPrim (PMakeBlock (TDict clsName))
+          <$> eachWithCurrentEnv goRec members
     -- Constructor. If every argument is constant, translate to blok constant. 
     ECF.ExprConstruct _ desc args -> do
       sequence <$> (traverse constantOfExpr args) >>= case _ of
@@ -394,7 +410,7 @@ constantOfLiteral = case _ of
     ECF.LitArray lits -> SCBlock TArray <$> (traverse constantOfLiteral lits)
     ECF.LitRecord props -> do
       { globals } <- get
-      let recordSig = RecordSig (ECF.propKey <$> props)
+      let recordSig = mkRecordSig (ECF.propKey <$> props)
       case Global.lookupRecordType Nothing recordSig globals of
         Nothing -> unsafeCrashWith "constantOfLiteral: Unknown record type!"
         Just recordId ->

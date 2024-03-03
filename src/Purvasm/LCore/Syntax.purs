@@ -17,6 +17,7 @@ import Purvasm.Types (Arity, AtomicConstant, ConstructorTag, Ident, ModuleName, 
 newtype Program = Program
   { name :: ModuleName
   , decls :: Array Declaration
+  , static :: Array Declaration
   , foreigns :: Array Ident
   }
 

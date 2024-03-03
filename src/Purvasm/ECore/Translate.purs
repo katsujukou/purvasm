@@ -18,7 +18,7 @@ import Data.Tuple (Tuple(..), fst)
 import Data.Tuple.Nested (type (/\), (/\))
 import Partial.Unsafe (unsafeCrashWith)
 import PureScript.CoreFn as CF
-import Purvasm.Global.SpecialGlobal (glo_Prim_undefined)
+import Purvasm.Global.SpecialGlobal (_Prim_undefined)
 import Purvasm.ECore.Syntax (Ann(..), Binding(..), CaseAlternative(..), Context(..), Expr(..), Literal(..), Meta(..), Module(..), Pattern(..), Prop(..), StructuredLiteral(..), addContext, emptyAnn, exprAnn, setMeta)
 import Purvasm.Global (GlobalEnv, GlobalName, ValueDesc(..), globalNameOfQualifiedVar, identOfGlobalName, lookupConstructor, lookupTypeclass, mkGlobalName)
 import Purvasm.Global as Global
@@ -183,7 +183,7 @@ translateExpr { moduleName, global } ident = transl
 
   translExprVar ann qual@(CF.Qualified _ ident') = case globalNameOfQualifiedVar qual of
     Just gloname
-      | gloname == glo_Prim_undefined ->
+      | gloname == _Prim_undefined ->
           ExprNil ann
       | otherwise ->
           let

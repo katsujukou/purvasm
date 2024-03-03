@@ -8,7 +8,7 @@ module Purvasm.Types
   , Ident(..)
   , ModuleName(..)
   , RecordId(..)
-  , RecordSig(..)
+  , RecordSig
   , RecordTypeDesc(..)
   , StaticRef(..)
   , StaticValue(..)
@@ -16,6 +16,7 @@ module Purvasm.Types
   , class IsIdent
   , mkGlobal
   , mkGlobalName
+  , mkRecordSig
   , offsetOfProp
   , parseModuleName
   , toIdent
@@ -131,6 +132,9 @@ instance Show RecordSig where
 
 derive newtype instance Eq RecordSig
 derive newtype instance Hashable RecordSig
+
+mkRecordSig :: Array String -> RecordSig
+mkRecordSig = RecordSig <<< Array.nub <<< Array.sort
 
 offsetOfProp :: String -> RecordSig -> Maybe Int
 offsetOfProp prop (RecordSig sig) = Array.findIndex (_ == prop) sig

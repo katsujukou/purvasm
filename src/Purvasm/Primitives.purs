@@ -17,11 +17,27 @@ data Primitive
   | PSetField Int
   | PGetRecordField String
   | PLookupField String
-  -- Arithmetic operations
+  -- Numeric comparison & arithmetic operations
   | P_add_i32
   | P_mul_i32
+  | P_sub_i32
+  | P_div_i32
+  | P_mod_i32
+  | P_neg_i32
+  | P_equ_i32
+  | P_neq_i32
+  | P_ge_i32
+  | P_gt_i32
+  | P_lt_i32
+  | P_le_i32
   | P_add_f64
   | P_mul_f64
+  | P_equ_f64
+  | P_neq_f64
+  | P_ge_f64
+  | P_gt_f64
+  | P_lt_f64
+  | P_le_f64
 
 derive instance Generic Primitive _
 instance Show Primitive where

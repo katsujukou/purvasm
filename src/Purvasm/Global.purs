@@ -42,6 +42,7 @@ import Data.String.Regex as Re
 import Data.Traversable (foldMap, foldl)
 import Data.Tuple (fst, snd, uncurry)
 import Data.Tuple.Nested (type (/\), (/\))
+import Debug (spy)
 import Partial.Unsafe (unsafeCrashWith)
 import PureScript.CoreFn as CF
 import PureScript.CoreFn.Analyser (typeclassInstanceOfExpr)
@@ -51,10 +52,10 @@ import PureScript.ExternsFile (ExternsDeclaration(..), ExternsFile(..)) as Ext
 import PureScript.ExternsFile (identOfExternsDeclaration)
 import PureScript.ExternsFile.Names (ProperName(..), Qualified(..), QualifiedBy(..)) as Ext
 import PureScript.ExternsFile.Types (Constraint(..), Type(..)) as Ext
-import Purvasm.Global.SpecialGlobal (glo_Data_Semiring_intAdd, glo_Data_Semiring_intMul)
+import Purvasm.Global.SpecialGlobal as SpecialGlobal
 import Purvasm.Primitives (Primitive(..))
 import Purvasm.Types (Global(..), GlobalName, mkGlobal, mkGlobalName) as ReExports
-import Purvasm.Types (class IsIdent, Arity, ConstructorTag, Global(..), GlobalName, Ident(..), ModuleName, RecordId(..), RecordSig(..), mkGlobalName, toIdent)
+import Purvasm.Types (class IsIdent, Arity, ConstructorTag, Global(..), GlobalName, Ident(..), ModuleName, RecordId(..), RecordSig(..), mkGlobalName, mkRecordSig, toIdent)
 import Safe.Coerce (coerce)
 
 globalNameOfQualifiedVar :: forall name. IsIdent name => CF.Qualified name -> Maybe GlobalName
@@ -180,7 +181,7 @@ applyCorefnEnv (CF.Module cfm@{ decls }) =
     >>> flip (foldr (uncurry insertConstructor')) classified.constructors
     >>> flip (foldr (uncurry insertNewtypeConstructor)) classified.newtypeConstructors
     >>> flip (foldr insertTypeclassConstructor) (fst <$> classified.typeclassConstructors)
-    >>> flip (foldr insertPrimValue) (fst <$> classified.plain)
+    >>> flip (foldr insertPrimValue) (cfm.foreign <> (fst <$> classified.plain))
     >>> flip (foldr (uncurry insertAnyValue)) classified.plain
   where
   moduleName :: ModuleName
@@ -270,7 +271,7 @@ applyCorefnEnv (CF.Module cfm@{ decls }) =
   insertRecordIdsOfExpr :: CF.Expr CF.Ann -> GlobalEnv -> GlobalEnv
   insertRecordIdsOfExpr expr genv =
     Analyser.collectRecordSignatures expr
-      # foldr (insertRecordId <<< RecordId Nothing <<< RecordSig) genv
+      # foldr (insertRecordId <<< RecordId Nothing <<< mkRecordSig) genv
 
   insertPrimValue :: CF.Ident -> GlobalEnv -> GlobalEnv
   insertPrimValue (CF.Ident ident) genv =
@@ -278,8 +279,10 @@ applyCorefnEnv (CF.Module cfm@{ decls }) =
       gloname = mkGlobalName moduleName (Ident ident)
       prim = case gloname of
         _
-          | gloname == glo_Data_Semiring_intAdd -> Just { prim: P_add_i32, arity: 2 }
-          | gloname == glo_Data_Semiring_intMul -> Just { prim: P_mul_i32, arity: 2 }
+          | gloname == SpecialGlobal._Data_Semiring_intAdd -> Just { prim: P_add_i32, arity: 2 }
+          | gloname == SpecialGlobal._Data_Semiring_intMul -> Just { prim: P_mul_i32, arity: 2 }
+          | gloname == SpecialGlobal._Data_Ring_intSub -> Just { prim: P_sub_i32, arity: 2 }
+          -- | gloname == SpecialGlobal._Data_
           | otherwise -> Nothing
     in
       case prim of
@@ -294,7 +297,7 @@ applyCorefnEnv (CF.Module cfm@{ decls }) =
   insertAnyValue (CF.Ident ident) expr genv =
     let
       globalIdent = mkGlobalName moduleName (Ident ident)
-      mkRecordId = RecordId Nothing <<< RecordSig
+      mkRecordId = RecordId Nothing <<< mkRecordSig
       recordIds = mkRecordId <$> Analyser.collectRecordSignatures expr
       genv' =
         if Array.null recordIds then genv

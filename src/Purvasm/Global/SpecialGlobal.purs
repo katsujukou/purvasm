@@ -1,25 +1,53 @@
 module Purvasm.Global.SpecialGlobal where
 
-import Purvasm.Types (GlobalName, mkGlobalName, Ident(..), ModuleName(..))
+import Purvasm.Types (GlobalName, Ident(..), ModuleName(..))
+import Purvasm.Types (mkGlobalName) as T
 
-glo_Data_Unit_unit :: GlobalName
-glo_Data_Unit_unit = mkGlobalName (ModuleName "Data.Unit") (Ident "unit")
+mkGlobalName :: String -> String -> GlobalName
+mkGlobalName m i = T.mkGlobalName (ModuleName m) (Ident i)
 
-glo_Prim_undefined :: GlobalName
-glo_Prim_undefined = mkGlobalName (ModuleName "Prim") (Ident "undefined")
+_Data_Unit_unit :: GlobalName
+_Data_Unit_unit = mkGlobalName "Data.Unit" "unit"
 
-glo_Data_Boolean_otherwise :: GlobalName
-glo_Data_Boolean_otherwise = mkGlobalName (ModuleName "Data.Boolean") (Ident "otherwise")
+_Prim_undefined :: GlobalName
+_Prim_undefined = mkGlobalName "Prim" "undefined"
 
-glo_Data_Semiring_intAdd :: GlobalName
-glo_Data_Semiring_intAdd = mkGlobalName (ModuleName "Data.Semiring") (Ident "intAdd")
+_Data_Ord_ordInt :: GlobalName
+_Data_Ord_ordInt = mkGlobalName "Data.Ord" "ordInt"
 
-glo_Data_Semiring_intMul :: GlobalName
-glo_Data_Semiring_intMul = mkGlobalName (ModuleName "Data.Semiring") (Ident "intMul")
+_Data_Ord_ordNum :: GlobalName
+_Data_Ord_ordNum = mkGlobalName "Data.Ord" "ordNum"
 
-glo_Data_Semiring_numAdd :: GlobalName
-glo_Data_Semiring_numAdd = mkGlobalName (ModuleName "Data.Semiring") (Ident "numAdd")
+_Data_Ordering_LT :: GlobalName
+_Data_Ordering_LT = mkGlobalName "Data.Ordering" "LT"
 
-glo_Data_Semiring_numMul :: GlobalName
-glo_Data_Semiring_numMul = mkGlobalName (ModuleName "Data.Semiring") (Ident "numMul")
+_Data_Ordering_EQ :: GlobalName
+_Data_Ordering_EQ = mkGlobalName "Data.Ordering" "EQ"
+
+_Data_Ordering_GT :: GlobalName
+_Data_Ordering_GT = mkGlobalName "Data.Ordering" "GT"
+
+_Data_Boolean_otherwise :: GlobalName
+_Data_Boolean_otherwise = mkGlobalName "Data.Boolean" "otherwise"
+
+_Data_Semiring_intAdd :: GlobalName
+_Data_Semiring_intAdd = mkGlobalName "Data.Semiring" "intAdd"
+
+_Data_Semiring_intMul :: GlobalName
+_Data_Semiring_intMul = mkGlobalName "Data.Semiring" "intMul"
+
+_Data_Ring_intSub :: GlobalName
+_Data_Ring_intSub = mkGlobalName "Data.Ring" "intSub"
+
+_Data_EuclideanRing_intDiv :: GlobalName
+_Data_EuclideanRing_intDiv = mkGlobalName "Data.EuclideanRing" "intDiv"
+
+_Data_EuclideanRing_intMod :: GlobalName
+_Data_EuclideanRing_intMod = mkGlobalName "Data.EuclideanRing" "intMod"
+
+_Data_Semiring_numAdd :: GlobalName
+_Data_Semiring_numAdd = mkGlobalName "Data.Semiring" "numAdd"
+
+_Data_Semiring_numMul :: GlobalName
+_Data_Semiring_numMul = mkGlobalName "Data.Semiring" "numMul"
 
