@@ -51,7 +51,6 @@ data UnitaryCompileStep
   | Transformed (ECore.Module ECore.Ann)
   | Lowered LCore.Program
   | Optimized LCore.Program
-  | Linearized PmoFile
   | Assembled PmoFile
 
 type CompileEffects r = (LOG + FS + WENV GlobalEnv + EXCEPT String + r)
@@ -89,7 +88,7 @@ nextStep = case _ of
         , pursVersion: Spago.pursVersion
         , version: "0.1.0"
         }
-    pmoFile <- Backend.compileProgram header lcProgram
+      pmoFile = Backend.compileProgram header lcProgram
     pure $ (Assembled pmoFile)
   Assembled pmoFile -> pure $ Assembled pmoFile
 

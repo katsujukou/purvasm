@@ -155,29 +155,6 @@ translateExpr { moduleName, global } ident = transl
       , globalName' <- mkGlobalName moduleName (Ident ctor')
       , Just x <- lookupTypeclass globalName' global -> unsafeCrashWith "FO!"
       | otherwise -> translConstructor ann typ (coerce ctor) args
-    -- We trap the special case: the case destructuring against 
-    -- typeclass constructor:
-    CF.ExprCase _ [ caseHead ] [ caseAlt ]
-      | CF.ExprVar _ (CF.Qualified _ headVar) <- caseHead
-      , CF.CaseAlternative [ binder ] act <- caseAlt
-      , CF.Unconditional actExpr <- act
-      , CF.BinderConstructor (CF.Ann { meta: Just CF.IsNewtype }) _ ctor [ arg ] <- binder
-      , CF.BinderVar _ var <- arg
-      , Just { desc: Global.ValTypeclass clsName } <-
-          Global.globalNameOfQualifiedVar ctor
-            >>= flip Global.lookupValue global
-      , Just typeclass <- Global.lookupTypeclass clsName global ->
-          let
-            casHeadAnn = ann # addContext CaseHead # setMeta (IsTypeclassDict clsName)
-            casActAnn = ann # addContext CaseAction
-          in
-            ExprCase ann
-              [ ExprVar casHeadAnn (coerce headVar) ]
-              [ CaseAlternative
-                  { patterns: [ PatVar (coerce var) ]
-                  , action: transl casActAnn actExpr
-                  }
-              ]
     -- Translating case expression.
     CF.ExprCase _ caseExprs caseAlts -> translExprCase ann caseExprs caseAlts
 

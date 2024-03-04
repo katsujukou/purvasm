@@ -28,14 +28,14 @@ type SymbolDesc =
   , textOfs :: Int
   }
 
-type ObjectHeader =
+type PmoHeader =
   { version :: String
   , pursVersion :: String
   , name :: ModuleName
   }
 
 newtype PmoFile = PmoFile
-  { head :: ObjectHeader
+  { head :: PmoHeader
   , symbols :: Array SymbolDesc
   , textsec :: Array CodeBlock
   , datasec :: Array CodeBlock
@@ -67,7 +67,7 @@ instance Show FuncSig where
   show (FuncSig sig) = "(FuncSig " <> show sig <> ")"
 
 newtype PmiFile = PmiFile
-  { head :: ObjectHeader
+  { head :: PmoHeader
   , typeclasses :: HashMap Ident (Array Ident)
   , records :: HashMap RecordId (Array String)
   , functions :: HashMap Ident FuncSig

@@ -252,10 +252,6 @@ translateExpr ident = go
             (\exp -> fromMaybe exp <<< map (ECF.ExprVar ECF.emptyAnn <<< fst))
             casHeads
             mbBinds
-          _ = unsafePerformEffect do
-            logShow $ ECF.ExprLet ECF.emptyAnn
-              (Array.catMaybes mbBinds)
-              (ECF.ExprCase ECF.emptyAnn casHeads' casAlts)
         goRec $
           ECF.ExprLet ECF.emptyAnn
             (Array.catMaybes mbBinds)
