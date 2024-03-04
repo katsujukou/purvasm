@@ -14,16 +14,16 @@ import Purvasm.NCore.Types (Var)
 import Purvasm.Primitives (Primitive)
 import Purvasm.Types (Arity, AtomicConstant, ConstructorTag, Ident, ModuleName, StructuredConstant)
 
-newtype Program = Program
+newtype Module = Module
   { name :: ModuleName
   , decls :: Array Declaration
   , static :: Array Declaration
   , foreigns :: Array Ident
   }
 
-derive instance Newtype Program _
-instance Show Program where
-  show (Program m) = "(Program " <> show m <> ")"
+derive instance Newtype Module _
+instance Show Module where
+  show (Module m) = "(Module " <> show m <> ")"
 
 type Declaration =
   { name :: Ident

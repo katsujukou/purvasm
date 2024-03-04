@@ -2,13 +2,7 @@ module Purvasm.Compiler.Compile where
 
 import Prelude
 
-import Data.Array as Array
-import Data.Foldable (for_)
-import Data.Tuple (snd)
-import Effect.Console (log, logShow)
-import Effect.Unsafe (unsafePerformEffect)
 import PureScript.CoreFn as CF
-import PureScript.ExternsFile (ExternsFile(..))
 import Purvasm.Backend as Backend
 import Purvasm.Backend.PmoFile (PmoFile(..))
 import Purvasm.Compiler.Effects.FS (FS)
@@ -17,18 +11,17 @@ import Purvasm.Compiler.Effects.Log as Log
 import Purvasm.Compiler.Effects.WEnv (WENV)
 import Purvasm.Compiler.Effects.WEnv as WEnv
 import Purvasm.Compiler.PureScript (openExternsCbor)
-import Purvasm.ECore.Syntax (Ann, Module(..), Binding(..)) as ECore
+import Purvasm.ECore.Syntax (Ann, Module) as ECore
 import Purvasm.ECore.Transform (transformModule) as ECore
 import Purvasm.Global (GlobalEnv)
 import Purvasm.Global as Global
-import Purvasm.NCore.Env (LocalSymbolTable(..))
-import Purvasm.NCore.Syntax (Program(..)) as NCore
-import Purvasm.NCore.Translate as NCore
+import Purvasm.LCore.Syntax (Module(..)) as LCore
 import Purvasm.MiddleEnd (translateModuleName)
 import Purvasm.MiddleEnd as ME
+import Purvasm.NCore.Syntax (Program(..)) as NCore
+import Purvasm.NCore.Translate (translateProgram) as NCore
 import Purvasm.Types (ModuleName)
-import Run (Run, EFFECT)
-import Run as Run
+import Run (Run)
 import Run.Except (EXCEPT)
 import Safe.Coerce (coerce)
 import Spago.Generated.BuildInfo (pursVersion)
@@ -49,8 +42,8 @@ data UnitaryCompileStep
   = Initial (CF.Module CF.Ann)
   | Translated (ECore.Module ECore.Ann)
   | Transformed (ECore.Module ECore.Ann)
-  | Lowered NCore.Program
-  | Optimized NCore.Program
+  | Optimized NCore.Module
+  | Lowered LCore.Module
   | Assembled PmoFile
 
 type CompileEffects r = (LOG + FS + WENV GlobalEnv + EXCEPT String + r)

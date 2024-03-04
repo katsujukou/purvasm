@@ -23,8 +23,9 @@ import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.Backend.Instruction (CodeBlock, Instruction(..))
 import Purvasm.Backend.PmoFile (PmoFile(..), SymbolDesc, SymbolType(..))
 import Purvasm.Backend.Types (Arity, Ident, Label(..), ModuleName, Primitive(..), mkGlobalName)
-import Purvasm.MiddleEnd (NCore(..), Var(..))
-import Purvasm.MiddleEnd as ME
+import Purvasm.NCore.Syntax (NCore(..))
+import Purvasm.NCore.Types (Var(..))
+import Purvasm.LCore.Syntax as LCF
 import Safe.Coerce (coerce)
 
 type SymbolsManagerState =
@@ -141,17 +142,17 @@ compileExpr handler = go
           c' <- go cont head
           compileExprList (KPush : c') tail
 
-compileModule :: ME.Program -> Aff PmoFile
-compileModule (ME.Program m@{ decls }) = do
+compileModule :: LCF.Module -> Aff PmoFile
+compileModule (LCF.Module m@{ decls }) = do
   symMngr <- AVar.new { tbl: Map.empty, dataNext: 0, textNext: 0 }
   let
-    moduleName = translModuleName m.name
+    moduleName = coerce m.name
     env = { moduleName, symMngr }
 
   phrases <- parSequence
     ( decls <#> \({ name, lambda: bound }) -> do
         let
-          toplevelSymbol = translIdent name
+          toplevelSymbol = coerce name
           initialState =
             { stack: L.Nil
             , nextLabel: 0
@@ -194,12 +195,6 @@ pushNewSymbol name typ hasText = do
           , textNext = symMngr.textNext + if hasText then 1 else 0
           }
       )
-
-translIdent :: ME.Ident -> Ident
-translIdent = coerce
-
-translModuleName :: ME.ModuleName -> ModuleName
-translModuleName = coerce
 
 isTail :: CodeBlock -> Boolean
 isTail = case _ of

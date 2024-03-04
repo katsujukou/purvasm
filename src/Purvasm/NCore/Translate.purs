@@ -27,7 +27,7 @@ import Purvasm.NCore.Env (LocalSymbolTable(..), TranslEnv, VariableDesc(..), ext
 import Purvasm.NCore.Foreign (overrideForeign)
 import Purvasm.NCore.MatchComp (PatternMatching(..), partitionEither)
 import Purvasm.NCore.MatchComp as MatchComp
-import Purvasm.NCore.Syntax (NCore(..), Program(..))
+import Purvasm.NCore.Syntax (NCore(..), Module(..))
 import Purvasm.NCore.Typeclass (overrideInstance)
 import Purvasm.NCore.Types (FieldPos(..), Occurrunce, Var(..))
 import Purvasm.Primitives (Primitive(..))
@@ -93,8 +93,8 @@ runTransl tenv (TranslM k) = k tenv
 
 type Translate a = ECF.Expr ECF.Ann -> TranslM a
 
-translateProgram :: GlobalEnv -> ECF.Module ECF.Ann -> Program
-translateProgram genv (ECF.Module ecfModule@{ name: moduleName }) = do
+translateModule :: GlobalEnv -> ECF.Module ECF.Ann -> Module
+translateModule genv (ECF.Module ecfModule@{ name: moduleName }) = do
   let
     decls = ecfModule.decls <#> \(ECF.Binding ident expr) ->
       let
@@ -124,15 +124,15 @@ translateProgram genv (ECF.Module ecfModule@{ name: moduleName }) = do
             _ -> overrideForeign genv gloname
               # maybe (Left foreign_) ({ name: foreign_, lambda: _ } >>> Right)
 
-    unarrangedProgram =
-      Program $
+    unarrangedModule =
+      Module $
         { name: moduleName
         , static: []
         , decls: foreignDelcs <> catMaybes decls
         , foreigns
         }
 
-  arrangeDecls unarrangedProgram
+  arrangeDecls unarrangedModule
   where
   mkPrimDecl prim = case _ of
     0 -> NCPrim prim []

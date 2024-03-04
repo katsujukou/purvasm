@@ -35,6 +35,7 @@ data Expr a
   | ExprGlobal a GlobalName
   | ExprArray a (Array (Expr a))
   | ExprRecord a (Array (Prop (Expr a)))
+  -- identifier of typeclass member and optional reference to parent class
   | ExprTypeclass a (Array (Ident /\ Maybe GlobalName))
   | ExprTypeclassInstance a GlobalName (Array (Expr a))
   | ExprAbs a (Array Ident) (Expr a)
@@ -44,19 +45,17 @@ data Expr a
   -- Unlike the `ExprConstructor` in Corefn,
   -- `ExprConstruct` represents the constructed value, not the constructor itself.
   | ExprConstruct a ConstructorDesc (Array (Expr a))
-  -- during transformation, accessors and updators should be eliminated
-  -- because they will be splitted into Lookup and Get/SetField.
   | ExprAccess a (Expr a) String
   | ExprUpdate a (Expr a) (Array (Tuple String (Expr a)))
-  | ExprLookup a (Expr a) String
   | ExprGetField a Int (Expr a)
-  | ExprSetField a Int (Expr a) (Expr a)
   | ExprGetSize a (Expr a)
-  -- Get constructor tag
+  -- pattern matching
   | ExprCase a (Array (Expr a)) (Array (CaseAlternative a))
   -- if-then-else
   | ExprIf a (Expr a) (Expr a) (Expr a)
+  -- indicate that evaluation of this expression should cause runtime error.
   | ExprStaticFail a
+  -- recovery from staticfail.   
   | ExprstaticHandle a (Expr a) (Expr a)
   -- null pointer
   | ExprNil a
@@ -88,10 +87,6 @@ data Pattern
 derive instance Generic Pattern _
 instance Show Pattern where
   show pat = genericShow pat
-
-data LiteralType
-  = TArray
-  | TRecord
 
 data Literal
   = LitAtomic AtomicConstant
@@ -205,9 +200,7 @@ exprAnn = case _ of
   ExprConstruct a _ _ -> a
   ExprAccess a _ _ -> a
   ExprUpdate a _ _ -> a
-  ExprLookup a _ _ -> a
   ExprGetField a _ _ -> a
-  ExprSetField a _ _ _ -> a
   ExprGetSize a _ -> a
   ExprCase a _ _ -> a
   ExprIf a _ _ _ -> a
