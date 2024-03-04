@@ -8,16 +8,10 @@ module Purvasm.Types
   , Ident(..)
   , ModuleName(..)
   , RecordId(..)
-  , RecordSig
-  , RecordTypeDesc(..)
-  , StaticRef(..)
-  , StaticValue(..)
   , StructuredConstant(..)
   , class IsIdent
   , mkGlobal
   , mkGlobalName
-  , mkRecordSig
-  , offsetOfProp
   , parseModuleName
   , toIdent
   ) where
@@ -34,7 +28,10 @@ import Data.String (Pattern(..), split)
 import Data.String.Regex (test) as Re
 import Data.String.Regex.Flags (unicode) as Re
 import Data.String.Regex.Unsafe (unsafeRegex) as Re
+import Data.Tuple (Tuple(..))
 import PureScript.CoreFn as CF
+import PureScript.ExternsFile.Names as Ext
+import Purvasm.Record (RecordSignature)
 import Safe.Coerce (coerce)
 
 class IsIdent a where
@@ -47,6 +44,12 @@ instance IsIdent CF.Ident where
   toIdent = coerce
 
 instance IsIdent CF.ProperName where
+  toIdent = coerce
+
+instance IsIdent Ext.Ident where
+  toIdent = coerce
+
+instance IsIdent Ext.ProperName where
   toIdent = coerce
 
 newtype ModuleName = ModuleName String
@@ -71,6 +74,7 @@ derive instance Eq Ident
 derive instance Ord Ident
 derive instance Newtype Ident _
 derive newtype instance Hashable Ident
+
 instance Show Ident where
   show (Ident ident) = "(Ident " <> ident <> ")"
 
@@ -95,7 +99,6 @@ data BlockTag
   | TRecord RecordId
   | TNumberArray
   | TClosure
-  | TClosureGrp
   | TConstr Int
 
 derive instance Generic BlockTag _
@@ -115,34 +118,15 @@ derive instance Generic AtomicConstant _
 instance Show AtomicConstant where
   show = genericShow
 
-data RecordId = RecordId (Maybe ModuleName) RecordSig
+data RecordId = RecordId (Maybe ModuleName) RecordSignature
 
-derive instance Eq RecordId
 derive instance Generic RecordId _
+derive instance Eq RecordId
+derive instance Ord RecordId
 instance Hashable RecordId where
-  hash (RecordId mn id) = hash { modname: mn, ident: id }
+  hash (RecordId modname sig) = hash (Tuple modname sig)
 
 instance Show RecordId where
-  show = genericShow
-
-newtype RecordSig = RecordSig (Array String)
-
-instance Show RecordSig where
-  show (RecordSig sig) = "(RecordSig " <> show sig <> ")"
-
-derive newtype instance Eq RecordSig
-derive newtype instance Hashable RecordSig
-
-mkRecordSig :: Array String -> RecordSig
-mkRecordSig = RecordSig <<< Array.nub <<< Array.sort
-
-offsetOfProp :: String -> RecordSig -> Maybe Int
-offsetOfProp prop (RecordSig sig) = Array.findIndex (_ == prop) sig
-
-data RecordTypeDesc = RTDict GlobalName | RTPlain
-
-derive instance Generic RecordTypeDesc _
-instance Show RecordTypeDesc where
   show = genericShow
 
 newtype Global a = Global
@@ -167,17 +151,3 @@ type GlobalName = Global Unit
 
 mkGlobalName :: ModuleName -> Ident -> GlobalName
 mkGlobalName modname ident = mkGlobal modname ident unit
-
-data StaticValue
-  = SConst StructuredConstant
-  | SRef StaticRef
-
-derive instance Generic StaticValue _
-
-instance Show StaticValue where
-  show = genericShow
-
-newtype StaticRef = StaticRef GlobalName
-
-instance Show StaticRef where
-  show (StaticRef ref) = "(StaticRef { refTo: " <> show ref <> " })"

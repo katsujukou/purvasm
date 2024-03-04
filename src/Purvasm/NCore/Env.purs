@@ -1,4 +1,4 @@
-module Purvasm.LCore.Env where
+module Purvasm.NCore.Env where
 
 import Prelude
 
@@ -12,7 +12,7 @@ import Data.Tuple (Tuple)
 import Data.Tuple.Nested (type (/\), (/\))
 import Purvasm.ECore.Syntax as ECF
 import Purvasm.Global (GlobalEnv, GlobalName)
-import Purvasm.LCore.Types (Occurrunce)
+import Purvasm.NCore.Types (Occurrunce)
 import Purvasm.Types (Ident, ModuleName, RecordId)
 
 type TranslEnv =

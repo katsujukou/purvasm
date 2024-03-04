@@ -1,4 +1,4 @@
-module Purvasm.LCore.MatchComp where
+module Purvasm.NCore.MatchComp where
 
 -- | Pattern matching compiler.
 

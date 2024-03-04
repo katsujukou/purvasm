@@ -1,4 +1,4 @@
-module Purvasm.LCore.Types where
+module Purvasm.NCore.Types where
 
 import Prelude
 

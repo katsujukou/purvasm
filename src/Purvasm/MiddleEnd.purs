@@ -1,7 +1,7 @@
 module Purvasm.MiddleEnd
   ( module ReExports
   , module ECore
-  , module LCore
+  , module NCore
   , translateIdent
   , translateModuleName
   ) where
@@ -9,8 +9,8 @@ module Purvasm.MiddleEnd
 import PureScript.CoreFn as CF
 import Purvasm.ECore.Syntax (Binding(..), Expr(..), Literal(..), Module(..)) as ECore
 import Purvasm.ECore.Translate (translateCoreFn) as ECore
-import Purvasm.LCore.Syntax (Program(..), LCore(..)) as LCore
-import Purvasm.LCore.Types (Var(..)) as LCore
+import Purvasm.NCore.Syntax (Program(..), NCore(..)) as NCore
+import Purvasm.NCore.Types (Var(..)) as NCore
 import Purvasm.Primitives (Primitive(..)) as ReExports
 import Purvasm.Types (Arity, Ident(..), ModuleName(..)) as ReExports
 import Purvasm.Types (Ident, ModuleName)

@@ -53,8 +53,9 @@ import PureScript.ExternsFile.Names (ProperName(..), Qualified(..), QualifiedBy(
 import PureScript.ExternsFile.Types (Constraint(..), Type(..)) as Ext
 import Purvasm.Global.SpecialGlobal as SpecialGlobal
 import Purvasm.Primitives (Primitive(..))
+import Purvasm.Record (RecordSignature, mkRecordSignature)
 import Purvasm.Types (Global(..), GlobalName, mkGlobal, mkGlobalName) as ReExports
-import Purvasm.Types (class IsIdent, Arity, ConstructorTag, Global(..), GlobalName, Ident(..), ModuleName, RecordId(..), RecordSig, mkGlobalName, mkRecordSig, toIdent)
+import Purvasm.Types (class IsIdent, Arity, ConstructorTag, Global(..), GlobalName, Ident(..), ModuleName, RecordId(..), mkGlobalName, toIdent)
 import Safe.Coerce (coerce)
 
 globalNameOfQualifiedVar :: forall name. IsIdent name => CF.Qualified name -> Maybe GlobalName
@@ -81,7 +82,7 @@ lookupTypeclassValue name genv = lookupValue name genv >>= case _ of
 lookupConstructor :: GlobalName -> GlobalEnv -> Maybe ConstructorDesc
 lookupConstructor ctorName (GlobalEnv genv) = HM.lookup ctorName genv.constructorDecls
 
-lookupRecordType :: Maybe ModuleName -> RecordSig -> GlobalEnv -> Maybe RecordId
+lookupRecordType :: Maybe ModuleName -> RecordSignature -> GlobalEnv -> Maybe RecordId
 lookupRecordType mbModuleName sig (GlobalEnv genv) =
   let
     recordId = RecordId mbModuleName sig
@@ -270,7 +271,7 @@ applyCorefnEnv (CF.Module cfm@{ decls }) =
   insertRecordIdsOfExpr :: CF.Expr CF.Ann -> GlobalEnv -> GlobalEnv
   insertRecordIdsOfExpr expr genv =
     Analyser.collectRecordSignatures expr
-      # foldr (insertRecordId <<< RecordId Nothing <<< mkRecordSig) genv
+      # foldr (insertRecordId <<< RecordId Nothing <<< mkRecordSignature) genv
 
   insertPrimValue :: CF.Ident -> GlobalEnv -> GlobalEnv
   insertPrimValue (CF.Ident ident) genv =
@@ -297,7 +298,7 @@ applyCorefnEnv (CF.Module cfm@{ decls }) =
   insertAnyValue (CF.Ident ident) expr genv =
     let
       globalIdent = mkGlobalName moduleName (Ident ident)
-      mkRecordId = RecordId Nothing <<< mkRecordSig
+      mkRecordId = RecordId Nothing <<< mkRecordSignature
       recordIds = mkRecordId <$> Analyser.collectRecordSignatures expr
       genv' =
         if Array.null recordIds then genv

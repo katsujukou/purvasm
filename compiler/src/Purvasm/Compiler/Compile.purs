@@ -21,9 +21,9 @@ import Purvasm.ECore.Syntax (Ann, Module(..), Binding(..)) as ECore
 import Purvasm.ECore.Transform (transformModule) as ECore
 import Purvasm.Global (GlobalEnv)
 import Purvasm.Global as Global
-import Purvasm.LCore.Env (LocalSymbolTable(..))
-import Purvasm.LCore.Syntax (Program(..)) as LCore
-import Purvasm.LCore.Translate as LCore
+import Purvasm.NCore.Env (LocalSymbolTable(..))
+import Purvasm.NCore.Syntax (Program(..)) as NCore
+import Purvasm.NCore.Translate as NCore
 import Purvasm.MiddleEnd (translateModuleName)
 import Purvasm.MiddleEnd as ME
 import Purvasm.Types (ModuleName)
@@ -49,8 +49,8 @@ data UnitaryCompileStep
   = Initial (CF.Module CF.Ann)
   | Translated (ECore.Module ECore.Ann)
   | Transformed (ECore.Module ECore.Ann)
-  | Lowered LCore.Program
-  | Optimized LCore.Program
+  | Lowered NCore.Program
+  | Optimized NCore.Program
   | Assembled PmoFile
 
 type CompileEffects r = (LOG + FS + WENV GlobalEnv + EXCEPT String + r)
@@ -77,11 +77,11 @@ nextStep = case _ of
   Transformed ecModule -> do
     genv <- WEnv.read
     let
-      lcProgram = LCore.translateProgram genv ecModule
+      lcProgram = NCore.translateProgram genv ecModule
     Log.info (show lcProgram)
     pure $ Lowered lcProgram
   Lowered lcProgram -> pure $ Optimized lcProgram
-  Optimized lcProgram@(LCore.Program { name }) -> do
+  Optimized lcProgram@(NCore.Program { name }) -> do
     let
       header =
         { name

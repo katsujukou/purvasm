@@ -1,9 +1,9 @@
-module Purvasm.LCore.Foreign where
+module Purvasm.NCore.Foreign where
 
 import Data.Maybe (Maybe(..))
 import Purvasm.Global (GlobalEnv)
-import Purvasm.LCore.Syntax (LCore)
+import Purvasm.NCore.Syntax (NCore)
 import Purvasm.Types (GlobalName)
 
-overrideForeign :: GlobalEnv -> GlobalName -> Maybe LCore
+overrideForeign :: GlobalEnv -> GlobalName -> Maybe NCore
 overrideForeign _ _ = Nothing

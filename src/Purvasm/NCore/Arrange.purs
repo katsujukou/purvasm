@@ -1,4 +1,4 @@
-module Purvasm.LCore.Arrange where
+module Purvasm.NCore.Arrange where
 
 import Prelude
 
@@ -17,7 +17,7 @@ import Data.Maybe (Maybe(..))
 import Data.Tuple (snd)
 import Data.Tuple.Nested ((/\))
 import Partial.Unsafe (unsafeCrashWith)
-import Purvasm.LCore.Syntax (LCore(..), Program(..))
+import Purvasm.NCore.Syntax (NCore(..), Program(..))
 import Purvasm.Primitives (Primitive(..))
 import Purvasm.Types (Global(..), Ident)
 
@@ -108,12 +108,12 @@ arrangeDecls (Program { name: moduleName, decls, foreigns }) = do
     }
   where
   staticDecl { lambda } = case lambda of
-    LCConst _ -> true
-    LCFunction _ _ -> true
-    LCNil -> true
-    LCNone -> true
-    LCStaticFail -> true
-    LCStaticHandle _ _ -> true
+    NCConst _ -> true
+    NCFunction _ _ -> true
+    NCNil -> true
+    NCNone -> true
+    NCStaticFail -> true
+    NCStaticHandle _ _ -> true
     _ -> false
 
   sortDecl decls' =
@@ -171,19 +171,19 @@ arrangeDecls (Program { name: moduleName, decls, foreigns }) = do
   collectRef node nodes = go >>> S.fromFoldable
     where
     go = case _ of
-      LCPrim (PGetGlobal gloname) _
+      NCPrim (PGetGlobal gloname) _
         | Global { modname, ident } <- gloname
         , modname == moduleName
         , ident `member` nodes
         -- exclude itself
         , ident /= node -> [ ident ]
-      LCPrim _ args -> args >>= go
-      LCApply func args -> go func <> (args >>= go)
-      LCFunction _ body -> go body
-      LCConditional head branches -> go head <> (branches >>= snd >>> go)
-      LCSwitch head table -> go head <> (table >>= snd >>> go)
-      LCifthenelse cond ifSo notSo -> go cond <> go ifSo <> go notSo
-      LClet vars body -> go body <> (vars >>= go)
-      LCletrec vars body -> go body <> (vars >>= go)
-      LCStaticHandle e1 e2 -> go e1 <> go e2
+      NCPrim _ args -> args >>= go
+      NCApply func args -> go func <> (args >>= go)
+      NCFunction _ body -> go body
+      NCConditional head branches -> go head <> (branches >>= snd >>> go)
+      NCSwitch head table -> go head <> (table >>= snd >>> go)
+      NCifthenelse cond ifSo notSo -> go cond <> go ifSo <> go notSo
+      NClet vars body -> go body <> (vars >>= go)
+      NCletrec vars body -> go body <> (vars >>= go)
+      NCStaticHandle e1 e2 -> go e1 <> go e2
       _ -> []

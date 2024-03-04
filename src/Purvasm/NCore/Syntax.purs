@@ -1,6 +1,6 @@
-module Purvasm.LCore.Syntax where
+module Purvasm.NCore.Syntax where
 
--- This module defines the syntax of the *LCore* intermediate representation (IR).
+-- This module defines the syntax of the *NCore* intermediate representation (IR).
 
 import Prelude
 
@@ -9,8 +9,8 @@ import Data.Newtype (class Newtype)
 import Data.Show.Generic (genericShow)
 import Data.Tuple (Tuple)
 import Purvasm.Global (GlobalName)
-import Purvasm.LCore.Env (VariableDesc)
-import Purvasm.LCore.Types (Var)
+import Purvasm.NCore.Env (VariableDesc)
+import Purvasm.NCore.Types (Var)
 import Purvasm.Primitives (Primitive)
 import Purvasm.Types (Arity, AtomicConstant, ConstructorTag, Ident, ModuleName, StructuredConstant)
 
@@ -27,28 +27,28 @@ instance Show Program where
 
 type Declaration =
   { name :: Ident
-  , lambda :: LCore
+  , lambda :: NCore
   }
 
-data LCore
-  = LCNil
-  | LCConst StructuredConstant
-  | LCStatic (Array StaticValue)
-  | LCVar VariableDesc Var
-  | LCFunction Arity LCore
-  | LCApply LCore (Array LCore)
-  | LCPrim Primitive (Array LCore)
-  | LClet (Array LCore) LCore
-  | LCletrec (Array LCore) LCore
-  | LCSwitch (LCore) (Array (Tuple ConstructorTag LCore))
-  | LCConditional (LCore) (Array (Tuple AtomicConstant LCore))
-  | LCifthenelse LCore LCore LCore
-  | LCStaticFail
-  | LCStaticHandle LCore LCore
-  | LCNone
+data NCore
+  = NCNil
+  | NCConst StructuredConstant
+  | NCStatic (Array StaticValue)
+  | NCVar VariableDesc Var
+  | NCFunction Arity NCore
+  | NCApply NCore (Array NCore)
+  | NCPrim Primitive (Array NCore)
+  | NClet (Array NCore) NCore
+  | NCletrec (Array NCore) NCore
+  | NCSwitch (NCore) (Array (Tuple ConstructorTag NCore))
+  | NCConditional (NCore) (Array (Tuple AtomicConstant NCore))
+  | NCifthenelse NCore NCore NCore
+  | NCStaticFail
+  | NCStaticHandle NCore NCore
+  | NCNone
 
-derive instance Generic LCore _
-instance Show LCore where
+derive instance Generic NCore _
+instance Show NCore where
   show elambda = genericShow elambda
 
 data StaticValue

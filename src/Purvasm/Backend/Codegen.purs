@@ -23,7 +23,7 @@ import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.Backend.Instruction (CodeBlock, Instruction(..))
 import Purvasm.Backend.PmoFile (PmoFile(..), SymbolDesc, SymbolType(..))
 import Purvasm.Backend.Types (Arity, Ident, Label(..), ModuleName, Primitive(..), mkGlobalName)
-import Purvasm.MiddleEnd (LCore(..), Var(..))
+import Purvasm.MiddleEnd (NCore(..), Var(..))
 import Purvasm.MiddleEnd as ME
 import Safe.Coerce (coerce)
 
@@ -39,7 +39,7 @@ type CodegenEnv =
   }
 
 type CodegenState =
-  { stack :: List { label :: Label, arity :: Arity, function :: LCore }
+  { stack :: List { label :: Label, arity :: Arity, function :: NCore }
   , nextLabel :: Int
   -- , code :: Array CodeBlock
   }
@@ -52,20 +52,20 @@ newLabel = do
   modify_ (_ { nextLabel = st.nextLabel + 1 })
   pure (Label st.nextLabel)
 
-addToCompile :: Arity -> LCore -> Codegen Label
+addToCompile :: Arity -> NCore -> Codegen Label
 addToCompile arity function = do
   label <- newLabel
   let newEntry = { label, arity, function }
   modify_ (\st -> st { stack = L.Cons newEntry st.stack })
   pure label
 
-typeOfPhrase :: LCore -> SymbolType
+typeOfPhrase :: NCore -> SymbolType
 typeOfPhrase = case _ of
-  LCVar _ _ -> unsafeCrashWith "Impossible: toplevel phrase is LCVar."
-  LCFunction arity _ -> Function arity
+  NCVar _ _ -> unsafeCrashWith "Impossible: toplevel phrase is NCVar."
+  NCFunction arity _ -> Function arity
   _ -> Value
 
-compileToplevelPhrase :: Ident -> LCore -> Codegen (CodeBlock /\ CodeBlock)
+compileToplevelPhrase :: Ident -> NCore -> Codegen (CodeBlock /\ CodeBlock)
 compileToplevelPhrase ident lambda = do
   { moduleName } <- ask
   let
@@ -91,13 +91,13 @@ compileToplevelPhrase ident lambda = do
               KLabel label : KStartFun :
                 (Array.foldr (\_ -> (KGrab : _)) compiled (1 .. (arity - 1)))
 
-compileExpr :: Maybe Label -> CodeBlock -> LCore -> Codegen CodeBlock
+compileExpr :: Maybe Label -> CodeBlock -> NCore -> Codegen CodeBlock
 compileExpr handler = go
   where
   go cont = case _ of
-    LCConst cst -> pure (KQuote cst : cont)
-    LCVar _ (Var n) -> pure (KAccess n : cont)
-    LCApply body args -> case cont of
+    NCConst cst -> pure (KQuote cst : cont)
+    NCVar _ (Var n) -> pure (KAccess n : cont)
+    NCApply body args -> case cont of
       KReturn : c' -> do
         cbody <- go (KTermApply : c') body
         compileExprList (KPush : cbody) args
@@ -105,14 +105,14 @@ compileExpr handler = go
         cbody <- go (KApply : cont) body
         code <- compileExprList (KPush : cbody) args
         pure (KPushMark : code)
-    LCFunction arity body
+    NCFunction arity body
       | isTail cont -> do
           let grabN = flip (Array.foldr (\_ c -> KGrab : c)) (1 .. arity)
           grabN <$> go cont body
       | otherwise -> do
           label <- addToCompile arity body
           pure (KClosure label : cont)
-    LClet args body -> do
+    NClet args body -> do
       let
         c1 =
           if isTail cont then cont
@@ -124,15 +124,15 @@ compileExpr handler = go
             go (KLet : compiledArgs) head
       c2 <- go c1 body
       compArgs c2 args
-    LCPrim (PGetGlobal globalName) _ ->
+    NCPrim (PGetGlobal globalName) _ ->
       pure (KGetGlobal globalName : cont)
-    LCPrim (PSetGlobal globalName) _ ->
+    NCPrim (PSetGlobal globalName) _ ->
       pure (KSetGlobal globalName : cont)
-    LCPrim p exprList -> do
+    NCPrim p exprList -> do
       compileExprList (Kprim p : cont) exprList
     _ -> unsafeCrashWith "Not implemented!"
 
-  compileExprList :: CodeBlock -> Array LCore -> Codegen CodeBlock
+  compileExprList :: CodeBlock -> Array NCore -> Codegen CodeBlock
   compileExprList cont = Array.uncons >>> case _ of
     Nothing -> pure cont
     Just { head, tail }

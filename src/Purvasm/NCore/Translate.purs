@@ -1,4 +1,4 @@
-module Purvasm.LCore.Translate where
+module Purvasm.NCore.Translate where
 
 import Prelude
 
@@ -22,16 +22,17 @@ import Partial.Unsafe (unsafeCrashWith, unsafePartial)
 import Purvasm.ECore.Syntax as ECF
 import Purvasm.Global (GlobalEnv(..), ValueDesc(..), mkGlobalName)
 import Purvasm.Global as Global
-import Purvasm.LCore.Arrange (arrangeDecls)
-import Purvasm.LCore.Env (LocalSymbolTable(..), TranslEnv, VariableDesc(..), extendByNewVar)
-import Purvasm.LCore.Foreign (overrideForeign)
-import Purvasm.LCore.MatchComp (PatternMatching(..), partitionEither)
-import Purvasm.LCore.MatchComp as MatchComp
-import Purvasm.LCore.Syntax (LCore(..), Program(..))
-import Purvasm.LCore.Typeclass (overrideInstance)
-import Purvasm.LCore.Types (FieldPos(..), Occurrunce, Var(..))
+import Purvasm.NCore.Arrange (arrangeDecls)
+import Purvasm.NCore.Env (LocalSymbolTable(..), TranslEnv, VariableDesc(..), extendByNewVar)
+import Purvasm.NCore.Foreign (overrideForeign)
+import Purvasm.NCore.MatchComp (PatternMatching(..), partitionEither)
+import Purvasm.NCore.MatchComp as MatchComp
+import Purvasm.NCore.Syntax (NCore(..), Program(..))
+import Purvasm.NCore.Typeclass (overrideInstance)
+import Purvasm.NCore.Types (FieldPos(..), Occurrunce, Var(..))
 import Purvasm.Primitives (Primitive(..))
-import Purvasm.Types (BlockTag(..), Ident(..), StructuredConstant(..), mkRecordSig)
+import Purvasm.Record (mkRecordSignature)
+import Purvasm.Types (BlockTag(..), Ident(..), StructuredConstant(..))
 
 newtype TranslM a = TranslM (TranslEnv -> TranslEnv /\ a)
 
@@ -108,7 +109,7 @@ translateProgram genv (ECF.Module ecfModule@{ name: moduleName }) = do
         _ /\ lambda = runTransl tenv (translateExpr ident expr)
       in
         case lambda of
-          LCNone -> Nothing
+          NCNone -> Nothing
           _ -> Just { name: ident, lambda }
 
     { left: foreigns, right: foreignDelcs } = partitionEither $
@@ -134,21 +135,21 @@ translateProgram genv (ECF.Module ecfModule@{ name: moduleName }) = do
   arrangeDecls unarrangedProgram
   where
   mkPrimDecl prim = case _ of
-    0 -> LCPrim prim []
-    arity -> LCFunction arity $
-      LCPrim prim (unfoldr unfoldArg arity)
+    0 -> NCPrim prim []
+    arity -> NCFunction arity $
+      NCPrim prim (unfoldr unfoldArg arity)
   unfoldArg n
-    | n > 0 = Just $ (LCVar VarUnknown (Var (n - 1))) /\ (n - 1)
+    | n > 0 = Just $ (NCVar VarUnknown (Var (n - 1))) /\ (n - 1)
     | otherwise = Nothing
 
-translateExpr :: Ident -> Translate LCore
+translateExpr :: Ident -> Translate NCore
 translateExpr ident = go
   where
   -- translation for nested subexpression
   goRec exp = update (\tenv -> tenv { isToplevel = false }) >>= \_ -> go exp
 
   go = case _ of
-    ECF.ExprLit _ lit -> LCConst <$> (constantOfLiteral lit)
+    ECF.ExprLit _ lit -> NCConst <$> (constantOfLiteral lit)
     ECF.ExprVar _ var -> searchVar var >>= case _ of
       Nothing -> unsafeCrashWith $ "translateExpr: Unknown variable!" <> show var
       Just (i /\ desc /\ occur) ->
@@ -158,53 +159,53 @@ translateExpr ident = go
             PosProp p -> PGetRecordField p
         in
           pure $
-            L.foldr (\o lambda -> LCPrim (accessorPrim o) [ lambda ]) (LCVar desc $ Var i) occur
+            L.foldr (\o lambda -> NCPrim (accessorPrim o) [ lambda ]) (NCVar desc $ Var i) occur
     ECF.ExprGlobal _ gname -> do
       { globals } <- get
       case Global.lookupConstructor gname globals of
         Just desc
-          | desc.arity == 0 -> pure $ LCPrim (PMakeBlock (TConstr desc.tag)) []
-        _ -> pure $ LCPrim (PGetGlobal gname) []
-    ECF.ExprArray _ exprs -> LCPrim (PMakeBlock TArray)
+          | desc.arity == 0 -> pure $ NCPrim (PMakeBlock (TConstr desc.tag)) []
+        _ -> pure $ NCPrim (PGetGlobal gname) []
+    ECF.ExprArray _ exprs -> NCPrim (PMakeBlock TArray)
       <$> (eachWithCurrentEnv goRec exprs)
 
     -- Record and Typeclass instances
     ECF.ExprRecord _ props -> do
       { globals: globals@(GlobalEnv { recordTypes }) } <- get
       let
-        recordSig = mkRecordSig (ECF.propKey <$> props)
+        recordSig = mkRecordSignature (ECF.propKey <$> props)
       case Global.lookupRecordType Nothing recordSig globals of
         Nothing -> unsafePerformEffect do
           logShow $ recordTypes
           throw $ "translateExpr: Unknown record type: " <> "\n" <> show recordTypes
-        Just recordId -> LCPrim (PMakeBlock $ TRecord recordId)
+        Just recordId -> NCPrim (PMakeBlock $ TRecord recordId)
           <$> eachWithCurrentEnv goRec (ECF.propValue <$> props)
     -- Typeclass related should be static.
-    exp@(ECF.ExprTypeclass _ _) -> putStatic ident exp $> LCNone
+    exp@(ECF.ExprTypeclass _ _) -> putStatic ident exp $> NCNone
     -- Typeclass instance is static iff all members are static
     ECF.ExprTypeclassInstance _ clsName members -> do
       { moduleName, globals } <- get
       case overrideInstance globals clsName (mkGlobalName moduleName ident) of
         Just impl -> pure impl
-        _ -> LCPrim (PMakeBlock (TDict clsName))
+        _ -> NCPrim (PMakeBlock (TDict clsName))
           <$> eachWithCurrentEnv goRec members
     -- Constructor. If every argument is constant, translate to blok constant. 
     ECF.ExprConstruct _ desc args -> do
       sequence <$> (traverse constantOfExpr args) >>= case _ of
-        Just constArgs -> pure $ LCConst $ SCBlock (TConstr desc.tag) constArgs
-        _ -> LCPrim (PMakeBlock (TConstr desc.tag))
+        Just constArgs -> pure $ NCConst $ SCBlock (TConstr desc.tag) constArgs
+        _ -> NCPrim (PMakeBlock (TConstr desc.tag))
           <$> eachWithCurrentEnv goRec args
 
     -- Let and Letrec.
     ECF.ExprLet _ binds body ->
-      LClet <$> traverse translLetBind binds <*> (goRec body)
+      NClet <$> traverse translLetBind binds <*> (goRec body)
     ECF.ExprLetRec _ binds body -> do
       -- Well... is it possible to recursive binding group has a member 
       -- which should be treated as known variable (other local variable, global, typeclass dict, etc)
       -- I did not come up with such an example X(
       for_ binds \(bindName /\ _) -> do
         update (extendByNewVar bindName VarUnknown)
-      LCletrec
+      NCletrec
         <$> traverse (goRec <<< snd) binds
         <*> goRec body
 
@@ -217,7 +218,7 @@ translateExpr ident = go
             if isToplevel then (constraints !! i) # join # maybe VarUnknown VarTypeclass
             else VarUnknown
         update (extendByNewVar param desc)
-      LCFunction (Array.length params) <$> goRec body
+      NCFunction (Array.length params) <$> goRec body
       where
       getConstraints globalIdent
         | Ident ident' <- Global.identOfGlobalName globalIdent
@@ -235,7 +236,7 @@ translateExpr ident = go
     ECF.ExprApp _ func args -> do
       spine <- eachWithCurrentEnv goRec $ Array.cons func args
       case Array.uncons spine of
-        Just { head, tail } -> pure $ LCApply head tail
+        Just { head, tail } -> pure $ NCApply head tail
         _ -> unsafeCrashWith "translateExpr: Impossible"
     -- Pattern matching compilation
     ECF.ExprCase _ casHeads casAlts -> do
@@ -260,28 +261,28 @@ translateExpr ident = go
     -- Record property access.
     ECF.ExprAccess _ exp prop
       -- | Just sig <- lookupField exp prop -> case offsetOfProp prop sig of
-      --     Just ofs -> LCPrim (PGetField ofs) [ go exp ]
+      --     Just ofs -> NCPrim (PGetField ofs) [ go exp ]
       --     Nothing -> unsafeCrashWith "translateExpr: Record property missing!"
       | otherwise ->
           do
             { globals } <- get
             trExp <- goRec exp
             -- Access to typeclass member should be resolved statically
-            case typeclassOfLCoreExpr globals trExp of
+            case typeclassOfNCoreExpr globals trExp of
               Just (_ /\ { members })
                 | Just i <- Array.findIndex (fst >>> (_ == Ident prop)) members ->
-                    pure $ LCPrim (PGetField i) [ trExp ]
-              _ -> pure $ LCPrim (PGetRecordField prop) [ trExp ]
+                    pure $ NCPrim (PGetField i) [ trExp ]
+              _ -> pure $ NCPrim (PGetRecordField prop) [ trExp ]
     -- Misc.
-    ECF.ExprGetField _ i exp -> LCPrim (PGetField i) <<< Array.singleton <$> goRec exp
-    ECF.ExprGetSize _ exp -> LCPrim PBlockSize <<< Array.singleton <$> goRec exp
-    ECF.ExprStaticFail _ -> pure LCStaticFail
-    ECF.ExprstaticHandle _ e1 e2 -> LCStaticHandle <$> (goRec e1) <*> (goRec e2)
-    ECF.ExprNone -> pure LCNone
-    ECF.ExprNil _ -> pure LCNil
+    ECF.ExprGetField _ i exp -> NCPrim (PGetField i) <<< Array.singleton <$> goRec exp
+    ECF.ExprGetSize _ exp -> NCPrim PBlockSize <<< Array.singleton <$> goRec exp
+    ECF.ExprStaticFail _ -> pure NCStaticFail
+    ECF.ExprstaticHandle _ e1 e2 -> NCStaticHandle <$> (goRec e1) <*> (goRec e2)
+    ECF.ExprNone -> pure NCNone
+    ECF.ExprNil _ -> pure NCNil
     ECF.ExprIf _ cond ifSo notSo -> unsafePartial do
       [ trCond, trSo, trNot ] <- eachWithCurrentEnv goRec [ cond, ifSo, notSo ]
-      pure $ LCifthenelse trCond trSo trNot
+      pure $ NCifthenelse trCond trSo trNot
     exp -> unsafeCrashWith $ "Not Implemented!" <> show exp
 
   translExprCase :: Array (ECF.Expr ECF.Ann) -> Array (ECF.CaseAlternative ECF.Ann) -> _
@@ -294,21 +295,21 @@ translateExpr ident = go
     in
       translDecisionTree $ MatchComp.decomposePatternMatch pm
     where
-    translDecisionTree :: MatchComp.DecisionTree -> _ LCore
+    translDecisionTree :: MatchComp.DecisionTree -> _ NCore
     translDecisionTree = case _ of
-      MatchComp.MatchFail -> pure $ LCStaticFail
+      MatchComp.MatchFail -> pure $ NCStaticFail
       MatchComp.MatchLeaf act
         | Just (ECF.CaseAlternative { action, patterns }) <- caseAlts !! act ->
             extendByPatternVars patterns
               *> goRec action
         | otherwise -> unsafeCrashWith "translDecisionTree: Impossible!"
-      MatchComp.Conditional exp tbl -> LCConditional
+      MatchComp.Conditional exp tbl -> NCConditional
         <$> goRec exp
         <*> traverse (\(ac /\ subtree) -> (ac /\ _) <$> translDecisionTree subtree) tbl
-      MatchComp.JumpThru exp tbl -> LCSwitch
+      MatchComp.JumpThru exp tbl -> NCSwitch
         <$> goRec exp
         <*> traverse (\(tag /\ subtree) -> (tag /\ _) <$> translDecisionTree subtree) tbl
-      MatchComp.MatchTry tree1 tree2 -> LCStaticHandle
+      MatchComp.MatchTry tree1 tree2 -> NCStaticHandle
         <$> translDecisionTree tree1
         <*> translDecisionTree tree2
 
@@ -322,7 +323,7 @@ translateExpr ident = go
   extendByPattern exp pat = for (occurrenceOfPat L.Nil pat) \(var /\ o) -> do
     update (extendEnvByBind var (Just o) exp)
 
-  translLetBind :: Ident /\ ECF.Expr ECF.Ann -> TranslM LCore
+  translLetBind :: Ident /\ ECF.Expr ECF.Ann -> TranslM NCore
   translLetBind (bindName /\ exp) = case exp of
     _ -> do
       goRec exp
@@ -406,19 +407,19 @@ constantOfLiteral = case _ of
     ECF.LitArray lits -> SCBlock TArray <$> (traverse constantOfLiteral lits)
     ECF.LitRecord props -> do
       { globals } <- get
-      let recordSig = mkRecordSig (ECF.propKey <$> props)
+      let recordSig = mkRecordSignature (ECF.propKey <$> props)
       case Global.lookupRecordType Nothing recordSig globals of
         Nothing -> unsafeCrashWith "constantOfLiteral: Unknown record type!"
         Just recordId ->
           SCBlock (TRecord recordId) <$> traverse (ECF.propValue >>> constantOfLiteral) props
     ECF.LitConstructor desc args -> SCBlock (TConstr desc.tag) <$> traverse constantOfLiteral args
 
-typeclassOfLCoreExpr :: GlobalEnv -> LCore -> Maybe (Global.GlobalName /\ Global.TypeclassDesc)
-typeclassOfLCoreExpr genv = go
+typeclassOfNCoreExpr :: GlobalEnv -> NCore -> Maybe (Global.GlobalName /\ Global.TypeclassDesc)
+typeclassOfNCoreExpr genv = go
   where
   go = case _ of
-    LCVar (VarTypeclass clsname) _ -> (clsname /\ _) <$> Global.lookupTypeclass clsname genv
-    LCPrim (PGetField i) [ exp ]
+    NCVar (VarTypeclass clsname) _ -> (clsname /\ _) <$> Global.lookupTypeclass clsname genv
+    NCPrim (PGetField i) [ exp ]
       | Just (cls /\ { members }) <- go exp
       , Just (_ /\ Just constraint) <- members !! i ->
           (constraint /\ _) <$> Global.lookupTypeclass constraint genv

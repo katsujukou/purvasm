@@ -15,7 +15,7 @@ import PureScript.CST.Types (ModuleHeader(..))
 import PureScript.CST.Types as CST
 import PureScript.CoreFn as CF
 import PureScript.CoreFn.Json as CFJ
-import PureScript.ExternsFile (ExternsFile(..))
+import PureScript.ExternsFile (ExternsFile)
 import PureScript.ExternsFile.Decoder.Class (decoder)
 import PureScript.ExternsFile.Decoder.Monad (describeError, runDecoder)
 import Purvasm.Compiler.Effects.FS (FS, FilePath, concatPaths, readCborFile, readTextFile)
