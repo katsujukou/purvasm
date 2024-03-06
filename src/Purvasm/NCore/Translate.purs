@@ -22,7 +22,6 @@ import Partial.Unsafe (unsafeCrashWith, unsafePartial)
 import Purvasm.ECore.Syntax as ECF
 import Purvasm.Global (GlobalEnv(..), ValueDesc(..), mkGlobalName)
 import Purvasm.Global as Global
-import Purvasm.NCore.Arrange (arrangeDecls)
 import Purvasm.NCore.Env (LocalSymbolTable(..), TranslEnv, VariableDesc(..), extendByNewVar)
 import Purvasm.NCore.Foreign (overrideForeign)
 import Purvasm.NCore.MatchComp (PatternMatching(..), partitionEither)
@@ -72,9 +71,6 @@ eachWithCurrentEnv f ta = do
   tenv <- get
   traverse (\a -> put tenv *> f a) ta
 
-putStatic :: Ident -> ECF.Expr ECF.Ann -> TranslM Unit
-putStatic ident expr = update (\tenv -> tenv { static = Array.cons (ident /\ expr) tenv.static })
-
 searchVar :: Ident -> TranslM (Maybe (Int /\ VariableDesc /\ Occurrunce))
 searchVar ident = get >>= \{ locals } -> go 0 locals
   where
@@ -102,7 +98,6 @@ translateModule genv (ECF.Module ecfModule@{ name: moduleName }) = do
           { moduleName: ecfModule.name
           , locals: Tnull
           , globals: genv
-          , static: []
           , fresh: 0
           , isToplevel: true
           }
@@ -123,16 +118,12 @@ translateModule genv (ECF.Module ecfModule@{ name: moduleName }) = do
                   Right $ { name: foreign_, lambda: mkPrimDecl prim arity }
             _ -> overrideForeign genv gloname
               # maybe (Left foreign_) ({ name: foreign_, lambda: _ } >>> Right)
+  Module
+    { name: moduleName
+    , decls: foreignDelcs <> catMaybes decls
+    , foreigns
+    }
 
-    unarrangedModule =
-      Module $
-        { name: moduleName
-        , static: []
-        , decls: foreignDelcs <> catMaybes decls
-        , foreigns
-        }
-
-  arrangeDecls unarrangedModule
   where
   mkPrimDecl prim = case _ of
     0 -> NCPrim prim []
@@ -180,8 +171,8 @@ translateExpr ident = go
           throw $ "translateExpr: Unknown record type: " <> "\n" <> show recordTypes
         Just recordId -> NCPrim (PMakeBlock $ TRecord recordId)
           <$> eachWithCurrentEnv goRec (ECF.propValue <$> props)
-    -- Typeclass related should be static.
-    exp@(ECF.ExprTypeclass _ _) -> putStatic ident exp $> NCNone
+    -- Typeclass dictionary is no longer needed to be included in.
+    ECF.ExprTypeclass _ _ -> pure NCNone
     -- Typeclass instance is static iff all members are static
     ECF.ExprTypeclassInstance _ clsName members -> do
       { moduleName, globals } <- get
@@ -202,7 +193,7 @@ translateExpr ident = go
     ECF.ExprLetRec _ binds body -> do
       -- Well... is it possible to recursive binding group has a member 
       -- which should be treated as known variable (other local variable, global, typeclass dict, etc)
-      -- I did not come up with such an example X(
+      -- I did not come up with such an example :-(
       for_ binds \(bindName /\ _) -> do
         update (extendByNewVar bindName VarUnknown)
       NCletrec
@@ -277,7 +268,9 @@ translateExpr ident = go
     ECF.ExprGetField _ i exp -> NCPrim (PGetField i) <<< Array.singleton <$> goRec exp
     ECF.ExprGetSize _ exp -> NCPrim PBlockSize <<< Array.singleton <$> goRec exp
     ECF.ExprStaticFail _ -> pure NCStaticFail
-    ECF.ExprstaticHandle _ e1 e2 -> NCStaticHandle <$> (goRec e1) <*> (goRec e2)
+    ECF.ExprstaticHandle _ e1 e2 -> unsafePartial do
+      [ trExp1, trExp2 ] <- eachWithCurrentEnv goRec [ e1, e2 ]
+      pure $ NCStaticHandle trExp1 trExp2
     ECF.ExprNone -> pure NCNone
     ECF.ExprNil _ -> pure NCNil
     ECF.ExprIf _ cond ifSo notSo -> unsafePartial do

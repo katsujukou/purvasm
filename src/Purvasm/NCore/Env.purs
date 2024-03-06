@@ -8,9 +8,7 @@ import Data.HashMap as HM
 import Data.List as L
 import Data.Maybe (Maybe(..))
 import Data.Show.Generic (genericShow)
-import Data.Tuple (Tuple)
 import Data.Tuple.Nested (type (/\), (/\))
-import Purvasm.ECore.Syntax as ECF
 import Purvasm.Global (GlobalEnv, GlobalName)
 import Purvasm.NCore.Types (Occurrunce)
 import Purvasm.Types (Ident, ModuleName, RecordId)
@@ -19,7 +17,6 @@ type TranslEnv =
   { moduleName :: ModuleName
   , globals :: GlobalEnv
   , locals :: LocalSymbolTable
-  , static :: Array (Tuple Ident (ECF.Expr ECF.Ann))
   , fresh :: Int
   , isToplevel :: Boolean
   }

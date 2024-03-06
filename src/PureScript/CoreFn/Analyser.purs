@@ -51,6 +51,22 @@ collectRecordSignatures = case _ of
         ]
   _ -> []
 
+staticExpr :: CF.Expr CF.Ann -> Boolean
+staticExpr = case _ of
+  CF.ExprAbs _ _ _ -> true
+  CF.ExprLit _ lit -> case lit of
+    CF.LitArray elts -> Array.all staticExpr elts
+    CF.LitRecord props -> Array.all (CF.propValue >>> staticExpr) props
+    _ -> true
+  exp@(CF.ExprApp _ _ _)
+    | f /\ args <- appSpine [] exp
+    , CF.ExprConstructor _ _ _ _ <- f -> Array.all staticExpr args
+  _ -> false
+  where
+  appSpine args = case _ of
+    CF.ExprApp _ f arg -> appSpine (Array.cons arg args) f
+    exp -> exp /\ args
+
 type TypeclassInstance =
   { typeclass :: CF.Qualified CF.ProperName
   , members :: Array (CF.Ident /\ CF.Expr CF.Ann)

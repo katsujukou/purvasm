@@ -1,10 +1,10 @@
 module Purvasm.Backend where
 
 import Purvasm.Backend.PmoFile (PmoFile(..), PmoHeader)
-import Purvasm.MiddleEnd as ME
+import Purvasm.LCore.Syntax as LCF
 
-compileProgram :: PmoHeader -> ME.Program -> PmoFile
-compileProgram head (ME.Program lcProgram) = do
+compileModule :: PmoHeader -> LCF.Module -> PmoFile
+compileModule head (LCF.Module lcModule) = do
   PmoFile
     { head
     , datasec: []

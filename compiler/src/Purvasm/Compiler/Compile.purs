@@ -11,15 +11,14 @@ import Purvasm.Compiler.Effects.Log as Log
 import Purvasm.Compiler.Effects.WEnv (WENV)
 import Purvasm.Compiler.Effects.WEnv as WEnv
 import Purvasm.Compiler.PureScript (openExternsCbor)
-import Purvasm.ECore.Syntax (Ann, Module) as ECore
-import Purvasm.ECore.Transform (transformModule) as ECore
+import Purvasm.ECore.Syntax (Ann, Module) as ECF
+import Purvasm.ECore.Translate (translateCoreFn)
 import Purvasm.Global (GlobalEnv)
 import Purvasm.Global as Global
-import Purvasm.LCore.Syntax (Module(..)) as LCore
-import Purvasm.MiddleEnd (translateModuleName)
-import Purvasm.MiddleEnd as ME
-import Purvasm.NCore.Syntax (Program(..)) as NCore
-import Purvasm.NCore.Translate (translateProgram) as NCore
+import Purvasm.LCore.Syntax (Module(..)) as LCF
+import Purvasm.LCore.Translate (lowerModule) as LCF
+import Purvasm.NCore.Syntax (Module(..)) as NCF
+import Purvasm.NCore.Translate (translateModule) as NCF
 import Purvasm.Types (ModuleName)
 import Run (Run)
 import Run.Except (EXCEPT)
@@ -40,10 +39,10 @@ data UnitaryCompileResultDesc
 
 data UnitaryCompileStep
   = Initial (CF.Module CF.Ann)
-  | Translated (ECore.Module ECore.Ann)
-  | Transformed (ECore.Module ECore.Ann)
-  | Optimized NCore.Module
-  | Lowered LCore.Module
+  | Translated (ECF.Module ECF.Ann)
+  | Transformed NCF.Module
+  | Optimized NCF.Module
+  | Lowered LCF.Module
   | Assembled PmoFile
 
 type CompileEffects r = (LOG + FS + WENV GlobalEnv + EXCEPT String + r)
@@ -60,28 +59,28 @@ nextStep = case _ of
     -- Apply corefn to global env
     genv <- WEnv.update (Global.applyCorefnEnv cfm)
     -- translate CoreFn module and pass it in to next stage.
-    pure $ Translated $ ME.translateCoreFn genv cfm
+    pure $ Translated $ translateCoreFn genv cfm
 
   Translated ecModule -> do
     Log.debug $ show ecModule
-    pure $ Transformed $
-      ECore.transformModule ecModule
-
-  Transformed ecModule -> do
     genv <- WEnv.read
     let
-      lcProgram = NCore.translateProgram genv ecModule
-    Log.info (show lcProgram)
-    pure $ Lowered lcProgram
-  Lowered lcProgram -> pure $ Optimized lcProgram
-  Optimized lcProgram@(NCore.Program { name }) -> do
+      ncfModule = NCF.translateModule genv ecModule
+    Log.info (show ncfModule)
+    pure $ Transformed $ ncfModule
+
+  Transformed ncfModule -> pure $ Optimized ncfModule
+
+  Optimized ncfModule -> pure $ Lowered $ LCF.lowerModule ncfModule
+
+  Lowered lcfModule@(LCF.Module { name }) -> do
     let
       header =
         { name
         , pursVersion: Spago.pursVersion
         , version: "0.1.0"
         }
-      pmoFile = Backend.compileProgram header lcProgram
+      pmoFile = Backend.compileModule header lcfModule
     pure $ (Assembled pmoFile)
   Assembled pmoFile -> pure $ Assembled pmoFile
 
@@ -91,7 +90,7 @@ compileModule
   -> Run (CompileEffects r) UnitaryCompileResult
 compileModule cfModule@(CF.Module { name }) = loop (Initial cfModule)
   where
-  name' = translateModuleName name
+  name' = coerce name
 
   loop step = do
     nextStep step >>= case _ of

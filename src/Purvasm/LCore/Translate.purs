@@ -2,7 +2,7 @@ module Purvasm.LCore.Translate where
 
 import Prelude
 
-import Control.Monad.State (State, get, modify_, put, runState)
+import Control.Monad.State (State, get, modify, modify_, put, runState)
 import Data.Array as Array
 import Data.Either (Either(..))
 import Data.Enum (fromEnum)
@@ -19,7 +19,7 @@ import Purvasm.Types (AtomicConstant(..), BlockTag(..), GlobalName, Ident(..), M
 type LowerEnv =
   { moduleName :: ModuleName
   , next :: Int
-  , static :: Array (GlobalName /\ StaticExpr)
+  , static :: Array (Ident /\ StaticExpr)
   }
 
 type Lower a = State LowerEnv a
@@ -27,54 +27,54 @@ type Lower a = State LowerEnv a
 lower :: forall a. LowerEnv -> Lower a -> a /\ LowerEnv
 lower lenv m = runState m lenv
 
-pushStatic :: GlobalName -> StaticExpr -> Lower StaticRef
+pushStatic :: Ident -> StaticExpr -> Lower StaticRef
 pushStatic ident lexp = do
-  modify_ \env -> env { static = Array.cons (ident /\ lexp) env.static }
-  pure $ StaticRef ident
+  { moduleName } <- modify \env -> env { static = Array.cons (ident /\ lexp) env.static }
+  pure $ StaticRef $ mkGlobalName moduleName ident
 
 pushStaticAnon :: StaticExpr -> Lower StaticRef
 pushStaticAnon lexp = do
   env <- get
   let
-    gloIdent = mkGlobalName env.moduleName (toIdent $ "$pvsm_static_" <> show env.next)
-    env' = env { static = Array.cons (gloIdent /\ lexp) env.static, next = env.next + 1 }
+    ident = toIdent $ "$pvsm_static_" <> show env.next
+    env' = env { static = Array.cons (ident /\ lexp) env.static, next = env.next + 1 }
   put env'
-  pure $ StaticRef gloIdent
+  pure $ StaticRef $ mkGlobalName env.moduleName ident
 
 lowerModule :: NC.Module -> Module
 lowerModule (NC.Module ncModule@{ name: moduleName, foreigns }) = do
-  let
-    decls /\ { static } = lower { moduleName, static: [], next: 0 } do
-      traverse (lowerDeclaration moduleName) ncModule.decls
+  -- let
+  --   decls /\ { static } = lower { moduleName, static: [], next: 0 } do
+  --     traverse (lowerDeclaration moduleName) ncModule.decls
 
   Module
     { name: moduleName
-    , decls: decls
-    , static
+    , decls: [] -- decls
+    , static: []
     , foreigns
     }
 
-lowerDeclaration :: ModuleName -> NC.Declaration -> Lower (Ident /\ LowExpr)
-lowerDeclaration moduleName { lambda, name } = (name /\ _) <$> go { isToplevel: true } lambda
-  where
-  globalName = mkGlobalName moduleName name
+-- lowerDeclaration :: ModuleName -> Ident /\ NC.NCore -> Lower (Ident /\ LowExpr)
+-- lowerDeclaration moduleName (name /\ lambda) = (name /\ _) <$> go { isToplevel: true } lambda
+--   where
+--   globalName = mkGlobalName moduleName name
 
-  go { isToplevel } = case _ of
-    NC.NCConst cst -> case cst of
-      SCAtom acst -> case constImm acst of
-        Right imm
-          | isToplevel ->
-              LEDynamic <<< LEStaticRef <$> (pushStatic globalName (SEImm imm))
-          | otherwise -> pure $ LEStatic (SEImm imm)
-        Left seCst
-          | isToplevel ->
-              LEDynamic <<< LEStaticRef <$> (pushStatic globalName seCst)
-          | otherwise -> do
-              ref <- pushStaticAnon seCst
-              pure $ LEDynamic (LEStaticRef ref)
-      SCBlock tag items -> case tag of
-        _ -> unsafeCrashWith "Not implemented"
-    _ -> unsafeCrashWith "Not implemented"
+--   go { isToplevel } = case _ of
+--     NC.NCConst cst -> case cst of
+--       SCAtom acst -> case constImm acst of
+--         Right imm
+--           | isToplevel ->
+--               LEDynamic <<< LEStaticRef <$> (pushStatic name (SEImm imm))
+--           | otherwise -> pure $ LEStatic (SEImm imm)
+--         Left seCst
+--           | isToplevel ->
+--               LEDynamic <<< LEStaticRef <$> (pushStatic name seCst)
+--           | otherwise -> do
+--               ref <- pushStaticAnon seCst
+--               pure $ LEDynamic (LEStaticRef ref)
+--       SCBlock tag items -> case tag of
+--         _ -> unsafeCrashWith "Not implemented"
+--     _ -> unsafeCrashWith "Not implemented"
 
 constImm :: AtomicConstant -> Either StaticExpr StaticImm
 constImm = case _ of

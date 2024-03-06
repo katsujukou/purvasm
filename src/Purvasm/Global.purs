@@ -128,8 +128,16 @@ derive instance Newtype GlobalEnv _
 type Value =
   { constraints :: Array (Maybe GlobalName)
   , desc :: ValueDesc
+  -- , inline :: InlineDesc
+  , static :: Boolean
   , source :: Set ValueSource
   }
+
+data InlineDesc = Always | Never
+
+derive instance Generic InlineDesc _
+instance Show InlineDesc where
+  show = genericShow
 
 data ValueSource = Corefn | ExternsFile | PmiFile
 
@@ -168,12 +176,12 @@ type PrimDesc =
   , arity :: Int
   }
 
-setConstraints :: ValueSource -> GlobalName -> Array (Maybe GlobalName) -> GlobalEnv -> GlobalEnv
-setConstraints src ident constraints genv = insertValue ident value genv
+setConstraints :: ValueSource -> Boolean -> GlobalName -> Array (Maybe GlobalName) -> GlobalEnv -> GlobalEnv
+setConstraints src static ident constraints genv = insertValue ident value genv
   where
   value = case lookupValue ident genv of
-    Nothing -> { desc: ValPlain, constraints: constraints, source: Set.singleton src }
-    Just v -> v { constraints = constraints, source = Set.insert src v.source }
+    Nothing -> { desc: ValPlain, constraints: constraints, static, source: Set.singleton src }
+    Just v -> v { constraints = constraints, source = Set.insert src v.source, static = static }
 
 applyCorefnEnv :: CF.Module CF.Ann -> GlobalEnv -> GlobalEnv
 applyCorefnEnv (CF.Module cfm@{ decls }) =
@@ -236,6 +244,7 @@ applyCorefnEnv (CF.Module cfm@{ decls }) =
         { desc: ValTypeclass $ mkGlobalName moduleName className
         , constraints: []
         , source: Set.singleton Corefn
+        , static: true
         }
 
   insertTypeclassInstance :: CF.Ident -> (CF.Expr CF.Ann) -> GlobalEnv -> GlobalEnv
@@ -260,11 +269,13 @@ applyCorefnEnv (CF.Module cfm@{ decls }) =
                   { desc: ValTypeclassInstance className
                   , constraints
                   , source: Set.singleton Corefn
+                  , static: true
                   }
                 Just val -> genv2 # insertValue globalIdent
                   { desc: ValTypeclassInstance className
                   , constraints: Array.zipWith (<|>) val.constraints constraints
                   , source: Set.insert Corefn val.source
+                  , static: true
                   }
       _ -> unsafeCrashWith "insertTypeclassInstance: Impossible!"
 
@@ -292,6 +303,7 @@ applyCorefnEnv (CF.Module cfm@{ decls }) =
           { desc: ValPrim desc
           , constraints: []
           , source: Set.empty
+          , static: true
           }
 
   insertAnyValue :: CF.Ident -> CF.Expr CF.Ann -> GlobalEnv -> GlobalEnv
@@ -300,6 +312,7 @@ applyCorefnEnv (CF.Module cfm@{ decls }) =
       globalIdent = mkGlobalName moduleName (Ident ident)
       mkRecordId = RecordId Nothing <<< mkRecordSignature
       recordIds = mkRecordId <$> Analyser.collectRecordSignatures expr
+      static = Analyser.staticExpr expr
       genv' =
         if Array.null recordIds then genv
         else foldr insertRecordId genv recordIds
@@ -309,6 +322,7 @@ applyCorefnEnv (CF.Module cfm@{ decls }) =
           # insertValue globalIdent
               ( val
                   { source = Set.insert Corefn val.source
+                  , static = static
                   }
               )
         Nothing -> genv'
@@ -316,6 +330,7 @@ applyCorefnEnv (CF.Module cfm@{ decls }) =
               { desc: ValPlain
               , constraints: []
               , source: Set.singleton Corefn
+              , static
               }
 
   insertRecordId :: RecordId -> GlobalEnv -> GlobalEnv
@@ -369,12 +384,13 @@ externsEnv (Ext.ExternsFile _ modname _ _ _ _ extDecls _) genv =
       _ -> identity
 
     insertPlainValue :: GlobalName -> GlobalEnv -> GlobalEnv
-    insertPlainValue name = insertValue name { desc: ValPlain, constraints: [], source: Set.singleton ExternsFile }
+    insertPlainValue name = insertValue name { desc: ValPlain, static: false, constraints: [], source: Set.singleton ExternsFile }
 
     insertTypeclassInstanceValue clsName constraints = insertValue globalIdent
       { desc: ValTypeclassInstance clsName
       , constraints
       , source: Set.singleton ExternsFile
+      , static: true
       }
 
     applyConstraints :: Ext.ExternsDeclaration -> GlobalEnv -> GlobalEnv
@@ -382,7 +398,7 @@ externsEnv (Ext.ExternsFile _ modname _ _ _ _ extDecls _) genv =
       Ext.EDValue _ type_
         | Ext.ForAll _ _ _ _ typ _ <- type_
         , constrs <- constraintsPart (stripForall typ)
-        , not (Array.null constrs) -> setConstraints ExternsFile globalIdent constrs
+        , not (Array.null constrs) -> setConstraints ExternsFile false globalIdent constrs
 
       _ -> identity
 
