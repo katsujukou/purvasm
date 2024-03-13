@@ -6,3 +6,4 @@ import Data.Hashable (hash)
 -- based on http://www.cse.yorku.ca/%7Eoz/hash.html
 stringHash :: String -> Int
 stringHash = hash
+ 

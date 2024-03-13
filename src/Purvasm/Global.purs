@@ -55,7 +55,7 @@ import Purvasm.Global.SpecialGlobal as SpecialGlobal
 import Purvasm.Primitives (Primitive(..))
 import Purvasm.Record (RecordSignature, mkRecordSignature)
 import Purvasm.Types (Global(..), GlobalName, mkGlobal, mkGlobalName) as ReExports
-import Purvasm.Types (class IsIdent, Arity, ConstructorTag, Global(..), GlobalName, Ident(..), ModuleName, RecordId(..), mkGlobalName, toIdent)
+import Purvasm.Types (class IsIdent, ConstructorTag, Global(..), GlobalName, Ident(..), ModuleName, RecordId(..), Arity, mkGlobalName, toIdent)
 import Safe.Coerce (coerce)
 
 globalNameOfQualifiedVar :: forall name. IsIdent name => CF.Qualified name -> Maybe GlobalName
