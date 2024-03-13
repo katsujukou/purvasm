@@ -59,6 +59,7 @@ nextStep = case _ of
     -- Apply corefn to global env
     genv <- WEnv.update (Global.applyCorefnEnv cfm)
     -- translate CoreFn module and pass it in to next stage.
+    Log.debug $ show genv
     pure $ Translated $ translateCoreFn genv cfm
 
   Translated ecModule -> do
@@ -71,7 +72,12 @@ nextStep = case _ of
 
   Transformed ncfModule -> pure $ Optimized ncfModule
 
-  Optimized ncfModule -> pure $ Lowered $ LCF.lowerModule ncfModule
+  Optimized ncfModule -> do
+    genv <- WEnv.read
+    let
+      lcModule = LCF.lowerModule genv ncfModule
+    Log.info $ show lcModule
+    pure $ Lowered lcModule
 
   Lowered lcfModule@(LCF.Module { name }) -> do
     let

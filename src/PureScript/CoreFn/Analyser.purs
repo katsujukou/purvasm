@@ -58,7 +58,8 @@ staticExpr = case _ of
     CF.LitArray elts -> Array.all staticExpr elts
     CF.LitRecord props -> Array.all (CF.propValue >>> staticExpr) props
     _ -> true
-  exp@(CF.ExprApp _ _ _)
+  exp@(CF.ExprApp _ f' arg)
+    | CF.Ann { meta: Just CF.IsNewtype } <- CF.exprAnn f' -> staticExpr exp
     | f /\ args <- appSpine [] exp
     , CF.ExprConstructor _ _ _ _ <- f -> Array.all staticExpr args
   _ -> false

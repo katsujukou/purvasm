@@ -15,13 +15,21 @@ import Purvasm.Types (Arity, AtomicConstant, ConstructorTag, Ident, ModuleName, 
 
 newtype Module = Module
   { name :: ModuleName
-  , decls :: Array Declaration
+  , decls :: Array ToplevelDecl
   , foreigns :: Array Ident
   }
 
 derive instance Newtype Module _
 instance Show Module where
   show (Module m) = "(Module " <> show m <> ")"
+
+data ToplevelDecl
+  = DeclNonRec Declaration
+  | DeclRec (Array Declaration)
+
+derive instance Generic ToplevelDecl _
+instance Show ToplevelDecl where
+  show = genericShow
 
 type Declaration =
   { name :: Ident

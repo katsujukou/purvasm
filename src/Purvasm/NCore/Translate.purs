@@ -24,9 +24,9 @@ import Purvasm.Global (GlobalEnv(..), ValueDesc(..), mkGlobalName)
 import Purvasm.Global as Global
 import Purvasm.NCore.Env (LocalSymbolTable(..), TranslEnv, VariableDesc(..), extendByNewVar)
 import Purvasm.NCore.Foreign (overrideForeign)
-import Purvasm.NCore.MatchComp (PatternMatching(..), partitionEither)
 import Purvasm.NCore.MatchComp as MatchComp
-import Purvasm.NCore.Syntax (NCore(..), Module(..))
+import Purvasm.NCore.Sort (sortDecls)
+import Purvasm.NCore.Syntax (Module(..), NCore(..))
 import Purvasm.NCore.Typeclass (overrideInstance)
 import Purvasm.NCore.Types (FieldPos(..), Occurrunce, Var(..))
 import Purvasm.Primitives (Primitive(..))
@@ -107,7 +107,7 @@ translateModule genv (ECF.Module ecfModule@{ name: moduleName }) = do
           NCNone -> Nothing
           _ -> Just { name: ident, lambda }
 
-    { left: foreigns, right: foreignDelcs } = partitionEither $
+    { left: foreigns, right: foreignDelcs } = MatchComp.partitionEither $
       ecfModule.foreigns <#> \foreign_ ->
         let
           gloname = mkGlobalName moduleName foreign_
@@ -120,8 +120,8 @@ translateModule genv (ECF.Module ecfModule@{ name: moduleName }) = do
               # maybe (Left foreign_) ({ name: foreign_, lambda: _ } >>> Right)
   Module
     { name: moduleName
-    , decls: foreignDelcs <> catMaybes decls
     , foreigns
+    , decls: sortDecls moduleName (foreignDelcs <> catMaybes decls)
     }
 
   where
@@ -171,15 +171,16 @@ translateExpr ident = go
           throw $ "translateExpr: Unknown record type: " <> "\n" <> show recordTypes
         Just recordId -> NCPrim (PMakeBlock $ TRecord recordId)
           <$> eachWithCurrentEnv goRec (ECF.propValue <$> props)
-    -- Typeclass dictionary is no longer needed to be included in.
-    ECF.ExprTypeclass _ _ -> pure NCNone
-    -- Typeclass instance is static iff all members are static
+
     ECF.ExprTypeclassInstance _ clsName members -> do
       { moduleName, globals } <- get
       case overrideInstance globals clsName (mkGlobalName moduleName ident) of
         Just impl -> pure impl
         _ -> NCPrim (PMakeBlock (TDict clsName))
           <$> eachWithCurrentEnv goRec members
+    -- Typeclass dictionary is no longer needed to be included in.
+    ECF.ExprTypeclass _ _ -> pure NCNone
+
     -- Constructor. If every argument is constant, translate to blok constant. 
     ECF.ExprConstruct _ desc args -> do
       sequence <$> (traverse constantOfExpr args) >>= case _ of
@@ -281,7 +282,7 @@ translateExpr ident = go
   translExprCase :: Array (ECF.Expr ECF.Ann) -> Array (ECF.CaseAlternative ECF.Ann) -> _
   translExprCase caseHeads caseAlts =
     let
-      pm = PatternMatching
+      pm = MatchComp.PatternMatching
         { pmHeads: caseHeads
         , pmMatrix: mapWithIndex (\i (ECF.CaseAlternative { patterns }) -> { pats: patterns, action: i }) caseAlts
         }
