@@ -48,6 +48,7 @@ language and are kept out of version control.)
 | # | Title | Status |
 | - | - | - |
 | [0001](0001-phase-1-host-language-ocaml.md) | Implement the phase-1 host in OCaml; reject a PureScript-on-V8 seed | Accepted |
-| [0002](0002-cesk-execution-model.md) | Start phase 1 with a CESK machine over a minimal strict core | Proposed |
+| [0002](0002-cesk-execution-model.md) | Start phase 1 with a CESK machine over a minimal strict core | Accepted |
+| [0003](0003-stack-based-bytecode.md) | PURVASM bytecode is a stack machine | Accepted |
 
 ## Scope

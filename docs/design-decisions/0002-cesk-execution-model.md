@@ -1,6 +1,6 @@
 # 0002. Start phase 1 with a CESK machine over a minimal strict core
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-06-16
 
 ## Context
@@ -75,9 +75,18 @@ address; `σ[α ↦ v]` extends the store; `ρ[x ↦ α]` extends the environmen
 | `Prim_args(op, done, [], ρ, κ′)` | | `⟨Return δ(op, rev(v :: done)), σ, κ′⟩` |
 | `Prim_args(op, done, a :: rest, ρ, κ′)` | | `⟨Eval(a, ρ), σ, Prim_args(op, v :: done, rest, ρ, κ′)⟩` |
 
-The only rules that allocate (`σ[α ↦ v]`) are `Arg` (function application) and
-`Let_body`; everything else threads `σ` unchanged. This is why, in a trace, the
-store grows exactly at applications and `let` bindings.
+### Reading the rules
+
+One symmetry runs through the whole table:
+
+- **Eval-mode rules decompose** a compound term and **push** the remaining work
+  onto `κ` as a frame.
+- **Return-mode rules** fire once a value exists: they **pop** the top frame off
+  `κ` and resume the work it saved.
+- **Allocation (`σ[α ↦ v]`) happens in exactly two rules — `Arg` (function
+  application) and `Let_body`** — everything else threads `σ` unchanged. This is
+  why, in a trace, the store grows at precisely the moments a function is applied
+  or a `let` binds a name, and nowhere else.
 
 ## Consequences
 
