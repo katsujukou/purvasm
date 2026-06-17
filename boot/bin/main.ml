@@ -5,6 +5,7 @@ open Cesk.Ast
    so programs are built directly as core terms. *)
 let num n = Lit (LInt n)
 let add a b = Prim (Add, [ a; b ])
+let sub a b = Prim (Sub, [ a; b ])
 let mul a b = Prim (Mul, [ a; b ])
 let lt a b = Prim (Lt, [ a; b ])
 
@@ -19,6 +20,16 @@ let samples : (string * term) list =
         (Lam ("f", App (Var "f", App (Var "f", num 1))), Lam ("n", mul (Var "n") (num 2)))
     )
   ; "if: if 1<2 then 10 else 20", If (lt (num 1) (num 2), num 10, num 20)
+  ; ( "letrec: fact 5"
+    , Letrec
+        ( "fact"
+        , Lam
+            ( "n"
+            , If
+                ( lt (Var "n") (num 1)
+                , num 1
+                , mul (Var "n") (App (Var "fact", sub (Var "n") (num 1))) ) )
+        , App (Var "fact", num 5) ) )
   ]
 ;;
 
