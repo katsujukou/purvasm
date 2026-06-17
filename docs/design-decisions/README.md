@@ -52,5 +52,7 @@ language and are kept out of version control.)
 | [0003](0003-stack-based-bytecode.md) | PURVASM bytecode is a stack machine | Accepted |
 | [0004](0004-recursion-letrec-fix.md) | Recursion via `letrec` and store-backpatching | Accepted |
 | [0005](0005-mutual-recursion-binding-groups.md) | Mutual recursion via recursive binding groups | Accepted |
+| [0006](0006-string-utf8-char-int.md) | String as a UTF-8 byte sequence; Char as Int | Accepted |
+| [0007](0007-monomorphic-primitives.md) | Monomorphic primitives; type classes stay dictionary-passing | Accepted |
 
 ## Scope
