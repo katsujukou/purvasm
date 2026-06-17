@@ -7,6 +7,7 @@ open Base
 
 type lit =
   | LInt of int
+  | LNumber of float
   | LBool of bool
   | LString of string
 
@@ -14,10 +15,16 @@ type primop =
   | AddInt
   | SubInt
   | MulInt
+  | AddNumber
+  | SubNumber
+  | MulNumber
+  | DivNumber
   | EqInt
   | EqString
+  | EqNumber
   | LtInt
   | LtString
+  | LtNumber
   | Append
 
 type term =
@@ -34,14 +41,21 @@ let primop_to_string : primop -> string = function
   | AddInt -> "+i"
   | SubInt -> "-i"
   | MulInt -> "*i"
+  | AddNumber -> "+n"
+  | SubNumber -> "-n"
+  | MulNumber -> "*n"
+  | DivNumber -> "/n"
   | EqInt -> "==i"
   | EqString -> "==s"
+  | EqNumber -> "==n"
   | LtInt -> "<i"
   | LtString -> "<s"
+  | LtNumber -> "<n"
   | Append -> "<>"
 
 let lit_to_string : lit -> string = function
   | LInt n -> Int.to_string n
+  | LNumber f -> Float.to_string f
   | LBool b -> Bool.to_string b
   | LString s -> "\"" ^ s ^ "\""
 

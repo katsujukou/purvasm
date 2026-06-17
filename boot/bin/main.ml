@@ -12,6 +12,9 @@ let lt_string a b = Prim (LtString, [ a; b ])
 let eq_int a b = Prim (EqInt, [ a; b ])
 let str s = Lit (LString s)
 let append a b = Prim (Append, [ a; b ])
+let numf f = Lit (LNumber f)
+let add_num a b = Prim (AddNumber, [ a; b ])
+let div_num a b = Prim (DivNumber, [ a; b ])
 
 let samples : (string * term) list =
   [ "arith: (2+3)*2", mul_int (add_int (num 2) (num 3)) (num 2)
@@ -57,6 +60,8 @@ let samples : (string * term) list =
   ; "string: \"foo\" <> \"bar\"", append (str "foo") (str "bar")
   ; ( "string: if \"a\" < \"b\" then \"yes\" else \"no\""
     , If (lt_string (str "a") (str "b"), str "yes", str "no") )
+  ; "number: 1.5 + 2.0", add_num (numf 1.5) (numf 2.0)
+  ; "number: 10.0 / 4.0", div_num (numf 10.0) (numf 4.0)
   ]
 
 let run_all (trace : bool) : unit =

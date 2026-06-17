@@ -12,6 +12,13 @@ let eq_int a b = Prim (EqInt, [ a; b ])
 let eq_string a b = Prim (EqString, [ a; b ])
 let str s = Lit (LString s)
 let append a b = Prim (Append, [ a; b ])
+let numf f = Lit (LNumber f)
+let add_num a b = Prim (AddNumber, [ a; b ])
+let sub_num a b = Prim (SubNumber, [ a; b ])
+let mul_num a b = Prim (MulNumber, [ a; b ])
+let div_num a b = Prim (DivNumber, [ a; b ])
+let eq_num a b = Prim (EqNumber, [ a; b ])
+let lt_num a b = Prim (LtNumber, [ a; b ])
 
 let eval_int (term : term) : int =
   match Cesk.Machine.eval term with
@@ -27,6 +34,11 @@ let eval_string (term : term) : string =
   match Cesk.Machine.eval term with
   | Cesk.Value.VString s -> s
   | _ -> Alcotest.fail "expected a string result"
+
+let eval_number (term : term) : float =
+  match Cesk.Machine.eval term with
+  | Cesk.Value.VNumber f -> f
+  | _ -> Alcotest.fail "expected a number result"
 
 (* Evaluation must get stuck (raise Machine_error), regardless of the message. *)
 let assert_stuck (term : term) : unit =
@@ -217,6 +229,70 @@ let test_string_eq_false () =
 let test_string_lt () =
   Alcotest.(check bool) "abc<abd" true (eval_bool (lt_string (str "abc") (str "abd")))
 
+(* Numbers ------------------------------------------------------------------ *)
+
+let test_number_add () =
+  Alcotest.(check (float 1e-9))
+    "1.5+2.0"
+    3.5
+    (eval_number (add_num (numf 1.5) (numf 2.0)))
+
+let test_number_sub () =
+  Alcotest.(check (float 1e-9))
+    "5.0-1.5"
+    3.5
+    (eval_number (sub_num (numf 5.0) (numf 1.5)))
+
+let test_number_mul () =
+  Alcotest.(check (float 1e-9))
+    "2.0*1.5"
+    3.0
+    (eval_number (mul_num (numf 2.0) (numf 1.5)))
+
+let test_number_div () =
+  Alcotest.(check (float 1e-9))
+    "10.0/4.0"
+    2.5
+    (eval_number (div_num (numf 10.0) (numf 4.0)))
+
+(* Division is total: 1.0/0.0 = +inf, no exception. *)
+let test_number_div_inf () =
+  Alcotest.(check bool)
+    "1.0/0.0 = +inf"
+    true
+    (eval_number (div_num (numf 1.0) (numf 0.0)) = infinity)
+
+(* 0.0/0.0 = nan, again no exception. *)
+let test_number_div_nan () =
+  Alcotest.(check bool)
+    "0.0/0.0 is nan"
+    true
+    (Float.is_nan (eval_number (div_num (numf 0.0) (numf 0.0))))
+
+let test_number_eq_true () =
+  Alcotest.(check bool) "1.5==1.5" true (eval_bool (eq_num (numf 1.5) (numf 1.5)))
+
+let test_number_eq_false () =
+  Alcotest.(check bool) "1.5==2.0" false (eval_bool (eq_num (numf 1.5) (numf 2.0)))
+
+(* IEEE: nan is not equal to itself (matches PureScript/JS). The crux of ADR-0008
+   — it must NOT use a total-order comparison. *)
+let test_number_eq_nan () =
+  Alcotest.(check bool)
+    "nan==nan is false"
+    false
+    (eval_bool (eq_num (numf nan) (numf nan)))
+
+let test_number_lt () =
+  Alcotest.(check bool) "1.5<2.0" true (eval_bool (lt_num (numf 1.5) (numf 2.0)))
+
+(* IEEE: any ordering comparison involving nan is false. *)
+let test_number_lt_nan () =
+  Alcotest.(check bool)
+    "nan<1.0 is false"
+    false
+    (eval_bool (lt_num (numf nan) (numf 1.0)))
+
 (* Stuck states ------------------------------------------------------------- *)
 
 let test_unbound () = assert_stuck (Var "nope")
@@ -241,6 +317,10 @@ let test_letrec_mutual_blackhole () =
    a mixed-type comparison has no matching rule. *)
 let test_append_type_error () = assert_stuck (append (num 1) (num 2))
 let test_eq_mixed_type () = assert_stuck (eq_int (num 1) (str "a"))
+
+(* Number arithmetic on Ints has no matching rule (Int and Number are distinct
+   primitives — no cross-type arithmetic). *)
+let test_number_type_error () = assert_stuck (add_num (num 1) (num 2))
 
 let () =
   Alcotest.run
@@ -276,6 +356,17 @@ let () =
         ; Alcotest.test_case "string_eq_true" `Quick test_string_eq_true
         ; Alcotest.test_case "string_eq_false" `Quick test_string_eq_false
         ; Alcotest.test_case "string_lt" `Quick test_string_lt
+        ; Alcotest.test_case "number_add" `Quick test_number_add
+        ; Alcotest.test_case "number_sub" `Quick test_number_sub
+        ; Alcotest.test_case "number_mul" `Quick test_number_mul
+        ; Alcotest.test_case "number_div" `Quick test_number_div
+        ; Alcotest.test_case "number_div_inf" `Quick test_number_div_inf
+        ; Alcotest.test_case "number_div_nan" `Quick test_number_div_nan
+        ; Alcotest.test_case "number_eq_true" `Quick test_number_eq_true
+        ; Alcotest.test_case "number_eq_false" `Quick test_number_eq_false
+        ; Alcotest.test_case "number_eq_nan" `Quick test_number_eq_nan
+        ; Alcotest.test_case "number_lt" `Quick test_number_lt
+        ; Alcotest.test_case "number_lt_nan" `Quick test_number_lt_nan
         ] )
     ; ( "stuck"
       , [ Alcotest.test_case "unbound" `Quick test_unbound
@@ -287,5 +378,6 @@ let () =
         ; Alcotest.test_case "letrec_mutual_blackhole" `Quick test_letrec_mutual_blackhole
         ; Alcotest.test_case "append_type_error" `Quick test_append_type_error
         ; Alcotest.test_case "eq_mixed_type" `Quick test_eq_mixed_type
+        ; Alcotest.test_case "number_type_error" `Quick test_number_type_error
         ] )
     ]
