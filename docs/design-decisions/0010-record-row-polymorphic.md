@@ -41,8 +41,9 @@ out but the representation is chosen so they drop in later.
    - `Ast.Record of (string * term) list` — a record literal (`ObjectLiteral`).
      Fields evaluate **left to right** via a `Record_fields` frame (the
      label-carrying sibling of `Array_elems`/`Prim_args`).
-   - `Ast.Accessor of string * term` — `r.label` (`Accessor`), a **static**
-     label fixed at compile time. Evaluates the record, then projects.
+   - `Ast.Accessor of term * string` — `r.label` (`Accessor`), a **static**
+     label fixed at compile time. Evaluates the record, then projects. (Record
+     first, label second — matching `Update` and the `r.label` reading.)
    - `Ast.Update of term * (string * term) list` — `r { l = e, … }`
      (`ObjectUpdate`). Evaluates the base record, then each new field value
      left to right, then returns a **new** record (immutable) with those labels
@@ -71,16 +72,16 @@ a lookup, `m{l ↦ v}` an update, `∅` the empty record.
 | `t` | next state |
 | - | - |
 | `Record []` | `⟨Return (VRecord ∅), σ, κ⟩` |
-| `Record ((l,e) :: rest)` | `⟨Eval(e, ρ), σ, Record_fields(l, [], rest, ρ, κ)⟩` |
-| `Accessor(l, e)` | `⟨Eval(e, ρ), σ, Project(l, κ)⟩` |
+| `Record ((l,e) :: rest)` | `⟨Eval(e, ρ), σ, Record_fields(∅, l, rest, ρ, κ)⟩` |
+| `Accessor(e, l)` | `⟨Eval(e, ρ), σ, Project(l, κ)⟩` |
 | `Update(e, ups)` | `⟨Eval(e, ρ), σ, Update_rec(ups, ρ, κ)⟩` |
 
 **Return mode** — record literal:
 
 | `κ` | next state |
 | - | - |
-| `Record_fields(l, done, [], ρ, κ′)` | `⟨Return (VRecord (mapOf ((l,v) :: done))), σ, κ′⟩` |
-| `Record_fields(l, done, (l₂,e₂) :: rest, ρ, κ′)` | `⟨Eval(e₂, ρ), σ, Record_fields(l₂, (l,v) :: done, rest, ρ, κ′)⟩` |
+| `Record_fields(m, l, [], ρ, κ′)` | `⟨Return (VRecord m{l ↦ v}), σ, κ′⟩` |
+| `Record_fields(m, l, (l₂,e₂) :: rest, ρ, κ′)` | `⟨Eval(e₂, ρ), σ, Record_fields(m{l ↦ v}, l₂, rest, ρ, κ′)⟩` |
 
 **Return mode** — projection:
 
@@ -89,15 +90,25 @@ a lookup, `m{l ↦ v}` an update, `∅` the empty record.
 | `Project(l, κ′)` | `v = VRecord m`, `l ∈ m` | `⟨Return m[l], σ, κ′⟩` |
 | `Project(l, κ′)` | otherwise | **stuck** |
 
-**Return mode** — update (base record first, then new field values):
+**Return mode** — update (evaluate the base record, then hand off to
+`Record_fields` seeded with it):
 
 | `κ` | condition | next state |
 | - | - | - |
 | `Update_rec([], ρ, κ′)` | `v = VRecord m` | `⟨Return (VRecord m), σ, κ′⟩` (no-op update) |
-| `Update_rec((l,e) :: rest, ρ, κ′)` | `v = VRecord m` | `⟨Eval(e, ρ), σ, Update_fields(m, l, [], rest, ρ, κ′)⟩` |
+| `Update_rec((l,e) :: rest, ρ, κ′)` | `v = VRecord m` | `⟨Eval(e, ρ), σ, Record_fields(m, l, rest, ρ, κ′)⟩` |
 | `Update_rec(_, ρ, κ′)` | `v` not a record | **stuck** |
-| `Update_fields(m, l, done, [], ρ, κ′)` | | `⟨Return (VRecord (m with all ((l,v) :: done) set)), σ, κ′⟩` |
-| `Update_fields(m, l, done, (l₂,e₂) :: rest, ρ, κ′)` | | `⟨Eval(e₂, ρ), σ, Update_fields(m, l₂, (l,v) :: done, rest, ρ, κ′)⟩` |
+
+> **Correction (2026-06-18):** the rules above were revised to match the
+> implementation. (1) `Record_fields` threads the **partial field map** `m`
+> (seeded `∅` for a literal) rather than a `done` list reversed and `mapOf`-ed at
+> the end — equivalent, but one fewer pass and unambiguous last-writer-wins.
+> (2) A **record update is a record build seeded with the base record**:
+> `Update_rec` evaluates the base to `m`, then hands off to the *same*
+> `Record_fields` frame seeded with `m`. The separately-listed `Update_fields`
+> frame folds into `Record_fields` (identical once the map is threaded), so the
+> machine has **three** record frames — `Record_fields`, `Project`, `Update_rec`
+> — not four. (3) `Accessor` takes `term * string` (record first, label second).
 
 ## Consequences
 
