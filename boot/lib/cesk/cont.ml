@@ -32,4 +32,3 @@ let frame_name : t -> string = function
   | If_branch _ -> "if"
   | Prim_args _ -> "prim"
   | Letrec_bind _ -> "rec"
-;;

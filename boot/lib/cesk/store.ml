@@ -25,20 +25,17 @@ let empty : t = { map = Map.empty (module Addr); next = Addr.zero }
 let alloc (store : t) (value : Value.t) : Addr.t * t =
   let addr = store.next in
   addr, { map = Map.set store.map ~key:addr ~data:(Filled value); next = Addr.next addr }
-;;
 
 (* Reserve a fresh address holding a black-hole, to be filled later by `set`.
    This lets `letrec` bind a name to an address before the value exists. *)
 let reserve (store : t) : Addr.t * t =
   let addr = store.next in
   addr, { map = Map.set store.map ~key:addr ~data:Blackhole; next = Addr.next addr }
-;;
 
 (* Overwrite an already-reserved address with its value — the recursive knot.
    Callers only `set` an address previously handed out by `reserve`. *)
 let set (store : t) (addr : Addr.t) (value : Value.t) : t =
   { store with map = Map.set store.map ~key:addr ~data:(Filled value) }
-;;
 
 let find (store : t) (addr : Addr.t) : Value.t =
   match Map.find store.map addr with
@@ -47,6 +44,5 @@ let find (store : t) (addr : Addr.t) : Value.t =
     Errors.stuck
       ("recursive binding used before initialization: address " ^ Addr.to_string addr)
   | None -> Errors.stuck ("dangling store address: " ^ Addr.to_string addr)
-;;
 
 let size (store : t) : int = Map.length store.map

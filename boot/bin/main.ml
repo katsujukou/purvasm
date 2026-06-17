@@ -31,7 +31,6 @@ let samples : (string * term) list =
                 , mul (Var "n") (App (Var "fact", sub (Var "n") (num 1))) ) )
         , App (Var "fact", num 5) ) )
   ]
-;;
 
 let run_all (trace : bool) : unit =
   List.iter
@@ -40,17 +39,14 @@ let run_all (trace : bool) : unit =
        let v = Machine.eval ~trace term in
        Stdlib.Printf.printf "%-44s => %s\n" name (Value.to_string v))
     samples
-;;
 
 let trace_arg =
   let open Cmdliner in
   Arg.(value & flag & info [ "t"; "trace" ] ~doc:"Print every CESK transition.")
-;;
 
 let cmd =
   let open Cmdliner in
   let doc = "Run sample programs on the CESK machine." in
   Cmd.v (Cmd.info "cesk" ~version:"0.1.0" ~doc) Term.(const run_all $ trace_arg)
-;;
 
 let () = Stdlib.exit (Cmdliner.Cmd.eval cmd)

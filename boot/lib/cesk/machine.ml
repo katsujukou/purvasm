@@ -22,7 +22,6 @@ type result =
 
 let inject (term : Ast.term) : state =
   { focus = Eval (term, Env.empty); store = Store.empty; kont = Cont.Halt }
-;;
 
 let step (s : state) : result =
   match s.focus with
@@ -96,7 +95,6 @@ let step (s : state) : result =
               focus = Eval (a, env)
             ; kont = Cont.Prim_args (op, done_, rest, env, k)
             }))
-;;
 
 let state_to_string (s : state) : string =
   let focus =
@@ -109,13 +107,11 @@ let state_to_string (s : state) : string =
     focus
     (Cont.frame_name s.kont)
     (Store.size s.store)
-;;
 
 let rec run ?(trace = false) (s : state) : Value.t =
   if trace then Stdlib.print_endline (state_to_string s);
   match step s with
   | Done v -> v
   | Step s' -> run ~trace s'
-;;
 
 let eval ?(trace = false) (term : Ast.term) : Value.t = run ~trace (inject term)

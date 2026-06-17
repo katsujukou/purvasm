@@ -15,4 +15,3 @@ let lookup (env : t) (name : string) : Addr.t =
   match List.Assoc.find env ~equal:String.equal name with
   | Some addr -> addr
   | None -> Errors.stuck ("unbound variable: " ^ name)
-;;

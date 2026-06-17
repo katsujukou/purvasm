@@ -32,12 +32,10 @@ let primop_to_string : primop -> string = function
   | Mul -> "*"
   | Eq -> "=="
   | Lt -> "<"
-;;
 
 let lit_to_string : lit -> string = function
   | LInt n -> Int.to_string n
   | LBool b -> Bool.to_string b
-;;
 
 let rec to_string : term -> string = function
   | Lit l -> lit_to_string l
@@ -55,4 +53,3 @@ let rec to_string : term -> string = function
     ^ " "
     ^ String.concat ~sep:" " (List.map args ~f:to_string)
     ^ ")"
-;;
