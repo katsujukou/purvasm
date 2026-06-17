@@ -55,5 +55,6 @@ language and are kept out of version control.)
 | [0006](0006-string-utf8-char-int.md) | String as a UTF-8 byte sequence; Char as Int | Accepted |
 | [0007](0007-monomorphic-primitives.md) | Monomorphic primitives; type classes stay dictionary-passing | Accepted |
 | [0008](0008-number-ieee754-double.md) | Number as an IEEE 754 double (host float) | Accepted |
+| [0009](0009-array-immutable-host-backed.md) | Array as an immutable, host-backed vector | Accepted |
 
 ## Scope
