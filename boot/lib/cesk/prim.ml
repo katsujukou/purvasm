@@ -12,3 +12,4 @@ let eval (op : primop) (args : Value.t list) : Value.t =
   | Eq, [ Value.VInt a; Value.VInt b ] -> Value.VBool (a = b)
   | Lt, [ Value.VInt a; Value.VInt b ] -> Value.VBool (a < b)
   | _ -> Errors.stuck ("primop " ^ primop_to_string op ^ ": ill-typed arguments")
+;;

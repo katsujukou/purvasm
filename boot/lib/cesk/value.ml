@@ -19,3 +19,4 @@ let to_string : t -> string = function
   | VInt n -> Int.to_string n
   | VBool b -> Bool.to_string b
   | VClosure _ -> "<closure>"
+;;

@@ -22,6 +22,7 @@ type result =
 
 let inject (term : Ast.term) : state =
   { focus = Eval (term, Env.empty); store = Store.empty; kont = Cont.Halt }
+;;
 
 let step (s : state) : result =
   match s.focus with
@@ -30,8 +31,10 @@ let step (s : state) : result =
      | Ast.Lit (Ast.LInt n) -> Step { s with focus = Return (Value.VInt n) }
      | Ast.Lit (Ast.LBool b) -> Step { s with focus = Return (Value.VBool b) }
      | Ast.Var x -> Step { s with focus = Return (Store.find s.store (Env.lookup env x)) }
-     | Ast.Lam (param, body) -> Step { s with focus = Return (Value.VClosure { param; body; env }) }
-     | Ast.App (f, a) -> Step { s with focus = Eval (f, env); kont = Cont.Fun (a, env, s.kont) }
+     | Ast.Lam (param, body) ->
+       Step { s with focus = Return (Value.VClosure { param; body; env }) }
+     | Ast.App (f, a) ->
+       Step { s with focus = Eval (f, env); kont = Cont.Fun (a, env, s.kont) }
      | Ast.Let (x, e1, e2) ->
        Step { s with focus = Eval (e1, env); kont = Cont.Let_body (x, e2, env, s.kont) }
      | Ast.If (c, t, e) ->
@@ -40,11 +43,16 @@ let step (s : state) : result =
        (match args with
         | [] -> Step { s with focus = Return (Prim.eval op []) }
         | a :: rest ->
-          Step { s with focus = Eval (a, env); kont = Cont.Prim_args (op, [], rest, env, s.kont) }))
+          Step
+            { s with
+              focus = Eval (a, env)
+            ; kont = Cont.Prim_args (op, [], rest, env, s.kont)
+            }))
   | Return v ->
     (match s.kont with
      | Cont.Halt -> Done v
-     | Cont.Fun (a, env, k) -> Step { s with focus = Eval (a, env); kont = Cont.Arg (v, k) }
+     | Cont.Fun (a, env, k) ->
+       Step { s with focus = Eval (a, env); kont = Cont.Arg (v, k) }
      | Cont.Arg (vfun, k) ->
        (match vfun with
         | Value.VClosure { param; body; env = closure_env } ->
@@ -58,14 +66,20 @@ let step (s : state) : result =
        Step { focus = Eval (e2, env'); store = store'; kont = k }
      | Cont.If_branch (t, e, env, k) ->
        (match v with
-        | Value.VBool b -> Step { focus = Eval ((if b then t else e), env); store = s.store; kont = k }
+        | Value.VBool b ->
+          Step { focus = Eval ((if b then t else e), env); store = s.store; kont = k }
         | _ -> Errors.stuck "if-condition is not a boolean")
      | Cont.Prim_args (op, done_, remaining, env, k) ->
        let done_ = v :: done_ in
        (match remaining with
         | [] -> Step { s with focus = Return (Prim.eval op (List.rev done_)); kont = k }
         | a :: rest ->
-          Step { s with focus = Eval (a, env); kont = Cont.Prim_args (op, done_, rest, env, k) }))
+          Step
+            { s with
+              focus = Eval (a, env)
+            ; kont = Cont.Prim_args (op, done_, rest, env, k)
+            }))
+;;
 
 let state_to_string (s : state) : string =
   let focus =
@@ -73,12 +87,18 @@ let state_to_string (s : state) : string =
     | Eval (t, _) -> "eval " ^ Ast.to_string t
     | Return v -> "ret  " ^ Value.to_string v
   in
-  Stdlib.Printf.sprintf "[ %-28s | k:%-4s | store:%d ]" focus (Cont.frame_name s.kont) (Store.size s.store)
+  Stdlib.Printf.sprintf
+    "[ %-28s | k:%-4s | store:%d ]"
+    focus
+    (Cont.frame_name s.kont)
+    (Store.size s.store)
+;;
 
 let rec run ?(trace = false) (s : state) : Value.t =
   if trace then Stdlib.print_endline (state_to_string s);
   match step s with
   | Done v -> v
   | Step s' -> run ~trace s'
+;;
 
 let eval ?(trace = false) (term : Ast.term) : Value.t = run ~trace (inject term)

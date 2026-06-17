@@ -1,0 +1,86 @@
+name: OCaml-CI
+
+# The workflow always triggers (no top-level `paths-ignore`) so that the required
+# `ci-gate` status check is *always* produced — otherwise a docs-only PR would skip the
+# workflow, never report `ci-gate`, and branch protection would leave the PR unmergeable.
+# The expensive Nix matrix is gated on whether non-docs files actually changed, so a
+# docs-only change still skips the heavy build but the gate goes green.
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+# Cancel a superseded run when new commits land on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Decide whether the heavy build needs to run: true iff something other than docs /
+  # README changed.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'boot/**'
+
+  ci:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      # Setup Nix envirionment
+      - uses: actions/checkout@v5
+      # v30 ships Nix >= 2.18, required by the pinned nixos-25.11 nixpkgs.
+      - uses: cachix/install-nix-action@v30
+        with:
+          # No nixpkgs channel pin here: the toolchain comes from `nix develop`,
+          # so flake.nix + flake.lock are the single source of truth.
+          extra_nix_config: experimental-features = nix-command flakes
+      - uses: cachix/cachix-action@v17
+        with:
+          name: purvasm
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+      # Loads the `nix develop` environment (dune, ocaml, alcotest, ocamlformat,
+      # …) into PATH for every `run:` step below.
+      - uses: nicknovitski/nix-develop@v1
+
+      # Build, test, and format-check the OCaml project under boot/.
+      - name: Build
+        run: dune build
+        working-directory: boot
+
+      - name: Test
+        run: dune test
+        working-directory: boot
+
+      # Fails if any file is not ocamlformat-clean (profile pinned in
+      # boot/.ocamlformat). The PURescript "check" step's OCaml equivalent.
+      - name: Format check
+        run: dune build @fmt
+        working-directory: boot
+
+  # The single required status check. Always runs; green when the matrix passed OR was
+  # skipped (docs-only), red when any matrix leg failed or was cancelled. Point branch
+  # protection at THIS job (`ci-gate`), not the matrix legs.
+  ci-gate:
+    needs: [ci]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate on the matrix result
+        run: |
+          result='${{ needs.ci.result }}'
+          if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+            echo "::error::CI matrix did not pass (result: $result)"
+            exit 1
+          fi
+          echo "CI gate green (matrix result: $result)"

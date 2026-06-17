@@ -27,3 +27,4 @@ let frame_name : t -> string = function
   | Let_body _ -> "let"
   | If_branch _ -> "if"
   | Prim_args _ -> "prim"
+;;

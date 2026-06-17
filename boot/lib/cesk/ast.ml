@@ -30,10 +30,12 @@ let primop_to_string : primop -> string = function
   | Mul -> "*"
   | Eq -> "=="
   | Lt -> "<"
+;;
 
 let lit_to_string : lit -> string = function
   | LInt n -> Int.to_string n
   | LBool b -> Bool.to_string b
+;;
 
 let rec to_string : term -> string = function
   | Lit l -> lit_to_string l
@@ -44,4 +46,9 @@ let rec to_string : term -> string = function
   | If (c, t, e) ->
     "(if " ^ to_string c ^ " then " ^ to_string t ^ " else " ^ to_string e ^ ")"
   | Prim (op, args) ->
-    "(" ^ primop_to_string op ^ " " ^ String.concat ~sep:" " (List.map args ~f:to_string) ^ ")"
+    "("
+    ^ primop_to_string op
+    ^ " "
+    ^ String.concat ~sep:" " (List.map args ~f:to_string)
+    ^ ")"
+;;

@@ -14,11 +14,13 @@ let empty : t = { map = Map.empty (module Int); next = 0 }
 
 let alloc (store : t) (value : Value.t) : int * t =
   let addr = store.next in
-  (addr, { map = Map.set store.map ~key:addr ~data:value; next = addr + 1 })
+  addr, { map = Map.set store.map ~key:addr ~data:value; next = addr + 1 }
+;;
 
 let find (store : t) (addr : int) : Value.t =
   match Map.find store.map addr with
   | Some value -> value
   | None -> Errors.stuck ("dangling store address: " ^ Int.to_string addr)
+;;
 
 let size (store : t) : int = Map.length store.map

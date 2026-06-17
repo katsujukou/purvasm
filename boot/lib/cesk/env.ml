@@ -9,10 +9,10 @@ open Base
 type t = (string * int) list
 
 let empty : t = []
-
 let extend (env : t) (name : string) (addr : int) : t = (name, addr) :: env
 
 let lookup (env : t) (name : string) : int =
   match List.Assoc.find env ~equal:String.equal name with
   | Some addr -> addr
   | None -> Errors.stuck ("unbound variable: " ^ name)
+;;
