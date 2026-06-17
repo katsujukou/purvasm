@@ -6,10 +6,9 @@
       url = "github:thomashoneyman/purescript-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    nix-claude-code.url = "github:ryoppippi/nix-claude-code";
  };
 
-  outputs = { self, nixpkgs, flake-utils, purescript-overlay, nix-claude-code }:
+  outputs = { self, nixpkgs, flake-utils, purescript-overlay }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
@@ -34,7 +33,6 @@
           js_of_ocaml-ppx
           alcotest
         ];
-        claude-code = nix-claude-code.packages.${system}.default;
       in
         {
           devShells.default = pkgs.mkShellNoCC {
@@ -57,7 +55,6 @@
               nodejs_24
               pnpm
               gnuplot
-              claude-code
             ]);
           };
         }
