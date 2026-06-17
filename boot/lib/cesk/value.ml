@@ -7,6 +7,7 @@ open Base
 type t =
   | VInt of int
   | VBool of bool
+  | VString of string
   | VClosure of closure
 
 and closure =
@@ -18,4 +19,5 @@ and closure =
 let to_string : t -> string = function
   | VInt n -> Int.to_string n
   | VBool b -> Bool.to_string b
+  | VString s -> "\"" ^ s ^ "\""
   | VClosure _ -> "<closure>"

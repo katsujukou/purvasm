@@ -6,9 +6,13 @@ open Ast
 
 let eval (op : primop) (args : Value.t list) : Value.t =
   match op, args with
-  | Add, [ Value.VInt a; Value.VInt b ] -> Value.VInt (a + b)
-  | Sub, [ Value.VInt a; Value.VInt b ] -> Value.VInt (a - b)
-  | Mul, [ Value.VInt a; Value.VInt b ] -> Value.VInt (a * b)
-  | Eq, [ Value.VInt a; Value.VInt b ] -> Value.VBool (a = b)
-  | Lt, [ Value.VInt a; Value.VInt b ] -> Value.VBool (a < b)
+  | AddInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (a + b)
+  | SubInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (a - b)
+  | MulInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (a * b)
+  | EqInt, [ Value.VInt a; Value.VInt b ] -> Value.VBool (a = b)
+  | EqString, [ Value.VString a; Value.VString b ] -> Value.VBool (String.equal a b)
+  | LtInt, [ Value.VInt a; Value.VInt b ] -> Value.VBool (a < b)
+  (* Byte-wise comparison; for UTF-8 this is code-point (natural) order. *)
+  | LtString, [ Value.VString a; Value.VString b ] -> Value.VBool (String.compare a b < 0)
+  | Append, [ Value.VString a; Value.VString b ] -> Value.VString (a ^ b)
   | _ -> Errors.stuck ("primop " ^ primop_to_string op ^ ": ill-typed arguments")

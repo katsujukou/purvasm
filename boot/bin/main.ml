@@ -4,32 +4,36 @@ open Cesk.Ast
 (* Smart constructors keep the sample programs readable. There is no parser yet,
    so programs are built directly as core terms. *)
 let num n = Lit (LInt n)
-let add a b = Prim (Add, [ a; b ])
-let sub a b = Prim (Sub, [ a; b ])
-let mul a b = Prim (Mul, [ a; b ])
-let lt a b = Prim (Lt, [ a; b ])
-let eq a b = Prim (Eq, [ a; b ])
+let add_int a b = Prim (AddInt, [ a; b ])
+let sub_int a b = Prim (SubInt, [ a; b ])
+let mul_int a b = Prim (MulInt, [ a; b ])
+let lt_int a b = Prim (LtInt, [ a; b ])
+let lt_string a b = Prim (LtString, [ a; b ])
+let eq_int a b = Prim (EqInt, [ a; b ])
+let str s = Lit (LString s)
+let append a b = Prim (Append, [ a; b ])
 
 let samples : (string * term) list =
-  [ "arith: (2+3)*2", mul (add (num 2) (num 3)) (num 2)
-  ; "let: let x=2 in x+1", Let ("x", num 2, add (Var "x") (num 1))
-  ; "lambda: (\\x -> x+1) 4", App (Lam ("x", add (Var "x") (num 1)), num 4)
+  [ "arith: (2+3)*2", mul_int (add_int (num 2) (num 3)) (num 2)
+  ; "let: let x=2 in x+1", Let ("x", num 2, add_int (Var "x") (num 1))
+  ; "lambda: (\\x -> x+1) 4", App (Lam ("x", add_int (Var "x") (num 1)), num 4)
   ; ( "closure: let a=10 in (\\x -> x+a) 5"
-    , Let ("a", num 10, App (Lam ("x", add (Var "x") (Var "a")), num 5)) )
+    , Let ("a", num 10, App (Lam ("x", add_int (Var "x") (Var "a")), num 5)) )
   ; ( "higher-order: (\\f -> f (f 1)) (\\n -> n*2)"
     , App
-        (Lam ("f", App (Var "f", App (Var "f", num 1))), Lam ("n", mul (Var "n") (num 2)))
-    )
-  ; "if: if 1<2 then 10 else 20", If (lt (num 1) (num 2), num 10, num 20)
+        ( Lam ("f", App (Var "f", App (Var "f", num 1)))
+        , Lam ("n", mul_int (Var "n") (num 2)) ) )
+  ; "if: if 1<2 then 10 else 20", If (lt_int (num 1) (num 2), num 10, num 20)
   ; ( "letrec: fact 5"
     , Letrec
         ( [ ( "fact"
             , Lam
                 ( "n"
                 , If
-                    ( lt (Var "n") (num 1)
+                    ( lt_int (Var "n") (num 1)
                     , num 1
-                    , mul (Var "n") (App (Var "fact", sub (Var "n") (num 1))) ) ) )
+                    , mul_int (Var "n") (App (Var "fact", sub_int (Var "n") (num 1))) ) )
+            )
           ]
         , App (Var "fact", num 5) ) )
   ; ( "mutual: even 10"
@@ -38,18 +42,21 @@ let samples : (string * term) list =
             , Lam
                 ( "n"
                 , If
-                    ( eq (Var "n") (num 0)
+                    ( eq_int (Var "n") (num 0)
                     , Lit (LBool true)
-                    , App (Var "odd", sub (Var "n") (num 1)) ) ) )
+                    , App (Var "odd", sub_int (Var "n") (num 1)) ) ) )
           ; ( "odd"
             , Lam
                 ( "n"
                 , If
-                    ( eq (Var "n") (num 0)
+                    ( eq_int (Var "n") (num 0)
                     , Lit (LBool false)
-                    , App (Var "even", sub (Var "n") (num 1)) ) ) )
+                    , App (Var "even", sub_int (Var "n") (num 1)) ) ) )
           ]
         , App (Var "even", num 10) ) )
+  ; "string: \"foo\" <> \"bar\"", append (str "foo") (str "bar")
+  ; ( "string: if \"a\" < \"b\" then \"yes\" else \"no\""
+    , If (lt_string (str "a") (str "b"), str "yes", str "no") )
   ]
 
 let run_all (trace : bool) : unit =

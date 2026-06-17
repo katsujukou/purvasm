@@ -29,6 +29,7 @@ let step (s : state) : result =
     (match term with
      | Ast.Lit (Ast.LInt n) -> Step { s with focus = Return (Value.VInt n) }
      | Ast.Lit (Ast.LBool b) -> Step { s with focus = Return (Value.VBool b) }
+     | Ast.Lit (Ast.LString str) -> Step { s with focus = Return (Value.VString str) }
      | Ast.Var x -> Step { s with focus = Return (Store.find s.store (Env.lookup env x)) }
      | Ast.Lam (param, body) ->
        Step { s with focus = Return (Value.VClosure { param; body; env }) }

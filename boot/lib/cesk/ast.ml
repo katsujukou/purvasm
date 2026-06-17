@@ -8,13 +8,17 @@ open Base
 type lit =
   | LInt of int
   | LBool of bool
+  | LString of string
 
 type primop =
-  | Add
-  | Sub
-  | Mul
-  | Eq
-  | Lt
+  | AddInt
+  | SubInt
+  | MulInt
+  | EqInt
+  | EqString
+  | LtInt
+  | LtString
+  | Append
 
 type term =
   | Lit of lit
@@ -27,15 +31,19 @@ type term =
   | Prim of primop * term list
 
 let primop_to_string : primop -> string = function
-  | Add -> "+"
-  | Sub -> "-"
-  | Mul -> "*"
-  | Eq -> "=="
-  | Lt -> "<"
+  | AddInt -> "+i"
+  | SubInt -> "-i"
+  | MulInt -> "*i"
+  | EqInt -> "==i"
+  | EqString -> "==s"
+  | LtInt -> "<i"
+  | LtString -> "<s"
+  | Append -> "<>"
 
 let lit_to_string : lit -> string = function
   | LInt n -> Int.to_string n
   | LBool b -> Bool.to_string b
+  | LString s -> "\"" ^ s ^ "\""
 
 let rec to_string : term -> string = function
   | Lit l -> lit_to_string l
