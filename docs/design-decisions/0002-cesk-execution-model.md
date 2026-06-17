@@ -112,6 +112,11 @@ One symmetry runs through the whole table:
   types and pattern matching, effect handlers, a real GC, a CoreFn frontend, and
   bytecode. These are follow-on slices.
 
+  > **Progress (2026-06-17):** recursion (`letrec`/`fix`) is now specified as a
+  > follow-on decision in [0004](0004-recursion-letrec-fix.md) (Proposed), which
+  > extends the transition rules above with store-backpatching. The remaining
+  > items stay uncovered.
+
 ## Alternatives considered
 
 - **Tree-walking interpreter using the host call stack.** Simplest, but the
