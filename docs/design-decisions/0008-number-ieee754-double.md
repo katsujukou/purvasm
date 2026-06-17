@@ -32,10 +32,19 @@ representation choice.
    different instances → different FFI idents).
 
 3. **Semantics are exactly host-float semantics, which coincide with
-   PureScript/JS.** Implement `EqNumber` / `LtNumber` with the **IEEE float
-   comparison operators** (`Float.equal` / float `<`), explicitly **not** OCaml's
-   polymorphic `compare` or `Float.compare` (which impose a total order that
-   makes `nan` orderable). This is what makes:
+   PureScript/JS.** Implement `EqNumber` / `LtNumber` with **IEEE comparison**:
+   the polymorphic `=` and `<` operators yield IEEE results on floats
+   (`nan = nan` is `false`, any `nan` comparison is `false`). Do **not** use
+   `Float.compare` *or* `Float.equal` — both impose a total order in which `nan`
+   equals itself.
+
+   > **Correction (2026-06-17):** an earlier draft of this point named
+   > `Float.equal` as the IEEE primitive. It is not: OCaml's `Float.equal` is
+   > defined via `Float.compare` and is therefore total (`Float.equal nan nan =
+   > true`). The IEEE behaviour comes from the polymorphic `=`/`<` operators
+   > applied to floats, which is what the implementation uses.
+
+   This is what makes:
    - `EqNumber nan nan = false` (matches JS `NaN === NaN` → false),
    - `LtNumber nan _ = false` and `LtNumber _ nan = false`,
    - `±0.0`, `±inf` behave as IEEE specifies,
