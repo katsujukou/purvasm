@@ -28,6 +28,18 @@ type t =
   (* Building an array literal: elements already evaluated (in reverse), then the
      element terms still to evaluate — the same shape as Prim_args (ADR-0009). *)
   | Array_elems of Value.t list * Ast.term list * Env.t * t
+  (* Building a record value field by field (ADR-0010): the field map so far, the
+     label whose value is being evaluated now, and the (label, term) fields still
+     to go. A record literal seeds the map empty; a record update seeds it with
+     the base record (Update_rec evaluates that base first), so both share this
+     frame. *)
+  | Record_fields of Value.record * string * (string * Ast.term) list * Env.t * t
+  (* Projecting a field: the record is being evaluated; once it is a value we
+     read this label out of it. *)
+  | Project of string * t
+  (* A record *functional* update whose base record is being evaluated; once it is a record we
+     start evaluating the update fields (see Record_fields). *)
+  | Update_rec of (string * Ast.term) list * Env.t * t
 
 let frame_name : t -> string = function
   | Halt -> "halt"
@@ -38,3 +50,6 @@ let frame_name : t -> string = function
   | Prim_args _ -> "prim"
   | Letrec_bind _ -> "rec"
   | Array_elems _ -> "arr"
+  | Record_fields _ -> "fld"
+  | Project _ -> "prj"
+  | Update_rec _ -> "upd"

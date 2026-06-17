@@ -39,6 +39,9 @@ type term =
   | If of term * term * term
   | Prim of primop * term list
   | Array of term list
+  | Record of (string * term) list
+  | Accessor of term * string
+  | Update of term * (string * term) list
 
 let primop_to_string : primop -> string = function
   | AddInt -> "+i"
@@ -87,3 +90,13 @@ let rec to_string : term -> string = function
     ^ String.concat ~sep:" " (List.map args ~f:to_string)
     ^ ")"
   | Array elems -> "[" ^ String.concat ~sep:", " (List.map elems ~f:to_string) ^ "]"
+  | Record fields ->
+    "{"
+    ^ String.concat ~sep:", " (List.map fields ~f:(fun (l, e) -> l ^ ": " ^ to_string e))
+    ^ "}"
+  | Accessor (e, l) -> to_string e ^ "." ^ l
+  | Update (e, ups) ->
+    to_string e
+    ^ " { "
+    ^ String.concat ~sep:", " (List.map ups ~f:(fun (l, u) -> l ^ " = " ^ to_string u))
+    ^ " }"

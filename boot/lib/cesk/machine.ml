@@ -78,7 +78,20 @@ let step (s : state) : result =
             { s with
               focus = Eval (e1, env)
             ; kont = Cont.Array_elems ([], rest, env, s.kont)
-            }))
+            })
+     | Ast.Record fields ->
+       (match fields with
+        | [] -> Step { s with focus = Return (Value.VRecord (Map.empty (module String))) }
+        | (l, e) :: rest ->
+          Step
+            { s with
+              focus = Eval (e, env)
+            ; kont = Cont.Record_fields (Map.empty (module String), l, rest, env, s.kont)
+            })
+     | Ast.Accessor (e, l) ->
+       Step { s with focus = Eval (e, env); kont = Cont.Project (l, s.kont) }
+     | Ast.Update (e, ups) ->
+       Step { s with focus = Eval (e, env); kont = Cont.Update_rec (ups, env, s.kont) })
   | Return v ->
     (match s.kont with
      | Cont.Halt -> Done v
@@ -137,7 +150,36 @@ let step (s : state) : result =
             { s with
               focus = Eval (e, env)
             ; kont = Cont.Array_elems (done_, rest, env, k)
-            }))
+            })
+     | Cont.Record_fields (m, l, remaining, env, k) ->
+       let m = Map.set m ~key:l ~data:v in
+       (match remaining with
+        | [] -> Step { s with focus = Return (Value.VRecord m); kont = k }
+        | (l2, e2) :: rest ->
+          Step
+            { s with
+              focus = Eval (e2, env)
+            ; kont = Cont.Record_fields (m, l2, rest, env, k)
+            })
+     | Cont.Project (l, k) ->
+       (match v with
+        | Value.VRecord m ->
+          (match Map.find m l with
+           | Some value -> Step { s with focus = Return value; kont = k }
+           | None -> Errors.stuck ("record has no field: " ^ l))
+        | _ -> Errors.stuck "projection of a non-record")
+     | Cont.Update_rec (ups, env, k) ->
+       (match v with
+        | Value.VRecord m ->
+          (match ups with
+           | [] -> Step { s with focus = Return (Value.VRecord m); kont = k }
+           | (l, e) :: rest ->
+             Step
+               { s with
+                 focus = Eval (e, env)
+               ; kont = Cont.Record_fields (m, l, rest, env, k)
+               })
+        | _ -> Errors.stuck "record update of a non-record"))
 
 let state_to_string (s : state) : string =
   let focus =

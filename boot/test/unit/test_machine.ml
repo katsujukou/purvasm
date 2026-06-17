@@ -22,6 +22,9 @@ let lt_num a b = Prim (LtNumber, [ a; b ])
 let arr es = Array es
 let index a i = Prim (IndexArray, [ a; i ])
 let length a = Prim (LengthArray, [ a ])
+let rcd fields = Record fields
+let proj l e = Accessor (e, l)
+let upd e ups = Update (e, ups)
 
 let eval_int (term : term) : int =
   match Cesk.Machine.eval term with
@@ -336,6 +339,59 @@ let test_array_nested () =
           (index (arr [ arr [ num 1; num 2 ]; arr [ num 3; num 4 ] ]) (num 1))
           (num 0)))
 
+(* Records ------------------------------------------------------------------ *)
+
+let test_record_proj () =
+  Alcotest.(check int)
+    "{x:1,y:2}.y"
+    2
+    (eval_int (proj "y" (rcd [ "x", num 1; "y", num 2 ])))
+
+let test_record_proj_first () =
+  Alcotest.(check int)
+    "{x:1,y:2}.x"
+    1
+    (eval_int (proj "x" (rcd [ "x", num 1; "y", num 2 ])))
+
+(* Field order in the literal does not matter: projection finds the label. *)
+let test_record_field_order () =
+  Alcotest.(check int)
+    "{y:2,x:1}.x"
+    1
+    (eval_int (proj "x" (rcd [ "y", num 2; "x", num 1 ])))
+
+let test_record_update () =
+  Alcotest.(check int)
+    "({x:1,y:2}{x=9}).x"
+    9
+    (eval_int (proj "x" (upd (rcd [ "x", num 1; "y", num 2 ]) [ "x", num 9 ])))
+
+(* Update overwrites only the named fields; others are carried through. *)
+let test_record_update_preserves () =
+  Alcotest.(check int)
+    "({x:1,y:2}{x=9}).y"
+    2
+    (eval_int (proj "y" (upd (rcd [ "x", num 1; "y", num 2 ]) [ "x", num 9 ])))
+
+(* Update is immutable: the original record is unchanged. r{x=9}.x is 9 while the
+   original r.x is still 1, so their sum is 10. *)
+let test_record_update_immutable () =
+  Alcotest.(check int)
+    "update does not mutate"
+    10
+    (eval_int
+       (Let
+          ( "r"
+          , rcd [ "x", num 1 ]
+          , add_int (proj "x" (upd (Var "r") [ "x", num 9 ])) (proj "x" (Var "r")) )))
+
+(* Records nest; projection composes. *)
+let test_record_nested () =
+  Alcotest.(check int)
+    "{p:{x:3}}.p.x"
+    3
+    (eval_int (proj "x" (proj "p" (rcd [ "p", rcd [ "x", num 3 ] ]))))
+
 (* Stuck states ------------------------------------------------------------- *)
 
 let test_unbound () = assert_stuck (Var "nope")
@@ -371,6 +427,12 @@ let test_array_index_oob () = assert_stuck (index (arr [ num 10 ]) (num 5))
 let test_array_index_negative () = assert_stuck (index (arr [ num 10 ]) (num (-1)))
 let test_array_index_non_array () = assert_stuck (index (num 5) (num 0))
 let test_array_length_non_array () = assert_stuck (length (num 5))
+
+(* Projecting a missing label, or projecting/updating a non-record, is stuck
+   (well-typed CoreFn never does this). *)
+let test_record_missing_field () = assert_stuck (proj "z" (rcd [ "x", num 1 ]))
+let test_record_proj_non_record () = assert_stuck (proj "x" (num 5))
+let test_record_update_non_record () = assert_stuck (upd (num 5) [ "x", num 1 ])
 
 let () =
   Alcotest.run
@@ -423,6 +485,13 @@ let () =
         ; Alcotest.test_case "array_index_first" `Quick test_array_index_first
         ; Alcotest.test_case "array_index_last" `Quick test_array_index_last
         ; Alcotest.test_case "array_nested" `Quick test_array_nested
+        ; Alcotest.test_case "record_proj" `Quick test_record_proj
+        ; Alcotest.test_case "record_proj_first" `Quick test_record_proj_first
+        ; Alcotest.test_case "record_field_order" `Quick test_record_field_order
+        ; Alcotest.test_case "record_update" `Quick test_record_update
+        ; Alcotest.test_case "record_update_preserves" `Quick test_record_update_preserves
+        ; Alcotest.test_case "record_update_immutable" `Quick test_record_update_immutable
+        ; Alcotest.test_case "record_nested" `Quick test_record_nested
         ] )
     ; ( "stuck"
       , [ Alcotest.test_case "unbound" `Quick test_unbound
@@ -439,5 +508,11 @@ let () =
         ; Alcotest.test_case "array_index_negative" `Quick test_array_index_negative
         ; Alcotest.test_case "array_index_non_array" `Quick test_array_index_non_array
         ; Alcotest.test_case "array_length_non_array" `Quick test_array_length_non_array
+        ; Alcotest.test_case "record_missing_field" `Quick test_record_missing_field
+        ; Alcotest.test_case "record_proj_non_record" `Quick test_record_proj_non_record
+        ; Alcotest.test_case
+            "record_update_non_record"
+            `Quick
+            test_record_update_non_record
         ] )
     ]
