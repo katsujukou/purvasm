@@ -51,5 +51,6 @@ language and are kept out of version control.)
 | [0002](0002-cesk-execution-model.md) | Start phase 1 with a CESK machine over a minimal strict core | Accepted |
 | [0003](0003-stack-based-bytecode.md) | PURVASM bytecode is a stack machine | Accepted |
 | [0004](0004-recursion-letrec-fix.md) | Recursion via `letrec` and store-backpatching | Accepted |
+| [0005](0005-mutual-recursion-binding-groups.md) | Mutual recursion via recursive binding groups | Accepted |
 
 ## Scope

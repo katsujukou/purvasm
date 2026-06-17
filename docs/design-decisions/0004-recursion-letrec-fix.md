@@ -42,6 +42,11 @@ address, so backpatching ties the knot.
 - A term `Letrec(x, e₁, e₂)` — bind `x` (recursively visible in `e₁`) to `e₁`,
   then evaluate `e₂`. The n-ary / mutually recursive group is a generalization
   (see Consequences); the core starts with the single-binding form.
+
+  > **Progress (2026-06-17):** that generalization is now specified in
+  > [0005](0005-mutual-recursion-binding-groups.md) (Proposed), which widens
+  > `Letrec` to a recursive binding group (`(name, rhs) list`); this
+  > single-binding form is its one-element case.
 - A store sentinel `⊥` — an **uninitialized ("black-hole")** slot, the value an
   address holds between its reservation and its backpatch.
 - A continuation frame `Letrec_bind(α, e₂, ρ, κ)` — remembers the reserved
