@@ -1,0 +1,18 @@
+(lang dune 3.20)
+
+(name purvasm)
+
+(generate_opam_files true)
+(formatting (enabled_for ocaml))
+
+(package
+ (name purvasm)
+ (synopsis "Purvasm is an experimental VM which executes PureScript")
+(depends
+ (ocaml (>= 5.3))
+ dune
+ cmdliner
+ base
+ ; js_of_ocaml
+ ; js_of_ocaml-ppx
+ (alcotest (and :with-test (>= 1.0)))))

@@ -1,0 +1,4 @@
+(executable
+ (name main)
+ (public_name purvm)
+ (libraries purvasm.cesk cmdliner))

@@ -1,0 +1,6 @@
+(include_subdirs qualified)
+
+(library
+ (name cesk)
+ (public_name purvasm.cesk)
+ (libraries base))
