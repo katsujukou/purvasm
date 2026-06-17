@@ -15,6 +15,9 @@ let append a b = Prim (Append, [ a; b ])
 let numf f = Lit (LNumber f)
 let add_num a b = Prim (AddNumber, [ a; b ])
 let div_num a b = Prim (DivNumber, [ a; b ])
+let arr es = Array es
+let index a i = Prim (IndexArray, [ a; i ])
+let length a = Prim (LengthArray, [ a ])
 
 let samples : (string * term) list =
   [ "arith: (2+3)*2", mul_int (add_int (num 2) (num 3)) (num 2)
@@ -62,6 +65,8 @@ let samples : (string * term) list =
     , If (lt_string (str "a") (str "b"), str "yes", str "no") )
   ; "number: 1.5 + 2.0", add_num (numf 1.5) (numf 2.0)
   ; "number: 10.0 / 4.0", div_num (numf 10.0) (numf 4.0)
+  ; "array: [10,20,30] !! 1", index (arr [ num 10; num 20; num 30 ]) (num 1)
+  ; "array: length [1,2,3]", length (arr [ num 1; num 2; num 3 ])
   ]
 
 let run_all (trace : bool) : unit =

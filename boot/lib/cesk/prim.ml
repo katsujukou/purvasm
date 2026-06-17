@@ -26,4 +26,11 @@ let eval (op : primop) (args : Value.t list) : Value.t =
   (* IEEE ordering: polymorphic < is false for any comparison involving nan. *)
   | LtNumber, [ Value.VNumber a; Value.VNumber b ] -> Value.VBool (a < b)
   | Append, [ Value.VString a; Value.VString b ] -> Value.VString (a ^ b)
+  (* Unsafe index (ADR-0009): out-of-bounds is stuck, not an OCaml exception.
+     The safe `index` (returning Maybe) is library code on top of this + length. *)
+  | IndexArray, [ Value.VArray a; Value.VInt i ] ->
+    if i >= 0 && i < Array.length a
+    then a.(i)
+    else Errors.stuck ("array index out of bounds: " ^ string_of_int i)
+  | LengthArray, [ Value.VArray a ] -> Value.VInt (Array.length a)
   | _ -> Errors.stuck ("primop " ^ primop_to_string op ^ ": ill-typed arguments")

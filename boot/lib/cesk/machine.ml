@@ -69,6 +69,15 @@ let step (s : state) : result =
             { s with
               focus = Eval (a, env)
             ; kont = Cont.Prim_args (op, [], rest, env, s.kont)
+            })
+     | Ast.Array elems ->
+       (match elems with
+        | [] -> Step { s with focus = Return (Value.VArray [||]) }
+        | e1 :: rest ->
+          Step
+            { s with
+              focus = Eval (e1, env)
+            ; kont = Cont.Array_elems ([], rest, env, s.kont)
             }))
   | Return v ->
     (match s.kont with
@@ -113,6 +122,21 @@ let step (s : state) : result =
             { s with
               focus = Eval (a, env)
             ; kont = Cont.Prim_args (op, done_, rest, env, k)
+            })
+     | Cont.Array_elems (done_, remaining, env, k) ->
+       let done_ = v :: done_ in
+       (match remaining with
+        | [] ->
+          Step
+            { s with
+              focus = Return (Value.VArray (Array.of_list (List.rev done_)))
+            ; kont = k
+            }
+        | e :: rest ->
+          Step
+            { s with
+              focus = Eval (e, env)
+            ; kont = Cont.Array_elems (done_, rest, env, k)
             }))
 
 let state_to_string (s : state) : string =

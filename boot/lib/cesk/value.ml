@@ -9,6 +9,7 @@ type t =
   | VNumber of float
   | VBool of bool
   | VString of string
+  | VArray of t array
   | VClosure of closure
 
 and closure =
@@ -17,9 +18,11 @@ and closure =
   ; env : Env.t
   }
 
-let to_string : t -> string = function
+let rec to_string : t -> string = function
   | VInt n -> Int.to_string n
   | VNumber f -> Float.to_string f
   | VBool b -> Bool.to_string b
   | VString s -> "\"" ^ s ^ "\""
+  | VArray a ->
+    "[" ^ String.concat ~sep:", " (List.map (Array.to_list a) ~f:to_string) ^ "]"
   | VClosure _ -> "<closure>"

@@ -25,6 +25,9 @@ type t =
      filled now, the (address, right-hand side) pairs still pending, the body,
      the recursive environment shared by every binding, and the rest. *)
   | Letrec_bind of Addr.t * (Addr.t * Ast.term) list * Ast.term * Env.t * t
+  (* Building an array literal: elements already evaluated (in reverse), then the
+     element terms still to evaluate — the same shape as Prim_args (ADR-0009). *)
+  | Array_elems of Value.t list * Ast.term list * Env.t * t
 
 let frame_name : t -> string = function
   | Halt -> "halt"
@@ -34,3 +37,4 @@ let frame_name : t -> string = function
   | If_branch _ -> "if"
   | Prim_args _ -> "prim"
   | Letrec_bind _ -> "rec"
+  | Array_elems _ -> "arr"

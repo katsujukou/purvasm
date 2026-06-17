@@ -26,6 +26,8 @@ type primop =
   | LtString
   | LtNumber
   | Append
+  | IndexArray
+  | LengthArray
 
 type term =
   | Lit of lit
@@ -36,6 +38,7 @@ type term =
   | Letrec of (string * term) list * term
   | If of term * term * term
   | Prim of primop * term list
+  | Array of term list
 
 let primop_to_string : primop -> string = function
   | AddInt -> "+i"
@@ -52,6 +55,8 @@ let primop_to_string : primop -> string = function
   | LtString -> "<s"
   | LtNumber -> "<n"
   | Append -> "<>"
+  | IndexArray -> "!!"
+  | LengthArray -> "#"
 
 let lit_to_string : lit -> string = function
   | LInt n -> Int.to_string n
@@ -81,3 +86,4 @@ let rec to_string : term -> string = function
     ^ " "
     ^ String.concat ~sep:" " (List.map args ~f:to_string)
     ^ ")"
+  | Array elems -> "[" ^ String.concat ~sep:", " (List.map elems ~f:to_string) ^ "]"

@@ -19,6 +19,9 @@ let mul_num a b = Prim (MulNumber, [ a; b ])
 let div_num a b = Prim (DivNumber, [ a; b ])
 let eq_num a b = Prim (EqNumber, [ a; b ])
 let lt_num a b = Prim (LtNumber, [ a; b ])
+let arr es = Array es
+let index a i = Prim (IndexArray, [ a; i ])
+let length a = Prim (LengthArray, [ a ])
 
 let eval_int (term : term) : int =
   match Cesk.Machine.eval term with
@@ -293,6 +296,46 @@ let test_number_lt_nan () =
     false
     (eval_bool (lt_num (numf nan) (numf 1.0)))
 
+(* Arrays ------------------------------------------------------------------- *)
+
+let test_array_length () =
+  Alcotest.(check int)
+    "length [10,20,30]"
+    3
+    (eval_int (length (arr [ num 10; num 20; num 30 ])))
+
+let test_array_empty_length () =
+  Alcotest.(check int) "length []" 0 (eval_int (length (arr [])))
+
+let test_array_index () =
+  Alcotest.(check int)
+    "[10,20,30]!!1"
+    20
+    (eval_int (index (arr [ num 10; num 20; num 30 ]) (num 1)))
+
+(* Boundary indices: first and last element. *)
+let test_array_index_first () =
+  Alcotest.(check int)
+    "[10,20,30]!!0"
+    10
+    (eval_int (index (arr [ num 10; num 20; num 30 ]) (num 0)))
+
+let test_array_index_last () =
+  Alcotest.(check int)
+    "[10,20,30]!!2"
+    30
+    (eval_int (index (arr [ num 10; num 20; num 30 ]) (num 2)))
+
+(* Nested arrays: elements are arbitrary values, so indexing composes. *)
+let test_array_nested () =
+  Alcotest.(check int)
+    "[[1,2],[3,4]]!!1!!0"
+    3
+    (eval_int
+       (index
+          (index (arr [ arr [ num 1; num 2 ]; arr [ num 3; num 4 ] ]) (num 1))
+          (num 0)))
+
 (* Stuck states ------------------------------------------------------------- *)
 
 let test_unbound () = assert_stuck (Var "nope")
@@ -321,6 +364,13 @@ let test_eq_mixed_type () = assert_stuck (eq_int (num 1) (str "a"))
 (* Number arithmetic on Ints has no matching rule (Int and Number are distinct
    primitives — no cross-type arithmetic). *)
 let test_number_type_error () = assert_stuck (add_num (num 1) (num 2))
+
+(* Indexing is unsafe (ADR-0009): out of bounds (either end) is stuck, and
+   indexing/length of a non-array has no matching rule. *)
+let test_array_index_oob () = assert_stuck (index (arr [ num 10 ]) (num 5))
+let test_array_index_negative () = assert_stuck (index (arr [ num 10 ]) (num (-1)))
+let test_array_index_non_array () = assert_stuck (index (num 5) (num 0))
+let test_array_length_non_array () = assert_stuck (length (num 5))
 
 let () =
   Alcotest.run
@@ -367,6 +417,12 @@ let () =
         ; Alcotest.test_case "number_eq_nan" `Quick test_number_eq_nan
         ; Alcotest.test_case "number_lt" `Quick test_number_lt
         ; Alcotest.test_case "number_lt_nan" `Quick test_number_lt_nan
+        ; Alcotest.test_case "array_length" `Quick test_array_length
+        ; Alcotest.test_case "array_empty_length" `Quick test_array_empty_length
+        ; Alcotest.test_case "array_index" `Quick test_array_index
+        ; Alcotest.test_case "array_index_first" `Quick test_array_index_first
+        ; Alcotest.test_case "array_index_last" `Quick test_array_index_last
+        ; Alcotest.test_case "array_nested" `Quick test_array_nested
         ] )
     ; ( "stuck"
       , [ Alcotest.test_case "unbound" `Quick test_unbound
@@ -379,5 +435,9 @@ let () =
         ; Alcotest.test_case "append_type_error" `Quick test_append_type_error
         ; Alcotest.test_case "eq_mixed_type" `Quick test_eq_mixed_type
         ; Alcotest.test_case "number_type_error" `Quick test_number_type_error
+        ; Alcotest.test_case "array_index_oob" `Quick test_array_index_oob
+        ; Alcotest.test_case "array_index_negative" `Quick test_array_index_negative
+        ; Alcotest.test_case "array_index_non_array" `Quick test_array_index_non_array
+        ; Alcotest.test_case "array_length_non_array" `Quick test_array_length_non_array
         ] )
     ]
