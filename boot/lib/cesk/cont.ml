@@ -19,10 +19,12 @@ type t =
   (* Evaluating a primitive's arguments left to right: values already computed
      (in reverse), then the terms still to evaluate. *)
   | Prim_args of Ast.primop * Value.t list * Ast.term list * Env.t * t
-  (* Evaluating a recursive binding's value; its address is already reserved in
-     the store. Once the value is known we backpatch that address — tying
-     Landin's knot — and evaluate the body (see ADR-0004). *)
-  | Letrec_bind of Addr.t * Ast.term * Env.t * t
+  (* Tying a recursive binding group's knot (ADR-0004/0005). Every address in
+     the group is already reserved; the right-hand sides are evaluated left to
+     right, each backpatched as its value arrives. Fields: the address being
+     filled now, the (address, right-hand side) pairs still pending, the body,
+     the recursive environment shared by every binding, and the rest. *)
+  | Letrec_bind of Addr.t * (Addr.t * Ast.term) list * Ast.term * Env.t * t
 
 let frame_name : t -> string = function
   | Halt -> "halt"

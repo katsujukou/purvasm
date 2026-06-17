@@ -22,7 +22,7 @@ type term =
   | Lam of string * term
   | App of term * term
   | Let of string * term * term
-  | Letrec of string * term * term
+  | Letrec of (string * term) list * term
   | If of term * term * term
   | Prim of primop * term list
 
@@ -43,8 +43,14 @@ let rec to_string : term -> string = function
   | Lam (x, body) -> "(\\" ^ x ^ " -> " ^ to_string body ^ ")"
   | App (f, a) -> "(" ^ to_string f ^ " " ^ to_string a ^ ")"
   | Let (x, e1, e2) -> "(let " ^ x ^ " = " ^ to_string e1 ^ " in " ^ to_string e2 ^ ")"
-  | Letrec (x, e1, e2) ->
-    "(letrec " ^ x ^ " = " ^ to_string e1 ^ " in " ^ to_string e2 ^ ")"
+  | Letrec (binds, body) ->
+    "(letrec "
+    ^ String.concat
+        ~sep:" and "
+        (List.map binds ~f:(fun (x, e) -> x ^ " = " ^ to_string e))
+    ^ " in "
+    ^ to_string body
+    ^ ")"
   | If (c, t, e) ->
     "(if " ^ to_string c ^ " then " ^ to_string t ^ " else " ^ to_string e ^ ")"
   | Prim (op, args) ->

@@ -80,13 +80,14 @@ let test_eq_false () = Alcotest.(check bool) "3==4" false (eval_bool (eq (num 3)
 (* fact = \n -> if n < 1 then 1 else n * fact (n-1) *)
 let fact body =
   Letrec
-    ( "fact"
-    , Lam
-        ( "n"
-        , If
-            ( lt (Var "n") (num 1)
-            , num 1
-            , mul (Var "n") (App (Var "fact", sub (Var "n") (num 1))) ) )
+    ( [ ( "fact"
+        , Lam
+            ( "n"
+            , If
+                ( lt (Var "n") (num 1)
+                , num 1
+                , mul (Var "n") (App (Var "fact", sub (Var "n") (num 1))) ) ) )
+      ]
     , body )
 
 let test_letrec_fact () =
@@ -103,13 +104,14 @@ let test_letrec_sum () =
     15
     (eval_int
        (Letrec
-          ( "sum"
-          , Lam
-              ( "n"
-              , If
-                  ( lt (Var "n") (num 1)
-                  , num 0
-                  , add (Var "n") (App (Var "sum", sub (Var "n") (num 1))) ) )
+          ( [ ( "sum"
+              , Lam
+                  ( "n"
+                  , If
+                      ( lt (Var "n") (num 1)
+                      , num 0
+                      , add (Var "n") (App (Var "sum", sub (Var "n") (num 1))) ) ) )
+            ]
           , App (Var "sum", num 5) )))
 
 (* A letrec whose binding never calls itself still works (non-recursive use). *)
@@ -117,7 +119,51 @@ let test_letrec_nonrecursive () =
   Alcotest.(check int)
     "letrec f = \\x -> x+1 in f 10"
     11
-    (eval_int (Letrec ("f", Lam ("x", add (Var "x") (num 1)), App (Var "f", num 10))))
+    (eval_int (Letrec ([ "f", Lam ("x", add (Var "x") (num 1)) ], App (Var "f", num 10))))
+
+(* even/odd: a mutually recursive group. Each calls the other; both must be in
+   scope in both right-hand sides, which a single-binding letrec cannot do. *)
+let even_odd body =
+  Letrec
+    ( [ ( "even"
+        , Lam
+            ( "n"
+            , If
+                ( eq (Var "n") (num 0)
+                , Lit (LBool true)
+                , App (Var "odd", sub (Var "n") (num 1)) ) ) )
+      ; ( "odd"
+        , Lam
+            ( "n"
+            , If
+                ( eq (Var "n") (num 0)
+                , Lit (LBool false)
+                , App (Var "even", sub (Var "n") (num 1)) ) ) )
+      ]
+    , body )
+
+let test_letrec_mutual_even () =
+  Alcotest.(check bool) "even 10" true (eval_bool (even_odd (App (Var "even", num 10))))
+
+let test_letrec_mutual_odd () =
+  Alcotest.(check bool) "odd 7" true (eval_bool (even_odd (App (Var "odd", num 7))))
+
+(* The first binding refers forward to the second; both are λ, so reserving both
+   addresses before evaluation is what makes the forward reference resolve. *)
+let test_letrec_forward_reference () =
+  Alcotest.(check int)
+    "f forwards to g"
+    6
+    (eval_int
+       (Letrec
+          ( [ "f", Lam ("x", App (Var "g", Var "x"))
+            ; "g", Lam ("x", add (Var "x") (num 1))
+            ]
+          , App (Var "f", num 5) )))
+
+(* An empty group just evaluates its body. *)
+let test_letrec_empty () =
+  Alcotest.(check int) "empty group" 42 (eval_int (Letrec ([], num 42)))
 
 (* Stuck states ------------------------------------------------------------- *)
 
@@ -129,10 +175,15 @@ let test_if_non_bool () = assert_stuck (If (num 0, num 1, num 2))
 (* Black-hole: a binding that forces its own value before it is initialized.
    The RHS is not a value form, so it reads the reserved address (⊥) and gets
    stuck — the dynamic stand-in for OCaml's static let-rec restriction. *)
-let test_letrec_self_reference () = assert_stuck (Letrec ("x", Var "x", Var "x"))
+let test_letrec_self_reference () = assert_stuck (Letrec ([ "x", Var "x" ], Var "x"))
 
 let test_letrec_strict_rhs () =
-  assert_stuck (Letrec ("x", add (Var "x") (num 1), Var "x"))
+  assert_stuck (Letrec ([ "x", add (Var "x") (num 1) ], Var "x"))
+
+(* The mutual version of the same: x = y and y = x, both non-value, so whichever
+   is evaluated first reads the other's still-reserved (⊥) address. *)
+let test_letrec_mutual_blackhole () =
+  assert_stuck (Letrec ([ "x", Var "y"; "y", Var "x" ], Var "x"))
 
 let () =
   Alcotest.run
@@ -154,6 +205,13 @@ let () =
         ; Alcotest.test_case "letrec_base_case" `Quick test_letrec_base_case
         ; Alcotest.test_case "letrec_sum" `Quick test_letrec_sum
         ; Alcotest.test_case "letrec_nonrecursive" `Quick test_letrec_nonrecursive
+        ; Alcotest.test_case "letrec_mutual_even" `Quick test_letrec_mutual_even
+        ; Alcotest.test_case "letrec_mutual_odd" `Quick test_letrec_mutual_odd
+        ; Alcotest.test_case
+            "letrec_forward_reference"
+            `Quick
+            test_letrec_forward_reference
+        ; Alcotest.test_case "letrec_empty" `Quick test_letrec_empty
         ] )
     ; ( "stuck"
       , [ Alcotest.test_case "unbound" `Quick test_unbound
@@ -162,5 +220,6 @@ let () =
         ; Alcotest.test_case "if_non_bool" `Quick test_if_non_bool
         ; Alcotest.test_case "letrec_self_reference" `Quick test_letrec_self_reference
         ; Alcotest.test_case "letrec_strict_rhs" `Quick test_letrec_strict_rhs
+        ; Alcotest.test_case "letrec_mutual_blackhole" `Quick test_letrec_mutual_blackhole
         ] )
     ]

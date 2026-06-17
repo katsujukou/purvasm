@@ -8,6 +8,7 @@ let add a b = Prim (Add, [ a; b ])
 let sub a b = Prim (Sub, [ a; b ])
 let mul a b = Prim (Mul, [ a; b ])
 let lt a b = Prim (Lt, [ a; b ])
+let eq a b = Prim (Eq, [ a; b ])
 
 let samples : (string * term) list =
   [ "arith: (2+3)*2", mul (add (num 2) (num 3)) (num 2)
@@ -22,14 +23,33 @@ let samples : (string * term) list =
   ; "if: if 1<2 then 10 else 20", If (lt (num 1) (num 2), num 10, num 20)
   ; ( "letrec: fact 5"
     , Letrec
-        ( "fact"
-        , Lam
-            ( "n"
-            , If
-                ( lt (Var "n") (num 1)
-                , num 1
-                , mul (Var "n") (App (Var "fact", sub (Var "n") (num 1))) ) )
+        ( [ ( "fact"
+            , Lam
+                ( "n"
+                , If
+                    ( lt (Var "n") (num 1)
+                    , num 1
+                    , mul (Var "n") (App (Var "fact", sub (Var "n") (num 1))) ) ) )
+          ]
         , App (Var "fact", num 5) ) )
+  ; ( "mutual: even 10"
+    , Letrec
+        ( [ ( "even"
+            , Lam
+                ( "n"
+                , If
+                    ( eq (Var "n") (num 0)
+                    , Lit (LBool true)
+                    , App (Var "odd", sub (Var "n") (num 1)) ) ) )
+          ; ( "odd"
+            , Lam
+                ( "n"
+                , If
+                    ( eq (Var "n") (num 0)
+                    , Lit (LBool false)
+                    , App (Var "even", sub (Var "n") (num 1)) ) ) )
+          ]
+        , App (Var "even", num 10) ) )
   ]
 
 let run_all (trace : bool) : unit =
