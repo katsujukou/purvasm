@@ -19,6 +19,10 @@ type t =
   (* Evaluating a primitive's arguments left to right: values already computed
      (in reverse), then the terms still to evaluate. *)
   | Prim_args of Ast.primop * Value.t list * Ast.term list * Env.t * t
+  (* Evaluating a recursive binding's value; its address is already reserved in
+     the store. Once the value is known we backpatch that address — tying
+     Landin's knot — and evaluate the body (see ADR-0004). *)
+  | Letrec_bind of Addr.t * Ast.term * Env.t * t
 
 let frame_name : t -> string = function
   | Halt -> "halt"
@@ -27,4 +31,5 @@ let frame_name : t -> string = function
   | Let_body _ -> "let"
   | If_branch _ -> "if"
   | Prim_args _ -> "prim"
+  | Letrec_bind _ -> "rec"
 ;;

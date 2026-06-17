@@ -1,8 +1,9 @@
 open Base
 
-(* The minimal strict core the machine evaluates. Deliberately first-order in
-   its surface (no recursion / letrec yet): just enough to exercise every CESK
-   transition. Recursion, data constructors, and a CoreFn frontend come next. *)
+(* The minimal strict core the machine evaluates. Small by design — literals,
+   variables, lambda, application, let, recursive let, if, and primitives — just
+   enough to exercise every CESK transition. Data constructors, pattern
+   matching, and a CoreFn frontend come next. *)
 
 type lit =
   | LInt of int
@@ -21,6 +22,7 @@ type term =
   | Lam of string * term
   | App of term * term
   | Let of string * term * term
+  | Letrec of string * term * term
   | If of term * term * term
   | Prim of primop * term list
 
@@ -43,6 +45,8 @@ let rec to_string : term -> string = function
   | Lam (x, body) -> "(\\" ^ x ^ " -> " ^ to_string body ^ ")"
   | App (f, a) -> "(" ^ to_string f ^ " " ^ to_string a ^ ")"
   | Let (x, e1, e2) -> "(let " ^ x ^ " = " ^ to_string e1 ^ " in " ^ to_string e2 ^ ")"
+  | Letrec (x, e1, e2) ->
+    "(letrec " ^ x ^ " = " ^ to_string e1 ^ " in " ^ to_string e2 ^ ")"
   | If (c, t, e) ->
     "(if " ^ to_string c ^ " then " ^ to_string t ^ " else " ^ to_string e ^ ")"
   | Prim (op, args) ->

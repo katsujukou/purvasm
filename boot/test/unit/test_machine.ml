@@ -86,12 +86,70 @@ let test_if_false () =
 let test_eq_true () = Alcotest.(check bool) "3==3" true (eval_bool (eq (num 3) (num 3)))
 let test_eq_false () = Alcotest.(check bool) "3==4" false (eval_bool (eq (num 3) (num 4)))
 
+(* Recursion ---------------------------------------------------------------- *)
+
+(* fact = \n -> if n < 1 then 1 else n * fact (n-1) *)
+let fact body =
+  Letrec
+    ( "fact"
+    , Lam
+        ( "n"
+        , If
+            ( lt (Var "n") (num 1)
+            , num 1
+            , mul (Var "n") (App (Var "fact", sub (Var "n") (num 1))) ) )
+    , body )
+;;
+
+let test_letrec_fact () =
+  Alcotest.(check int) "fact 5" 120 (eval_int (fact (App (Var "fact", num 5))))
+;;
+
+(* Base case taken immediately: the recursive call is never reached. *)
+let test_letrec_base_case () =
+  Alcotest.(check int) "fact 0" 1 (eval_int (fact (App (Var "fact", num 0))))
+;;
+
+(* sum = \n -> if n < 1 then 0 else n + sum (n-1) *)
+let test_letrec_sum () =
+  Alcotest.(check int)
+    "sum 5"
+    15
+    (eval_int
+       (Letrec
+          ( "sum"
+          , Lam
+              ( "n"
+              , If
+                  ( lt (Var "n") (num 1)
+                  , num 0
+                  , add (Var "n") (App (Var "sum", sub (Var "n") (num 1))) ) )
+          , App (Var "sum", num 5) )))
+;;
+
+(* A letrec whose binding never calls itself still works (non-recursive use). *)
+let test_letrec_nonrecursive () =
+  Alcotest.(check int)
+    "letrec f = \\x -> x+1 in f 10"
+    11
+    (eval_int (Letrec ("f", Lam ("x", add (Var "x") (num 1)), App (Var "f", num 10))))
+;;
+
 (* Stuck states ------------------------------------------------------------- *)
 
 let test_unbound () = assert_stuck (Var "nope")
 let test_apply_non_function () = assert_stuck (App (num 1, num 2))
 let test_prim_type_error () = assert_stuck (add (num 1) (Lam ("x", Var "x")))
 let test_if_non_bool () = assert_stuck (If (num 0, num 1, num 2))
+
+(* Black-hole: a binding that forces its own value before it is initialized.
+   The RHS is not a value form, so it reads the reserved address (⊥) and gets
+   stuck — the dynamic stand-in for OCaml's static let-rec restriction. *)
+let test_letrec_self_reference () = assert_stuck (Letrec ("x", Var "x", Var "x"))
+
+let test_letrec_strict_rhs () =
+  assert_stuck (Letrec ("x", add (Var "x") (num 1), Var "x"))
+;;
 
 let () =
   Alcotest.run
@@ -109,12 +167,18 @@ let () =
         ; Alcotest.test_case "if_false" `Quick test_if_false
         ; Alcotest.test_case "eq_true" `Quick test_eq_true
         ; Alcotest.test_case "eq_false" `Quick test_eq_false
+        ; Alcotest.test_case "letrec_fact" `Quick test_letrec_fact
+        ; Alcotest.test_case "letrec_base_case" `Quick test_letrec_base_case
+        ; Alcotest.test_case "letrec_sum" `Quick test_letrec_sum
+        ; Alcotest.test_case "letrec_nonrecursive" `Quick test_letrec_nonrecursive
         ] )
     ; ( "stuck"
       , [ Alcotest.test_case "unbound" `Quick test_unbound
         ; Alcotest.test_case "apply_non_function" `Quick test_apply_non_function
         ; Alcotest.test_case "prim_type_error" `Quick test_prim_type_error
         ; Alcotest.test_case "if_non_bool" `Quick test_if_non_bool
+        ; Alcotest.test_case "letrec_self_reference" `Quick test_letrec_self_reference
+        ; Alcotest.test_case "letrec_strict_rhs" `Quick test_letrec_strict_rhs
         ] )
     ]
 ;;

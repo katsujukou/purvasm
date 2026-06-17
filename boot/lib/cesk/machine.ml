@@ -37,6 +37,17 @@ let step (s : state) : result =
        Step { s with focus = Eval (f, env); kont = Cont.Fun (a, env, s.kont) }
      | Ast.Let (x, e1, e2) ->
        Step { s with focus = Eval (e1, env); kont = Cont.Let_body (x, e2, env, s.kont) }
+     | Ast.Letrec (x, e1, e2) ->
+       (* Reserve the binding's address, bind the name to it, then evaluate the
+          bound expression in the already-recursive environment. The backpatch
+          happens when the value comes back (see Cont.Letrec_bind below). *)
+       let addr, store' = Store.reserve s.store in
+       let env' = Env.extend env x addr in
+       Step
+         { focus = Eval (e1, env')
+         ; store = store'
+         ; kont = Cont.Letrec_bind (addr, e2, env', s.kont)
+         }
      | Ast.If (c, t, e) ->
        Step { s with focus = Eval (c, env); kont = Cont.If_branch (t, e, env, s.kont) }
      | Ast.Prim (op, args) ->
@@ -64,6 +75,12 @@ let step (s : state) : result =
        let addr, store' = Store.alloc s.store v in
        let env' = Env.extend env x addr in
        Step { focus = Eval (e2, env'); store = store'; kont = k }
+     | Cont.Letrec_bind (addr, e2, env, k) ->
+       (* Backpatch the reserved address with the now-known value, then run the
+          body. A self-referential closure built by e1 already points at this
+          address, so this write is what makes the recursion observable. *)
+       let store' = Store.set s.store addr v in
+       Step { focus = Eval (e2, env); store = store'; kont = k }
      | Cont.If_branch (t, e, env, k) ->
        (match v with
         | Value.VBool b ->
