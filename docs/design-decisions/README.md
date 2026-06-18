@@ -60,5 +60,6 @@ language and are kept out of version control.)
 | [0011](0011-adt-pattern-matching.md) | Algebraic data types and `case` pattern matching | Accepted |
 | [0012](0012-array-record-binders.md) | Array and record binders | Accepted |
 | [0013](0013-case-guards.md) | Guards in `case` alternatives | Accepted |
+| [0014](0014-corefn-ingestion.md) | CoreFn ingestion: decode `corefn.json` to a faithful `Corefn` AST | Accepted |
 
 ## Scope
