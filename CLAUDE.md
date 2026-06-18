@@ -13,6 +13,8 @@
   - Comments should explain **why** something is done, not **what** it does.
     Code should be written to be as self-descriptive as possible, making "what" comments unnecessary in principle.
     However, when an implementation must be made unusually complex due to performance optimizations, workarounds for bugs in external dependencies, or other unavoidable reasons, comments should explain the rationale behind such implementations.
+  - Use the host language's **documentation-comment** form for the documentation of a *declaration* — a module's purpose (a preamble comment at the top of the file) and its public types, values, record fields, and variant constructors. In OCaml this is `(** ... *)` (in PureScript, `-- |`); place it in a valid documentation position (before the item, or trailing for a field/constructor). These feed generated docs (odoc) and editor hover, which ordinary comments do not.
+    Reserve ordinary comments (`(* ... *)`) for implementation/"why" notes inside a definition; those are not interface documentation. (The OCaml dev build treats a misplaced documentation comment — warning 50 — as an error, so a `(**` comment must sit in a valid position.)
 
 - Modules should, whenever practical, have a single responsibility.
 
