@@ -45,6 +45,22 @@ type t =
      alternatives to try once all scrutinees are values, and the environment of
      the case. Same accumulate-in-reverse shape as Prim_args / Array_elems. *)
   | Case_scrut of Value.t list * Ast.term list * Ast.alternative list * Env.t * t
+  (* Evaluating a guard of a matched alternative (ADR-0013). If the guard returns
+     true we take `on_true`; if false we try the next guard in `rest_guards`, or —
+     when those are exhausted — fall through to `rest_alts` (re-matching them
+     against the already-evaluated `scrutinees` in `case_env`). `alt_env` is the
+     environment extended with this alternative's pattern bindings, shared by the
+     guards and their results. An inline record (not the tuple shape of the other
+     frames) keeps these seven fields legible; it is still first-order data. *)
+  | Guard_test of
+      { on_true : Ast.term
+      ; rest_guards : (Ast.term * Ast.term) list
+      ; alt_env : Env.t
+      ; rest_alts : Ast.alternative list
+      ; scrutinees : Value.t list
+      ; case_env : Env.t
+      ; rest : t
+      }
 
 let frame_name : t -> string = function
   | Halt -> "halt"
@@ -59,3 +75,4 @@ let frame_name : t -> string = function
   | Project _ -> "prj"
   | Update_rec _ -> "upd"
   | Case_scrut _ -> "case"
+  | Guard_test _ -> "grd"

@@ -75,12 +75,22 @@ type term =
      is taken. *)
   | Case of term list * alternative list
 
-(* One arm of a `Case`: a binder per scrutinee and the term to evaluate when they
-   all match. Guards are deferred to a follow-on record. *)
+(* One arm of a `Case`: a binder per scrutinee and the right-hand side to take
+   when they all match (ADR-0013). *)
 and alternative =
   { binders : binder list
-  ; result : term
+  ; result : rhs
   }
+
+(* An alternative's right-hand side (ADR-0013): either an unconditional result,
+   or a list of (guard, result) pairs tried in order — the first guard that
+   evaluates to `true` wins, and if all fail control falls through to the next
+   alternative. Mirrors CoreFn's `Either Expr [(Guard, Expr)]`; pattern and
+   conjunctive guards are desugared to nested cases by the frontend, so a guard
+   here is always a single boolean term. *)
+and rhs =
+  | Unconditional of term
+  | Guarded of (term * term) list
 
 let primop_to_string : primop -> string = function
   | AddInt -> "+i"
@@ -163,7 +173,13 @@ let rec to_string : term -> string = function
     ^ String.concat
         ~sep:"; "
         (List.map alts ~f:(fun { binders; result } ->
-           String.concat ~sep:", " (List.map binders ~f:binder_to_string)
-           ^ " -> "
-           ^ to_string result))
+           let bs = String.concat ~sep:", " (List.map binders ~f:binder_to_string) in
+           match result with
+           | Unconditional t -> bs ^ " -> " ^ to_string t
+           | Guarded gs ->
+             bs
+             ^ String.concat
+                 ~sep:""
+                 (List.map gs ~f:(fun (g, e) ->
+                    " | " ^ to_string g ^ " -> " ^ to_string e))))
     ^ ")"

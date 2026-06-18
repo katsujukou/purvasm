@@ -24,7 +24,8 @@ let upd e ups = Update (e, ups)
 let just x = App (Ctor ("Just", 1), x)
 let nil = Ctor ("Nil", 0)
 let cons h t = App (App (Ctor ("Cons", 2), h), t)
-let alt binders result = { binders; result }
+let alt binders result = { binders; result = Unconditional result }
+let altg binders guards = { binders; result = Guarded guards }
 
 let samples : (string * term) list =
   [ "arith: (2+3)*2", mul_int (add_int (num 2) (num 3)) (num 2)
@@ -105,6 +106,16 @@ let samples : (string * term) list =
     , Case
         ( [ rcd [ "x", num 1; "y", num 2 ] ]
         , [ alt [ BRecord [ "x", BVar "a"; "y", BVar "b" ] ] (add_int (Var "a") (Var "b"))
+          ] ) )
+  ; ( "guard: case 5 of x | x<0 -> -1 | x==0 -> 0 | _ -> 1"
+    , Case
+        ( [ num 5 ]
+        , [ altg
+              [ BVar "x" ]
+              [ lt_int (Var "x") (num 0), num (-1)
+              ; eq_int (Var "x") (num 0), num 0
+              ; Lit (LBool true), num 1
+              ]
           ] ) )
   ]
 

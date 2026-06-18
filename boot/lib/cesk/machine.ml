@@ -23,29 +23,59 @@ type result =
 let inject (term : Ast.term) : state =
   { focus = Eval (term, Env.empty); store = Store.empty; kont = Cont.Halt }
 
-(* Take the first alternative whose binders match the scrutinee values
-   (ADR-0011): allocate its pattern bindings in the store, extend the case's
-   environment with them, and evaluate the result there. Matching itself is a
-   pure structural walk over already-computed values (see `Pmatch`); only the
-   chosen result re-enters the machine. No matching alternative is a stuck state
-   — well-typed CoreFn produces exhaustive cases (or its own failure arm). *)
-let dispatch_case
-      (values : Value.t list)
-      (alts : Ast.alternative list)
-      (store : Store.t)
-      (env : Env.t)
-      (kont : Cont.t)
+(* Allocate each pattern binding in the store and extend the environment with it
+   — the same name -> address -> value indirection every binder uses (ADR-0011). *)
+let bind_all (bindings : (string * Value.t) list) (store : Store.t) (env : Env.t)
+  : Store.t * Env.t
+  =
+  List.fold bindings ~init:(store, env) ~f:(fun (st, e) (name, value) ->
+    let addr, st' = Store.alloc st value in
+    st', Env.extend e name addr)
+
+(* Scan alternatives top to bottom for the first whose binders match the
+   scrutinee values, then take its right-hand side (ADR-0011/0013). An
+   unconditional arm runs immediately; a guarded arm binds its patterns and
+   evaluates the first guard under a `Guard_test` frame, which on failure falls
+   back here with the remaining alternatives. Matching is a pure structural walk
+   (`Pmatch`); only the chosen result/guard re-enters the machine. No matching
+   alternative is a stuck state — well-typed CoreFn is exhaustive. *)
+let rec dispatch_case
+          (values : Value.t list)
+          (alts : Ast.alternative list)
+          (store : Store.t)
+          (env : Env.t)
+          (kont : Cont.t)
   : result
   =
-  match Pmatch.select alts values with
-  | Some (bindings, body) ->
-    let store', env' =
-      List.fold bindings ~init:(store, env) ~f:(fun (st, e) (name, value) ->
-        let addr, st' = Store.alloc st value in
-        st', Env.extend e name addr)
-    in
-    Step { focus = Eval (body, env'); store = store'; kont }
-  | None -> Errors.stuck "no matching case alternative"
+  match alts with
+  | [] -> Errors.stuck "no matching case alternative"
+  | { Ast.binders; result } :: rest ->
+    (match Pmatch.match_binders binders values [] with
+     | None -> dispatch_case values rest store env kont
+     | Some bindings ->
+       (match result with
+        | Ast.Unconditional body ->
+          let store', env' = bind_all bindings store env in
+          Step { focus = Eval (body, env'); store = store'; kont }
+        (* An empty guard list never holds; fall through (defensive — CoreFn's
+           guard list is non-empty). The speculative bindings are not allocated. *)
+        | Ast.Guarded [] -> dispatch_case values rest store env kont
+        | Ast.Guarded ((g, e) :: more) ->
+          let store', env' = bind_all bindings store env in
+          Step
+            { focus = Eval (g, env')
+            ; store = store'
+            ; kont =
+                Cont.Guard_test
+                  { on_true = e
+                  ; rest_guards = more
+                  ; alt_env = env'
+                  ; rest_alts = rest
+                  ; scrutinees = values
+                  ; case_env = env
+                  ; rest = kont
+                  }
+            }))
 
 let step (s : state) : result =
   match s.focus with
@@ -242,7 +272,32 @@ let step (s : state) : result =
             { s with
               focus = Eval (e, env)
             ; kont = Cont.Case_scrut (done_, rest, alts, env, k)
-            }))
+            })
+     | Cont.Guard_test
+         { on_true; rest_guards; alt_env; rest_alts; scrutinees; case_env; rest } ->
+       (match v with
+        | Value.VBool true -> Step { s with focus = Eval (on_true, alt_env); kont = rest }
+        | Value.VBool false ->
+          (match rest_guards with
+           | (g2, e2) :: more ->
+             Step
+               { s with
+                 focus = Eval (g2, alt_env)
+               ; kont =
+                   Cont.Guard_test
+                     { on_true = e2
+                     ; rest_guards = more
+                     ; alt_env
+                     ; rest_alts
+                     ; scrutinees
+                     ; case_env
+                     ; rest
+                     }
+               }
+           (* All guards of this alternative failed: fall through to the next
+              alternative, re-matching it against the same scrutinee values. *)
+           | [] -> dispatch_case scrutinees rest_alts s.store case_env rest)
+        | _ -> Errors.stuck "case guard is not a boolean"))
 
 let state_to_string (s : state) : string =
   let focus =

@@ -36,7 +36,7 @@ let rec match_binder (b : Ast.binder) (v : Value.t) (acc : (string * Value.t) li
       (* Same constructor always has the same arity; an inequality here is
          type-impossible, not a discrimination. *)
       if List.length subs = Array.length fields
-      then match_seq subs (Array.to_list fields) acc
+      then match_binders subs (Array.to_list fields) acc
       else Errors.stuck ("constructor pattern arity mismatch: " ^ tag)
     else (* a different tag is how a sum discriminates: fall through *)
       None
@@ -44,17 +44,19 @@ let rec match_binder (b : Ast.binder) (v : Value.t) (acc : (string * Value.t) li
     (* Array length is a runtime property, not part of the type, so a different
        length is a legitimate non-match. *)
     if List.length subs = Array.length arr
-    then match_seq subs (Array.to_list arr) acc
+    then match_binders subs (Array.to_list arr) acc
     else None
   | Ast.BRecord fields, Value.VRecord m -> match_fields fields m acc
   (* A binder against a value of the wrong kind is type-impossible (ADR-0012). *)
   | (Ast.BLit _ | Ast.BCtor _ | Ast.BArray _ | Ast.BRecord _), _ ->
     Errors.stuck "pattern matched against a value of the wrong shape"
 
-(* Positional matching for constructor fields and array elements; callers ensure
-   equal lengths, so an inequality is a malformed pattern, not a non-match. Used
-   for a `case`'s binders-against-scrutinees too (one binder per scrutinee). *)
-and match_seq
+(* Positional matching of a list of binders against a list of values, threading
+   the bindings and failing fast. Used for a `case`'s binders-against-scrutinees
+   (one binder per scrutinee) and for constructor fields / array elements; callers
+   ensure equal lengths, so an inequality is a malformed pattern, not a
+   non-match. *)
+and match_binders
       (binders : Ast.binder list)
       (values : Value.t list)
       (acc : (string * Value.t) list)
@@ -89,13 +91,3 @@ and match_fields
         | Some acc' -> match_fields rest m acc'
         | None -> None)
      | None -> Errors.stuck ("record pattern: missing label " ^ label))
-
-(* Select the first alternative whose binders all match the scrutinee values,
-   returning its bindings and result term. *)
-let select (alts : Ast.alternative list) (values : Value.t list)
-  : ((string * Value.t) list * Ast.term) option
-  =
-  List.find_map alts ~f:(fun { Ast.binders; result } ->
-    match match_seq binders values [] with
-    | Some bindings -> Some (bindings, result)
-    | None -> None)

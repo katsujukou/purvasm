@@ -31,7 +31,8 @@ let nil = Ctor ("Nil", 0)
 let cons h t = App (App (Ctor ("Cons", 2), h), t)
 let pair a b = App (App (Ctor ("Pair", 2), a), b)
 let case scruts alts = Case (scruts, alts)
-let alt binders result = { binders; result }
+let alt binders result = { binders; result = Unconditional result }
+let altg binders guards = { binders; result = Guarded guards }
 
 let eval_int (term : term) : int =
   match Cesk.Machine.eval term with
@@ -739,6 +740,88 @@ let test_case_record_nested_ctor () =
           [ rcd [ "p", just (num 5) ] ]
           [ alt [ BRecord [ "p", BCtor ("Just", [ BVar "v" ]) ] ] (Var "v") ]))
 
+(* Guards (ADR-0013) -------------------------------------------------------- *)
+
+(* A guard that holds selects its result. *)
+let test_guard_true () =
+  Alcotest.(check int)
+    "x | x<10 -> 1"
+    1
+    (eval_int (case [ num 5 ] [ altg [ BVar "x" ] [ lt_int (Var "x") (num 10), num 1 ] ]))
+
+(* A false guard falls to the next guard of the same alternative. *)
+let test_guard_second_disjunct () =
+  Alcotest.(check int)
+    "first false, second true"
+    2
+    (eval_int
+       (case
+          [ num 5 ]
+          [ altg [ BVar "x" ] [ lt_int (Var "x") (num 0), num 1; Lit (LBool true), num 2 ]
+          ]))
+
+(* The first holding guard wins even if a later one would too. *)
+let test_guard_first_wins () =
+  Alcotest.(check int)
+    "first true wins"
+    1
+    (eval_int
+       (case
+          [ num 5 ]
+          [ altg [ BVar "x" ] [ Lit (LBool true), num 1; Lit (LBool true), num 2 ] ]))
+
+(* When every guard of an alternative fails, control falls through to the next
+   alternative, whose binders are matched afresh. *)
+let test_guard_fallthrough_to_next_alt () =
+  Alcotest.(check int)
+    "all guards fail -> next alt"
+    2
+    (eval_int
+       (case
+          [ num 5 ]
+          [ altg [ BVar "x" ] [ lt_int (Var "x") (num 0), num 1 ]; alt [ BNull ] (num 2) ]))
+
+(* Fall-through can land on a later guarded alternative too. *)
+let test_guard_fallthrough_to_guarded () =
+  Alcotest.(check int)
+    "fall to second guarded"
+    7
+    (eval_int
+       (case
+          [ num 5 ]
+          [ altg [ BVar "x" ] [ lt_int (Var "x") (num 0), num 1 ]
+          ; altg [ BVar "y" ] [ lt_int (num 0) (Var "y"), num 7 ]
+          ]))
+
+(* Pattern bindings are in scope in the guard, not only in the result. *)
+let test_guard_uses_pattern_binding () =
+  Alcotest.(check int)
+    "Just x | x>0 -> x"
+    5
+    (eval_int
+       (case
+          [ just (num 5) ]
+          [ altg [ BCtor ("Just", [ BVar "x" ]) ] [ lt_int (num 0) (Var "x"), Var "x" ]
+          ; alt [ BNull ] (num 0)
+          ]))
+
+(* A guard chain acts as a multi-way classifier; the matching guard's result is
+   taken. *)
+let test_guard_classify () =
+  Alcotest.(check int)
+    "classify 0 -> 0"
+    0
+    (eval_int
+       (case
+          [ num 0 ]
+          [ altg
+              [ BVar "x" ]
+              [ lt_int (Var "x") (num 0), num (-1)
+              ; eq_int (Var "x") (num 0), num 0
+              ; Lit (LBool true), num 1
+              ]
+          ]))
+
 (* Stuck states for matching --------------------------------------------------*)
 
 (* No alternative matches: a non-exhaustive case is stuck (well-typed CoreFn is
@@ -777,6 +860,14 @@ let test_match_record_missing_label () =
    (distinct from a same-typed unequal scalar, which falls through). *)
 let test_match_int_literal_vs_string () =
   assert_stuck (case [ str "s" ] [ alt [ BLit (LInt 0) ] (num 1) ])
+
+(* A guard must evaluate to a boolean; a non-boolean guard is stuck (ADR-0013). *)
+let test_guard_non_boolean () =
+  assert_stuck (case [ num 5 ] [ altg [ BVar "x" ] [ Var "x", num 1 ] ])
+
+(* All guards failing with no further alternative is a non-exhaustive case. *)
+let test_guard_all_fail_non_exhaustive () =
+  assert_stuck (case [ num 5 ] [ altg [ BVar "x" ] [ lt_int (Var "x") (num 0), num 1 ] ])
 
 let () =
   Alcotest.run
@@ -883,6 +974,24 @@ let () =
         ; Alcotest.test_case "case_record_field_order" `Quick test_case_record_field_order
         ; Alcotest.test_case "case_record_nested_ctor" `Quick test_case_record_nested_ctor
         ] )
+    ; ( "guards"
+      , [ Alcotest.test_case "guard_true" `Quick test_guard_true
+        ; Alcotest.test_case "guard_second_disjunct" `Quick test_guard_second_disjunct
+        ; Alcotest.test_case "guard_first_wins" `Quick test_guard_first_wins
+        ; Alcotest.test_case
+            "guard_fallthrough_to_next_alt"
+            `Quick
+            test_guard_fallthrough_to_next_alt
+        ; Alcotest.test_case
+            "guard_fallthrough_to_guarded"
+            `Quick
+            test_guard_fallthrough_to_guarded
+        ; Alcotest.test_case
+            "guard_uses_pattern_binding"
+            `Quick
+            test_guard_uses_pattern_binding
+        ; Alcotest.test_case "guard_classify" `Quick test_guard_classify
+        ] )
     ; ( "stuck"
       , [ Alcotest.test_case "unbound" `Quick test_unbound
         ; Alcotest.test_case "apply_non_function" `Quick test_apply_non_function
@@ -924,5 +1033,10 @@ let () =
             "match_int_literal_vs_string"
             `Quick
             test_match_int_literal_vs_string
+        ; Alcotest.test_case "guard_non_boolean" `Quick test_guard_non_boolean
+        ; Alcotest.test_case
+            "guard_all_fail_non_exhaustive"
+            `Quick
+            test_guard_all_fail_non_exhaustive
         ] )
     ]
