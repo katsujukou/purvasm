@@ -658,6 +658,87 @@ let test_case_list_sum () =
 let test_case_empty_scrutinee () =
   Alcotest.(check int) "empty case" 42 (eval_int (case [] [ alt [] (num 42) ]))
 
+(* Array and record binders (ADR-0012) -------------------------------------- *)
+
+(* A fixed-length array binder matches element-wise and binds each element. *)
+let test_case_array () =
+  Alcotest.(check int)
+    "[a,b] -> a+b"
+    30
+    (eval_int
+       (case
+          [ arr [ num 10; num 20 ] ]
+          [ alt [ BArray [ BVar "a"; BVar "b" ] ] (add_int (Var "a") (Var "b")) ]))
+
+(* A different length is a legitimate non-match (length is not in the type): it
+   falls through to the next alternative. *)
+let test_case_array_length_fallthrough () =
+  Alcotest.(check int)
+    "[a,b] vs 3 elems"
+    99
+    (eval_int
+       (case
+          [ arr [ num 1; num 2; num 3 ] ]
+          [ alt [ BArray [ BVar "a"; BVar "b" ] ] (num 0); alt [ BNull ] (num 99) ]))
+
+(* The empty-array pattern matches only the empty array. *)
+let test_case_array_empty () =
+  Alcotest.(check int)
+    "[] -> 1"
+    1
+    (eval_int (case [ arr [] ] [ alt [ BArray [] ] (num 1) ]))
+
+(* Array element binders are themselves patterns, so they nest with constructors. *)
+let test_case_array_nested_ctor () =
+  Alcotest.(check int)
+    "[Just x, _] -> x"
+    7
+    (eval_int
+       (case
+          [ arr [ just (num 7); nothing ] ]
+          [ alt [ BArray [ BCtor ("Just", [ BVar "x" ]); BNull ] ] (Var "x") ]))
+
+(* A record binder matches each named field and binds it. *)
+let test_case_record () =
+  Alcotest.(check int)
+    "{x:a,y:b} -> a+b"
+    3
+    (eval_int
+       (case
+          [ rcd [ "x", num 1; "y", num 2 ] ]
+          [ alt [ BRecord [ "x", BVar "a"; "y", BVar "b" ] ] (add_int (Var "a") (Var "b"))
+          ]))
+
+(* A record pattern names a row-polymorphic subset: extra fields are ignored. *)
+let test_case_record_subset () =
+  Alcotest.(check int)
+    "{y:b} on {x,y,z}"
+    2
+    (eval_int
+       (case
+          [ rcd [ "x", num 1; "y", num 2; "z", num 3 ] ]
+          [ alt [ BRecord [ "y", BVar "b" ] ] (Var "b") ]))
+
+(* Field order in the value is irrelevant (VRecord is an unordered map). *)
+let test_case_record_field_order () =
+  Alcotest.(check int)
+    "{x:a} on {y,x}"
+    1
+    (eval_int
+       (case
+          [ rcd [ "y", num 2; "x", num 1 ] ]
+          [ alt [ BRecord [ "x", BVar "a" ] ] (Var "a") ]))
+
+(* Record field binders nest with constructor patterns. *)
+let test_case_record_nested_ctor () =
+  Alcotest.(check int)
+    "{p: Just v} -> v"
+    5
+    (eval_int
+       (case
+          [ rcd [ "p", just (num 5) ] ]
+          [ alt [ BRecord [ "p", BCtor ("Just", [ BVar "v" ]) ] ] (Var "v") ]))
+
 (* Stuck states for matching --------------------------------------------------*)
 
 (* No alternative matches: a non-exhaustive case is stuck (well-typed CoreFn is
@@ -672,6 +753,30 @@ let test_case_literal_no_match () =
 (* Over-applying a saturated constructor applies data as a function — stuck, via
    the Arg non-function rule. *)
 let test_ctor_over_application () = assert_stuck (App (just (num 1), num 2))
+
+(* The matcher's None-vs-stuck contract (ADR-0012): a type-impossible shape
+   mismatch — a binder against a value of the wrong kind — is stuck, not a
+   fall-through. These ill-typed terms stand in for unsafeCoerce / lowering bugs;
+   the machine has no type checker, so they exercise the defensive path. *)
+let test_match_ctor_vs_non_data () =
+  assert_stuck (case [ num 5 ] [ alt [ BCtor ("Just", [ BVar "x" ]) ] (Var "x") ])
+
+let test_match_array_vs_non_array () =
+  assert_stuck (case [ num 5 ] [ alt [ BArray [ BVar "a" ] ] (Var "a") ])
+
+let test_match_record_vs_non_record () =
+  assert_stuck (case [ num 5 ] [ alt [ BRecord [ "x", BVar "a" ] ] (Var "a") ])
+
+(* A record pattern naming a label the value lacks: presence is in the row type,
+   so a missing label is type-impossible -> stuck (not a non-match). *)
+let test_match_record_missing_label () =
+  assert_stuck
+    (case [ rcd [ "y", num 2 ] ] [ alt [ BRecord [ "x", BVar "a" ] ] (Var "a") ])
+
+(* A scalar-literal binder against a wrong-kind value is type-impossible -> stuck
+   (distinct from a same-typed unequal scalar, which falls through). *)
+let test_match_int_literal_vs_string () =
+  assert_stuck (case [ str "s" ] [ alt [ BLit (LInt 0) ] (num 1) ])
 
 let () =
   Alcotest.run
@@ -766,6 +871,17 @@ let () =
             test_case_multi_scrutinee_fallthrough
         ; Alcotest.test_case "case_list_sum" `Quick test_case_list_sum
         ; Alcotest.test_case "case_empty_scrutinee" `Quick test_case_empty_scrutinee
+        ; Alcotest.test_case "case_array" `Quick test_case_array
+        ; Alcotest.test_case
+            "case_array_length_fallthrough"
+            `Quick
+            test_case_array_length_fallthrough
+        ; Alcotest.test_case "case_array_empty" `Quick test_case_array_empty
+        ; Alcotest.test_case "case_array_nested_ctor" `Quick test_case_array_nested_ctor
+        ; Alcotest.test_case "case_record" `Quick test_case_record
+        ; Alcotest.test_case "case_record_subset" `Quick test_case_record_subset
+        ; Alcotest.test_case "case_record_field_order" `Quick test_case_record_field_order
+        ; Alcotest.test_case "case_record_nested_ctor" `Quick test_case_record_nested_ctor
         ] )
     ; ( "stuck"
       , [ Alcotest.test_case "unbound" `Quick test_unbound
@@ -791,5 +907,22 @@ let () =
         ; Alcotest.test_case "case_non_exhaustive" `Quick test_case_non_exhaustive
         ; Alcotest.test_case "case_literal_no_match" `Quick test_case_literal_no_match
         ; Alcotest.test_case "ctor_over_application" `Quick test_ctor_over_application
+        ; Alcotest.test_case "match_ctor_vs_non_data" `Quick test_match_ctor_vs_non_data
+        ; Alcotest.test_case
+            "match_array_vs_non_array"
+            `Quick
+            test_match_array_vs_non_array
+        ; Alcotest.test_case
+            "match_record_vs_non_record"
+            `Quick
+            test_match_record_vs_non_record
+        ; Alcotest.test_case
+            "match_record_missing_label"
+            `Quick
+            test_match_record_missing_label
+        ; Alcotest.test_case
+            "match_int_literal_vs_string"
+            `Quick
+            test_match_int_literal_vs_string
         ] )
     ]

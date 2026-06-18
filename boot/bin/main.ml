@@ -97,6 +97,15 @@ let samples : (string * term) list =
                       ] ) ) )
           ]
         , App (Var "sum", cons (num 1) (cons (num 2) (cons (num 3) nil))) ) )
+  ; ( "match: case [10,20] of [a,b] -> a+b"
+    , Case
+        ( [ arr [ num 10; num 20 ] ]
+        , [ alt [ BArray [ BVar "a"; BVar "b" ] ] (add_int (Var "a") (Var "b")) ] ) )
+  ; ( "match: case {x:1,y:2} of {x:a,y:b} -> a+b"
+    , Case
+        ( [ rcd [ "x", num 1; "y", num 2 ] ]
+        , [ alt [ BRecord [ "x", BVar "a"; "y", BVar "b" ] ] (add_int (Var "a") (Var "b"))
+          ] ) )
   ]
 
 let run_all (trace : bool) : unit =

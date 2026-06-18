@@ -1,12 +1,19 @@
 open Base
 
-(* Structural pattern matching (ADR-0011): attempt to match a binder against an
-   already-evaluated value, accumulating `name -> value` bindings. This is a
-   pure, total function over values — a binder only decomposes an existing value,
-   it never evaluates a subterm or forces a black-hole — so the host recursion
-   here hides no evaluation step (cf. ADR-0002), exactly like `Prim.eval` working
-   on already-computed arguments. A binder either matches (yielding bindings) or
-   fails; a failure is a normal "try the next alternative", not a stuck state. *)
+(* Structural pattern matching (ADR-0011, ADR-0012): match a binder against an
+   already-evaluated value, accumulating `name -> value` bindings. A binder only
+   decomposes an existing value — it never evaluates a subterm or forces a
+   black-hole — so the host recursion here hides no evaluation step (cf. ADR-0002),
+   the same status as `Prim.eval` working on already-computed arguments.
+
+   The result distinguishes the machine's two kinds of "does not match" (ADR-0012):
+   - a *legitimate, well-typed value-level non-match* — a different constructor
+     tag, an unequal same-typed scalar, a different array length — returns `None`,
+     so `case` falls through to the next alternative;
+   - a *type-impossible shape mismatch* — a binder against a value of the wrong
+     kind, or a record pattern naming a label the value lacks — is `stuck`
+     (reachable only via `unsafeCoerce` or a lowering bug), consistent with
+     `Accessor` (ADR-0010) and ill-typed primitives (ADR-0007 §4). *)
 
 let rec match_binder (b : Ast.binder) (v : Value.t) (acc : (string * Value.t) list)
   : (string * Value.t) list option
@@ -24,26 +31,37 @@ let rec match_binder (b : Ast.binder) (v : Value.t) (acc : (string * Value.t) li
      matches, since polymorphic `=` on floats is false for NaN. *)
   | Ast.BLit (Ast.LNumber f), Value.VNumber m -> if Poly.(f = m) then Some acc else None
   | Ast.BCtor (tag, subs), Value.VData { tag = vtag; fields } ->
-    (* A different tag is a legitimate match failure (take the next alternative),
-       not an error. Arity always agrees for a well-typed program. *)
-    if String.equal tag vtag && List.length subs = Array.length fields
-    then match_binders subs (Array.to_list fields) acc
+    if String.equal tag vtag
+    then
+      (* Same constructor always has the same arity; an inequality here is
+         type-impossible, not a discrimination. *)
+      if List.length subs = Array.length fields
+      then match_seq subs (Array.to_list fields) acc
+      else Errors.stuck ("constructor pattern arity mismatch: " ^ tag)
+    else (* a different tag is how a sum discriminates: fall through *)
+      None
+  | Ast.BArray subs, Value.VArray arr ->
+    (* Array length is a runtime property, not part of the type, so a different
+       length is a legitimate non-match. *)
+    if List.length subs = Array.length arr
+    then match_seq subs (Array.to_list arr) acc
     else None
-  (* Any other binder/value pairing cannot match. Well-typed CoreFn only reaches
-     this for a literal/constructor pattern that legitimately does not match the
-     value, so it falls through to the next alternative. *)
-  | _ -> None
+  | Ast.BRecord fields, Value.VRecord m -> match_fields fields m acc
+  (* A binder against a value of the wrong kind is type-impossible (ADR-0012). *)
+  | (Ast.BLit _ | Ast.BCtor _ | Ast.BArray _ | Ast.BRecord _), _ ->
+    Errors.stuck "pattern matched against a value of the wrong shape"
 
-(* Match a list of binders against the same-length list of values, threading the
-   accumulated bindings and short-circuiting on the first failure. *)
-and match_binders
+(* Positional matching for constructor fields and array elements; callers ensure
+   equal lengths, so an inequality is a malformed pattern, not a non-match. Used
+   for a `case`'s binders-against-scrutinees too (one binder per scrutinee). *)
+and match_seq
       (binders : Ast.binder list)
       (values : Value.t list)
       (acc : (string * Value.t) list)
   : (string * Value.t) list option
   =
   match List.zip binders values with
-  | List.Or_unequal_lengths.Unequal_lengths -> None
+  | List.Or_unequal_lengths.Unequal_lengths -> Errors.stuck "pattern arity mismatch"
   | List.Or_unequal_lengths.Ok pairs ->
     List.fold_until
       pairs
@@ -54,12 +72,30 @@ and match_binders
         | None -> Stop None)
       ~finish:(fun acc -> Some acc)
 
+(* Record patterns name a row-polymorphic subset of fields. A named label absent
+   from the value is type-impossible (presence is in the row type) -> stuck. *)
+and match_fields
+      (fields : (string * Ast.binder) list)
+      (m : Value.record)
+      (acc : (string * Value.t) list)
+  : (string * Value.t) list option
+  =
+  match fields with
+  | [] -> Some acc
+  | (label, p) :: rest ->
+    (match Map.find m label with
+     | Some value ->
+       (match match_binder p value acc with
+        | Some acc' -> match_fields rest m acc'
+        | None -> None)
+     | None -> Errors.stuck ("record pattern: missing label " ^ label))
+
 (* Select the first alternative whose binders all match the scrutinee values,
    returning its bindings and result term. *)
 let select (alts : Ast.alternative list) (values : Value.t list)
   : ((string * Value.t) list * Ast.term) option
   =
   List.find_map alts ~f:(fun { Ast.binders; result } ->
-    match match_binders binders values [] with
+    match match_seq binders values [] with
     | Some bindings -> Some (bindings, result)
     | None -> None)

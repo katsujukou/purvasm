@@ -29,10 +29,10 @@ type primop =
   | IndexArray
   | LengthArray
 
-(* A pattern, matched structurally against an already-evaluated value (ADR-0011).
-   This first slice covers CoreFn's scalar binders: wildcard, variable, scalar
-   literal, (nested) constructor, and as-pattern. Array- and record-literal
-   binders, and guards, are deferred to follow-on records. *)
+(* A pattern, matched structurally against an already-evaluated value (ADR-0011,
+   ADR-0012). Covers all of CoreFn's binders: wildcard, variable, scalar literal,
+   (nested) constructor, array, record, and as-pattern. Guards live on the
+   alternative, not the binder, and are a separate axis (ADR-0013). *)
 type binder =
   (* `_` — matches anything, binds nothing. *)
   | BNull
@@ -43,6 +43,13 @@ type binder =
   (* A constructor pattern — matches a `VData` with the same tag and arity, then
      matches each sub-binder against the corresponding field. *)
   | BCtor of string * binder list
+  (* A fixed-length array pattern (ADR-0012) — matches a `VArray` of exactly this
+     many elements, element-wise. A different length is a legitimate non-match
+     (array length is not part of the type). *)
+  | BArray of binder list
+  (* A record pattern (ADR-0012) — matches a `VRecord` that has at least these
+     labels (row-polymorphic subset), matching each named field's sub-binder. *)
+  | BRecord of (string * binder) list
   (* An as-pattern `x@p` — binds the whole value to `x` and also matches `p`. *)
   | BNamed of string * binder
 
@@ -106,6 +113,13 @@ let rec binder_to_string : binder -> string = function
   | BCtor (tag, []) -> tag
   | BCtor (tag, subs) ->
     tag ^ "(" ^ String.concat ~sep:", " (List.map subs ~f:binder_to_string) ^ ")"
+  | BArray subs -> "[" ^ String.concat ~sep:", " (List.map subs ~f:binder_to_string) ^ "]"
+  | BRecord fields ->
+    "{"
+    ^ String.concat
+        ~sep:", "
+        (List.map fields ~f:(fun (l, b) -> l ^ ": " ^ binder_to_string b))
+    ^ "}"
   | BNamed (x, b) -> x ^ "@" ^ binder_to_string b
 
 let rec to_string : term -> string = function
