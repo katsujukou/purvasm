@@ -58,5 +58,7 @@ language and are kept out of version control.)
 | [0009](0009-array-immutable-host-backed.md) | Array as an immutable, host-backed vector | Accepted |
 | [0010](0010-record-row-polymorphic.md) | Record as an unordered field map | Accepted |
 | [0011](0011-adt-pattern-matching.md) | Algebraic data types and `case` pattern matching | Accepted |
+| [0012](0012-array-record-binders.md) | Array and record binders | Accepted |
+| [0013](0013-case-guards.md) | Guards in `case` alternatives | Accepted |
 
 ## Scope
