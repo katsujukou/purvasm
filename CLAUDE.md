@@ -67,3 +67,16 @@
     ```
 
     This example assumes that `test.main` in `spago.yaml` is set to `Test.Unit.Foo`.
+
+## For Coding Agents
+
+- Start by proposing the design as an ADR. When a coding agent creates a new ADR, it MUST set the ADR status to `Proposed`.
+
+- Implementation must begin only after the human maintainer reviews the ADR and changes its status to `Accepted`.
+
+- An ADR is considered accepted only if one of the following occurs:
+
+  1. The human maintainer explicitly states "Accept" (or equivalent explicit approval), or
+  2. The human maintainer directly edits the ADR and changes its status to `Accepted`.
+
+- Do not interpret conversational feedback in prompts (e.g. "looks good", "sounds reasonable", "seems fine", etc.) as acceptance. Only the explicit signals above authorize implementation work.
