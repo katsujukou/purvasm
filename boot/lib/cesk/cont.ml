@@ -40,6 +40,11 @@ type t =
   (* A record *functional* update whose base record is being evaluated; once it is a record we
      start evaluating the update fields (see Record_fields). *)
   | Update_rec of (string * Ast.term) list * Env.t * t
+  (* Evaluating a case's scrutinees left to right (ADR-0011): values already
+     computed (in reverse), the scrutinee terms still to evaluate, the
+     alternatives to try once all scrutinees are values, and the environment of
+     the case. Same accumulate-in-reverse shape as Prim_args / Array_elems. *)
+  | Case_scrut of Value.t list * Ast.term list * Ast.alternative list * Env.t * t
 
 let frame_name : t -> string = function
   | Halt -> "halt"
@@ -53,3 +58,4 @@ let frame_name : t -> string = function
   | Record_fields _ -> "fld"
   | Project _ -> "prj"
   | Update_rec _ -> "upd"
+  | Case_scrut _ -> "case"

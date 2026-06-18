@@ -11,9 +11,28 @@ type t =
   | VString of string
   | VArray of t array
   | VRecord of record
+  (* A fully-applied data constructor: its name (the tag we match on, ADR-0011)
+     and its field values in declaration order. *)
+  | VData of data
+  (* A constructor still collecting its arguments. CoreFn's `Constructor` is a
+     curried function of a fixed arity; this is the partial application that the
+     `Arg` rule grows one field at a time until `arity` is reached, at which
+     point it becomes a `VData`. `args` is accumulated in reverse. *)
+  | VCtor of ctor
   | VClosure of closure
 
 and record = t Map.M(String).t
+
+and data =
+  { tag : string
+  ; fields : t array
+  }
+
+and ctor =
+  { tag : string
+  ; arity : int
+  ; args : t list
+  }
 
 and closure =
   { param : string
@@ -34,4 +53,13 @@ let rec to_string : t -> string = function
         ~sep:", "
         (List.map (Map.to_alist m) ~f:(fun (k, v) -> k ^ ": " ^ to_string v))
     ^ "}"
+  | VData { tag; fields } ->
+    if Array.is_empty fields
+    then tag
+    else
+      tag
+      ^ "("
+      ^ String.concat ~sep:", " (List.map (Array.to_list fields) ~f:to_string)
+      ^ ")"
+  | VCtor { tag; arity; _ } -> "<ctor " ^ tag ^ "/" ^ Int.to_string arity ^ ">"
   | VClosure _ -> "<closure>"

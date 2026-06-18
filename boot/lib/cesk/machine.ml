@@ -23,6 +23,30 @@ type result =
 let inject (term : Ast.term) : state =
   { focus = Eval (term, Env.empty); store = Store.empty; kont = Cont.Halt }
 
+(* Take the first alternative whose binders match the scrutinee values
+   (ADR-0011): allocate its pattern bindings in the store, extend the case's
+   environment with them, and evaluate the result there. Matching itself is a
+   pure structural walk over already-computed values (see `Pmatch`); only the
+   chosen result re-enters the machine. No matching alternative is a stuck state
+   — well-typed CoreFn produces exhaustive cases (or its own failure arm). *)
+let dispatch_case
+      (values : Value.t list)
+      (alts : Ast.alternative list)
+      (store : Store.t)
+      (env : Env.t)
+      (kont : Cont.t)
+  : result
+  =
+  match Pmatch.select alts values with
+  | Some (bindings, body) ->
+    let store', env' =
+      List.fold bindings ~init:(store, env) ~f:(fun (st, e) (name, value) ->
+        let addr, st' = Store.alloc st value in
+        st', Env.extend e name addr)
+    in
+    Step { focus = Eval (body, env'); store = store'; kont }
+  | None -> Errors.stuck "no matching case alternative"
+
 let step (s : state) : result =
   match s.focus with
   | Eval (term, env) ->
@@ -91,7 +115,22 @@ let step (s : state) : result =
      | Ast.Accessor (e, l) ->
        Step { s with focus = Eval (e, env); kont = Cont.Project (l, s.kont) }
      | Ast.Update (e, ups) ->
-       Step { s with focus = Eval (e, env); kont = Cont.Update_rec (ups, env, s.kont) })
+       Step { s with focus = Eval (e, env); kont = Cont.Update_rec (ups, env, s.kont) }
+     | Ast.Ctor (tag, arity) ->
+       (* A nullary constructor is data right away; otherwise it is a curried
+          constructor function that the Arg rule fills in field by field. *)
+       if arity = 0
+       then Step { s with focus = Return (Value.VData { tag; fields = [||] }) }
+       else Step { s with focus = Return (Value.VCtor { tag; arity; args = [] }) }
+     | Ast.Case (scruts, alts) ->
+       (match scruts with
+        | [] -> dispatch_case [] alts s.store env s.kont
+        | e1 :: rest ->
+          Step
+            { s with
+              focus = Eval (e1, env)
+            ; kont = Cont.Case_scrut ([], rest, alts, env, s.kont)
+            }))
   | Return v ->
     (match s.kont with
      | Cont.Halt -> Done v
@@ -103,6 +142,20 @@ let step (s : state) : result =
           let addr, store' = Store.alloc s.store v in
           let env' = Env.extend closure_env param addr in
           Step { focus = Eval (body, env'); store = store'; kont = k }
+        | Value.VCtor { tag; arity; args } ->
+          (* Collect one more field. Saturating the arity turns the partial
+             constructor into data. Like array/record literals, this allocates
+             nothing in the store — the field value lives inside the data. *)
+          let args = v :: args in
+          if List.length args = arity
+          then
+            Step
+              { s with
+                focus =
+                  Return (Value.VData { tag; fields = Array.of_list (List.rev args) })
+              ; kont = k
+              }
+          else Step { s with focus = Return (Value.VCtor { tag; arity; args }); kont = k }
         | _ -> Errors.stuck "application of a non-function")
      | Cont.Let_body (x, e2, env, k) ->
        let addr, store' = Store.alloc s.store v in
@@ -179,7 +232,17 @@ let step (s : state) : result =
                  focus = Eval (e, env)
                ; kont = Cont.Record_fields (m, l, rest, env, k)
                })
-        | _ -> Errors.stuck "record update of a non-record"))
+        | _ -> Errors.stuck "record update of a non-record")
+     | Cont.Case_scrut (done_, remaining, alts, env, k) ->
+       let done_ = v :: done_ in
+       (match remaining with
+        | [] -> dispatch_case (List.rev done_) alts s.store env k
+        | e :: rest ->
+          Step
+            { s with
+              focus = Eval (e, env)
+            ; kont = Cont.Case_scrut (done_, rest, alts, env, k)
+            }))
 
 let state_to_string (s : state) : string =
   let focus =

@@ -21,6 +21,10 @@ let length a = Prim (LengthArray, [ a ])
 let rcd fields = Record fields
 let proj l e = Accessor (e, l)
 let upd e ups = Update (e, ups)
+let just x = App (Ctor ("Just", 1), x)
+let nil = Ctor ("Nil", 0)
+let cons h t = App (App (Ctor ("Cons", 2), h), t)
+let alt binders result = { binders; result }
 
 let samples : (string * term) list =
   [ "arith: (2+3)*2", mul_int (add_int (num 2) (num 3)) (num 2)
@@ -73,6 +77,26 @@ let samples : (string * term) list =
   ; "record: {x:1, y:2}.y", proj "y" (rcd [ "x", num 1; "y", num 2 ])
   ; ( "record: ({x:1,y:2} {x=9}).x"
     , proj "x" (upd (rcd [ "x", num 1; "y", num 2 ]) [ "x", num 9 ]) )
+  ; ( "adt: case Just 5 of Just x -> x+1; Nothing -> 0"
+    , Case
+        ( [ just (num 5) ]
+        , [ alt [ BCtor ("Just", [ BVar "x" ]) ] (add_int (Var "x") (num 1))
+          ; alt [ BCtor ("Nothing", []) ] (num 0)
+          ] ) )
+  ; ( "adt: sum [1,2,3] over Cons/Nil"
+    , Letrec
+        ( [ ( "sum"
+            , Lam
+                ( "xs"
+                , Case
+                    ( [ Var "xs" ]
+                    , [ alt [ BCtor ("Nil", []) ] (num 0)
+                      ; alt
+                          [ BCtor ("Cons", [ BVar "h"; BVar "t" ]) ]
+                          (add_int (Var "h") (App (Var "sum", Var "t")))
+                      ] ) ) )
+          ]
+        , App (Var "sum", cons (num 1) (cons (num 2) (cons (num 3) nil))) ) )
   ]
 
 let run_all (trace : bool) : unit =

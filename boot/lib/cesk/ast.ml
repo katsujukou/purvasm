@@ -29,6 +29,23 @@ type primop =
   | IndexArray
   | LengthArray
 
+(* A pattern, matched structurally against an already-evaluated value (ADR-0011).
+   This first slice covers CoreFn's scalar binders: wildcard, variable, scalar
+   literal, (nested) constructor, and as-pattern. Array- and record-literal
+   binders, and guards, are deferred to follow-on records. *)
+type binder =
+  (* `_` — matches anything, binds nothing. *)
+  | BNull
+  (* A variable — matches anything and binds it to the name. *)
+  | BVar of string
+  (* A scalar literal — matches only an equal value (Int/Number/Bool/String). *)
+  | BLit of lit
+  (* A constructor pattern — matches a `VData` with the same tag and arity, then
+     matches each sub-binder against the corresponding field. *)
+  | BCtor of string * binder list
+  (* An as-pattern `x@p` — binds the whole value to `x` and also matches `p`. *)
+  | BNamed of string * binder
+
 type term =
   | Lit of lit
   | Var of string
@@ -42,6 +59,21 @@ type term =
   | Record of (string * term) list
   | Accessor of term * string
   | Update of term * (string * term) list
+  (* A data constructor as a value: its tag and arity. Arity 0 is a nullary
+     constructor (immediately a `VData`); higher arities yield a curried
+     constructor function (a `VCtor`). *)
+  | Ctor of string * int
+  (* Case analysis over one or more scrutinees (ADR-0011). The scrutinees are
+     evaluated left to right, then the first alternative whose binders all match
+     is taken. *)
+  | Case of term list * alternative list
+
+(* One arm of a `Case`: a binder per scrutinee and the term to evaluate when they
+   all match. Guards are deferred to a follow-on record. *)
+and alternative =
+  { binders : binder list
+  ; result : term
+  }
 
 let primop_to_string : primop -> string = function
   | AddInt -> "+i"
@@ -66,6 +98,15 @@ let lit_to_string : lit -> string = function
   | LNumber f -> Float.to_string f
   | LBool b -> Bool.to_string b
   | LString s -> "\"" ^ s ^ "\""
+
+let rec binder_to_string : binder -> string = function
+  | BNull -> "_"
+  | BVar x -> x
+  | BLit l -> lit_to_string l
+  | BCtor (tag, []) -> tag
+  | BCtor (tag, subs) ->
+    tag ^ "(" ^ String.concat ~sep:", " (List.map subs ~f:binder_to_string) ^ ")"
+  | BNamed (x, b) -> x ^ "@" ^ binder_to_string b
 
 let rec to_string : term -> string = function
   | Lit l -> lit_to_string l
@@ -100,3 +141,15 @@ let rec to_string : term -> string = function
     ^ " { "
     ^ String.concat ~sep:", " (List.map ups ~f:(fun (l, u) -> l ^ " = " ^ to_string u))
     ^ " }"
+  | Ctor (tag, arity) -> tag ^ "/" ^ Int.to_string arity
+  | Case (scruts, alts) ->
+    "(case "
+    ^ String.concat ~sep:", " (List.map scruts ~f:to_string)
+    ^ " of "
+    ^ String.concat
+        ~sep:"; "
+        (List.map alts ~f:(fun { binders; result } ->
+           String.concat ~sep:", " (List.map binders ~f:binder_to_string)
+           ^ " -> "
+           ^ to_string result))
+    ^ ")"

@@ -25,6 +25,13 @@ let length a = Prim (LengthArray, [ a ])
 let rcd fields = Record fields
 let proj l e = Accessor (e, l)
 let upd e ups = Update (e, ups)
+let nothing = Ctor ("Nothing", 0)
+let just x = App (Ctor ("Just", 1), x)
+let nil = Ctor ("Nil", 0)
+let cons h t = App (App (Ctor ("Cons", 2), h), t)
+let pair a b = App (App (Ctor ("Pair", 2), a), b)
+let case scruts alts = Case (scruts, alts)
+let alt binders result = { binders; result }
 
 let eval_int (term : term) : int =
   match Cesk.Machine.eval term with
@@ -45,6 +52,12 @@ let eval_number (term : term) : float =
   match Cesk.Machine.eval term with
   | Cesk.Value.VNumber f -> f
   | _ -> Alcotest.fail "expected a number result"
+
+(* The tag and field values of a fully-applied constructor result. *)
+let eval_data (term : term) : string * Cesk.Value.t list =
+  match Cesk.Machine.eval term with
+  | Cesk.Value.VData { tag; fields } -> tag, Array.to_list fields
+  | _ -> Alcotest.fail "expected a data (VData) result"
 
 (* Evaluation must get stuck (raise Machine_error), regardless of the message. *)
 let assert_stuck (term : term) : unit =
@@ -434,6 +447,232 @@ let test_record_missing_field () = assert_stuck (proj "z" (rcd [ "x", num 1 ]))
 let test_record_proj_non_record () = assert_stuck (proj "x" (num 5))
 let test_record_update_non_record () = assert_stuck (upd (num 5) [ "x", num 1 ])
 
+(* ADTs and pattern matching (ADR-0011) -------------------------------------- *)
+
+(* A nullary constructor evaluates straight to data with no fields. *)
+let test_ctor_nullary () =
+  let tag, fields = eval_data nothing in
+  Alcotest.(check string) "tag" "Nothing" tag;
+  Alcotest.(check int) "no fields" 0 (List.length fields)
+
+(* A saturated constructor application builds data carrying its field. *)
+let test_ctor_saturated () =
+  let tag, fields = eval_data (just (num 5)) in
+  Alcotest.(check string) "tag" "Just" tag;
+  Alcotest.(check int) "one field" 1 (List.length fields)
+
+(* A binary constructor saturates only after both arguments. *)
+let test_ctor_binary_saturated () =
+  let tag, fields = eval_data (pair (num 1) (num 2)) in
+  Alcotest.(check string) "tag" "Pair" tag;
+  Alcotest.(check int) "two fields" 2 (List.length fields)
+
+(* A constructor given fewer arguments than its arity is a partial constructor
+   (VCtor) — a first-class value, not data yet. *)
+let test_ctor_partial () =
+  match Cesk.Machine.eval (App (Ctor ("Pair", 2), num 1)) with
+  | Cesk.Value.VCtor { tag; arity; args } ->
+    Alcotest.(check string) "tag" "Pair" tag;
+    Alcotest.(check int) "arity" 2 arity;
+    Alcotest.(check int) "one collected" 1 (List.length args)
+  | _ -> Alcotest.fail "expected a partial constructor (VCtor)"
+
+(* A partial constructor survives as a value (here, bound by let) and saturates
+   when the remaining argument is applied later. *)
+let test_ctor_partial_then_saturated () =
+  Alcotest.(check int)
+    "first-class partial ctor"
+    3
+    (eval_int
+       (Let
+          ( "p"
+          , App (Ctor ("Pair", 2), num 1)
+          , case
+              [ App (Var "p", num 2) ]
+              [ alt
+                  [ BCtor ("Pair", [ BVar "a"; BVar "b" ]) ]
+                  (add_int (Var "a") (Var "b"))
+              ] )))
+
+(* case selects the matching constructor arm and binds its field. *)
+let test_case_just () =
+  Alcotest.(check int)
+    "Just 5 -> x+1"
+    6
+    (eval_int
+       (case
+          [ just (num 5) ]
+          [ alt [ BCtor ("Just", [ BVar "x" ]) ] (add_int (Var "x") (num 1))
+          ; alt [ BCtor ("Nothing", []) ] (num 0)
+          ]))
+
+(* The other arm of the same case, reached by the nullary constructor. *)
+let test_case_nothing () =
+  Alcotest.(check int)
+    "Nothing -> 0"
+    0
+    (eval_int
+       (case
+          [ nothing ]
+          [ alt [ BCtor ("Just", [ BVar "x" ]) ] (add_int (Var "x") (num 1))
+          ; alt [ BCtor ("Nothing", []) ] (num 0)
+          ]))
+
+(* Alternatives are tried in order: the first match wins even if a later one
+   would also match. *)
+let test_case_first_match_wins () =
+  Alcotest.(check int)
+    "wildcard first"
+    99
+    (eval_int
+       (case
+          [ just (num 5) ]
+          [ alt [ BNull ] (num 99); alt [ BCtor ("Just", [ BVar "x" ]) ] (Var "x") ]))
+
+(* A wildcard matches anything and binds nothing. *)
+let test_case_wildcard () =
+  Alcotest.(check int) "_ -> 1" 1 (eval_int (case [ num 7 ] [ alt [ BNull ] (num 1) ]))
+
+(* A variable binder matches anything and binds the whole value. *)
+let test_case_var_binds_whole () =
+  Alcotest.(check int)
+    "x -> x+1"
+    8
+    (eval_int (case [ num 7 ] [ alt [ BVar "x" ] (add_int (Var "x") (num 1)) ]))
+
+(* A scalar literal binder matches an equal value. *)
+let test_case_int_literal () =
+  Alcotest.(check int)
+    "0 -> 10"
+    10
+    (eval_int (case [ num 0 ] [ alt [ BLit (LInt 0) ] (num 10); alt [ BNull ] (num 20) ]))
+
+(* ...and falls through to the next alternative when it differs. *)
+let test_case_int_literal_fallthrough () =
+  Alcotest.(check int)
+    "5 -> _"
+    20
+    (eval_int (case [ num 5 ] [ alt [ BLit (LInt 0) ] (num 10); alt [ BNull ] (num 20) ]))
+
+let test_case_bool_literal () =
+  Alcotest.(check int)
+    "true -> 1"
+    1
+    (eval_int
+       (case
+          [ Lit (LBool true) ]
+          [ alt [ BLit (LBool true) ] (num 1); alt [ BLit (LBool false) ] (num 0) ]))
+
+let test_case_string_literal () =
+  Alcotest.(check int)
+    "\"b\" -> 2"
+    2
+    (eval_int
+       (case
+          [ str "b" ]
+          [ alt [ BLit (LString "a") ] (num 1)
+          ; alt [ BLit (LString "b") ] (num 2)
+          ; alt [ BNull ] (num 0)
+          ]))
+
+(* IEEE: a NaN literal pattern never matches a NaN value, so it falls through.
+   This is the matcher's link to ADR-0008 (Prim.eval EqNumber semantics). *)
+let test_case_nan_literal_never_matches () =
+  Alcotest.(check int)
+    "nan literal falls through"
+    0
+    (eval_int
+       (case [ numf nan ] [ alt [ BLit (LNumber nan) ] (num 1); alt [ BNull ] (num 0) ]))
+
+(* Nested constructor patterns destructure several levels at once. *)
+let test_case_nested_ctor () =
+  Alcotest.(check int)
+    "Just (Just 7) -> x"
+    7
+    (eval_int
+       (case
+          [ just (just (num 7)) ]
+          [ alt [ BCtor ("Just", [ BCtor ("Just", [ BVar "x" ]) ]) ] (Var "x") ]))
+
+(* An as-pattern binds the whole value AND its parts: here `m` is rebound and
+   re-matched to recover the field, proving both bindings are in scope. *)
+let test_case_as_pattern () =
+  Alcotest.(check int)
+    "m@(Just x)"
+    10
+    (eval_int
+       (case
+          [ just (num 5) ]
+          [ alt
+              [ BNamed ("m", BCtor ("Just", [ BVar "x" ])) ]
+              (case
+                 [ Var "m" ]
+                 [ alt [ BCtor ("Just", [ BVar "y" ]) ] (add_int (Var "x") (Var "y")) ])
+          ]))
+
+(* Multiple scrutinees are matched position-wise by one binder each. *)
+let test_case_multi_scrutinee () =
+  Alcotest.(check int)
+    "a, b -> a+b"
+    3
+    (eval_int
+       (case
+          [ num 1; num 2 ]
+          [ alt [ BVar "a"; BVar "b" ] (add_int (Var "a") (Var "b")) ]))
+
+(* Multi-scrutinee discrimination with fall-through: the first alternative fails
+   on the first scrutinee, the second matches on the second. *)
+let test_case_multi_scrutinee_fallthrough () =
+  Alcotest.(check int)
+    "(_,Just y) reached"
+    3
+    (eval_int
+       (case
+          [ nothing; just (num 3) ]
+          [ alt [ BCtor ("Just", [ BVar "x" ]); BNull ] (Var "x")
+          ; alt [ BNull; BCtor ("Just", [ BVar "y" ]) ] (Var "y")
+          ; alt [ BNull; BNull ] (num 0)
+          ]))
+
+(* A recursive function over a Cons/Nil list: the canonical ADT + case use. *)
+let test_case_list_sum () =
+  Alcotest.(check int)
+    "sum [1,2,3]"
+    6
+    (eval_int
+       (Letrec
+          ( [ ( "sum"
+              , Lam
+                  ( "xs"
+                  , case
+                      [ Var "xs" ]
+                      [ alt [ BCtor ("Nil", []) ] (num 0)
+                      ; alt
+                          [ BCtor ("Cons", [ BVar "h"; BVar "t" ]) ]
+                          (add_int (Var "h") (App (Var "sum", Var "t")))
+                      ] ) )
+            ]
+          , App (Var "sum", cons (num 1) (cons (num 2) (cons (num 3) nil))) )))
+
+(* The degenerate zero-scrutinee case matches an alternative with no binders. *)
+let test_case_empty_scrutinee () =
+  Alcotest.(check int) "empty case" 42 (eval_int (case [] [ alt [] (num 42) ]))
+
+(* Stuck states for matching --------------------------------------------------*)
+
+(* No alternative matches: a non-exhaustive case is stuck (well-typed CoreFn is
+   exhaustive or supplies its own failure arm). *)
+let test_case_non_exhaustive () =
+  assert_stuck (case [ nothing ] [ alt [ BCtor ("Just", [ BVar "x" ]) ] (Var "x") ])
+
+(* A literal pattern that matches nothing and has no catch-all is also stuck. *)
+let test_case_literal_no_match () =
+  assert_stuck (case [ num 5 ] [ alt [ BLit (LInt 0) ] (num 1) ])
+
+(* Over-applying a saturated constructor applies data as a function — stuck, via
+   the Arg non-function rule. *)
+let test_ctor_over_application () = assert_stuck (App (just (num 1), num 2))
+
 let () =
   Alcotest.run
     "cesk"
@@ -493,6 +732,41 @@ let () =
         ; Alcotest.test_case "record_update_immutable" `Quick test_record_update_immutable
         ; Alcotest.test_case "record_nested" `Quick test_record_nested
         ] )
+    ; ( "adt"
+      , [ Alcotest.test_case "ctor_nullary" `Quick test_ctor_nullary
+        ; Alcotest.test_case "ctor_saturated" `Quick test_ctor_saturated
+        ; Alcotest.test_case "ctor_binary_saturated" `Quick test_ctor_binary_saturated
+        ; Alcotest.test_case "ctor_partial" `Quick test_ctor_partial
+        ; Alcotest.test_case
+            "ctor_partial_then_saturated"
+            `Quick
+            test_ctor_partial_then_saturated
+        ; Alcotest.test_case "case_just" `Quick test_case_just
+        ; Alcotest.test_case "case_nothing" `Quick test_case_nothing
+        ; Alcotest.test_case "case_first_match_wins" `Quick test_case_first_match_wins
+        ; Alcotest.test_case "case_wildcard" `Quick test_case_wildcard
+        ; Alcotest.test_case "case_var_binds_whole" `Quick test_case_var_binds_whole
+        ; Alcotest.test_case "case_int_literal" `Quick test_case_int_literal
+        ; Alcotest.test_case
+            "case_int_literal_fallthrough"
+            `Quick
+            test_case_int_literal_fallthrough
+        ; Alcotest.test_case "case_bool_literal" `Quick test_case_bool_literal
+        ; Alcotest.test_case "case_string_literal" `Quick test_case_string_literal
+        ; Alcotest.test_case
+            "case_nan_literal_never_matches"
+            `Quick
+            test_case_nan_literal_never_matches
+        ; Alcotest.test_case "case_nested_ctor" `Quick test_case_nested_ctor
+        ; Alcotest.test_case "case_as_pattern" `Quick test_case_as_pattern
+        ; Alcotest.test_case "case_multi_scrutinee" `Quick test_case_multi_scrutinee
+        ; Alcotest.test_case
+            "case_multi_scrutinee_fallthrough"
+            `Quick
+            test_case_multi_scrutinee_fallthrough
+        ; Alcotest.test_case "case_list_sum" `Quick test_case_list_sum
+        ; Alcotest.test_case "case_empty_scrutinee" `Quick test_case_empty_scrutinee
+        ] )
     ; ( "stuck"
       , [ Alcotest.test_case "unbound" `Quick test_unbound
         ; Alcotest.test_case "apply_non_function" `Quick test_apply_non_function
@@ -514,5 +788,8 @@ let () =
             "record_update_non_record"
             `Quick
             test_record_update_non_record
+        ; Alcotest.test_case "case_non_exhaustive" `Quick test_case_non_exhaustive
+        ; Alcotest.test_case "case_literal_no_match" `Quick test_case_literal_no_match
+        ; Alcotest.test_case "ctor_over_application" `Quick test_ctor_over_application
         ] )
     ]
