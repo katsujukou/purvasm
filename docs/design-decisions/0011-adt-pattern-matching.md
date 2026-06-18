@@ -274,4 +274,3 @@ a third reason guards are deferred (see *Alternatives considered*).
   [0007](0007-monomorphic-primitives.md): equality is per-type (and `Number` is
   IEEE, not total); the matcher compares each scalar literal with its own
   primitive's semantics, not a blanket deep-equal.
-```
