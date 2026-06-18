@@ -6,7 +6,7 @@
 
 open Corefn
 
-let m : Module.t = Decode.module_of_file "fixtures/fixture.corefn.json"
+let m : Module.t = Decode.module_of_file "../fixtures/fixture.corefn.json"
 
 (* Find the expression bound to a top-level identifier (NonRec or within Rec). *)
 let find (name : string) : Expr.expr =
