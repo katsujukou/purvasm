@@ -157,7 +157,19 @@ Literal equality follows the value's primitive: `Int`/`Bool`/`String` exact,
 `Prim.eval EqNumber`, [0008](0008-number-ieee754-double.md)). A constructor
 binder against data with a **different tag is an ordinary match failure** (fall
 through to the next alternative), *not* a stuck state — that is exactly how a
-`case` discriminates a sum. "Stuck" is reserved for *no* alternative matching.
+`case` discriminates a sum. ~~"Stuck" is reserved for *no* alternative matching.~~
+
+> **Correction (2026-06-18):** [0012](0012-array-record-binders.md) (Proposed)
+> refines the "any other pairing → never" row and the struck sentence above.
+> The matcher returns `None` only for a **legitimate, well-typed value-level
+> non-match** (different constructor tag, unequal same-typed scalar, different
+> array length); a **type-impossible shape mismatch** (a binder against a value
+> of the wrong kind — e.g. a constructor binder against a non-`VData`, reachable
+> only via `unsafeCoerce` or a lowering bug) is now **stuck**, consistent with
+> `Accessor` ([0010](0010-record-row-polymorphic.md)) and ill-typed primitives
+> ([0007](0007-monomorphic-primitives.md) §4). So "stuck" covers *both* no
+> alternative matching *and* a type-impossible pairing. See
+> [0012](0012-array-record-binders.md) for the full rule.
 
 ### Why matching may be host recursion
 
