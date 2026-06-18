@@ -1,3 +1,4 @@
 (tests
- (names test_machine)
- (libraries cesk alcotest))
+ (names test_machine test_corefn)
+ (libraries cesk corefn alcotest)
+ (deps (glob_files fixtures/*)))
