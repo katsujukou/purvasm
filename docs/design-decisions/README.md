@@ -62,5 +62,6 @@ language and are kept out of version control.)
 | [0013](0013-case-guards.md) | Guards in `case` alternatives | Accepted |
 | [0014](0014-corefn-ingestion.md) | CoreFn ingestion: decode `corefn.json` to a faithful `Corefn` AST | Accepted |
 | [0015](0015-corefn-lowering.md) | CoreFn lowering: `Corefn` → `Cesk.Ast` | Accepted |
+| [0016](0016-cross-module-linking.md) | Cross-module linking | Accepted |
 
 ## Scope
