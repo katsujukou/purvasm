@@ -57,5 +57,6 @@ language and are kept out of version control.)
 | [0008](0008-number-ieee754-double.md) | Number as an IEEE 754 double (host float) | Accepted |
 | [0009](0009-array-immutable-host-backed.md) | Array as an immutable, host-backed vector | Accepted |
 | [0010](0010-record-row-polymorphic.md) | Record as an unordered field map | Accepted |
+| [0011](0011-adt-pattern-matching.md) | Algebraic data types and `case` pattern matching | Accepted |
 
 ## Scope
