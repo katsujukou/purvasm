@@ -1,0 +1,4 @@
+(library
+ (name link)
+ (public_name purvasm.link)
+ (libraries corefn cesk lower))

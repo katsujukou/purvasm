@@ -138,16 +138,96 @@ let test_is_even_1 () =
 let test_is_odd_3 () =
   Alcotest.(check bool) "isOdd 3" true (as_bool (run_app "isOdd" (nat 3)))
 
-(* --- deferred linking: an unresolved external reference is stuck ---------- *)
+(* --- cross-module linking (ADR-0016) ------------------------------------- *)
 
-(* No module binds another module's name yet, so forcing one is stuck (ADR-0015,
-   total lowering). Lowered directly to keep the test self-contained. *)
+(* A multi-module program fixture: Main imports Lib, plus one foreign import. *)
+let app_outdir = "../fixtures/app"
+
+let program (entry : string) : C.term =
+  Link.link_program ~outdir:app_outdir ~entry_module:[ "Main" ] ~entry ()
+
+let run_program (entry : string) : V.t = Cesk.Machine.eval (program entry)
+
+(* `Main.result = unbox (Box 42)` — a cross-module reference (Main -> Lib) that
+   resolves and runs after linking. *)
+let test_link_result () =
+  Alcotest.(check int) "Main.result" 42 (as_int (run_program "result"))
+
+(* `Main.mapped = unbox (mapBox identity (Box 42))` — a guest closure passed into
+   a function defined in another module. *)
+let test_link_higher_order () =
+  Alcotest.(check int) "Main.mapped" 42 (as_int (run_program "mapped"))
+
+(* load resolves the entry's transitive import closure (Main + Lib); Prim has no
+   corefn.json and is skipped. *)
+let test_link_loads_closure () =
+  Alcotest.(check int)
+    "loaded module count"
+    2
+    (List.length (Link.load ~outdir:app_outdir ~entry_module:[ "Main" ]))
+
+(* `usesForeign` is a function, so the program links and loads; applying it forces
+   the foreign `native`, which the empty resolver leaves unbound -> stuck (the
+   ADR-0016 FFI seam). *)
+let test_link_foreign_unbound () =
+  match Cesk.Machine.eval (C.App (program "usesForeign", int 0)) with
+  | exception Cesk.Errors.Machine_error _ -> ()
+  | _ -> Alcotest.fail "forcing an unresolved foreign should be stuck"
+
+(* Lowering a bare cross-module reference is also stuck when unbound. *)
 let test_external_unbound () =
   match
     Cesk.Machine.eval (Lower.lower_var (Corefn.Names.Qualified (Some [ "Other" ], "foo")))
   with
   | exception Cesk.Errors.Machine_error _ -> ()
   | _ -> Alcotest.fail "an unresolved external reference should be stuck"
+
+(* --- module-graph shapes (ADR-0016 loading + topo order) ----------------- *)
+
+let run_at ~(outdir : string) ~(entry_module : string list) (entry : string) : V.t =
+  Cesk.Machine.eval (Link.link_program ~outdir ~entry_module ~entry ())
+
+let closure_size ~(outdir : string) ~(entry_module : string list) : int =
+  List.length (Link.load ~outdir ~entry_module)
+
+(* Transitive: TransA -> TransB -> TransC; the value threads through all three. *)
+let test_transitive () =
+  Alcotest.(check int)
+    "TransA.a = TransC.c via TransB"
+    3
+    (as_int (run_at ~outdir:"../fixtures/trans" ~entry_module:[ "TransA" ] "a"))
+
+let test_transitive_closure () =
+  Alcotest.(check int)
+    "transitive closure size"
+    3
+    (closure_size ~outdir:"../fixtures/trans" ~entry_module:[ "TransA" ])
+
+(* Diamond: DiaA -> {DiaB, DiaC} -> DiaD. Both paths reach the one DiaD, which is
+   loaded and bound once; `both = Two b c` forces both. *)
+let test_diamond () =
+  match run_at ~outdir:"../fixtures/diamond" ~entry_module:[ "DiaA" ] "both" with
+  | V.VData { tag = "Two"; fields } ->
+    Alcotest.(check (list int))
+      "Two 7 7"
+      [ 7; 7 ]
+      (List.map as_int (Array.to_list fields))
+  | _ -> Alcotest.fail "DiaA.both should be Two 7 7"
+
+let test_diamond_closure () =
+  Alcotest.(check int)
+    "diamond closure size (DiaD once)"
+    4
+    (closure_size ~outdir:"../fixtures/diamond" ~entry_module:[ "DiaA" ])
+
+(* Re-exports: Main imports `origin` via Reexport (which re-exports Origin); the
+   reference is to the canonical Origin.origin, so it resolves after linking even
+   though Reexport itself contributes no bindings. *)
+let test_reexport () =
+  Alcotest.(check int)
+    "re-exported origin resolves to canonical Origin"
+    5
+    (as_int (run_at ~outdir:"../fixtures/reexport" ~entry_module:[ "Main" ] "result"))
 
 let () =
   Alcotest.run
@@ -181,5 +261,18 @@ let () =
         ; Alcotest.test_case "is_even_1" `Quick test_is_even_1
         ; Alcotest.test_case "is_odd_3" `Quick test_is_odd_3
         ] )
-    ; "linking", [ Alcotest.test_case "external_unbound" `Quick test_external_unbound ]
+    ; ( "linking"
+      , [ Alcotest.test_case "link_result" `Quick test_link_result
+        ; Alcotest.test_case "link_higher_order" `Quick test_link_higher_order
+        ; Alcotest.test_case "link_loads_closure" `Quick test_link_loads_closure
+        ; Alcotest.test_case "link_foreign_unbound" `Quick test_link_foreign_unbound
+        ; Alcotest.test_case "external_unbound" `Quick test_external_unbound
+        ] )
+    ; ( "module-graph"
+      , [ Alcotest.test_case "transitive" `Quick test_transitive
+        ; Alcotest.test_case "transitive_closure" `Quick test_transitive_closure
+        ; Alcotest.test_case "diamond" `Quick test_diamond
+        ; Alcotest.test_case "diamond_closure" `Quick test_diamond_closure
+        ; Alcotest.test_case "reexport" `Quick test_reexport
+        ] )
     ]
