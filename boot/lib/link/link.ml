@@ -8,8 +8,61 @@
 module C = Cesk.Ast
 module M = Corefn.Module
 module N = Corefn.Names
+module SSet = Set.Make (String)
 
 let name_key (n : N.module_name) : string = String.concat "." n
+
+(* The names a binder binds (for free-variable analysis). *)
+let rec binder_vars (b : C.binder) : string list =
+  match b with
+  | C.BNull | C.BLit _ -> []
+  | C.BVar x -> [ x ]
+  | C.BNamed (x, inner) -> x :: binder_vars inner
+  | C.BCtor (_, subs) | C.BArray subs -> List.concat_map binder_vars subs
+  | C.BRecord fields -> List.concat_map (fun (_, b) -> binder_vars b) fields
+
+(* Free variables of a term: [Var] keys not bound by an enclosing
+   Lam/Let/Letrec/Case binder. After linking, the chain binds every module
+   declaration, so its free variables are exactly the program's external
+   references — `foreign import`s and compiler builtins (e.g. `Prim.undefined`) —
+   which the FFI resolver then binds. *)
+let free_vars (t : C.term) : SSet.t =
+  let rec fv (bound : SSet.t) (acc : SSet.t) (t : C.term) : SSet.t =
+    match t with
+    | C.Var x -> if SSet.mem x bound then acc else SSet.add x acc
+    | C.Lit _ | C.Ctor _ -> acc
+    | C.Lam (p, body) -> fv (SSet.add p bound) acc body
+    | C.App (f, a) -> fv bound (fv bound acc f) a
+    | C.Let (x, e, body) -> fv (SSet.add x bound) (fv bound acc e) body
+    | C.Letrec (binds, body) ->
+      let bound = List.fold_left (fun s (n, _) -> SSet.add n s) bound binds in
+      let acc = List.fold_left (fun a (_, e) -> fv bound a e) acc binds in
+      fv bound acc body
+    | C.If (c, t1, t2) -> fv bound (fv bound (fv bound acc c) t1) t2
+    | C.Prim (_, args) -> List.fold_left (fv bound) acc args
+    | C.Array es -> List.fold_left (fv bound) acc es
+    | C.Record fs -> List.fold_left (fun a (_, e) -> fv bound a e) acc fs
+    | C.Accessor (e, _) -> fv bound acc e
+    | C.Update (e, ups) ->
+      List.fold_left (fun a (_, e) -> fv bound a e) (fv bound acc e) ups
+    | C.Case (scruts, alts) ->
+      let acc = List.fold_left (fv bound) acc scruts in
+      List.fold_left
+        (fun acc (alt : C.alternative) ->
+           let bound =
+             List.fold_left
+               (fun s n -> SSet.add n s)
+               bound
+               (List.concat_map binder_vars alt.binders)
+           in
+           match alt.result with
+           | C.Unconditional e -> fv bound acc e
+           | C.Guarded gs ->
+             List.fold_left (fun a (g, e) -> fv bound (fv bound a g) e) acc gs)
+        acc
+        alts
+  in
+  fv SSet.empty SSet.empty t
 
 (* The file `purs` emits for a module: <outdir>/<dotted name>/corefn.json. *)
 let module_path (outdir : string) (n : N.module_name) : string =
@@ -80,17 +133,17 @@ let link
       sorted
       body
   in
-  (* Foreign names the resolver can bind, prepended outermost so every module
-     sees them. With the default empty resolver this is nothing. *)
+  (* Resolve the chain's free variables — its external references (`foreign
+     import`s and compiler builtins such as `Prim.undefined`) — through the FFI
+     resolver, and prepend the resolvable ones outermost so every module sees
+     them. Unresolved free variables stay unbound (stuck only if forced,
+     ADR-0016). With the default empty resolver this is nothing. *)
   let ffi_bindings =
-    List.concat_map
-      (fun (m : M.t) ->
-         List.filter_map
-           (fun (f : N.ident) ->
-              let key = Lower.qualified_key m.name f in
-              Option.map (fun term -> key, term) (resolver key))
-           m.foreign_names)
-      modules
+    SSet.fold
+      (fun key acc ->
+         Option.fold ~none:acc ~some:(fun t -> (key, t) :: acc) (resolver key))
+      (free_vars chain)
+      []
   in
   List.fold_right (fun (k, t) acc -> C.Let (k, t, acc)) ffi_bindings chain
 
