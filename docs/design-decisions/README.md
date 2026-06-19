@@ -65,5 +65,7 @@ language and are kept out of version control.)
 | [0016](0016-cross-module-linking.md) | Cross-module linking | Accepted |
 | [0017](0017-primitive-ffi.md) | Primitive FFI: foreign leaves as eta-expanded primops | Accepted |
 | [0018](0018-newtype-erasure.md) | Honour `IsNewtype`: erase newtype wrappers in lowering | Accepted |
+| [0019](0019-mutable-array-building.md) | Mutable array building primitives (revising ADR-0009) | Accepted |
+| [0020](0020-structural-ffi-guest-code.md) | Structural / higher-order FFI as guest code over first-order primitives | Accepted |
 
 ## Scope
