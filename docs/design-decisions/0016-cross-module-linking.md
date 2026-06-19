@@ -81,6 +81,14 @@ resolver is empty** — it is the seam the FFI records (ADR-0017+) will fill. So
 `Prelude` program *links and runs as far as its non-foreign parts go*, and forcing
 a foreign leaf (e.g. `Data.Semiring.intAdd`) is `stuck` until FFI lands.
 
+> **Progress (2026-06-19):** implemented by resolving the linked chain's **free
+> variables** (referenced-but-unbound keys) through the resolver, rather than
+> iterating each module's `foreign_names`. Free-variable resolution is the more
+> general mechanism: it also binds **compiler builtins that are not `foreign
+> import`s** — notably `Prim.undefined`, the throwaway argument applied to a
+> nullary superclass thunk — which a `foreign_names`-only pass would miss. The
+> resolver interface is unchanged.
+
 ### Scope of this slice
 
 Loading + linking only. **Deferred:** populating the FFI resolver (the FFI
