@@ -1,12 +1,15 @@
 (** Foreign-name resolution as an ordered *provider ladder* (ADR-0017): a foreign
-    qualified ident is tried against providers in priority order — intrinsic, then
-    (later) syscall, then user-defined foreign — the first match winning, else the
-    name stays unbound (and is [stuck] only if forced, ADR-0016). This slice fills
-    only the intrinsic rung: scalar leaves resolve to eta-expanded primop terms.
-    The resolver has the shape [Link] consumes: [qualified key -> Cesk.Ast.term
-    option]. Stdlib-only. *)
+    qualified ident is tried against providers in priority order — intrinsic
+    (eta-expanded primops, ADR-0017), then structural (guest terms over first-order
+    primitives, ADR-0020), then native (opaque host functions, ADR-0022) — the
+    first match winning, else the name stays unbound (and is [stuck] only if
+    forced, ADR-0016). The resolver has the shape [Link] consumes: [qualified key
+    -> Cesk.Ast.term option]; the native rung additionally exposes [host], the
+    registry the machine consults to run an opaque [Foreign] reference. A
+    user-defined foreign rung is a later provider appended here. Stdlib-only. *)
 
 module C = Cesk.Ast
+module V = Cesk.Value
 
 (** A provider: resolve a foreign qualified key to a binding term, or decline. *)
 type provider = string -> C.term option
@@ -145,9 +148,154 @@ let structural : (string * C.term) list =
 
 let structural_provider : provider = fun key -> List.assoc_opt key structural
 
-(** The provider ladder, in priority order. The syscall and user-foreign rungs
-    are later providers appended here, with linking unchanged. *)
-let ladder : provider list = [ intrinsic; structural_provider ]
+(* --- native rung: opaque host-provided foreign functions (ADR-0022) -------- *)
+
+(* Encode a Unicode code point as UTF-8 bytes (our `String`/`Char` representation,
+   ADR-0006), so a shown character round-trips its bytes. *)
+let utf8_of_cp (cp : int) : string =
+  let b = Buffer.create 4 in
+  if cp < 0x80
+  then Buffer.add_char b (Char.chr cp)
+  else if cp < 0x800
+  then (
+    Buffer.add_char b (Char.chr (0xC0 lor (cp lsr 6)));
+    Buffer.add_char b (Char.chr (0x80 lor (cp land 0x3F))))
+  else if cp < 0x10000
+  then (
+    Buffer.add_char b (Char.chr (0xE0 lor (cp lsr 12)));
+    Buffer.add_char b (Char.chr (0x80 lor ((cp lsr 6) land 0x3F)));
+    Buffer.add_char b (Char.chr (0x80 lor (cp land 0x3F))))
+  else (
+    Buffer.add_char b (Char.chr (0xF0 lor (cp lsr 18)));
+    Buffer.add_char b (Char.chr (0x80 lor ((cp lsr 12) land 0x3F)));
+    Buffer.add_char b (Char.chr (0x80 lor ((cp lsr 6) land 0x3F)));
+    Buffer.add_char b (Char.chr (0x80 lor (cp land 0x3F))));
+  Buffer.contents b
+
+(* The C-style control escapes the prelude's `showCharImpl`/`showStringImpl` use. *)
+let control_escape (code : int) : string option =
+  match code with
+  | 7 -> Some "\\a"
+  | 8 -> Some "\\b"
+  | 12 -> Some "\\f"
+  | 10 -> Some "\\n"
+  | 13 -> Some "\\r"
+  | 9 -> Some "\\t"
+  | 11 -> Some "\\v"
+  | _ -> None
+
+(* `showCharImpl`: a single-quoted, escaped character (Char is its code point). *)
+let show_char (cp : int) : string =
+  if cp < 0x20 || cp = 0x7F
+  then (
+    match control_escape cp with
+    | Some e -> "'" ^ e ^ "'"
+    | None -> "'\\" ^ string_of_int cp ^ "'")
+  else if cp = Char.code '\'' || cp = Char.code '\\'
+  then "'\\" ^ utf8_of_cp cp ^ "'"
+  else "'" ^ utf8_of_cp cp ^ "'"
+
+(* `showStringImpl`: a double-quoted, escaped string. Bytes are processed directly
+   — every escaped byte is < 0x80, so UTF-8 multi-byte sequences pass through
+   untouched. A numeric escape followed by a digit gets a `\&` gap, as in the JS
+   FFI, so `"\1" <> "2"` shows as `"\12\&3"`-style without ambiguity. *)
+let show_string (s : string) : string =
+  let buf = Buffer.create (String.length s + 2) in
+  Buffer.add_char buf '"';
+  let n = String.length s in
+  for i = 0 to n - 1 do
+    let c = s.[i] in
+    let code = Char.code c in
+    match c with
+    | '"' -> Buffer.add_string buf "\\\""
+    | '\\' -> Buffer.add_string buf "\\\\"
+    | _ ->
+      (match control_escape code with
+       | Some e -> Buffer.add_string buf e
+       | None ->
+         if code < 0x20 || code = 0x7F
+         then (
+           Buffer.add_string buf ("\\" ^ string_of_int code);
+           if i + 1 < n && s.[i + 1] >= '0' && s.[i + 1] <= '9'
+           then Buffer.add_string buf "\\&")
+         else Buffer.add_char buf c)
+  done;
+  Buffer.add_char buf '"';
+  Buffer.contents buf
+
+(* `showNumberImpl`: the shortest round-tripping decimal, with the prelude's
+   `"x.0"` rule for integral values (JS `n.toString()` then `isNaN(str + ".0")`).
+   The host's native float printing is not JS's, so we find the shortest `%g` that
+   round-trips and append `.0` only when the result stays numeric — matching the JS
+   FFI for finite values (ADR-0022's fidelity note). *)
+let show_number (f : float) : string =
+  if Float.is_nan f
+  then "NaN"
+  else if f = Float.infinity
+  then "Infinity"
+  else if f = Float.neg_infinity
+  then "-Infinity"
+  else if f = 0.0 (* also catches -0.0, which JS prints as "0" *)
+  then "0.0"
+  else if Float.is_integer f && Float.abs f < 1e21
+  then (* integral in fixed-notation range: print without exponent, add the ".0" *)
+    Printf.sprintf "%.0f" f ^ ".0"
+  else (
+    (* fractional (or beyond the fixed-notation range): the shortest decimal that
+       round-trips. `%g` only resorts to an exponent for genuinely extreme values,
+       matching JS there; a fractional value never needs the ".0" suffix. *)
+    let rec shortest p =
+      if p > 17
+      then Printf.sprintf "%.17g" f
+      else (
+        let s = Printf.sprintf "%.*g" p f in
+        if float_of_string s = f then s else shortest (p + 1))
+    in
+    shortest 1)
+
+(** The host registry (ADR-0022): the native foreign leaves, each an arity and a
+    first-order host implementation over evaluated values. Faithful to the
+    `prelude` package's `Data.Show` JS FFI. This is the single source of truth for
+    which names are native — [native_provider] derives from it. *)
+let host : Cesk.Machine.host =
+  let unary (f : V.t -> V.t) =
+    ( 1
+    , fun args ->
+        match args with
+        | [ a ] -> f a
+        | _ -> Cesk.Errors.stuck "native foreign: wrong arity" )
+  in
+  fun key ->
+    match key with
+    | "Data.Show.showIntImpl" ->
+      Some
+        (unary (function
+           | V.VInt n -> V.VString (string_of_int n)
+           | _ -> Cesk.Errors.stuck "showIntImpl: not an Int"))
+    | "Data.Show.showNumberImpl" ->
+      Some
+        (unary (function
+           | V.VNumber f -> V.VString (show_number f)
+           | _ -> Cesk.Errors.stuck "showNumberImpl: not a Number"))
+    | "Data.Show.showCharImpl" ->
+      Some
+        (unary (function
+           | V.VInt cp -> V.VString (show_char cp)
+           | _ -> Cesk.Errors.stuck "showCharImpl: not a Char"))
+    | "Data.Show.showStringImpl" ->
+      Some
+        (unary (function
+           | V.VString s -> V.VString (show_string s)
+           | _ -> Cesk.Errors.stuck "showStringImpl: not a String"))
+    | _ -> None
+
+(** The native rung: a name is bound to an opaque [Foreign] reference exactly when
+    the host registry implements it, so the two never drift apart. *)
+let native_provider : provider = fun key -> Option.map (fun _ -> C.Foreign key) (host key)
+
+(** The provider ladder, in priority order. The user-foreign rung is a later
+    provider appended here, with linking unchanged. *)
+let ladder : provider list = [ intrinsic; structural_provider; native_provider ]
 
 (** The resolver [Link] consumes: the first provider to bind the key wins;
     otherwise the key is left unbound (ADR-0016). *)
