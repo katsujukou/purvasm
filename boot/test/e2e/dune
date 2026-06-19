@@ -1,5 +1,5 @@
 (tests
  (names test_e2e)
- (libraries cesk corefn lower link alcotest)
+ (libraries cesk corefn lower link ffi alcotest)
  (deps
   (source_tree ../fixtures)))

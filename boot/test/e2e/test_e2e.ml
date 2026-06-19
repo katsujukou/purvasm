@@ -229,6 +229,59 @@ let test_reexport () =
     5
     (as_int (run_at ~outdir:"../fixtures/reexport" ~entry_module:[ "Main" ] "result"))
 
+(* --- real Prelude through the FFI provider ladder + newtype dicts --------- *)
+
+(* A program compiled against the real `prelude` package. Its arithmetic / Eq /
+   HeytingAlgebra type-class dictionaries are newtype-wrapped records (erased by
+   lowering, ADR-0018) whose foreign leaves resolve through the intrinsic rung of
+   the FFI ladder (ADR-0017). *)
+let run_prelude (entry : string) : V.t =
+  Cesk.Machine.eval
+    (Link.link_program
+       ~resolver:Ffi.resolver
+       ~outdir:"../fixtures/prelude"
+       ~entry_module:[ "Main" ]
+       ~entry
+       ())
+
+(* answer = add (mul 2 3) (sub 5 4) = 7 — Semiring + Ring dictionaries. *)
+let test_prelude_answer () =
+  Alcotest.(check int) "answer" 7 (as_int (run_prelude "answer"))
+
+(* quotient = div 17 5 = 3 — EuclideanRing dictionary (incl. degree). *)
+let test_prelude_div () =
+  Alcotest.(check int) "quotient" 3 (as_int (run_prelude "quotient"))
+
+(* isEq = eq answer 7 = true — Eq Int dictionary. *)
+let test_prelude_eq () = Alcotest.(check bool) "isEq" true (as_bool (run_prelude "isEq"))
+
+(* both = conj isEq (not false) = true — HeytingAlgebra Boolean dictionary. *)
+let test_prelude_bool () =
+  Alcotest.(check bool) "both" true (as_bool (run_prelude "both"))
+
+(* --- newtype erasure, including through as-patterns (ADR-0018) ------------ *)
+
+(* `newtype Box = Box Int`; at runtime a Box *is* its Int (the wrapper is erased),
+   so a Box argument is built as the bare int. *)
+let run_nt (entry : string) (arg : C.term) : V.t =
+  Cesk.Machine.eval
+    (C.App
+       ( Link.link_program ~outdir:"../fixtures/newtype" ~entry_module:[ "Main" ] ~entry ()
+       , arg ))
+
+(* A plain newtype match `case b of Box n -> n`. *)
+let test_newtype_match () =
+  Alcotest.(check int) "unInner (Box 7)" 7 (as_int (run_nt "unInner" (int 7)))
+
+(* The crux: `w@(Box _)` — the as-binding `w` must survive newtype erasure (it is
+   re-matched through the erased newtype to extract the inner value). *)
+let test_newtype_as_pattern () =
+  Alcotest.(check int) "asInner (Box 7)" 7 (as_int (run_nt "asInner" (int 7)))
+
+(* The as-bound whole returned directly. *)
+let test_newtype_as_whole () =
+  Alcotest.(check int) "asWhole (Box 7)" 7 (as_int (run_nt "asWhole" (int 7)))
+
 let () =
   Alcotest.run
     "e2e"
@@ -267,6 +320,17 @@ let () =
         ; Alcotest.test_case "link_loads_closure" `Quick test_link_loads_closure
         ; Alcotest.test_case "link_foreign_unbound" `Quick test_link_foreign_unbound
         ; Alcotest.test_case "external_unbound" `Quick test_external_unbound
+        ] )
+    ; ( "newtype"
+      , [ Alcotest.test_case "match" `Quick test_newtype_match
+        ; Alcotest.test_case "as_pattern" `Quick test_newtype_as_pattern
+        ; Alcotest.test_case "as_whole" `Quick test_newtype_as_whole
+        ] )
+    ; ( "prelude"
+      , [ Alcotest.test_case "answer" `Quick test_prelude_answer
+        ; Alcotest.test_case "div" `Quick test_prelude_div
+        ; Alcotest.test_case "eq" `Quick test_prelude_eq
+        ; Alcotest.test_case "bool" `Quick test_prelude_bool
         ] )
     ; ( "module-graph"
       , [ Alcotest.test_case "transitive" `Quick test_transitive
