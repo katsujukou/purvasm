@@ -507,6 +507,74 @@ let test_ctor_partial_then_saturated () =
                   (add_int (Var "a") (Var "b"))
               ] )))
 
+(* Native foreign functions (ADR-0022): an opaque `Foreign` reference resolves
+   through a host registry to an arity and host implementation, applied like any
+   curried function. A small registry stands in for the FFI one. *)
+let demo_host : Cesk.Machine.host =
+  let open Cesk.Value in
+  function
+  | "neg" ->
+    Some
+      ( 1
+      , function
+        | [ VInt n ] -> VInt (-n)
+        | _ -> Cesk.Errors.stuck "neg" )
+  | "add3" ->
+    Some
+      ( 3
+      , function
+        | [ VInt a; VInt b; VInt c ] -> VInt (a + b + c)
+        | _ -> Cesk.Errors.stuck "add3" )
+  | _ -> None
+
+let test_foreign_unary () =
+  Alcotest.(check int)
+    "neg 5"
+    (-5)
+    (match Cesk.Machine.eval ~host:demo_host (App (Foreign "neg", num 5)) with
+     | Cesk.Value.VInt n -> n
+     | _ -> Alcotest.fail "expected VInt")
+
+(* Arguments are collected one at a time until the arity is reached, then the host
+   implementation runs on them in order. *)
+let test_foreign_saturated () =
+  Alcotest.(check int)
+    "add3 1 2 3"
+    6
+    (match
+       Cesk.Machine.eval
+         ~host:demo_host
+         (App (App (App (Foreign "add3", num 1), num 2), num 3))
+     with
+     | Cesk.Value.VInt n -> n
+     | _ -> Alcotest.fail "expected VInt")
+
+(* Under-applied, a foreign is a first-class partial value (VForeign), like a
+   partial constructor. *)
+let test_foreign_partial () =
+  match Cesk.Machine.eval ~host:demo_host (App (Foreign "add3", num 1)) with
+  | Cesk.Value.VForeign { name; arity; args; _ } ->
+    Alcotest.(check string) "name" "add3" name;
+    Alcotest.(check int) "arity" 3 arity;
+    Alcotest.(check int) "one collected" 1 (List.length args)
+  | _ -> Alcotest.fail "expected a partial foreign (VForeign)"
+
+(* A partial foreign survives as a value and saturates when applied later. *)
+let test_foreign_partial_then_saturated () =
+  Alcotest.(check int)
+    "first-class partial foreign"
+    6
+    (match
+       Cesk.Machine.eval
+         ~host:demo_host
+         (Let ("f", App (Foreign "add3", num 1), App (App (Var "f", num 2), num 3)))
+     with
+     | Cesk.Value.VInt n -> n
+     | _ -> Alcotest.fail "expected VInt")
+
+(* An unregistered foreign name is stuck (the default registry declines all). *)
+let test_foreign_unknown_stuck () = assert_stuck (Foreign "nope")
+
 (* case selects the matching constructor arm and binds its field. *)
 let test_case_just () =
   Alcotest.(check int)
@@ -987,6 +1055,16 @@ let () =
         ; Alcotest.test_case "case_record_subset" `Quick test_case_record_subset
         ; Alcotest.test_case "case_record_field_order" `Quick test_case_record_field_order
         ; Alcotest.test_case "case_record_nested_ctor" `Quick test_case_record_nested_ctor
+        ] )
+    ; ( "foreign"
+      , [ Alcotest.test_case "foreign_unary" `Quick test_foreign_unary
+        ; Alcotest.test_case "foreign_saturated" `Quick test_foreign_saturated
+        ; Alcotest.test_case "foreign_partial" `Quick test_foreign_partial
+        ; Alcotest.test_case
+            "foreign_partial_then_saturated"
+            `Quick
+            test_foreign_partial_then_saturated
+        ; Alcotest.test_case "foreign_unknown_stuck" `Quick test_foreign_unknown_stuck
         ] )
     ; ( "guards"
       , [ Alcotest.test_case "guard_true" `Quick test_guard_true

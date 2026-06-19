@@ -237,6 +237,7 @@ let test_reexport () =
    the FFI ladder (ADR-0017). *)
 let run_prelude (entry : string) : V.t =
   Cesk.Machine.eval
+    ~host:Ffi.host
     (Link.link_program
        ~resolver:Ffi.resolver
        ~outdir:"../fixtures/prelude"
@@ -268,6 +269,27 @@ let test_prelude_map () =
   | V.VArray a ->
     Alcotest.(check (list int)) "doubled" [ 2; 3; 4 ] (List.map as_int (Array.to_list a))
   | _ -> Alcotest.fail "doubled should be a VArray"
+
+(* show on scalars goes through the native foreign rung (ADR-0022): the `Show`
+   dictionary's leaf resolves to an opaque `Foreign` reference whose host
+   implementation runs on the evaluated value. DCE links only the reached leaf. *)
+let test_prelude_show_int () =
+  Alcotest.(check string) "show 42" "42" (as_string (run_prelude "shownInt"))
+
+(* showNumberImpl's "x.0" rule for integral numbers. *)
+let test_prelude_show_number () =
+  Alcotest.(check string) "show 3.0" "3.0" (as_string (run_prelude "shownNum"))
+
+(* showCharImpl single-quotes (Char is its code point). *)
+let test_prelude_show_char () =
+  Alcotest.(check string) "show 'a'" "'a'" (as_string (run_prelude "shownChar"))
+
+(* showStringImpl double-quotes and escapes control characters. *)
+let test_prelude_show_string () =
+  Alcotest.(check string)
+    "show \"hi\\n\""
+    "\"hi\\n\""
+    (as_string (run_prelude "shownStr"))
 
 (* --- newtype erasure, including through as-patterns (ADR-0018) ------------ *)
 
@@ -342,6 +364,10 @@ let () =
         ; Alcotest.test_case "eq" `Quick test_prelude_eq
         ; Alcotest.test_case "bool" `Quick test_prelude_bool
         ; Alcotest.test_case "map" `Quick test_prelude_map
+        ; Alcotest.test_case "show_int" `Quick test_prelude_show_int
+        ; Alcotest.test_case "show_number" `Quick test_prelude_show_number
+        ; Alcotest.test_case "show_char" `Quick test_prelude_show_char
+        ; Alcotest.test_case "show_string" `Quick test_prelude_show_string
         ] )
     ; ( "module-graph"
       , [ Alcotest.test_case "transitive" `Quick test_transitive

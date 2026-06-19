@@ -10,7 +10,8 @@ module V = Cesk.Value
 let apply (key : string) (args : C.term list) : V.t =
   match Ffi.resolver key with
   | None -> Alcotest.failf "no resolution for %s" key
-  | Some term -> Cesk.Machine.eval (List.fold_left (fun f a -> C.App (f, a)) term args)
+  | Some term ->
+    Cesk.Machine.eval ~host:Ffi.host (List.fold_left (fun f a -> C.App (f, a)) term args)
 
 let int n = C.Lit (C.LInt n)
 let bool b = C.Lit (C.LBool b)
@@ -185,6 +186,52 @@ let test_eq_array_difflen () =
     false
     (as_bool (apply "Data.Eq.eqArrayImpl" [ eqf; arr [ 1 ]; arr [ 1; 2 ] ]))
 
+(* --- native rung: opaque host-provided foreign functions (ADR-0022) -------- *)
+
+let show_int n = as_string (apply "Data.Show.showIntImpl" [ int n ])
+let show_num f = as_string (apply "Data.Show.showNumberImpl" [ C.Lit (C.LNumber f) ])
+let show_chr cp = as_string (apply "Data.Show.showCharImpl" [ int cp ])
+let show_str s = as_string (apply "Data.Show.showStringImpl" [ str s ])
+
+let test_show_int () =
+  Alcotest.(check string) "show 42" "42" (show_int 42);
+  Alcotest.(check string) "show 0" "0" (show_int 0);
+  Alcotest.(check string) "show (-5)" "-5" (show_int (-5))
+
+(* Integral numbers get the `.0` suffix; fractional ones print their shortest
+   round-tripping form (ADR-0022). *)
+let test_show_number () =
+  Alcotest.(check string) "show 3.0" "3.0" (show_num 3.0);
+  Alcotest.(check string) "show 10.0" "10.0" (show_num 10.0);
+  Alcotest.(check string) "show 3.14" "3.14" (show_num 3.14);
+  Alcotest.(check string) "show (-0.5)" "-0.5" (show_num (-0.5));
+  Alcotest.(check string) "show 0.1" "0.1" (show_num 0.1)
+
+(* Char is its code point; control characters and the quote/backslash escape. *)
+let test_show_char () =
+  Alcotest.(check string) "show 'a'" "'a'" (show_chr 97);
+  Alcotest.(check string) "show '\\n'" "'\\n'" (show_chr 10);
+  Alcotest.(check string) "show '\\t'" "'\\t'" (show_chr 9);
+  Alcotest.(check string) "show '\\''" "'\\''" (show_chr 39);
+  Alcotest.(check string) "show '\\\\'" "'\\\\'" (show_chr 92);
+  Alcotest.(check string) "show DEL" "'\\127'" (show_chr 127)
+
+(* Strings are double-quoted; quote/backslash/control characters escape, and a
+   numeric escape before a digit gets a `\&` gap. *)
+let test_show_string () =
+  Alcotest.(check string) "show \"hi\"" "\"hi\"" (show_str "hi");
+  Alcotest.(check string) "show newline" "\"a\\nb\"" (show_str "a\nb");
+  Alcotest.(check string) "show quote" "\"x\\\"y\"" (show_str "x\"y");
+  Alcotest.(check string) "show backslash" "\"a\\\\b\"" (show_str "a\\b");
+  Alcotest.(check string) "show gap" "\"\\1\\&2\"" (show_str "\0012")
+
+(* The native name is bound exactly when the host registry implements it. *)
+let test_native_declines_unknown () =
+  Alcotest.(check bool)
+    "unimplemented native declined"
+    true
+    (Option.is_none (Ffi.host "Data.Show.showArrayImpl"))
+
 let () =
   Alcotest.run
     "ffi"
@@ -213,6 +260,13 @@ let () =
       , [ Alcotest.test_case "unit_constant" `Quick test_unit_constant
         ; Alcotest.test_case "partial_application" `Quick test_partial_application
         ; Alcotest.test_case "unknown_declined" `Quick test_unknown_declined
+        ] )
+    ; ( "native"
+      , [ Alcotest.test_case "show_int" `Quick test_show_int
+        ; Alcotest.test_case "show_number" `Quick test_show_number
+        ; Alcotest.test_case "show_char" `Quick test_show_char
+        ; Alcotest.test_case "show_string" `Quick test_show_string
+        ; Alcotest.test_case "native_declines_unknown" `Quick test_native_declines_unknown
         ] )
     ; ( "structural"
       , [ Alcotest.test_case "array_map" `Quick test_array_map
