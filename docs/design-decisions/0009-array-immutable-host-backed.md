@@ -20,9 +20,17 @@ length primitives. Mutation is explicitly out of scope here.
 1. **`Array` is `Value.t array` (the host OCaml `array`), treated as
    immutable.** Add `Value.VArray of Value.t array`. The core operations
    (literal construction, indexing, length) never mutate it, so although the
-   host array has a mutable backing we never use it; the value is read-only.
+   host array has a mutable backing ~~we never use it; the value is read-only.~~
    In phase 1b's uniform heap, an array becomes a contiguous heap block — the
    `VArray` interface is the seam, like `Store` is for the heap.
+
+   > **Correction (2026-06-19):** [0019](0019-mutable-array-building.md) (Proposed)
+   > revises "we never use it." The mutable backing *is* used by two confined,
+   > unsafe **array-building** primitives (`NewArray`/`SetArray`) so structural
+   > higher-order functions can be written as guest code over first-order
+   > primitives ([0020](0020-structural-ffi-guest-code.md)). The immutable value,
+   > its literal form, and the read API (this record) are unchanged; mutation is
+   > the local build-then-use (ST) discipline, not general mutable state.
 
 2. **Array literals are a dedicated term, not a primitive.** Add
    `Ast.Array of term list` (e.g. `[a, b, c]`). Its elements are evaluated
