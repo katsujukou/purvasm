@@ -330,6 +330,18 @@ let test_array_index () =
     20
     (eval_int (index (arr [ num 10; num 20; num 30 ]) (num 1)))
 
+(* Array builders (ADR-0019): NewArray allocates, SetArray fills in place and
+   returns the array, threading through a build. *)
+let test_array_build () =
+  Alcotest.(check int)
+    "build [_,20] then index 1"
+    20
+    (eval_int
+       (index (Prim (SetArray, [ Prim (NewArray, [ num 2 ]); num 1; num 20 ])) (num 1)))
+
+let test_array_new_length () =
+  Alcotest.(check int) "length (new 3)" 3 (eval_int (length (Prim (NewArray, [ num 3 ]))))
+
 (* Boundary indices: first and last element. *)
 let test_array_index_first () =
   Alcotest.(check int)
@@ -917,6 +929,8 @@ let () =
         ; Alcotest.test_case "array_length" `Quick test_array_length
         ; Alcotest.test_case "array_empty_length" `Quick test_array_empty_length
         ; Alcotest.test_case "array_index" `Quick test_array_index
+        ; Alcotest.test_case "array_build" `Quick test_array_build
+        ; Alcotest.test_case "array_new_length" `Quick test_array_new_length
         ; Alcotest.test_case "array_index_first" `Quick test_array_index_first
         ; Alcotest.test_case "array_index_last" `Quick test_array_index_last
         ; Alcotest.test_case "array_nested" `Quick test_array_nested

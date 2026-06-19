@@ -147,6 +147,44 @@ let test_unknown_declined () =
     true
     (Option.is_none (Ffi.resolver "Some.Unknown.thing"))
 
+(* --- structural / higher-order foreigns as guest terms (ADR-0020) --------- *)
+
+let arr xs = C.Array (List.map int xs)
+
+(* arrayMap maps a guest closure over the array via the first-order builders; the
+   callback is an ordinary App (no native re-entrancy). *)
+let test_array_map () =
+  let inc = C.Lam ("x", C.Prim (C.AddInt, [ C.Var "x"; int 1 ])) in
+  match apply "Data.Functor.arrayMap" [ inc; arr [ 1; 2; 3 ] ] with
+  | V.VArray a ->
+    Alcotest.(check (list int)) "map (+1)" [ 2; 3; 4 ] (List.map as_int (Array.to_list a))
+  | _ -> Alcotest.fail "arrayMap should return a VArray"
+
+let test_array_map_empty () =
+  match apply "Data.Functor.arrayMap" [ C.Lam ("x", C.Var "x"); arr [] ] with
+  | V.VArray a -> Alcotest.(check int) "map over []" 0 (Array.length a)
+  | _ -> Alcotest.fail "expected VArray"
+
+let eqf = C.Lam ("a", C.Lam ("b", C.Prim (C.EqInt, [ C.Var "a"; C.Var "b" ])))
+
+let test_eq_array_true () =
+  Alcotest.(check bool)
+    "eqArray [1,2] [1,2]"
+    true
+    (as_bool (apply "Data.Eq.eqArrayImpl" [ eqf; arr [ 1; 2 ]; arr [ 1; 2 ] ]))
+
+let test_eq_array_false () =
+  Alcotest.(check bool)
+    "eqArray [1,2] [1,3]"
+    false
+    (as_bool (apply "Data.Eq.eqArrayImpl" [ eqf; arr [ 1; 2 ]; arr [ 1; 3 ] ]))
+
+let test_eq_array_difflen () =
+  Alcotest.(check bool)
+    "eqArray [1] [1,2]"
+    false
+    (as_bool (apply "Data.Eq.eqArrayImpl" [ eqf; arr [ 1 ]; arr [ 1; 2 ] ]))
+
 let () =
   Alcotest.run
     "ffi"
@@ -175,5 +213,12 @@ let () =
       , [ Alcotest.test_case "unit_constant" `Quick test_unit_constant
         ; Alcotest.test_case "partial_application" `Quick test_partial_application
         ; Alcotest.test_case "unknown_declined" `Quick test_unknown_declined
+        ] )
+    ; ( "structural"
+      , [ Alcotest.test_case "array_map" `Quick test_array_map
+        ; Alcotest.test_case "array_map_empty" `Quick test_array_map_empty
+        ; Alcotest.test_case "eq_array_true" `Quick test_eq_array_true
+        ; Alcotest.test_case "eq_array_false" `Quick test_eq_array_false
+        ; Alcotest.test_case "eq_array_difflen" `Quick test_eq_array_difflen
         ] )
     ]

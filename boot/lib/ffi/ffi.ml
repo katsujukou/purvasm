@@ -71,9 +71,83 @@ let intrinsics : (string * C.term) list =
 (** The intrinsic rung as a provider. *)
 let intrinsic : provider = fun key -> List.assoc_opt key intrinsics
 
-(** The provider ladder, in priority order. Currently one rung; the syscall and
-    user-foreign rungs are later providers appended here, with linking unchanged. *)
-let ladder : provider list = [ intrinsic ]
+(* --- structural / higher-order foreigns as guest terms (ADR-0020) --------- *)
+
+(* Build a curried lambda from parameter names and a body. *)
+let lams (params : string list) (body : C.term) : C.term =
+  List.fold_right (fun p acc -> C.Lam (p, acc)) params body
+
+let v = (fun name -> C.Var name : string -> C.term)
+let int_lit n = C.Lit (C.LInt n)
+
+(* `arrayMap f xs` (Data.Functor): build a fresh array of [length xs] and fill
+   slot i with [f xs[i]] via a guest recursion — the callback is an ordinary
+   `App`, so no native re-entrancy (ADR-0020), over the first-order array builders
+   (ADR-0019). *)
+let array_map : C.term =
+  lams
+    [ "f"; "xs" ]
+    (C.Let
+       ( "n"
+       , C.Prim (LengthArray, [ v "xs" ])
+       , C.Letrec
+           ( [ ( "go"
+               , lams
+                   [ "out"; "i" ]
+                   (C.If
+                      ( C.Prim (LtInt, [ v "i"; v "n" ])
+                      , C.App
+                          ( C.App
+                              ( v "go"
+                              , C.Prim
+                                  ( SetArray
+                                  , [ v "out"
+                                    ; v "i"
+                                    ; C.App (v "f", C.Prim (IndexArray, [ v "xs"; v "i" ]))
+                                    ] ) )
+                          , C.Prim (AddInt, [ v "i"; int_lit 1 ]) )
+                      , v "out" )) )
+             ]
+           , C.App (C.App (v "go", C.Prim (NewArray, [ v "n" ])), int_lit 0) ) ))
+
+(* `eqArrayImpl eq xs ys` (Data.Eq): equal lengths and every element equal, the
+   element test `eq xs[i] ys[i]` an ordinary `App`. Needs no new primop. *)
+let eq_array : C.term =
+  lams
+    [ "eq"; "xs"; "ys" ]
+    (C.Let
+       ( "n"
+       , C.Prim (LengthArray, [ v "xs" ])
+       , C.If
+           ( C.Prim (EqInt, [ v "n"; C.Prim (LengthArray, [ v "ys" ]) ])
+           , C.Letrec
+               ( [ ( "go"
+                   , C.Lam
+                       ( "i"
+                       , C.If
+                           ( C.Prim (LtInt, [ v "i"; v "n" ])
+                           , C.If
+                               ( C.App
+                                   ( C.App (v "eq", C.Prim (IndexArray, [ v "xs"; v "i" ]))
+                                   , C.Prim (IndexArray, [ v "ys"; v "i" ]) )
+                               , C.App (v "go", C.Prim (AddInt, [ v "i"; int_lit 1 ]))
+                               , C.Lit (C.LBool false) )
+                           , C.Lit (C.LBool true) ) ) )
+                 ]
+               , C.App (v "go", int_lit 0) )
+           , C.Lit (C.LBool false) ) ))
+
+(** Structural / higher-order foreigns, as guest terms over the first-order
+    primitives. Hand-written `Cesk.Ast` for now; a PureScript surface comes with
+    the optimiser (ADR-0020). *)
+let structural : (string * C.term) list =
+  [ "Data.Functor.arrayMap", array_map; "Data.Eq.eqArrayImpl", eq_array ]
+
+let structural_provider : provider = fun key -> List.assoc_opt key structural
+
+(** The provider ladder, in priority order. The syscall and user-foreign rungs
+    are later providers appended here, with linking unchanged. *)
+let ladder : provider list = [ intrinsic; structural_provider ]
 
 (** The resolver [Link] consumes: the first provider to bind the key wins;
     otherwise the key is left unbound (ADR-0016). *)

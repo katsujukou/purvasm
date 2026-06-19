@@ -259,6 +259,16 @@ let test_prelude_eq () = Alcotest.(check bool) "isEq" true (as_bool (run_prelude
 let test_prelude_bool () =
   Alcotest.(check bool) "both" true (as_bool (run_prelude "both"))
 
+(* doubled = map (add 1) [1,2,3] = [2,3,4] — the Functor Array instance via the
+   structural `arrayMap` (ADR-0020), the mapper a real guest closure. Its closure
+   drags in Data.Show/Data.Ord, whose unused instance CAFs are dropped by
+   reachability DCE (ADR-0021) rather than forcing their unimplemented leaves. *)
+let test_prelude_map () =
+  match run_prelude "doubled" with
+  | V.VArray a ->
+    Alcotest.(check (list int)) "doubled" [ 2; 3; 4 ] (List.map as_int (Array.to_list a))
+  | _ -> Alcotest.fail "doubled should be a VArray"
+
 (* --- newtype erasure, including through as-patterns (ADR-0018) ------------ *)
 
 (* `newtype Box = Box Int`; at runtime a Box *is* its Int (the wrapper is erased),
@@ -331,6 +341,7 @@ let () =
         ; Alcotest.test_case "div" `Quick test_prelude_div
         ; Alcotest.test_case "eq" `Quick test_prelude_eq
         ; Alcotest.test_case "bool" `Quick test_prelude_bool
+        ; Alcotest.test_case "map" `Quick test_prelude_map
         ] )
     ; ( "module-graph"
       , [ Alcotest.test_case "transitive" `Quick test_transitive

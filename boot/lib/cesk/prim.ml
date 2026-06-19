@@ -45,4 +45,19 @@ let eval (op : primop) (args : Value.t list) : Value.t =
     then a.(i)
     else Errors.stuck ("array index out of bounds: " ^ string_of_int i)
   | LengthArray, [ Value.VArray a ] -> Value.VInt (Array.length a)
+  (* Unsafe array builders (ADR-0019). NewArray allocates n slots holding a filler
+     (0) that the caller must overwrite before reading; SetArray writes a slot
+     in place and returns the same array so a builder loop can thread it. Confined
+     to the first-order layer / structural-FFI guest code and used under the ST
+     discipline (fresh array, fill, then use immutably). *)
+  | NewArray, [ Value.VInt n ] ->
+    if n < 0
+    then Errors.stuck ("array allocation with negative length: " ^ string_of_int n)
+    else Value.VArray (Array.make n (Value.VInt 0))
+  | SetArray, [ Value.VArray a; Value.VInt i; v ] ->
+    if i >= 0 && i < Array.length a
+    then (
+      a.(i) <- v;
+      Value.VArray a)
+    else Errors.stuck ("array set out of bounds: " ^ string_of_int i)
   | _ -> Errors.stuck ("primop " ^ primop_to_string op ^ ": ill-typed arguments")

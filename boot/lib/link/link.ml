@@ -8,6 +8,7 @@
 module C = Cesk.Ast
 module M = Corefn.Module
 module N = Corefn.Names
+module E = Corefn.Expr
 module SSet = Set.Make (String)
 
 let name_key (n : N.module_name) : string = String.concat "." n
@@ -111,10 +112,38 @@ let topo_sort (modules : M.t list) : M.t list =
   List.iter visit modules;
   List.rev !order
 
-(** Link a set of modules into a term that evaluates [entry] (in [entry_module])
-    with every module's declarations in scope. [resolver] supplies a binding term
-    for a resolvable foreign ident (keyed by its qualified key); unresolved
-    foreign/external references stay unbound. Pure — no IO. *)
+(* A linkable binding group: the qualified keys it introduces, the free variables
+   its right-hand sides reference (its dependencies), and how it wraps a body. A
+   [NonRec] decl is a one-key [Let] group; a [Rec] decl is a multi-key [Letrec]
+   group kept atomic — reaching any member links the whole group (ADR-0021). *)
+type group =
+  { keys : string list
+  ; deps : SSet.t
+  ; wrap : C.term -> C.term
+  }
+
+let group_of_bind (key : N.ident -> string) (b : E.bind) : group =
+  match b with
+  | E.NonRec (_, id, e) ->
+    let k = key id in
+    let t = Lower.expr e in
+    { keys = [ k ]; deps = free_vars t; wrap = (fun body -> C.Let (k, t, body)) }
+  | E.Rec rbs ->
+    let pairs =
+      List.map (fun (rb : E.rec_binding) -> key rb.ident, Lower.expr rb.expr) rbs
+    in
+    let deps =
+      List.fold_left (fun acc (_, t) -> SSet.union acc (free_vars t)) SSet.empty pairs
+    in
+    { keys = List.map fst pairs; deps; wrap = (fun body -> C.Letrec (pairs, body)) }
+
+(** Link a set of modules into a term that evaluates [entry] (in [entry_module]).
+    Only the binding groups *reachable* from the entry are linked — the entry's
+    transitive free-variable closure over module declarations and resolved foreign
+    leaves (ADR-0021); declarations the import graph drags in but the entry never
+    references are dropped, so they are never forced. [resolver] supplies a binding
+    term for a resolvable foreign ident (keyed by its qualified key); an unresolved
+    reached reference stays unbound (stuck only if forced). Pure — no IO. *)
 let link
       ?(resolver : string -> C.term option = fun _ -> None)
       (modules : M.t list)
@@ -123,29 +152,77 @@ let link
   : C.term
   =
   let sorted = topo_sort modules in
-  let body = C.Var (Lower.qualified_key entry_module entry) in
-  (* Each module's decls are bound under its own-module qualified keys; in topo
-     order a dependency wraps outermost, so every cross-module reference resolves
-     to an already-introduced binding (ADR-0016). *)
-  let chain =
-    List.fold_right
-      (fun (m : M.t) acc -> Lower.lower_binds (Lower.qualified_key m.name) m.decls acc)
+  (* All module binding groups, outermost-first: in topo order a dependency module
+     precedes its dependents, and within a module earlier decls precede later, so
+     every cross-reference resolves to an already-introduced binding (ADR-0016). *)
+  let module_groups =
+    List.concat_map
+      (fun (m : M.t) ->
+         let key id = Lower.qualified_key m.name id in
+         List.map (group_of_bind key) m.decls)
       sorted
-      body
   in
-  (* Resolve the chain's free variables — its external references (`foreign
-     import`s and compiler builtins such as `Prim.undefined`) — through the FFI
-     resolver, and prepend the resolvable ones outermost so every module sees
-     them. Unresolved free variables stay unbound (stuck only if forced,
-     ADR-0016). With the default empty resolver this is nothing. *)
-  let ffi_bindings =
-    SSet.fold
-      (fun key acc ->
-         Option.fold ~none:acc ~some:(fun t -> (key, t) :: acc) (resolver key))
-      (free_vars chain)
-      []
+  (* Index each module-defined key to its group, for reachability lookup. *)
+  let defs : (string, group) Hashtbl.t = Hashtbl.create 256 in
+  List.iter (fun g -> List.iter (fun k -> Hashtbl.replace defs k g) g.keys) module_groups;
+  (* Foreign groups discovered during reachability (resolved leaves), memoised by
+     key. Foreign terms are closed (no module dependencies), so they can all sit
+     outermost in any order. *)
+  let foreign : (string, group) Hashtbl.t = Hashtbl.create 64 in
+  (* Reachability from the entry: follow each reached group's free variables into
+     the group that defines them (module decl or resolved foreign), to a fixpoint.
+     A reached key with no defining group is an unresolved external — left unbound,
+     stuck only if forced. A group is identified by its first key. *)
+  let seen : (string, unit) Hashtbl.t = Hashtbl.create 256 in
+  let reached_gid : (string, unit) Hashtbl.t = Hashtbl.create 256 in
+  let rec visit_key (k : string) : unit =
+    if not (Hashtbl.mem seen k)
+    then (
+      Hashtbl.replace seen k ();
+      let g_opt =
+        match Hashtbl.find_opt defs k with
+        | Some _ as g -> g
+        | None ->
+          (match Hashtbl.find_opt foreign k with
+           | Some _ as g -> g
+           | None ->
+             Option.map
+               (fun t ->
+                  let g =
+                    { keys = [ k ]
+                    ; deps = free_vars t
+                    ; wrap = (fun body -> C.Let (k, t, body))
+                    }
+                  in
+                  Hashtbl.replace foreign k g;
+                  g)
+               (resolver k))
+      in
+      match g_opt with
+      | None -> ()
+      | Some g ->
+        let gid = List.hd g.keys in
+        if not (Hashtbl.mem reached_gid gid)
+        then (
+          Hashtbl.replace reached_gid gid ();
+          List.iter (fun gk -> Hashtbl.replace seen gk ()) g.keys;
+          SSet.iter visit_key g.deps))
   in
-  List.fold_right (fun (k, t) acc -> C.Let (k, t, acc)) ffi_bindings chain
+  let entry_key = Lower.qualified_key entry_module entry in
+  visit_key entry_key;
+  (* Emit only reached groups: foreign leaves outermost (closed, order-free), then
+     the reached module groups in their original outermost-first order. *)
+  let foreign_groups =
+    Hashtbl.fold (fun _ g acc -> g :: acc) foreign []
+    |> List.sort (fun a b -> String.compare (List.hd a.keys) (List.hd b.keys))
+  in
+  let module_reached =
+    List.filter (fun g -> Hashtbl.mem reached_gid (List.hd g.keys)) module_groups
+  in
+  List.fold_right
+    (fun g acc -> g.wrap acc)
+    (foreign_groups @ module_reached)
+    (C.Var entry_key)
 
 (** Convenience: load then link from a CoreFn output directory. *)
 let link_program

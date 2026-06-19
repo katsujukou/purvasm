@@ -34,6 +34,8 @@ type primop =
   | Append
   | IndexArray
   | LengthArray
+  | NewArray
+  | SetArray
 
 (* A pattern, matched structurally against an already-evaluated value (ADR-0011,
    ADR-0012). Covers all of CoreFn's binders: wildcard, variable, scalar literal,
@@ -121,6 +123,8 @@ let primop_to_string : primop -> string = function
   | Append -> "<>"
   | IndexArray -> "!!"
   | LengthArray -> "#"
+  | NewArray -> "new[]"
+  | SetArray -> "set[]"
 
 let lit_to_string : lit -> string = function
   | LInt n -> Int.to_string n
