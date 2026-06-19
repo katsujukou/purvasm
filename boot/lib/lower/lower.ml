@@ -12,6 +12,7 @@ module C = Cesk.Ast
 module E = Corefn.Expr
 module L = Corefn.Literal
 module N = Corefn.Names
+module A = Corefn.Ann
 
 (** The flat environment key for a module-qualified name, e.g.
     [Data.Maybe.fromMaybe]. Top-level bindings are bound under this key and
@@ -28,6 +29,10 @@ let lower_var (q : N.ident N.qualified) : C.term =
 let rec expr (e : E.expr) : C.term =
   match e with
   | E.Literal (_, lit) -> lit_expr lit
+  (* A newtype constructor is erased — it is the identity (ADR-0018). PureScript
+     emits newtype ctors as identity *declarations*, so a `Constructor` node with
+     this meta should not occur; handled defensively. *)
+  | E.Constructor ({ A.meta = Some A.IsNewtype; _ }, _, _, _) -> C.Lam ("$x", C.Var "$x")
   (* Tag-only (ADR-0011): the type name and the constructor's module qualifier
      carry no runtime meaning, so only the constructor name and arity survive. *)
   | E.Constructor (_, _type_name, ctor, fields) -> C.Ctor (ctor, List.length fields)
@@ -70,6 +75,10 @@ and binder (b : E.binder) : C.binder =
   | E.NullBinder _ -> C.BNull
   | E.VarBinder (_, id) -> C.BVar id
   | E.LiteralBinder (_, lit) -> lit_binder lit
+  (* A newtype constructor binder is transparent: the wrapper is erased, so it
+     matches the value directly through its single inner binder (ADR-0018). This
+     is what makes typeclass-dictionary dispatch (dicts are newtypes) work. *)
+  | E.ConstructorBinder ({ A.meta = Some A.IsNewtype; _ }, _, _, [ sub ]) -> binder sub
   | E.ConstructorBinder (_, _type_name, N.Qualified (_, ctor), subs) ->
     C.BCtor (ctor, List.map binder subs)
   | E.NamedBinder (_, id, inner) -> C.BNamed (id, binder inner)
