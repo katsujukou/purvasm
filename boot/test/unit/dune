@@ -1,4 +1,4 @@
 (tests
- (names test_machine test_corefn test_lower)
- (libraries cesk corefn lower alcotest)
+ (names test_machine test_corefn test_lower test_ffi)
+ (libraries cesk corefn lower ffi alcotest)
  (deps ../fixtures/fixture.corefn.json))

@@ -15,6 +15,8 @@ type primop =
   | AddInt
   | SubInt
   | MulInt
+  | DivInt
+  | ModInt
   | AddNumber
   | SubNumber
   | MulNumber
@@ -22,9 +24,13 @@ type primop =
   | EqInt
   | EqString
   | EqNumber
+  | EqBool
   | LtInt
   | LtString
   | LtNumber
+  | AndBool
+  | OrBool
+  | NotBool
   | Append
   | IndexArray
   | LengthArray
@@ -96,6 +102,8 @@ let primop_to_string : primop -> string = function
   | AddInt -> "+i"
   | SubInt -> "-i"
   | MulInt -> "*i"
+  | DivInt -> "/i"
+  | ModInt -> "%i"
   | AddNumber -> "+n"
   | SubNumber -> "-n"
   | MulNumber -> "*n"
@@ -103,9 +111,13 @@ let primop_to_string : primop -> string = function
   | EqInt -> "==i"
   | EqString -> "==s"
   | EqNumber -> "==n"
+  | EqBool -> "==b"
   | LtInt -> "<i"
   | LtString -> "<s"
   | LtNumber -> "<n"
+  | AndBool -> "&&"
+  | OrBool -> "||"
+  | NotBool -> "!"
   | Append -> "<>"
   | IndexArray -> "!!"
   | LengthArray -> "#"

@@ -1,0 +1,4 @@
+(library
+ (name ffi)
+ (public_name purvasm.ffi)
+ (libraries cesk))
