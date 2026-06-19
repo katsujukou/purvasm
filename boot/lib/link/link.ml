@@ -31,7 +31,8 @@ let free_vars (t : C.term) : SSet.t =
   let rec fv (bound : SSet.t) (acc : SSet.t) (t : C.term) : SSet.t =
     match t with
     | C.Var x -> if SSet.mem x bound then acc else SSet.add x acc
-    | C.Lit _ | C.Ctor _ -> acc
+    (* A `Foreign` reference is an opaque host leaf — no free variables. *)
+    | C.Lit _ | C.Ctor _ | C.Foreign _ -> acc
     | C.Lam (p, body) -> fv (SSet.add p bound) acc body
     | C.App (f, a) -> fv bound (fv bound acc f) a
     | C.Let (x, e, body) -> fv (SSet.add x bound) (fv bound acc e) body
