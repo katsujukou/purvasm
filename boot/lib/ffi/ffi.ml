@@ -61,6 +61,11 @@ let intrinsics : (string * C.term) list =
        `Semiring Unit`-style dictionary's `zero`/`one` fields are built, so it
        must resolve to a value. *)
   ; "Data.Unit.unit", C.Lit (C.LInt 0)
+    (* The compiler builtin `Prim.undefined` is the throwaway argument applied to
+       a nullary superclass thunk (`(\_ -> superDict) Prim.undefined`) to force
+       it; never inspected, so any value works — the immediate [0]. (It is not a
+       module `foreign import`, so linking must resolve it as a free reference.) *)
+  ; "Prim.undefined", C.Lit (C.LInt 0)
   ]
 
 (** The intrinsic rung as a provider. *)
