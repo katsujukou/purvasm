@@ -67,5 +67,6 @@ language and are kept out of version control.)
 | [0018](0018-newtype-erasure.md) | Honour `IsNewtype`: erase newtype wrappers in lowering | Accepted |
 | [0019](0019-mutable-array-building.md) | Mutable array building primitives (revising ADR-0009) | Accepted |
 | [0020](0020-structural-ffi-guest-code.md) | Structural / higher-order FFI as guest code over first-order primitives | Accepted |
+| [0021](0021-reachability-dce.md) | Link only the entry's reachable closure (dead-binding elimination) | Accepted |
 
 ## Scope
