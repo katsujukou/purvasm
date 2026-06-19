@@ -78,6 +78,12 @@ type term =
      constructor (immediately a `VData`); higher arities yield a curried
      constructor function (a `VCtor`). *)
   | Ctor of string * int
+  (* An opaque reference to a host-provided foreign function, by its qualified key
+     (ADR-0022). It carries no implementation — the machine's host registry maps
+     the name to a concrete arity and host function when this is evaluated — so the
+     AST stays pure, printable data. The native rung of the FFI ladder for foreign
+     leaves the guest cannot express (e.g. `Data.Show.showNumberImpl`). *)
+  | Foreign of string
   (* Case analysis over one or more scrutinees (ADR-0011). The scrutinees are
      evaluated left to right, then the first alternative whose binders all match
      is taken. *)
@@ -182,6 +188,7 @@ let rec to_string : term -> string = function
     ^ String.concat ~sep:", " (List.map ups ~f:(fun (l, u) -> l ^ " = " ^ to_string u))
     ^ " }"
   | Ctor (tag, arity) -> tag ^ "/" ^ Int.to_string arity
+  | Foreign name -> "#" ^ name
   | Case (scruts, alts) ->
     "(case "
     ^ String.concat ~sep:", " (List.map scruts ~f:to_string)

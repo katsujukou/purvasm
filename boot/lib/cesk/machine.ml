@@ -20,6 +20,14 @@ type result =
   | Step of state
   | Done of Value.t
 
+(* A host registry (ADR-0022): resolve an opaque foreign name to the arity and
+   host implementation that an `Ast.Foreign` reference evaluates to. The default
+   [no_host] declines every name, so a program with no native foreigns runs
+   unchanged. The FFI module supplies the real registry. *)
+type host = string -> (int * (Value.t list -> Value.t)) option
+
+let no_host : host = fun _ -> None
+
 let inject (term : Ast.term) : state =
   { focus = Eval (term, Env.empty); store = Store.empty; kont = Cont.Halt }
 
@@ -77,7 +85,7 @@ let rec dispatch_case
                   }
             }))
 
-let step (s : state) : result =
+let step ~(host : host) (s : state) : result =
   match s.focus with
   | Eval (term, env) ->
     (match term with
@@ -152,6 +160,13 @@ let step (s : state) : result =
        if arity = 0
        then Step { s with focus = Return (Value.VData { tag; fields = [||] }) }
        else Step { s with focus = Return (Value.VCtor { tag; arity; args = [] }) }
+     | Ast.Foreign name ->
+       (* Resolve the opaque reference to a concrete host function (ADR-0022); an
+          unregistered name is stuck, like any other unbound reference. *)
+       (match host name with
+        | Some (arity, call) ->
+          Step { s with focus = Return (Value.VForeign { name; arity; args = []; call }) }
+        | None -> Errors.stuck ("unknown host foreign: " ^ name))
      | Ast.Case (scruts, alts) ->
        (match scruts with
         | [] -> dispatch_case [] alts s.store env s.kont
@@ -186,6 +201,13 @@ let step (s : state) : result =
               ; kont = k
               }
           else Step { s with focus = Return (Value.VCtor { tag; arity; args }); kont = k }
+        | Value.VForeign ({ arity; args; call; _ } as f) ->
+          (* Collect one more argument; saturating the arity applies the host
+             function to the arguments in order (ADR-0022). *)
+          let args = v :: args in
+          if List.length args = arity
+          then Step { s with focus = Return (call (List.rev args)); kont = k }
+          else Step { s with focus = Return (Value.VForeign { f with args }); kont = k }
         | _ -> Errors.stuck "application of a non-function")
      | Cont.Let_body (x, e2, env, k) ->
        let addr, store' = Store.alloc s.store v in
@@ -311,10 +333,11 @@ let state_to_string (s : state) : string =
     (Cont.frame_name s.kont)
     (Store.size s.store)
 
-let rec run ?(trace = false) (s : state) : Value.t =
+let rec run ?(trace = false) ?(host = no_host) (s : state) : Value.t =
   if trace then Stdlib.print_endline (state_to_string s);
-  match step s with
+  match step ~host s with
   | Done v -> v
-  | Step s' -> run ~trace s'
+  | Step s' -> run ~trace ~host s'
 
-let eval ?(trace = false) (term : Ast.term) : Value.t = run ~trace (inject term)
+let eval ?(trace = false) ?(host = no_host) (term : Ast.term) : Value.t =
+  run ~trace ~host (inject term)

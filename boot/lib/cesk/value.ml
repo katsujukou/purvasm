@@ -20,6 +20,12 @@ type t =
      point it becomes a `VData`. `args` is accumulated in reverse. *)
   | VCtor of ctor
   | VClosure of closure
+  (* A partially applied host-provided foreign function (ADR-0022). Like `VCtor`,
+     it grows one argument at a time; on reaching `arity` the machine applies
+     `call` to the collected arguments (in order) and returns the result. The
+     implementation is first-order — it consumes evaluated values and produces a
+     value, never applying a guest closure — so it needs no machine re-entrancy. *)
+  | VForeign of foreign
 
 and record = t Map.M(String).t
 
@@ -38,6 +44,13 @@ and closure =
   { param : string
   ; body : Ast.term
   ; env : Env.t
+  }
+
+and foreign =
+  { name : string
+  ; arity : int
+  ; args : t list (* collected in reverse, like [ctor] *)
+  ; call : t list -> t
   }
 
 let rec to_string : t -> string = function
@@ -63,3 +76,4 @@ let rec to_string : t -> string = function
       ^ ")"
   | VCtor { tag; arity; _ } -> "<ctor " ^ tag ^ "/" ^ Int.to_string arity ^ ">"
   | VClosure _ -> "<closure>"
+  | VForeign { name; arity; _ } -> "<foreign " ^ name ^ "/" ^ Int.to_string arity ^ ">"
