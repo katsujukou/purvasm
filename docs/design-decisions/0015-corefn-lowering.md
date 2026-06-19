@@ -108,6 +108,13 @@ its self-contained parts allow.
   optimisation** (newtype erasure, constructor fast paths). Unresolved
   externals/foreigns are the total-lowering case above.
 
+  > **Correction (2026-06-19):** ~~newtype erasure~~ is *not* a deferrable
+  > optimisation — modern PureScript represents type-class dictionaries as
+  > newtypes, so lowering **must** honour `IsNewtype` (erase the wrapper) for any
+  > real program to run. This is specified in
+  > [0018](0018-newtype-erasure.md) (Proposed). Only the genuinely optional
+  > `Meta` uses (e.g. constructor fast paths) remain deferred here.
+
 ## Consequences
 
 - **The pipeline runs end to end** for self-contained modules:
