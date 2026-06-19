@@ -140,11 +140,38 @@ let eq_array : C.term =
                , C.App (v "go", int_lit 0) )
            , C.Lit (C.LBool false) ) ))
 
-(** Structural / higher-order foreigns, as guest terms over the first-order
-    primitives. Hand-written `Cesk.Ast` for now; a PureScript surface comes with
-    the optimiser (ADR-0020). *)
+(* `ord<T>Impl lt eq gt x y` (Data.Ord): the comparator returns one of the three
+   `Ordering` values passed in (the instance supplies `LT`/`EQ`/`GT`). A composite
+   first-order guest term over the comparison primops — no new primop, no closure
+   at the boundary. *)
+let ord_cmp (lt : C.primop) (eq : C.primop) : C.term =
+  lams
+    [ "lt"; "eq"; "gt"; "x"; "y" ]
+    (C.If
+       ( C.Prim (lt, [ v "x"; v "y" ])
+       , v "lt"
+       , C.If (C.Prim (eq, [ v "x"; v "y" ]), v "eq", v "gt") ))
+
+(* Boolean order is `false < true`: equal -> eq, else the truthy one is greater. *)
+let ord_boolean : C.term =
+  lams
+    [ "lt"; "eq"; "gt"; "x"; "y" ]
+    (C.If (C.Prim (EqBool, [ v "x"; v "y" ]), v "eq", C.If (v "x", v "gt", v "lt")))
+
+(** Structural foreigns, as guest terms over the first-order primitives:
+    higher-order ones (`arrayMap`, `eqArrayImpl`) whose callback is an ordinary
+    `App`, and composite first-order ones (the scalar `Ord` comparisons). Hand-
+    written `Cesk.Ast` for now; a PureScript surface comes with the optimiser
+    (ADR-0020). `Char` is `Int` (ADR-0006), so `ordCharImpl` reuses the int term. *)
 let structural : (string * C.term) list =
-  [ "Data.Functor.arrayMap", array_map; "Data.Eq.eqArrayImpl", eq_array ]
+  [ "Data.Functor.arrayMap", array_map
+  ; "Data.Eq.eqArrayImpl", eq_array
+  ; "Data.Ord.ordIntImpl", ord_cmp LtInt EqInt
+  ; "Data.Ord.ordNumberImpl", ord_cmp LtNumber EqNumber
+  ; "Data.Ord.ordStringImpl", ord_cmp LtString EqString
+  ; "Data.Ord.ordCharImpl", ord_cmp LtInt EqInt
+  ; "Data.Ord.ordBooleanImpl", ord_boolean
+  ]
 
 let structural_provider : provider = fun key -> List.assoc_opt key structural
 

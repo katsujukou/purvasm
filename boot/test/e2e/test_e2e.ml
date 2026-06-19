@@ -291,6 +291,46 @@ let test_prelude_show_string () =
     "\"hi\\n\""
     (as_string (run_prelude "shownStr"))
 
+(* `Control.Lazy.fix f = go where go = defer \_ -> f go` — `go` is a recursive
+   *value* whose right-hand side is a general application (not a syntactic lambda
+   or constructor). It links and runs only if `letrec` evaluates an arbitrary RHS
+   while the self-reference (captured under the `defer` thunk) is not forced. Here
+   `sumTo = fix \rec n -> if n == 0 then 0 else n + rec (n-1)`, `sumTo 5 = 15`. *)
+let test_lazy_fix () =
+  Alcotest.(check int)
+    "sumTo 5 via fix"
+    15
+    (as_int
+       (Cesk.Machine.eval
+          ~host:Ffi.host
+          (Link.link_program
+             ~resolver:Ffi.resolver
+             ~outdir:"../fixtures/lazy"
+             ~entry_module:[ "Main" ]
+             ~entry:"result"
+             ())))
+
+(* A recursive *value* whose right-hand side is a constructor application, not a
+   lambda: `fibAnd = Fib "fib" \n -> … case fibAnd of Fib _ f -> f (n-k) …`. The
+   self-reference is reached by pattern-matching the recursive value back open
+   inside the closure, so it is only forced after `letrec` has backpatched it.
+   `fib 10 = 55`. Exercises Ord (`n < 2`) through the scalar `ordIntImpl` leaf. *)
+let test_recursive_value_fib () =
+  Alcotest.(check int)
+    "fib 10"
+    55
+    (as_int
+       (Cesk.Machine.eval
+          ~host:Ffi.host
+          (C.App
+             ( Link.link_program
+                 ~resolver:Ffi.resolver
+                 ~outdir:"../fixtures/fib"
+                 ~entry_module:[ "FibAnd" ]
+                 ~entry:"fib"
+                 ()
+             , int 10 ))))
+
 (* --- newtype erasure, including through as-patterns (ADR-0018) ------------ *)
 
 (* `newtype Box = Box Int`; at runtime a Box *is* its Int (the wrapper is erased),
@@ -357,6 +397,10 @@ let () =
       , [ Alcotest.test_case "match" `Quick test_newtype_match
         ; Alcotest.test_case "as_pattern" `Quick test_newtype_as_pattern
         ; Alcotest.test_case "as_whole" `Quick test_newtype_as_whole
+        ] )
+    ; ( "recursive-value"
+      , [ Alcotest.test_case "lazy_fix" `Quick test_lazy_fix
+        ; Alcotest.test_case "fib_and" `Quick test_recursive_value_fib
         ] )
     ; ( "prelude"
       , [ Alcotest.test_case "answer" `Quick test_prelude_answer

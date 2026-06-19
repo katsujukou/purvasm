@@ -186,6 +186,52 @@ let test_eq_array_difflen () =
     false
     (as_bool (apply "Data.Eq.eqArrayImpl" [ eqf; arr [ 1 ]; arr [ 1; 2 ] ]))
 
+(* --- scalar Ord comparisons (structural, ADR-0020) ------------------------ *)
+
+(* `ord<T>Impl LT EQ GT x y` returns the matching `Ordering` value; we read back
+   its constructor tag. *)
+let ordering key x y =
+  match apply key [ C.Ctor ("LT", 0); C.Ctor ("EQ", 0); C.Ctor ("GT", 0); x; y ] with
+  | V.VData { tag; _ } -> tag
+  | _ -> Alcotest.fail "expected an Ordering VData"
+
+let test_ord_int () =
+  Alcotest.(check string) "1 vs 2" "LT" (ordering "Data.Ord.ordIntImpl" (int 1) (int 2));
+  Alcotest.(check string) "2 vs 2" "EQ" (ordering "Data.Ord.ordIntImpl" (int 2) (int 2));
+  Alcotest.(check string) "3 vs 2" "GT" (ordering "Data.Ord.ordIntImpl" (int 3) (int 2))
+
+let test_ord_string () =
+  Alcotest.(check string)
+    "a vs b"
+    "LT"
+    (ordering "Data.Ord.ordStringImpl" (str "a") (str "b"));
+  Alcotest.(check string)
+    "b vs b"
+    "EQ"
+    (ordering "Data.Ord.ordStringImpl" (str "b") (str "b"))
+
+(* Char reuses the int comparison (Char is Int). *)
+let test_ord_char () =
+  Alcotest.(check string)
+    "'a' vs 'b'"
+    "LT"
+    (ordering "Data.Ord.ordCharImpl" (int 97) (int 98))
+
+(* Boolean order is false < true. *)
+let test_ord_boolean () =
+  Alcotest.(check string)
+    "false vs true"
+    "LT"
+    (ordering "Data.Ord.ordBooleanImpl" (bool false) (bool true));
+  Alcotest.(check string)
+    "true vs true"
+    "EQ"
+    (ordering "Data.Ord.ordBooleanImpl" (bool true) (bool true));
+  Alcotest.(check string)
+    "true vs false"
+    "GT"
+    (ordering "Data.Ord.ordBooleanImpl" (bool true) (bool false))
+
 (* --- native rung: opaque host-provided foreign functions (ADR-0022) -------- *)
 
 let show_int n = as_string (apply "Data.Show.showIntImpl" [ int n ])
@@ -260,6 +306,12 @@ let () =
       , [ Alcotest.test_case "unit_constant" `Quick test_unit_constant
         ; Alcotest.test_case "partial_application" `Quick test_partial_application
         ; Alcotest.test_case "unknown_declined" `Quick test_unknown_declined
+        ] )
+    ; ( "ord"
+      , [ Alcotest.test_case "ord_int" `Quick test_ord_int
+        ; Alcotest.test_case "ord_string" `Quick test_ord_string
+        ; Alcotest.test_case "ord_char" `Quick test_ord_char
+        ; Alcotest.test_case "ord_boolean" `Quick test_ord_boolean
         ] )
     ; ( "native"
       , [ Alcotest.test_case "show_int" `Quick test_show_int
