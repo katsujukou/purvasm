@@ -411,6 +411,105 @@ let test_newtype_as_pattern () =
 let test_newtype_as_whole () =
   Alcotest.(check int) "asWhole (Box 7)" 7 (as_int (run_nt "asWhole" (int 7)))
 
+(* --- lower IR round-trip against the oracle (ADR-0025) -------------------- *)
+
+(* The differential check: a real linked program, normalised to ANF and re-curried
+   back, evaluates to the same value on the oracle as the original. This validates
+   `transl`/`rev_transl` over the whole pipeline (dictionaries, foreign leaves,
+   `case`, by-need recursion). Later optimiser passes reuse exactly this harness. *)
+let prelude_term (entry : string) : C.term =
+  Link.link_program
+    ~resolver:Ffi.resolver
+    ~outdir:"../fixtures/prelude"
+    ~entry_module:[ "Main" ]
+    ~entry
+    ()
+
+let same_after_roundtrip (label : string) (t : C.term) =
+  let direct = Cesk.Machine.eval ~host:Ffi.host t in
+  let via_anf =
+    Cesk.Machine.eval
+      ~host:Ffi.host
+      (Middle_end.Transl.rev_transl (Middle_end.Transl.transl t))
+  in
+  Alcotest.(check string) label (V.to_string direct) (V.to_string via_anf)
+
+let test_rt_fixture () =
+  same_after_roundtrip "fixture.anInt" (Lower.module_ fixture ~entry:"anInt")
+
+let test_rt_app () = same_after_roundtrip "app.result" (program "result")
+
+let test_rt_prelude_answer () =
+  same_after_roundtrip "prelude.answer" (prelude_term "answer")
+
+let test_rt_prelude_doubled () =
+  same_after_roundtrip "prelude.doubled" (prelude_term "doubled")
+
+let test_rt_prelude_show () =
+  same_after_roundtrip "prelude.shownStr" (prelude_term "shownStr")
+
+let test_rt_newtype () =
+  same_after_roundtrip
+    "newtype.asInner 7"
+    (C.App
+       ( Link.link_program
+           ~outdir:"../fixtures/newtype"
+           ~entry_module:[ "Main" ]
+           ~entry:"asInner"
+           ()
+       , int 7 ))
+
+let test_rt_fib () =
+  same_after_roundtrip
+    "fib 10"
+    (C.App
+       ( Link.link_program
+           ~resolver:Ffi.resolver
+           ~outdir:"../fixtures/fib"
+           ~entry_module:[ "FibAnd" ]
+           ~entry:"fib"
+           ()
+       , int 10 ))
+
+(* Effect programs round-trip too: same returned value, and same effect order. *)
+let test_rt_effect_ref () =
+  let t =
+    Link.link_program
+      ~resolver:Ffi.resolver
+      ~outdir:"../fixtures/effect_ref"
+      ~entry_module:[ "RefMain" ]
+      ~entry:"main"
+      ()
+  in
+  Alcotest.(check int)
+    "effect ref round-trips"
+    (as_int (Cesk.Machine.run_effect ~host:Ffi.host t))
+    (as_int
+       (Cesk.Machine.run_effect
+          ~host:Ffi.host
+          (Middle_end.Transl.rev_transl (Middle_end.Transl.transl t))))
+
+let test_rt_effect_console () =
+  let t =
+    Link.link_program
+      ~resolver:Ffi.resolver
+      ~outdir:"../fixtures/effect_console"
+      ~entry_module:[ "ConsoleMain" ]
+      ~entry:"main"
+      ()
+  in
+  let direct =
+    with_captured_stdout (fun () -> ignore (Cesk.Machine.run_effect ~host:Ffi.host t))
+  in
+  let via_anf =
+    with_captured_stdout (fun () ->
+      ignore
+        (Cesk.Machine.run_effect
+           ~host:Ffi.host
+           (Middle_end.Transl.rev_transl (Middle_end.Transl.transl t))))
+  in
+  Alcotest.(check string) "effect console round-trips (same stdout)" direct via_anf
+
 let () =
   Alcotest.run
     "e2e"
@@ -462,6 +561,17 @@ let () =
     ; ( "effect"
       , [ Alcotest.test_case "ref" `Quick test_effect_ref
         ; Alcotest.test_case "console" `Quick test_effect_console
+        ] )
+    ; ( "lower-ir"
+      , [ Alcotest.test_case "fixture" `Quick test_rt_fixture
+        ; Alcotest.test_case "app" `Quick test_rt_app
+        ; Alcotest.test_case "prelude_answer" `Quick test_rt_prelude_answer
+        ; Alcotest.test_case "prelude_doubled" `Quick test_rt_prelude_doubled
+        ; Alcotest.test_case "prelude_show" `Quick test_rt_prelude_show
+        ; Alcotest.test_case "newtype" `Quick test_rt_newtype
+        ; Alcotest.test_case "fib" `Quick test_rt_fib
+        ; Alcotest.test_case "effect_ref" `Quick test_rt_effect_ref
+        ; Alcotest.test_case "effect_console" `Quick test_rt_effect_console
         ] )
     ; ( "prelude"
       , [ Alcotest.test_case "answer" `Quick test_prelude_answer

@@ -99,3 +99,46 @@ standard substrate for both an optimiser and a stack-machine codegen.
   to read, optimise, and round-trip.
 - **Curried ANF first, uncurry later.** Postpones arity/uncurrying work that
   `Effect` (ADR-0024) and the stack VM need regardless; do it once, up front.
+
+## Appendix: `atom` / `cexpr` / `expr` — which goes where
+
+The ANF type has three levels, and a sub-position of a compound node always uses
+exactly one of them. The choice follows one rule, stated three ways.
+
+The levels by role:
+
+- **`atom`** — no evaluation step (`AVar`/`ALit`/`AForeign`): "already a value".
+- **`cexpr`** — exactly *one* computation step. It appears only as the thing a
+  `Let` binds or a `Ret` returns — the unit of a straight-line let-sequence.
+- **`expr`** — a let-sequence (`Let … (Ret cexpr)`): a whole evaluation context.
+
+The decision rule for a sub-position:
+
+1. **Is it an operand consumed in this same step?** → `atom`. (`CApp` head/args,
+   `CPrim`/`CCtor`/`CArray`/`CRecord`/`CAccessor`/`CUpdate` operands, `CIf`
+   condition, `CCase` scrutinees.) Allowing a compound here would hide a
+   sub-evaluation inside the step and defeat ANF's explicit ordering.
+2. **Is it one operation whose result then flows on (bound or returned)?** →
+   `cexpr` (only under `Let`/`Ret`).
+3. **Is it its own block of control / scope?** → `expr`. (`CLam` body, `CIf`
+   branches, `CCase` alternative results and guards, `LetRec` right-hand sides,
+   the body of `Let`/`LetRec`.)
+
+The unifying principle is **"can a `let` be hoisted across this boundary?"**
+Normalisation makes an operand atomic by hoisting its `let`s outward into the
+enclosing `expr`. But a `let` cannot cross a control/scope boundary — into an
+`if` branch (it might not run), a `λ` body (different time and scope), a `case`
+alternative, or a `LetRec` right-hand side (its `let`s may reference the
+group). So at each such boundary normalisation *resets* to a fresh `expr` that
+carries its own `let`s; everywhere hoisting is legal, the operand collapses to an
+`atom`. `cexpr` is just the straight-line statement in between.
+
+This shows up directly in the normaliser ([Transl]): `norm_atom`/`norm_atoms`
+serve `atom` positions (emitting a hoisted `Let` when needed), `norm_ce`+`k`
+build the `cexpr` sequence, and `anf_tail` is called at exactly the `expr`
+positions — the control boundaries listed above.
+
+The cleanest illustration is the `Let` vs `LetRec` asymmetry: `Let` binds a
+`cexpr` (a non-recursive right-hand side's inner `let`s were hoisted in front of
+it), whereas `LetRec` binds `expr`s (a recursive right-hand side's inner `let`s
+may reference the group, so they cannot be hoisted out and must stay inside).

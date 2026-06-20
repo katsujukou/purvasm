@@ -1,0 +1,6 @@
+(include_subdirs qualified)
+
+(library
+ (name middle_end)
+ (public_name purvasm.middle_end)
+ (libraries cesk))
