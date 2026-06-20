@@ -71,5 +71,6 @@ language and are kept out of version control.)
 | [0022](0022-native-foreign-rung.md) | Native foreign rung: opaque host-provided functions | Accepted |
 | [0023](0023-effect-runtime-oracle.md) | Effect runtime at the CESK oracle: thunks, IO leaves, no reflection | Accepted |
 | [0024](0024-by-need-recursive-bindings.md) | By-need recursive bindings (refining ADR-0004) | Accepted |
+| [0025](0025-lower-ir-anf.md) | Lower IR: ANF with eval/apply, verified by round-trip against the oracle | Accepted |
 
 ## Scope
