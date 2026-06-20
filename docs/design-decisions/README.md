@@ -73,5 +73,6 @@ language and are kept out of version control.)
 | [0024](0024-by-need-recursive-bindings.md) | By-need recursive bindings (refining ADR-0004) | Accepted |
 | [0025](0025-lower-ir-anf.md) | Lower IR: ANF with eval/apply, verified by round-trip against the oracle | Accepted |
 | [0026](0026-benchmark-harness.md) | Benchmark harness: deterministic step/alloc cost on the oracle | Accepted |
+| [0027](0027-dictelim.md) | DictElim: collapse statically-known type-class dispatch | Accepted |
 
 ## Scope
