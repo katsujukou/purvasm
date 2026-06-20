@@ -3,6 +3,14 @@
 - Status: Accepted
 - Date: 2026-06-17
 
+> **Refinement ([0024](0024-by-need-recursive-bindings.md), 2026-06-20):** the
+> right-hand sides are no longer evaluated eagerly in source order and
+> backpatched. Each `letrec` member is parked as a *suspension* and forced **by
+> need** on its first dereference (then memoized) — required to build mutually
+> recursive type-class dictionaries (`Effect`). The store seam, address
+> reservation, and black-hole-on-self-reference described here are unchanged;
+> only *when* a member is evaluated moved from eager to by-need.
+
 ## Context
 
 The CESK core ([0002](0002-cesk-execution-model.md), Accepted) deliberately
