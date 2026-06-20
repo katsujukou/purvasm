@@ -43,6 +43,16 @@ meaningful and diffable across commits. They are a *stage proxy* for runtime cos
 not, the eventual VM's cost (the VM, once it exists, is benchmarked on the same
 suite for ground truth). The `x` axis is the entry's `Int` argument.
 
+## Baseline (regression check)
+
+`baseline/` holds the committed **no-opt** `.dat` snapshot (variants `direct` and
+`anf`, no optimiser passes). It is the regression reference: after a change,
+re-run the suite and diff `out/<bench>.dat` against `baseline/<bench>.dat` —
+the `size`, `direct_*`, and `anf_*` columns must be unchanged. An optimiser pass
+adds further columns whose curves should sit *below* `anf`; once a genuine
+improvement (or an intended baseline change) lands, refresh the snapshot with
+`cp bench/out/*.dat bench/baseline/`.
+
 ## The suite
 
 Each program is self-contained: a shared `Bench.List` (list type plus
