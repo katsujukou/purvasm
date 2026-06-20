@@ -12,6 +12,9 @@ _coverage/
 bisect*.coverage
 _doc/
 
+# Benchmark harness output — generated graphs + data (ADR-0026)
+bench/out/
+
 # OCaml compiler outputs (in case anything is built outside dune)
 *.cmi
 *.cmo

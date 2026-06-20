@@ -3,6 +3,15 @@
 - Status: Accepted
 - Date: 2026-06-20
 
+> **Progress (2026-06-21):** the harness sweeps each program over a range of
+> input sizes (the entry is an `Int -> Int`, applied to each size) and records
+> steps and allocs per `(bench, size, variant)` to `bench/out/<bench>.dat`, then
+> plots them with **gnuplot** to `bench/out/steps.png` and `bench/out/allocs.png`
+> (a panel per bench, a curve per variant, log-scaled). Variants today are
+> `direct` and the `anf` round-trip; each optimiser pass appends one variant and
+> one curve. Run from `boot`: `dune exec bench/bench.exe`. Generated output is
+> git-ignored.
+
 ## Context
 
 The next work is optimiser passes (DictElim, decision tree, inlining, uncurry,
