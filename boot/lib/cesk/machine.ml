@@ -93,7 +93,21 @@ let step ~(host : host) (s : state) : result =
      | Ast.Lit (Ast.LNumber f) -> Step { s with focus = Return (Value.VNumber f) }
      | Ast.Lit (Ast.LBool b) -> Step { s with focus = Return (Value.VBool b) }
      | Ast.Lit (Ast.LString str) -> Step { s with focus = Return (Value.VString str) }
-     | Ast.Var x -> Step { s with focus = Return (Store.find s.store (Env.lookup env x)) }
+     | Ast.Var x ->
+       let addr = Env.lookup env x in
+       (match Store.find_slot s.store addr with
+        | Store.Filled v -> Step { s with focus = Return v }
+        | Store.Blackhole ->
+          Errors.stuck ("recursive binding used before initialization: " ^ x)
+        (* A by-need recursive binding (ADR-0024): force its right-hand side now,
+           black-holing the slot so a self-reference during forcing is caught, and
+           memoize the result via the `Force` frame. *)
+        | Store.Suspended (rhs, rhs_env) ->
+          Step
+            { focus = Eval (rhs, rhs_env)
+            ; store = Store.blackhole s.store addr
+            ; kont = Cont.Force (addr, s.kont)
+            })
      | Ast.Lam (param, body) ->
        Step { s with focus = Return (Value.VClosure { param; body; env }) }
      | Ast.App (f, a) ->
@@ -101,9 +115,11 @@ let step ~(host : host) (s : state) : result =
      | Ast.Let (x, e1, e2) ->
        Step { s with focus = Eval (e1, env); kont = Cont.Let_body (x, e2, env, s.kont) }
      | Ast.Letrec (binds, body) ->
-       (* Reserve an address for every binding up front so all names are in
-          scope in every right-hand side (mutual recursion), then evaluate the
-          right-hand sides left to right, backpatching each (Cont.Letrec_bind). *)
+       (* By-need recursion (ADR-0024): reserve an address for every binding so all
+          names are in scope in every right-hand side (mutual recursion), park each
+          right-hand side as a suspension over that shared environment, then
+          evaluate the body. Each binding is forced — once, memoized — on its first
+          dereference (see the `Var`/`Force` rules). *)
        let store', targets =
          List.fold_map binds ~init:s.store ~f:(fun st (x, rhs) ->
            let addr, st' = Store.reserve st in
@@ -112,15 +128,11 @@ let step ~(host : host) (s : state) : result =
        let env' =
          List.fold targets ~init:env ~f:(fun e (x, addr, _) -> Env.extend e x addr)
        in
-       (match targets with
-        | [] -> Step { s with focus = Eval (body, env') }
-        | (_, addr1, e1) :: rest ->
-          let pending = List.map rest ~f:(fun (_, addr, rhs) -> addr, rhs) in
-          Step
-            { focus = Eval (e1, env')
-            ; store = store'
-            ; kont = Cont.Letrec_bind (addr1, pending, body, env', s.kont)
-            })
+       let store'' =
+         List.fold targets ~init:store' ~f:(fun st (_, addr, rhs) ->
+           Store.set_suspended st addr rhs env')
+       in
+       Step { s with focus = Eval (body, env'); store = store'' }
      | Ast.If (c, t, e) ->
        Step { s with focus = Eval (c, env); kont = Cont.If_branch (t, e, env, s.kont) }
      | Ast.Prim (op, args) ->
@@ -213,19 +225,10 @@ let step ~(host : host) (s : state) : result =
        let addr, store' = Store.alloc s.store v in
        let env' = Env.extend env x addr in
        Step { focus = Eval (e2, env'); store = store'; kont = k }
-     | Cont.Letrec_bind (addr, pending, body, env, k) ->
-       (* Backpatch the address just computed; a closure built earlier in the
-          group already points here, so this write is what makes the recursion
-          observable. Then move to the next right-hand side, or the body. *)
-       let store' = Store.set s.store addr v in
-       (match pending with
-        | [] -> Step { focus = Eval (body, env); store = store'; kont = k }
-        | (addr', e) :: rest ->
-          Step
-            { focus = Eval (e, env)
-            ; store = store'
-            ; kont = Cont.Letrec_bind (addr', rest, body, env, k)
-            })
+     | Cont.Force (addr, k) ->
+       (* The forced binding's value has arrived: memoize it at its address (ending
+          the black-hole) so later dereferences are O(1), then hand it on. *)
+       Step { store = Store.set s.store addr v; focus = Return v; kont = k }
      | Cont.If_branch (t, e, env, k) ->
        (match v with
         | Value.VBool b ->
@@ -341,3 +344,10 @@ let rec run ?(trace = false) ?(host = no_host) (s : state) : Value.t =
 
 let eval ?(trace = false) ?(host = no_host) (term : Ast.term) : Value.t =
   run ~trace ~host (inject term)
+
+(* Run a program's [main : Effect a] (ADR-0023). An `Effect` is the nullary thunk
+   `Unit -> a`, so the runtime forces it by applying it to a dummy unit argument
+   (the immediate 0, which the thunk ignores); this drives its effects to
+   completion and returns the final value. *)
+let run_effect ?(trace = false) ?(host = no_host) (main : Ast.term) : Value.t =
+  eval ~trace ~host (Ast.App (main, Ast.Lit (Ast.LInt 0)))

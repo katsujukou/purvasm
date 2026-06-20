@@ -158,11 +158,118 @@ let ord_boolean : C.term =
     [ "lt"; "eq"; "gt"; "x"; "y" ]
     (C.If (C.Prim (EqBool, [ v "x"; v "y" ]), v "eq", C.If (v "x", v "gt", v "lt")))
 
+(* --- Effect monad + combinators as structural guest terms (ADR-0023) ------ *)
+
+(* `Effect a` is the nullary thunk `Unit -> a`; `unit` is the immediate 0, which
+   these thunks ignore. Correct sequencing is just strict evaluation of `bindE`. *)
+let unit_lit = int_lit 0
+let run_eff (e : C.term) : C.term = C.App (e, unit_lit)
+
+(* pureE a = \_ -> a *)
+let eff_pure : C.term = lams [ "a"; "$u" ] (v "a")
+
+(* bindE a f = \_ -> f (a unit) unit — force a (its effects), pass the result to
+   f, then force the resulting effect. *)
+let eff_bind : C.term = lams [ "a"; "f"; "$u" ] (run_eff (C.App (v "f", run_eff (v "a"))))
+
+(* untilE f = \_ -> repeat (f unit) until it yields true. *)
+let eff_until : C.term =
+  lams
+    [ "f"; "$u" ]
+    (C.Letrec
+       ( [ "go", C.Lam ("$g", C.If (run_eff (v "f"), unit_lit, C.App (v "go", unit_lit))) ]
+       , C.App (v "go", unit_lit) ))
+
+(* whileE f a = \_ -> while (f unit) run (a unit). *)
+let eff_while : C.term =
+  lams
+    [ "f"; "a"; "$u" ]
+    (C.Letrec
+       ( [ ( "go"
+           , C.Lam
+               ( "$g"
+               , C.If
+                   ( run_eff (v "f")
+                   , C.Let ("$_", run_eff (v "a"), C.App (v "go", unit_lit))
+                   , unit_lit ) ) )
+         ]
+       , C.App (v "go", unit_lit) ))
+
+(* forE lo hi f = \_ -> for i in [lo, hi) run (f i unit). *)
+let eff_for : C.term =
+  lams
+    [ "lo"; "hi"; "f"; "$u" ]
+    (C.Letrec
+       ( [ ( "go"
+           , C.Lam
+               ( "i"
+               , C.If
+                   ( C.Prim (LtInt, [ v "i"; v "hi" ])
+                   , C.Let
+                       ( "$_"
+                       , run_eff (C.App (v "f", v "i"))
+                       , C.App (v "go", C.Prim (AddInt, [ v "i"; int_lit 1 ])) )
+                   , unit_lit ) ) )
+         ]
+       , C.App (v "go", v "lo") ))
+
+(* foreachE as f = \_ -> for each element run (f x unit). *)
+let eff_foreach : C.term =
+  lams
+    [ "as"; "f"; "$u" ]
+    (C.Let
+       ( "n"
+       , C.Prim (LengthArray, [ v "as" ])
+       , C.Letrec
+           ( [ ( "go"
+               , C.Lam
+                   ( "i"
+                   , C.If
+                       ( C.Prim (LtInt, [ v "i"; v "n" ])
+                       , C.Let
+                           ( "$_"
+                           , run_eff
+                               (C.App (v "f", C.Prim (IndexArray, [ v "as"; v "i" ])))
+                           , C.App (v "go", C.Prim (AddInt, [ v "i"; int_lit 1 ])) )
+                       , unit_lit ) ) )
+             ]
+           , C.App (v "go", int_lit 0) ) ))
+
+(* --- Effect.Ref as a one-cell mutable array (ADR-0019, ADR-0023) ---------- *)
+
+(* A `Ref` is opaque (`foreign import data Ref`), so we represent it as a fresh
+   one-cell mutable array; the JS `{ value }` record is mutable, which our records
+   (ADR-0010) are not. Every Ref op is an `Effect` thunk over the array builders. *)
+let ref_new : C.term =
+  lams
+    [ "val"; "$u" ]
+    (C.Prim (SetArray, [ C.Prim (NewArray, [ int_lit 1 ]); int_lit 0; v "val" ]))
+
+let ref_read : C.term = lams [ "ref"; "$u" ] (C.Prim (IndexArray, [ v "ref"; int_lit 0 ]))
+
+let ref_write : C.term =
+  lams
+    [ "val"; "ref"; "$u" ]
+    (C.Let ("$_", C.Prim (SetArray, [ v "ref"; int_lit 0; v "val" ]), unit_lit))
+
+(* modifyImpl f ref = \_ -> let t = f ref[0] in (ref[0] := t.state; t.value). *)
+let ref_modify : C.term =
+  lams
+    [ "f"; "ref"; "$u" ]
+    (C.Let
+       ( "t"
+       , C.App (v "f", C.Prim (IndexArray, [ v "ref"; int_lit 0 ]))
+       , C.Let
+           ( "$_"
+           , C.Prim (SetArray, [ v "ref"; int_lit 0; C.Accessor (v "t", "state") ])
+           , C.Accessor (v "t", "value") ) ))
+
 (** Structural foreigns, as guest terms over the first-order primitives:
     higher-order ones (`arrayMap`, `eqArrayImpl`) whose callback is an ordinary
-    `App`, and composite first-order ones (the scalar `Ord` comparisons). Hand-
-    written `Cesk.Ast` for now; a PureScript surface comes with the optimiser
-    (ADR-0020). `Char` is `Int` (ADR-0006), so `ordCharImpl` reuses the int term. *)
+    `App`, composite first-order ones (the scalar `Ord` comparisons), and the
+    `Effect` monad / `Effect.Ref` thunks (ADR-0023). Hand-written `Cesk.Ast` for
+    now; a PureScript surface comes with the optimiser (ADR-0020). `Char` is `Int`
+    (ADR-0006), so `ordCharImpl` reuses the int term. *)
 let structural : (string * C.term) list =
   [ "Data.Functor.arrayMap", array_map
   ; "Data.Eq.eqArrayImpl", eq_array
@@ -171,6 +278,16 @@ let structural : (string * C.term) list =
   ; "Data.Ord.ordStringImpl", ord_cmp LtString EqString
   ; "Data.Ord.ordCharImpl", ord_cmp LtInt EqInt
   ; "Data.Ord.ordBooleanImpl", ord_boolean
+  ; "Effect.pureE", eff_pure
+  ; "Effect.bindE", eff_bind
+  ; "Effect.untilE", eff_until
+  ; "Effect.whileE", eff_while
+  ; "Effect.forE", eff_for
+  ; "Effect.foreachE", eff_foreach
+  ; "Effect.Ref._new", ref_new
+  ; "Effect.Ref.read", ref_read
+  ; "Effect.Ref.write", ref_write
+  ; "Effect.Ref.modifyImpl", ref_modify
   ]
 
 let structural_provider : provider = fun key -> List.assoc_opt key structural
@@ -281,9 +398,11 @@ let show_number (f : float) : string =
     shortest 1)
 
 (** The host registry (ADR-0022): the native foreign leaves, each an arity and a
-    first-order host implementation over evaluated values. Faithful to the
-    `prelude` package's `Data.Show` JS FFI. This is the single source of truth for
-    which names are native — [native_provider] derives from it. *)
+    first-order host implementation over evaluated values. The pure leaves
+    (`Data.Show`) are faithful to the `prelude` JS FFI; the one effectful leaf
+    (`Effect.Console.log`, ADR-0023) performs real IO when its `Effect` thunk is
+    forced. This is the single source of truth for which names are native —
+    [native_provider] derives from it. *)
 let host : Cesk.Machine.host =
   let unary (f : V.t -> V.t) =
     ( 1
@@ -314,6 +433,26 @@ let host : Cesk.Machine.host =
         (unary (function
            | V.VString s -> V.VString (show_string s)
            | _ -> Cesk.Errors.stuck "showStringImpl: not a String"))
+    (* The one genuinely effectful leaf (ADR-0023): `log s :: Effect Unit` is the
+       thunk `\_ -> console.log s`. Applying [log] to the string returns that
+       thunk; forcing it (running the effect) performs the real stdout write — so
+       the side effect happens at the `Perform`, not at construction. *)
+    | "Effect.Console.log" ->
+      Some
+        (unary (function
+           | V.VString s ->
+             V.VForeign
+               { name = "Effect.Console.log#perform"
+               ; arity = 1
+               ; args = []
+               ; call =
+                   (fun _ ->
+                     print_string s;
+                     print_newline ();
+                     flush stdout;
+                     V.VInt 0)
+               }
+           | _ -> Cesk.Errors.stuck "log: not a String"))
     | _ -> None
 
 (** The native rung: a name is bound to an opaque [Foreign] reference exactly when

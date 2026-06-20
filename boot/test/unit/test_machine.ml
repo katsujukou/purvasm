@@ -217,6 +217,24 @@ let test_letrec_forward_reference () =
 let test_letrec_empty () =
   Alcotest.(check int) "empty group" 42 (eval_int (Letrec ([], num 42)))
 
+(* By-need recursion (ADR-0024): a binding is forced only on first dereference, in
+   source order *of use*, not of definition. Here `a = b` forward-references `b`,
+   but the body uses only `b`, so `a` is never forced — no black-hole. (Eager,
+   source-order `letrec` would force `a = b` before `b` and get stuck.) *)
+let test_letrec_byneed_unused_forward () =
+  Alcotest.(check int)
+    "unused forward reference"
+    1
+    (eval_int (Letrec ([ "a", Var "b"; "b", num 1 ], Var "b")))
+
+(* The forward reference is even *used*: forcing `a` forces `b` (already a value),
+   so the knot ties lazily. Eager source order would black-hole on `a = b`. *)
+let test_letrec_byneed_forward_resolved () =
+  Alcotest.(check int)
+    "resolved forward reference"
+    1
+    (eval_int (Letrec ([ "a", Var "b"; "b", num 1 ], Var "a")))
+
 (* Strings ------------------------------------------------------------------ *)
 
 let test_string_literal () =
@@ -976,6 +994,14 @@ let () =
             `Quick
             test_letrec_forward_reference
         ; Alcotest.test_case "letrec_empty" `Quick test_letrec_empty
+        ; Alcotest.test_case
+            "letrec_byneed_unused_forward"
+            `Quick
+            test_letrec_byneed_unused_forward
+        ; Alcotest.test_case
+            "letrec_byneed_forward_resolved"
+            `Quick
+            test_letrec_byneed_forward_resolved
         ; Alcotest.test_case "string_literal" `Quick test_string_literal
         ; Alcotest.test_case "string_append" `Quick test_string_append
         ; Alcotest.test_case "string_append_empty" `Quick test_string_append_empty

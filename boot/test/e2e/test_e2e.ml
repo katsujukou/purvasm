@@ -331,6 +331,63 @@ let test_recursive_value_fib () =
                  ()
              , int 10 ))))
 
+(* --- Effect runtime (ADR-0023), unblocked by by-need recursion (ADR-0024) - *)
+
+(* Run a program's `main :: Effect a` through the full pipeline with the FFI
+   resolver and host registry. The closure pulls `Effect`'s mutually recursive
+   instance dictionaries, which only link because recursive bindings are by-need. *)
+let run_effect_program ~(outdir : string) ~(entry_module : string list) : V.t =
+  Cesk.Machine.run_effect
+    ~host:Ffi.host
+    (Link.link_program ~resolver:Ffi.resolver ~outdir ~entry_module ~entry:"main" ())
+
+(* `main = do { r <- Ref.new 0; _ <- modify (_+1) r; _ <- modify (_+10) r; read r }`
+   = 11. Exercises the Effect monad (bindE), Effect.Ref as a one-cell mutable
+   array, and the run-to-completion driver — all observed as a returned value. *)
+let test_effect_ref () =
+  Alcotest.(check int)
+    "ref counter"
+    11
+    (as_int
+       (run_effect_program ~outdir:"../fixtures/effect_ref" ~entry_module:[ "RefMain" ]))
+
+(* Capture writes to stdout (fd 1) while running [f]. *)
+let with_captured_stdout (f : unit -> unit) : string =
+  flush stdout;
+  let tmp = Filename.temp_file "purvasm" ".out" in
+  let fd = Unix.openfile tmp [ Unix.O_WRONLY; Unix.O_TRUNC ] 0o600 in
+  let saved = Unix.dup Unix.stdout in
+  Unix.dup2 fd Unix.stdout;
+  Unix.close fd;
+  let restore () =
+    flush stdout;
+    Unix.dup2 saved Unix.stdout;
+    Unix.close saved
+  in
+  (try f () with
+   | e ->
+     restore ();
+     raise e);
+  restore ();
+  let ic = open_in_bin tmp in
+  let s = really_input_string ic (in_channel_length ic) in
+  close_in ic;
+  Sys.remove tmp;
+  s
+
+(* `main = do { log "Hello"; log "World" }` — the one genuinely effectful leaf
+   (`Effect.Console.log`) performs real stdout writes, in order, when each Effect
+   thunk is forced. *)
+let test_effect_console () =
+  let out =
+    with_captured_stdout (fun () ->
+      ignore
+        (run_effect_program
+           ~outdir:"../fixtures/effect_console"
+           ~entry_module:[ "ConsoleMain" ]))
+  in
+  Alcotest.(check string) "console output" "Hello\nWorld\n" out
+
 (* --- newtype erasure, including through as-patterns (ADR-0018) ------------ *)
 
 (* `newtype Box = Box Int`; at runtime a Box *is* its Int (the wrapper is erased),
@@ -401,6 +458,10 @@ let () =
     ; ( "recursive-value"
       , [ Alcotest.test_case "lazy_fix" `Quick test_lazy_fix
         ; Alcotest.test_case "fib_and" `Quick test_recursive_value_fib
+        ] )
+    ; ( "effect"
+      , [ Alcotest.test_case "ref" `Quick test_effect_ref
+        ; Alcotest.test_case "console" `Quick test_effect_console
         ] )
     ; ( "prelude"
       , [ Alcotest.test_case "answer" `Quick test_prelude_answer

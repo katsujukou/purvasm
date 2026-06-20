@@ -19,12 +19,10 @@ type t =
   (* Evaluating a primitive's arguments left to right: values already computed
      (in reverse), then the terms still to evaluate. *)
   | Prim_args of Ast.primop * Value.t list * Ast.term list * Env.t * t
-  (* Tying a recursive binding group's knot (ADR-0004/0005). Every address in
-     the group is already reserved; the right-hand sides are evaluated left to
-     right, each backpatched as its value arrives. Fields: the address being
-     filled now, the (address, right-hand side) pairs still pending, the body,
-     the recursive environment shared by every binding, and the rest. *)
-  | Letrec_bind of Addr.t * (Addr.t * Ast.term) list * Ast.term * Env.t * t
+  (* Forcing a by-need recursive binding (ADR-0024). The binding's right-hand side
+     is being evaluated; when its value arrives we memoize it at `addr` (ending the
+     black-hole) and hand it on. *)
+  | Force of Addr.t * t
   (* Building an array literal: elements already evaluated (in reverse), then the
      element terms still to evaluate — the same shape as Prim_args (ADR-0009). *)
   | Array_elems of Value.t list * Ast.term list * Env.t * t
@@ -69,7 +67,7 @@ let frame_name : t -> string = function
   | Let_body _ -> "let"
   | If_branch _ -> "if"
   | Prim_args _ -> "prim"
-  | Letrec_bind _ -> "rec"
+  | Force _ -> "force"
   | Array_elems _ -> "arr"
   | Record_fields _ -> "fld"
   | Project _ -> "prj"

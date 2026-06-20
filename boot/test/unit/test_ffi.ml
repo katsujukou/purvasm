@@ -278,6 +278,82 @@ let test_native_declines_unknown () =
     true
     (Option.is_none (Ffi.host "Data.Show.showArrayImpl"))
 
+(* --- Effect monad + Ref machinery (structural, ADR-0023) ------------------ *)
+
+let term key =
+  match Ffi.resolver key with
+  | Some t -> t
+  | None -> Alcotest.failf "no resolution for %s" key
+
+let run_eff (e : C.term) : V.t = Cesk.Machine.run_effect ~host:Ffi.host e
+let pe (x : C.term) : C.term = C.App (term "Effect.pureE", x)
+let bind_e (a : C.term) (f : C.term) : C.term = C.App (C.App (term "Effect.bindE", a), f)
+
+(* A `\s -> { state: s + n, value: s + n }` for modifyImpl. *)
+let add_field n =
+  C.Lam
+    ( "s"
+    , C.Record
+        [ "state", C.Prim (C.AddInt, [ C.Var "s"; int n ])
+        ; "value", C.Prim (C.AddInt, [ C.Var "s"; int n ])
+        ] )
+
+let test_effect_pure () = Alcotest.(check int) "pureE 7" 7 (as_int (run_eff (pe (int 7))))
+
+(* bindE sequences and threads the result: pureE 10 >>= \x -> pureE (x+1) = 11. *)
+let test_effect_bind () =
+  Alcotest.(check int)
+    "bindE/pureE"
+    11
+    (as_int
+       (run_eff
+          (bind_e
+             (pe (int 10))
+             (C.Lam ("x", pe (C.Prim (C.AddInt, [ C.Var "x"; int 1 ])))))))
+
+(* Ref as a one-cell mutable cell: new 5; modify (+1); read = 6. *)
+let test_effect_ref () =
+  let prog =
+    bind_e
+      (C.App (term "Effect.Ref._new", int 5))
+      (C.Lam
+         ( "r"
+         , bind_e
+             (C.App (C.App (term "Effect.Ref.modifyImpl", add_field 1), C.Var "r"))
+             (C.Lam ("$_", C.App (term "Effect.Ref.read", C.Var "r"))) ))
+  in
+  Alcotest.(check int) "ref new/modify/read" 6 (as_int (run_eff prog))
+
+(* Sequencing accumulates on the shared cell: new 0; +1; +10; read = 11. *)
+let test_effect_ref_seq () =
+  let prog =
+    bind_e
+      (C.App (term "Effect.Ref._new", int 0))
+      (C.Lam
+         ( "r"
+         , bind_e
+             (C.App (C.App (term "Effect.Ref.modifyImpl", add_field 1), C.Var "r"))
+             (C.Lam
+                ( "$_"
+                , bind_e
+                    (C.App (C.App (term "Effect.Ref.modifyImpl", add_field 10), C.Var "r"))
+                    (C.Lam ("$_", C.App (term "Effect.Ref.read", C.Var "r"))) )) ))
+  in
+  Alcotest.(check int) "ref accumulate" 11 (as_int (run_eff prog))
+
+(* write overwrites; a later read sees it: new 0; write 9; read = 9. *)
+let test_effect_ref_write () =
+  let prog =
+    bind_e
+      (C.App (term "Effect.Ref._new", int 0))
+      (C.Lam
+         ( "r"
+         , bind_e
+             (C.App (C.App (term "Effect.Ref.write", int 9), C.Var "r"))
+             (C.Lam ("$_", C.App (term "Effect.Ref.read", C.Var "r"))) ))
+  in
+  Alcotest.(check int) "ref write/read" 9 (as_int (run_eff prog))
+
 let () =
   Alcotest.run
     "ffi"
@@ -312,6 +388,13 @@ let () =
         ; Alcotest.test_case "ord_string" `Quick test_ord_string
         ; Alcotest.test_case "ord_char" `Quick test_ord_char
         ; Alcotest.test_case "ord_boolean" `Quick test_ord_boolean
+        ] )
+    ; ( "effect"
+      , [ Alcotest.test_case "pure" `Quick test_effect_pure
+        ; Alcotest.test_case "bind" `Quick test_effect_bind
+        ; Alcotest.test_case "ref" `Quick test_effect_ref
+        ; Alcotest.test_case "ref_seq" `Quick test_effect_ref_seq
+        ; Alcotest.test_case "ref_write" `Quick test_effect_ref_write
         ] )
     ; ( "native"
       , [ Alcotest.test_case "show_int" `Quick test_show_int
