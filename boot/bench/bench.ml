@@ -29,6 +29,10 @@ let measure ?(host = Cesk.Machine.no_host) (t : C.term) : int * int =
 let variants : (string * (C.term -> C.term)) list =
   [ ("direct", fun t -> t)
   ; ("anf", fun t -> Middle_end.Transl.rev_transl (Middle_end.Transl.transl t))
+  ; ( "dictelim"
+    , fun t ->
+        Middle_end.Transl.rev_transl
+          (Middle_end.Passes.Dict_elim.run (Middle_end.Transl.transl t)) )
   ]
 
 (* label, entry module, entry (an `Int -> Int`), and the input sizes to sweep. *)

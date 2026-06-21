@@ -3,6 +3,19 @@
 - Status: Accepted
 - Date: 2026-06-21
 
+> **Progress (2026-06-21):** implemented as `Middle_end.Passes.Dict_elim`; sound
+> (the ADR-0025 round-trip agrees with the oracle on every fixture) and no
+> baseline regression. **Measured standalone effect is ~0%** (a constant −20…−40
+> steps across the bench suite, independent of input size). The benchmark
+> explained why: PureScript already *floats* a constant dictionary-member
+> extraction (`add semiringInt`) to a shared binding, so the dispatch runs
+> **once** (by-need memoised) and the hot loop just applies the extracted binary
+> function — DictElim removes only that one-time dispatch. The per-call win it
+> sets up (`add' = intAdd`, then `add' a b`) is unlocked by a follow-up
+> copy-propagation-and-inlining pass that turns `intAdd a b` into
+> `Prim(AddInt, a, b)`; DictElim is the prerequisite that makes the method resolve
+> to `intAdd` for that inliner to see. Recommend that pass next.
+
 ## Context
 
 Type classes are dictionary-passing (ADR-0007). After lowering, a method call

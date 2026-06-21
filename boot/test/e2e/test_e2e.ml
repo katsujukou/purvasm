@@ -510,6 +510,51 @@ let test_rt_effect_console () =
   in
   Alcotest.(check string) "effect console round-trips (same stdout)" direct via_anf
 
+(* --- DictElim (ADR-0027) preserves semantics ----------------------------- *)
+
+(* The pass is sound iff round-tripping through it agrees with the oracle. *)
+let dictelim (t : C.term) : C.term =
+  Middle_end.Transl.rev_transl
+    (Middle_end.Passes.Dict_elim.run (Middle_end.Transl.transl t))
+
+let same_after_dictelim (label : string) (t : C.term) =
+  Alcotest.(check string)
+    label
+    (V.to_string (Cesk.Machine.eval ~host:Ffi.host t))
+    (V.to_string (Cesk.Machine.eval ~host:Ffi.host (dictelim t)))
+
+let test_de_prelude_answer () = same_after_dictelim "answer" (prelude_term "answer")
+let test_de_prelude_doubled () = same_after_dictelim "doubled" (prelude_term "doubled")
+let test_de_prelude_show () = same_after_dictelim "shownStr" (prelude_term "shownStr")
+
+let test_de_fib () =
+  same_after_dictelim
+    "fib 10"
+    (C.App
+       ( Link.link_program
+           ~resolver:Ffi.resolver
+           ~outdir:"../fixtures/fib"
+           ~entry_module:[ "FibAnd" ]
+           ~entry:"fib"
+           ()
+       , int 10 ))
+
+(* Effect's mutually recursive dicts have computed fields; DictElim must leave
+   them alone and stay correct. *)
+let test_de_effect_ref () =
+  let t =
+    Link.link_program
+      ~resolver:Ffi.resolver
+      ~outdir:"../fixtures/effect_ref"
+      ~entry_module:[ "RefMain" ]
+      ~entry:"main"
+      ()
+  in
+  Alcotest.(check int)
+    "effect ref via dictelim"
+    (as_int (Cesk.Machine.run_effect ~host:Ffi.host t))
+    (as_int (Cesk.Machine.run_effect ~host:Ffi.host (dictelim t)))
+
 let () =
   Alcotest.run
     "e2e"
@@ -572,6 +617,13 @@ let () =
         ; Alcotest.test_case "fib" `Quick test_rt_fib
         ; Alcotest.test_case "effect_ref" `Quick test_rt_effect_ref
         ; Alcotest.test_case "effect_console" `Quick test_rt_effect_console
+        ] )
+    ; ( "dictelim"
+      , [ Alcotest.test_case "prelude_answer" `Quick test_de_prelude_answer
+        ; Alcotest.test_case "prelude_doubled" `Quick test_de_prelude_doubled
+        ; Alcotest.test_case "prelude_show" `Quick test_de_prelude_show
+        ; Alcotest.test_case "fib" `Quick test_de_fib
+        ; Alcotest.test_case "effect_ref" `Quick test_de_effect_ref
         ] )
     ; ( "prelude"
       , [ Alcotest.test_case "answer" `Quick test_prelude_answer
