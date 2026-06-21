@@ -3,6 +3,18 @@
 - Status: Accepted
 - Date: 2026-06-21
 
+> **Progress (2026-06-21):** implemented as `Middle_end.Passes.Simplify`; sound
+> (the ADR-0025 round-trip agrees with the oracle on every fixture) and no
+> baseline regression. Measured as the combined `opt` = DictElim + Simplify
+> variant against the `anf` baseline (steps, max swept size): **fib −19.0%**,
+> **n-queens −28.0%**, **bintree-dfs −25.0%**, **map-fold −17.5%** — the per-call
+> win DictElim set up, now realised (`m a b` collapses to `Prim`). `quicksort`
+> (−0.2%) and `bintree-bfs` (−0.5%) barely move: their hot work is comparison via
+> the polymorphic `lessThan`/`compare` (dict is a parameter, so DictElim can't
+> resolve it) and list plumbing, neither of which this pass touches. Capturing Ord
+> needs specialisation (or inlining `lessThan`); that and list/array ops are the
+> natural next targets.
+
 ## Context
 
 DictElim (ADR-0027) collapses statically-known dispatch but measured ~0% alone:

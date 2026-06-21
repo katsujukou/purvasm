@@ -7,6 +7,7 @@ open Cesk.Ast
 module V = Cesk.Value
 module A = Middle_end.Anf
 module T = Middle_end.Transl
+module S = Middle_end.Passes.Simplify
 
 let eval = Cesk.Machine.eval
 
@@ -114,6 +115,31 @@ let test_shape_uncurried_lam () =
   | A.Ret (A.CLam ([ "x"; "y" ], _)) -> ()
   | _ -> Alcotest.fail "expected a single 2-parameter lambda"
 
+(* --- Simplify (ADR-0028): copy-propagation + small-callee inlining -------- *)
+
+(* A saturated call of a flat local function is inlined to its substituted body. *)
+let test_simplify_inline () =
+  let t = App (Lam ("x", add (Var "x") (num 1)), num 5) in
+  Alcotest.(check string)
+    "(\\x -> x+1) 5 preserved"
+    (V.to_string (eval t))
+    (V.to_string (eval (T.rev_transl (S.run (T.transl t)))));
+  match S.run (T.transl t) with
+  | A.Let (_, A.CLam _, A.Ret (A.CPrim (AddInt, [ A.ALit (LInt 5); A.ALit (LInt 1) ]))) ->
+    ()
+  | _ -> Alcotest.fail "expected the call to be inlined to a Prim"
+
+(* A chain of atom-aliases is copy-propagated away. *)
+let test_simplify_copyprop () =
+  let t = Let ("y", num 7, Let ("z", Var "y", Var "z")) in
+  Alcotest.(check string)
+    "let z = y = 7 in z"
+    (V.to_string (eval t))
+    (V.to_string (eval (T.rev_transl (S.run (T.transl t)))));
+  match S.run (T.transl t) with
+  | A.Ret (A.CAtom (A.ALit (LInt 7))) -> ()
+  | _ -> Alcotest.fail "expected the aliases to be propagated to a literal"
+
 let () =
   Alcotest.run
     "anf"
@@ -137,5 +163,9 @@ let () =
       , [ Alcotest.test_case "names_nested_app" `Quick test_shape_names_nested_app
         ; Alcotest.test_case "uncurried_app" `Quick test_shape_uncurried_app
         ; Alcotest.test_case "uncurried_lam" `Quick test_shape_uncurried_lam
+        ] )
+    ; ( "simplify"
+      , [ Alcotest.test_case "inline" `Quick test_simplify_inline
+        ; Alcotest.test_case "copyprop" `Quick test_simplify_copyprop
         ] )
     ]

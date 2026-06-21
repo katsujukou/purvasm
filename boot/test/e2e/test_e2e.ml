@@ -555,6 +555,62 @@ let test_de_effect_ref () =
     (as_int (Cesk.Machine.run_effect ~host:Ffi.host t))
     (as_int (Cesk.Machine.run_effect ~host:Ffi.host (dictelim t)))
 
+(* --- DictElim + Simplify (ADR-0028) preserves semantics ------------------ *)
+
+(* The full optimiser pipeline so far; sound iff it agrees with the oracle. *)
+let opt (t : C.term) : C.term =
+  Middle_end.Transl.rev_transl
+    (Middle_end.Passes.Simplify.run
+       (Middle_end.Passes.Dict_elim.run (Middle_end.Transl.transl t)))
+
+let same_after_opt (label : string) (t : C.term) =
+  Alcotest.(check string)
+    label
+    (V.to_string (Cesk.Machine.eval ~host:Ffi.host t))
+    (V.to_string (Cesk.Machine.eval ~host:Ffi.host (opt t)))
+
+let test_opt_prelude_answer () = same_after_opt "answer" (prelude_term "answer")
+let test_opt_prelude_doubled () = same_after_opt "doubled" (prelude_term "doubled")
+let test_opt_prelude_show () = same_after_opt "shownStr" (prelude_term "shownStr")
+let test_opt_app () = same_after_opt "app.result" (program "result")
+
+let test_opt_newtype () =
+  same_after_opt
+    "newtype.asInner 7"
+    (C.App
+       ( Link.link_program
+           ~outdir:"../fixtures/newtype"
+           ~entry_module:[ "Main" ]
+           ~entry:"asInner"
+           ()
+       , int 7 ))
+
+let test_opt_fib () =
+  same_after_opt
+    "fib 10"
+    (C.App
+       ( Link.link_program
+           ~resolver:Ffi.resolver
+           ~outdir:"../fixtures/fib"
+           ~entry_module:[ "FibAnd" ]
+           ~entry:"fib"
+           ()
+       , int 10 ))
+
+let test_opt_effect_ref () =
+  let t =
+    Link.link_program
+      ~resolver:Ffi.resolver
+      ~outdir:"../fixtures/effect_ref"
+      ~entry_module:[ "RefMain" ]
+      ~entry:"main"
+      ()
+  in
+  Alcotest.(check int)
+    "effect ref via opt"
+    (as_int (Cesk.Machine.run_effect ~host:Ffi.host t))
+    (as_int (Cesk.Machine.run_effect ~host:Ffi.host (opt t)))
+
 let () =
   Alcotest.run
     "e2e"
@@ -624,6 +680,15 @@ let () =
         ; Alcotest.test_case "prelude_show" `Quick test_de_prelude_show
         ; Alcotest.test_case "fib" `Quick test_de_fib
         ; Alcotest.test_case "effect_ref" `Quick test_de_effect_ref
+        ] )
+    ; ( "opt"
+      , [ Alcotest.test_case "prelude_answer" `Quick test_opt_prelude_answer
+        ; Alcotest.test_case "prelude_doubled" `Quick test_opt_prelude_doubled
+        ; Alcotest.test_case "prelude_show" `Quick test_opt_prelude_show
+        ; Alcotest.test_case "app" `Quick test_opt_app
+        ; Alcotest.test_case "newtype" `Quick test_opt_newtype
+        ; Alcotest.test_case "fib" `Quick test_opt_fib
+        ; Alcotest.test_case "effect_ref" `Quick test_opt_effect_ref
         ] )
     ; ( "prelude"
       , [ Alcotest.test_case "answer" `Quick test_prelude_answer

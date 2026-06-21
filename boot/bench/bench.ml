@@ -33,6 +33,11 @@ let variants : (string * (C.term -> C.term)) list =
     , fun t ->
         Middle_end.Transl.rev_transl
           (Middle_end.Passes.Dict_elim.run (Middle_end.Transl.transl t)) )
+  ; ( "opt"
+    , fun t ->
+        Middle_end.Transl.rev_transl
+          (Middle_end.Passes.Simplify.run
+             (Middle_end.Passes.Dict_elim.run (Middle_end.Transl.transl t))) )
   ]
 
 (* label, entry module, entry (an `Int -> Int`), and the input sizes to sweep. *)
