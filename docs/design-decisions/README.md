@@ -79,5 +79,6 @@ language and are kept out of version control.)
 | [0030](0030-bytecode-vm-slice1.md) | PURVASM bytecode VM (slice 1): instruction set, ANF codegen, stack interpreter | Accepted |
 | [0031](0031-decision-tree-matching.md) | Decision-tree pattern compilation in the VM | Accepted |
 | [0032](0032-vm-native-foreign-effect.md) | PURVASM bytecode VM (slice 2): native foreign rung and Effect | Accepted |
+| [0033](0033-separate-compilation.md) | Separate compilation: per-module artifacts (`.pvmo`/`.pvmi`), linker, and the `purvm` executable | Accepted |
 
 ## Scope

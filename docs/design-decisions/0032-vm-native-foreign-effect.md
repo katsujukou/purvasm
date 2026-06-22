@@ -3,6 +3,30 @@
 - Status: Accepted
 - Date: 2026-06-22
 
+> **Progress (2026-06-22).** Implemented in `boot/lib/vm/`: a `Vforeign` value +
+> `Foreign_ref` instruction + eval/apply case; `Foreign` (`to_oracle`/`of_oracle`)
+> reuses `Ffi.host` at the boundary; `Vm.eval ~host` and `Vm.run_effect ~host` thread
+> the registry. The pure `Data.Show.*` leaves and the `Effect` fixtures (Ref by value,
+> Console by stdout order) all agree with the oracle (e2e `vm` group, 32 cases); the
+> benchmark baseline is unchanged.
+>
+> **Correction — the recursive `Effect` dictionaries needed by-need, not eager
+> construction.** Decision point 5 (and the "by-need rejected" alternative) bet that
+> uncurried eval/apply makes the instance-dictionary graph a DAG. It does **not**: a
+> curried dictionary method like `ap monadEffect` keeps arity 1 (an eager `let proj =
+> dict.bind` sits between its lambdas, so uncurrying stops there), so it **saturates
+> and forces** `monadEffect` *during* `applyEffect`'s construction — a strict edge in
+> the cycle. Eager spine-order build left the sibling unbound; passive
+> allocate-then-backpatch black-holed. The implementation therefore builds
+> recursive-group CAFs **by-need** (`Codegen.Grec` → a `Vindirect` cell built on first
+> `Machine.force` and memoised; `Building` ⇒ black hole), exactly the oracle's ADR-0024
+> mechanism, while non-recursive `let` CAFs stay **strict** (`Codegen.Gcaf`, built in
+> spine order). This is sound because CAF construction is pure (records/closures), so
+> by-need is observationally identical to eager; it does **not** reintroduce by-need
+> for ordinary evaluation (only the top-level recursive group). The cycle closes
+> because the one forced edge leads to a sibling whose construction merely *stores*
+> the back-reference (a record field), never forcing it.
+
 ## Context
 
 The bytecode VM (ADR-0030, ADR-0031) runs the **pure** core: every pure fixture and
