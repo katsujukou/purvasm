@@ -15,6 +15,34 @@
 > flat-only inliner (ADR-0028) and DictElim (ADR-0027) stay — both blow-up-safe
 > (flat bodies hold no nested calls; DictElim is atom-only). The Context/Decision
 > below are kept as the considered-and-rejected design.
+>
+> **Correction (2026-06-22).** The rejection stands, but two claims above are
+> refined by the updated field notes (`sidenotes/0005`, and the corrections in
+> `0001`/`0003`/`0004`):
+>
+> - **"The discriminator is whether an inline reduces, not its size."** This is
+>   true only for the *duplication* class (fusion/CPS diamonds → `2^depth`, fixed by
+>   inline-or-**share**). There is a second, *size* class — recursive derived
+>   `Generic`/`Show`/`Eq` materialised as a nested `case` tree under a partial
+>   application — where the inline **does reduce** (β/projection fire, a neutral is
+>   produced) yet the neutral is huge. (So "~30× materialised stuck bulk" above is
+>   imprecise: it is *reduced* bulk, not stuck — only its **size** is the problem.)
+>   Reduce-or-not is necessary but not sufficient; **size is intrinsic** to this
+>   class.
+> - **"The principled answer is a reduction-aware NbE normaliser."** More precisely:
+>   the NbE reducer + sharing handles the duplication class, but the principled
+>   inline *decision* is a **per-reference gate** combining **complexity + size +
+>   usage**, decided *before* unfolding (purs-backend-optimizer's `shouldInline*`).
+>   A naive method-tagging backoff was implemented elsewhere and **disproven**
+>   (byte-neutral). Note purs-backend-es itself **uses size thresholds** — they are
+>   a legitimate part of the answer, not a smell; and a backend function-size budget
+>   may remain permanent for a super-linear codegen.
+>
+> The precise reason ADR-0029 is rejected is therefore **"unconditional unfold then
+> judge post-hoc"**, not "size thresholds are bad." When the principled inliner is
+> built (after the bytecode VM, now in place — ADR-0030), it should mirror the
+> per-reference gate above; the `vm_instrs` metric makes its effect measurable.
+> See [[inliner-blowup-reduction-aware]].
 
 ## Context
 
