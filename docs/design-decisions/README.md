@@ -75,5 +75,7 @@ language and are kept out of version control.)
 | [0026](0026-benchmark-harness.md) | Benchmark harness: deterministic step/alloc cost on the oracle | Accepted |
 | [0027](0027-dictelim.md) | DictElim: collapse statically-known type-class dispatch | Accepted |
 | [0028](0028-copyprop-inline.md) | Copy-propagation and small-callee inlining | Accepted |
+| [0029](0029-general-inlining.md) | General inlining (α-renaming) and value folding | Rejected |
+| [0030](0030-bytecode-vm-slice1.md) | PURVASM bytecode VM (slice 1): instruction set, ANF codegen, stack interpreter | Accepted |
 
 ## Scope
