@@ -12,6 +12,7 @@
 
 module C = Cesk.Ast
 module V = Cesk.Value
+module T = Middle_end.Transl
 
 (* Drive the machine ourselves (ADR-0026: keep instrumentation out of the spec),
    counting transitions and reading the final store size. *)
@@ -22,6 +23,31 @@ let measure ?(host = Cesk.Machine.no_host) (t : C.term) : int * int =
     | Cesk.Machine.Step s' -> go (steps + 1) s'
   in
   go 0 (Cesk.Machine.inject t)
+
+(* The VM (ADR-0030) is the real runtime, so it carries its own cost metrics: the
+   deterministic count of instructions executed and wall-clock. The oracle's
+   step/alloc are now the *proxy* this replaces. Each VM variant is an ANF transform
+   (the VM runs the lower IR directly), so the optimiser passes' effect is visible in
+   true VM-instruction terms — the decision the oracle proxy could not make. *)
+let vm_variants : (string * (C.term -> Middle_end.Anf.expr)) list =
+  [ ("anf", fun t -> T.transl t)
+  ; ("dictelim", fun t -> Middle_end.Passes.Dict_elim.run (T.transl t))
+  ; ( "opt"
+    , fun t ->
+        Middle_end.Passes.Simplify.run (Middle_end.Passes.Dict_elim.run (T.transl t)) )
+  ]
+
+(* Instructions executed (deterministic), wall-clock milliseconds, and the result
+   value for one VM run. *)
+let vm_measure (program : Middle_end.Anf.expr) : Vm.Value.t * int * float =
+  let t0 = Unix.gettimeofday () in
+  let v, instrs = Vm.eval_anf_counted program in
+  let ms = (Unix.gettimeofday () -. t0) *. 1000.0 in
+  (v, instrs, ms)
+
+(* ADR-0030 requires the VM to agree with the oracle on every benchmark, not just
+   the e2e fixtures. Tracked here and reported at the end of the sweep. *)
+let mismatches = ref 0
 
 (* Variants: each is a label and a term-to-term transform measured on the oracle.
    The baseline pair today; an optimiser pass appends one entry here (and a curve
@@ -64,13 +90,13 @@ let gnuplot_script () : string =
   add "set datafile separator whitespace\n";
   add "set terminal pngcairo size 1280,800\n";
   add "set key left top\n";
-  add "set logscale y\n";
   add "set grid\n";
-  let page metric col_of =
+  let page metric vars ~log col_of =
+    add (if log then "set logscale y\n" else "unset logscale y\n");
     add (Printf.sprintf "set output '%s.png'\n" metric);
     add
       (Printf.sprintf
-         "set multiplot layout 2,3 title 'purvasm benchmark — %s vs input size (ADR-0026)'\n"
+         "set multiplot layout 2,3 title 'purvasm benchmark — %s vs input size (ADR-0026/0030)'\n"
          metric);
     List.iter
       (fun (label, _, _, _) ->
@@ -85,15 +111,21 @@ let gnuplot_script () : string =
                   label
                   (col_of i)
                   vname)
-             variants
+             vars
          in
          add ("plot " ^ String.concat ", " plots ^ "\n"))
       benches;
     add "unset multiplot\n"
   in
-  (* variant i: steps at column 2i+2, allocs at 2i+3 (0-based i; col 1 = size). *)
-  page "steps" (fun i -> (2 * i) + 2);
-  page "allocs" (fun i -> (2 * i) + 3);
+  (* Oracle proxy: variant i (0-based) has steps at col 2i+2, allocs at 2i+3. *)
+  page "steps" variants ~log:true (fun i -> (2 * i) + 2);
+  page "allocs" variants ~log:true (fun i -> (2 * i) + 3);
+  (* VM metrics (ADR-0030): appended after the oracle columns. With [nv] oracle
+     variants the VM block starts at col 2*nv+2; VM variant j has v_instrs there and
+     v_ms one to the right. *)
+  let vm_base = (2 * List.length variants) + 2 in
+  page "vm_instrs" vm_variants ~log:true (fun j -> vm_base + (2 * j));
+  page "vm_ms" vm_variants ~log:false (fun j -> vm_base + (2 * j) + 1);
   Buffer.contents buf
 
 let () =
@@ -111,10 +143,16 @@ let () =
        in
        let buf = Buffer.create 256 in
        let header =
+         let oracle =
+           List.fold_left
+             (fun s (v, _) -> s ^ Printf.sprintf "  %s_steps  %s_allocs" v v)
+             "# size"
+             variants
+         in
          List.fold_left
-           (fun s (v, _) -> s ^ Printf.sprintf "  %s_steps  %s_allocs" v v)
-           "# size"
-           variants
+           (fun s (v, _) -> s ^ Printf.sprintf "  %s_vinstrs  %s_vms" v v)
+           oracle
+           vm_variants
        in
        Buffer.add_string buf (header ^ "\n");
        let last = ref (0, 0) in
@@ -128,6 +166,23 @@ let () =
                  if String.equal vname "anf" then last := steps, allocs;
                  Buffer.add_string buf (Printf.sprintf "  %d  %d" steps allocs))
               variants;
+            (* Differential check (ADR-0030): the VM result must match the oracle. *)
+            let oracle = V.to_string (Cesk.Machine.eval ~host:Ffi.host term) in
+            List.iter
+              (fun (vname, transform) ->
+                 let v, instrs, ms = vm_measure (transform term) in
+                 if not (String.equal (Vm.Value.to_string v) oracle)
+                 then (
+                   incr mismatches;
+                   Printf.printf
+                     "  !! VM MISMATCH %s/%s n=%d: vm=%s oracle=%s\n"
+                     label
+                     vname
+                     n
+                     (Vm.Value.to_string v)
+                     oracle);
+                 Buffer.add_string buf (Printf.sprintf "  %d  %.3f" instrs ms))
+              vm_variants;
             Buffer.add_char buf '\n')
          sizes;
        write_file (Filename.concat outdir (label ^ ".dat")) (Buffer.contents buf);
@@ -145,8 +200,14 @@ let () =
   let rc =
     Sys.command (Printf.sprintf "cd %s && gnuplot plot.gp" (Filename.quote outdir))
   in
+  if !mismatches = 0
+  then Printf.printf "\nVM differential: all benchmarks agree with the oracle\n"
+  else Printf.printf "\nVM differential: %d MISMATCH(es) — see above\n" !mismatches;
   if rc = 0
-  then Printf.printf "\nwrote %s/steps.png and %s/allocs.png\n" outdir outdir
+  then
+    Printf.printf
+      "wrote %s/{steps,allocs,vm_instrs,vm_ms}.png\n"
+      outdir
   else
     Printf.printf
       "\n\

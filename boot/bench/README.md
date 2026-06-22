@@ -1,13 +1,17 @@
 # Benchmarks
 
-A deterministic benchmark harness for the purvasm oracle (ADR-0026). It sweeps a
-suite of programs over input sizes and records two metrics per run — **steps**
-(CESK machine transitions to a value) and **allocs** (store growth) — then plots
-them with gnuplot.
+A deterministic benchmark harness for purvasm. It sweeps a suite of programs over
+input sizes and records, per run, both the **oracle proxy** (ADR-0026) — **steps**
+(CESK machine transitions to a value) and **allocs** (store growth) — and the
+**bytecode VM** ground truth (ADR-0030) — **vm_instrs** (instructions executed,
+deterministic) and **vm_ms** (wall-clock) — then plots them with gnuplot.
 
-These are reproducible *proxy* metrics for judging optimiser passes before the
-bytecode VM exists; they are **not** wall-clock. Rationale and scope: ADR-0026
-(and the round-trip methodology of ADR-0025).
+The oracle steps/allocs are a reproducible *proxy* for judging optimiser passes; the
+VM metrics are the real runtime, so an optimiser's effect is now visible in true
+VM-instruction terms (the decision the proxy could not make — see ADR-0030). Each VM
+run is also checked against the oracle (same value); a mismatch is reported and the
+run count printed at the end. Rationale and scope: ADR-0026, ADR-0030 (and the
+round-trip methodology of ADR-0025).
 
 ## Running
 
@@ -31,17 +35,24 @@ dir afterwards.
 
 Everything lands in `bench/out/` (git-ignored):
 
-- `<bench>.dat` — whitespace columns: `size`, then `steps allocs` per variant.
-- `steps.png`, `allocs.png` — one panel per bench, one curve per variant, log y.
+- `<bench>.dat` — whitespace columns: `size`, then `steps allocs` per oracle
+  variant, then `vm_instrs vm_ms` per VM variant (the ANF transforms `anf`,
+  `dictelim`, `opt`). The oracle columns come first, so the baseline regression check
+  (below) is unaffected by the appended VM columns.
+- `steps.png`, `allocs.png` — oracle proxy: one panel per bench, one curve per
+  variant, log y.
+- `vm_instrs.png`, `vm_ms.png` — VM ground truth (ADR-0030): instructions executed
+  (log y) and wall-clock (linear y), one curve per VM variant.
 - `plot.gp` — the generated gnuplot script.
 
 ## Reading the numbers
 
 `steps`/`allocs` are exact and deterministic, so a delta between variants is
-meaningful and diffable across commits. They are a *stage proxy* for runtime cost
-— they count work the program does on the oracle, which correlates with, but is
-not, the eventual VM's cost (the VM, once it exists, is benchmarked on the same
-suite for ground truth). The `x` axis is the entry's `Int` argument.
+meaningful and diffable across commits. They are a *stage proxy* for runtime cost —
+they count work the program does on the oracle, which correlates with, but is not,
+the VM's cost. `vm_instrs` is the VM's own exact, deterministic count (ADR-0030) and
+is the ground truth the proxy approximated; `vm_ms` is wall-clock (inherently noisy —
+read trends, not single points). The `x` axis is the entry's `Int` argument.
 
 ## Baseline (regression check)
 

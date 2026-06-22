@@ -1,0 +1,4 @@
+(library
+ (name vm)
+ (public_name purvasm.vm)
+ (libraries cesk middle_end))

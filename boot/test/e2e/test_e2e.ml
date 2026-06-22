@@ -611,6 +611,90 @@ let test_opt_effect_ref () =
     (as_int (Cesk.Machine.run_effect ~host:Ffi.host t))
     (as_int (Cesk.Machine.run_effect ~host:Ffi.host (opt t)))
 
+(* --- PURVASM bytecode VM (ADR-0030) differential equivalence -------------- *)
+
+(* The VM is sound iff its result equals the oracle's on every pure program. The
+   VM translates the term to ANF itself (`Vm.eval`), so this also re-exercises the
+   ADR-0025 lowering. Compared by printed form (`Value.to_string`), which the VM
+   reproduces byte-identically (ADR-0030). *)
+let same_on_vm (label : string) (t : C.term) =
+  let oracle = Cesk.Machine.eval ~host:Ffi.host t in
+  let vm = Vm.eval t in
+  Alcotest.(check string) label (V.to_string oracle) (Vm.Value.to_string vm)
+
+let test_vm_fixture () =
+  same_on_vm "fixture.anInt" (Lower.module_ fixture ~entry:"anInt")
+
+(* Module-fixture entries applied to an argument, run on the VM vs the oracle. These
+   reach the in-module `case`s directly: `classify`/`pick` are guarded (ADR-0013),
+   `firstOf`/`viaRecord` exercise array / record binders (ADR-0012). *)
+let same_on_vm_app (label : string) (entry : string) (arg : C.term) =
+  same_on_vm label (C.App (Lower.module_ fixture ~entry, arg))
+
+let test_vm_classify_just () = same_on_vm_app "classify (Just 0)" "classify" (just (int 0))
+let test_vm_classify_nothing () = same_on_vm_app "classify Nothing" "classify" nothing
+let test_vm_pick_true () = same_on_vm_app "pick true" "pick" (C.Lit (C.LBool true))
+let test_vm_pick_false () = same_on_vm_app "pick false" "pick" (C.Lit (C.LBool false))
+let test_vm_first_of () =
+  same_on_vm_app "firstOf [10,20]" "firstOf" (C.Array [ int 10; int 20 ])
+let test_vm_via_record () =
+  same_on_vm_app "viaRecord {x:5}" "viaRecord" (C.Record [ "x", int 5 ])
+
+let test_vm_app () = same_on_vm "app.result" (program "result")
+
+let test_vm_prelude_answer () = same_on_vm "prelude.answer" (prelude_term "answer")
+let test_vm_prelude_div () = same_on_vm "prelude.quotient" (prelude_term "quotient")
+let test_vm_prelude_eq () = same_on_vm "prelude.isEq" (prelude_term "isEq")
+let test_vm_prelude_bool () = same_on_vm "prelude.both" (prelude_term "both")
+let test_vm_prelude_map () = same_on_vm "prelude.doubled" (prelude_term "doubled")
+
+let test_vm_newtype () =
+  same_on_vm
+    "newtype.asInner 7"
+    (C.App
+       ( Link.link_program
+           ~outdir:"../fixtures/newtype"
+           ~entry_module:[ "Main" ]
+           ~entry:"asInner"
+           ()
+       , int 7 ))
+
+let test_vm_fib () =
+  same_on_vm
+    "fib 10"
+    (C.App
+       ( Link.link_program
+           ~resolver:Ffi.resolver
+           ~outdir:"../fixtures/fib"
+           ~entry_module:[ "FibAnd" ]
+           ~entry:"fib"
+           ()
+       , int 10 ))
+
+let test_vm_lazy_fix () =
+  same_on_vm
+    "sumTo 5 via fix"
+    (Link.link_program
+       ~resolver:Ffi.resolver
+       ~outdir:"../fixtures/lazy"
+       ~entry_module:[ "Main" ]
+       ~entry:"result"
+       ())
+
+let test_vm_transitive () =
+  same_on_vm
+    "trans.a"
+    (Link.link_program ~outdir:"../fixtures/trans" ~entry_module:[ "TransA" ] ~entry:"a" ())
+
+let test_vm_diamond () =
+  same_on_vm
+    "diamond.both"
+    (Link.link_program
+       ~outdir:"../fixtures/diamond"
+       ~entry_module:[ "DiaA" ]
+       ~entry:"both"
+       ())
+
 let () =
   Alcotest.run
     "e2e"
@@ -689,6 +773,26 @@ let () =
         ; Alcotest.test_case "newtype" `Quick test_opt_newtype
         ; Alcotest.test_case "fib" `Quick test_opt_fib
         ; Alcotest.test_case "effect_ref" `Quick test_opt_effect_ref
+        ] )
+    ; ( "vm"
+      , [ Alcotest.test_case "fixture" `Quick test_vm_fixture
+        ; Alcotest.test_case "app" `Quick test_vm_app
+        ; Alcotest.test_case "prelude_answer" `Quick test_vm_prelude_answer
+        ; Alcotest.test_case "prelude_div" `Quick test_vm_prelude_div
+        ; Alcotest.test_case "prelude_eq" `Quick test_vm_prelude_eq
+        ; Alcotest.test_case "prelude_bool" `Quick test_vm_prelude_bool
+        ; Alcotest.test_case "prelude_map" `Quick test_vm_prelude_map
+        ; Alcotest.test_case "newtype" `Quick test_vm_newtype
+        ; Alcotest.test_case "fib" `Quick test_vm_fib
+        ; Alcotest.test_case "lazy_fix" `Quick test_vm_lazy_fix
+        ; Alcotest.test_case "transitive" `Quick test_vm_transitive
+        ; Alcotest.test_case "diamond" `Quick test_vm_diamond
+        ; Alcotest.test_case "classify_just" `Quick test_vm_classify_just
+        ; Alcotest.test_case "classify_nothing" `Quick test_vm_classify_nothing
+        ; Alcotest.test_case "pick_true" `Quick test_vm_pick_true
+        ; Alcotest.test_case "pick_false" `Quick test_vm_pick_false
+        ; Alcotest.test_case "first_of" `Quick test_vm_first_of
+        ; Alcotest.test_case "via_record" `Quick test_vm_via_record
         ] )
     ; ( "prelude"
       , [ Alcotest.test_case "answer" `Quick test_prelude_answer
