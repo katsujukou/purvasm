@@ -140,6 +140,14 @@ Concrete prevention for the remaining decoupling work (method-tagging, self-host
    context is an *approximation* of whole-program; (c) the artifact store is *shared mutable state*
    (self-pollution class); (d) reduction-awareness (Layer C) is *owed*, not optional, once DCE no longer
    masks it.
-4. **Finish the principled fix (method-tagging, 0001 §4)** so the answer is an *invariant* ("inline only
-   when it reduces") rather than a *magnitude heuristic* (the cap), which is the thing that silently
-   re-tuned itself wrong across the WPO→SMO context change.
+4. ~~**Finish the principled fix (method-tagging, 0001 §4)**~~ **Finish the principled fix — the
+   *per-reference reduction-aware inline gate*, NOT method-tagging** (corrected 2026-06-22, see
+   [0005](0005-layer-c-attempt-and-the-size-cap-decision.md)). Method-tagging was implemented and is
+   byte-neutral on this blow-up (it targets the wrong shape; the blow-up is generic-helper *composition*
+   via a partial application). The invariant ("inline only when it reduces") is realised by a per-reference
+   gate combining **complexity + size + usage** decided *before* unfolding (purs-backend-es `shouldInline*`),
+   not by tagging projected methods. **Caveat:** a *magnitude* guard (a function-size budget) likely
+   **remains** regardless — this project lowers to Wasm and feeds **super-linear Binaryen** `B.optimize`,
+   which purs-backend-es (a JS backend) does not have. So the end-state is "per-reference gate in the
+   reducer **plus** an explicit codegen-side size budget for Binaryen", and the cap is **accepted** as the
+   current stand-in for both (0005 §5–§6).

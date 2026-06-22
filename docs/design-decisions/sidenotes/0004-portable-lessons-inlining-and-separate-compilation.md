@@ -91,10 +91,23 @@ that gets fully unfolded against an opaque argument.** Generics are the acute ca
 structural recursion as a dictionary DAG by construction*.
 
 Design implication: when recursion or large structure must survive as runtime dispatch, ensure it is
-carried by something the reducer treats as a **call**, not something it treats as **inlinable data** — or
-make the reducer able to *back off* a projection-then-apply when it won't reduce (the "method-tagging"
-fix in 0001 §4: tag a projected method with its origin so a non-reducing application can be reified back to
-a runtime `dict.method(arg)` call instead of inlined bulk).
+carried by something the reducer treats as a **call**, not something it treats as **inlinable data**. The
+robust way to achieve this is a **per-reference inline gate** that refuses to unfold a `NonTrivial`,
+multi-use binding in the first place (so the dispatch is never materialised), deciding from **complexity +
+size + usage** *before* unfolding — the modern PS/Haskell-backend `shouldInline` approach.
+
+> **Correction (2026-06-22, see the project's investigation 0005).** An earlier version of this design
+> implication pointed at a narrower "method-tagging" fix (tag a projected method so a non-reducing
+> *projection-then-apply* reifies back to a `dict.method(arg)` call). That was implemented and is
+> **byte-neutral** on the real instance of this pathology: the blow-up is generic-helper **composition**
+> (a `case` tree built from many small helpers, carried by a *partial application*), not a single
+> projected method — so per-projection back-off does not catch it, and a per-application size guard misses
+> it because the partial application is size-1 until it saturates at reify time. **The general lesson holds
+> — don't let the reducer treat a large recursive dispatch as inlinable data — but the realisation is the
+> per-reference gate above, not method-tagging.** A second, backend-specific caveat: if the downstream is
+> a **super-linear** optimizer (e.g. an SSA/Wasm backend), a *magnitude* function-size budget is needed
+> regardless of how reduction-aware the inliner is — a JS backend (linear codegen) is exempt and needs no
+> such guard.
 
 ## Lesson 5 — Whole-program → per-module is a "decoupling reveals hidden coupling" event
 

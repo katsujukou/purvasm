@@ -105,6 +105,19 @@ bulk. The cap is the (coarse, per-declaration) stand-in that achieves the same e
 
 ## 4. The principled fix (deferred): method-tagging — a backtracking inliner
 
+> **CORRECTION (2026-06-22 — method-tagging implemented and DISPROVEN; see [investigation 0005](0005-layer-c-attempt-and-the-size-cap-decision.md)).**
+> `SProjMethod` was implemented and is **byte-neutral on the metatheory blow-up** — the over-exported
+> `Typecheck` decl sizes are *identical* with and without it. Reason: this blow-up is **not** a single
+> anonymous record-method projection (the shape `SProjMethod` targets) but the recursive derived-`Generic`
+> `Eq`/`Show` materialised as a nested **`case` tree** — a *composition* of small `Data.Show.Generic.*`
+> helpers, carried by a **partial application** (`genericShow` is arity 3; the instance applies 2 args, so
+> the per-application `inc2` guard sees only a size-1 partial `SLam` and the bulk materialises later at
+> `quote`, unguarded — 0005 §2). The principled fix is therefore **not** method-tagging but a
+> **per-reference reduction-aware inline gate** (complexity + size + usage, decided *before* unfolding,
+> à la purs-backend-es), and the `normalFormSizeCap` is **accepted** as the per-declaration stand-in plus
+> a size budget for the super-linear Binaryen backend (0005 §5–§6). The design below is kept as the
+> historical proposal; do not implement it for this blow-up.
+
 Make the projection-then-apply step reduction-aware, mirroring inc2 but for record-method dispatch.
 
 1. **Tag projected methods with their origin.** In `accessor`, return a new
