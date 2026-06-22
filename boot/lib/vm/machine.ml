@@ -18,6 +18,23 @@ exception Vm_error of string
 
 let stuck msg = raise (Vm_error msg)
 
+(* Force through forwarding cells (top-level knot-tying, ADR-0030/0032) at every point
+   a value's shape is inspected; an unfilled cell is a black hole. Values are only
+   *stored* (record/array/data fields, env) without forcing, so a cyclic group builds. *)
+let rec force (v : Value.t) : Value.t =
+  match v with
+  | Value.Vindirect cell ->
+    (match !cell with
+     | Value.Built v' -> force v'
+     | Value.Unbuilt build ->
+       cell := Value.Building;
+       let v' = build () in
+       cell := Value.Built v';
+       force v'
+     | Value.Building ->
+       stuck "black hole: a recursive value was forced while being built")
+  | _ -> v
+
 (* Count of instructions dispatched — the deterministic VM cost metric (ADR-0030),
    for the benchmark harness. Kept out of the value-level result; reset by the
    measurement entry point ([Vm.eval_counted]). *)
@@ -115,7 +132,12 @@ let lit_kind_eq (l : C.lit) (v : V.t) : bool =
 (** Run a frame stack to completion on a fresh operand stack, resolving free names
     through [globals]; returns the lone value left on the operand stack. Reentrant:
     [make_rec] calls it again to build each member of a recursive group. *)
-let rec run (globals : (string, V.t) Hashtbl.t) (frames0 : frame list) : V.t =
+let rec run
+          (globals : (string, V.t) Hashtbl.t)
+          ~(foreigns : string -> V.t option)
+          (frames0 : frame list)
+  : V.t
+  =
   let stack = ref [] in
   let push v = stack := v :: !stack in
   let pop () =
@@ -169,7 +191,7 @@ let rec run (globals : (string, V.t) Hashtbl.t) (frames0 : frame list) : V.t =
       in
       frames := Code { chunk = c.V.body; ip = 0; env = ref base; share = false } :: !frames)
   and do_call ~tail (f : V.t) args =
-    match f with
+    match force f with
     | V.Vclosure c -> apply_closure ~tail c args
     | V.Vpap (c, got) -> apply_closure ~tail c (got @ args)
     | V.Vctor (tag, arity, got) ->
@@ -180,8 +202,20 @@ let rec run (globals : (string, V.t) Hashtbl.t) (frames0 : frame list) : V.t =
       else if na < arity
       then produce ~tail (V.Vctor (tag, arity, all))
       else stuck ("constructor " ^ tag ^ " over-applied")
+    | V.Vforeign (name, arity, got, call) ->
+      let all = got @ args in
+      let na = List.length all in
+      if na = arity
+      then produce ~tail (call all) (* saturated: run the host fn (an effect, if any) *)
+      else if na < arity
+      then produce ~tail (V.Vforeign (name, arity, all, call))
+      else (
+        (* Over-application: saturate, then apply the rest to the result. The host
+           call is synchronous, so no return frame is needed. *)
+        let v = call (take arity all) in
+        do_call ~tail v (drop arity all))
     | V.Vint _ | V.Vnumber _ | V.Vbool _ | V.Vstring _ | V.Varray _ | V.Vrecord _
-    | V.Vdata _ -> stuck "application of a non-function"
+    | V.Vdata _ | V.Vindirect _ -> stuck "application of a non-function"
   in
   let make_rec (fr : code_frame) (members : (string * B.chunk) list) =
     (* Knot-tying (ADR-0030): build each member in a [share] frame over one ref [r]
@@ -192,7 +226,7 @@ let rec run (globals : (string, V.t) Hashtbl.t) (frames0 : frame list) : V.t =
     let values =
       List.map
         (fun (name, chunk) ->
-          (name, run globals [ Code { chunk; ip = 0; env = r; share = true } ]))
+          (name, run globals ~foreigns [ Code { chunk; ip = 0; env = r; share = true } ]))
         members
     in
     let grp = List.fold_left (fun e (n, v) -> SMap.add n v e) !r values in
@@ -201,7 +235,7 @@ let rec run (globals : (string, V.t) Hashtbl.t) (frames0 : frame list) : V.t =
   in
   let rec loop () =
     match !frames with
-    | [] -> pop () (* the program's result is the lone value on the stack *)
+    | [] -> force (pop ()) (* the program's result is the lone value on the stack *)
     | Apply_more rest :: _ ->
       let v = pop () in
       frames := List.tl !frames;
@@ -229,6 +263,11 @@ let rec run (globals : (string, V.t) Hashtbl.t) (frames0 : frame list) : V.t =
           loop ()
         | B.Load x ->
           push (lookup fr.env x);
+          loop ()
+        | B.Foreign_ref key ->
+          (match foreigns key with
+           | Some v -> push v
+           | None -> stuck ("unbound native foreign: " ^ key));
           loop ()
         | B.Bind x ->
           let v = pop () in
@@ -260,7 +299,7 @@ let rec run (globals : (string, V.t) Hashtbl.t) (frames0 : frame list) : V.t =
           push (V.Varray (Array.of_list vs));
           loop ()
         | B.Get_field label ->
-          (match pop () with
+          (match force (pop ()) with
            | V.Vrecord m ->
              (match SMap.find_opt label m with
               | Some v -> push v
@@ -268,25 +307,25 @@ let rec run (globals : (string, V.t) Hashtbl.t) (frames0 : frame list) : V.t =
            | _ -> stuck "accessor: not a record");
           loop ()
         | B.Proj i ->
-          (match pop () with
+          (match force (pop ()) with
            | V.Vdata (_, fields) -> push fields.(i)
            | _ -> stuck "projection: not a data value");
           loop ()
         | B.Proj_arr i ->
-          (match pop () with
+          (match force (pop ()) with
            | V.Varray a -> push a.(i)
            | _ -> stuck "array projection: not an array");
           loop ()
         | B.Update labels ->
           let vs = popn (List.length labels) in
-          (match pop () with
+          (match force (pop ()) with
            | V.Vrecord m ->
              let m' = List.fold_left2 (fun acc l v -> SMap.add l v acc) m labels vs in
              push (V.Vrecord m')
            | _ -> stuck "update: not a record");
           loop ()
         | B.Prim (op, k) ->
-          let args = popn k in
+          let args = List.map force (popn k) in
           push (eval_prim op args);
           loop ()
         | B.Call k ->
@@ -306,13 +345,13 @@ let rec run (globals : (string, V.t) Hashtbl.t) (frames0 : frame list) : V.t =
           fr.ip <- fr.ip + rel;
           loop ()
         | B.Jump_unless rel ->
-          (match pop () with
+          (match force (pop ()) with
            | V.Vbool false -> fr.ip <- fr.ip + rel
            | V.Vbool true -> ()
            | _ -> stuck "if: non-boolean condition");
           loop ()
         | B.Switch_ctor (cases, default) ->
-          (match pop () with
+          (match force (pop ()) with
            | V.Vdata (tag, _) ->
              fr.ip
              <- fr.ip
@@ -322,7 +361,7 @@ let rec run (globals : (string, V.t) Hashtbl.t) (frames0 : frame list) : V.t =
            | _ -> stuck "switch on a non-data value");
           loop ()
         | B.Switch_lit (cases, default) ->
-          let v = pop () in
+          let v = force (pop ()) in
           (match cases with
            | (l, _) :: _ when not (lit_kind_eq l v) ->
              stuck "literal switch on a wrong-kind value"
@@ -334,7 +373,7 @@ let rec run (globals : (string, V.t) Hashtbl.t) (frames0 : frame list) : V.t =
                    | None -> default));
           loop ()
         | B.Switch_len (cases, default) ->
-          (match pop () with
+          (match force (pop ()) with
            | V.Varray a ->
              let n = Array.length a in
              fr.ip
@@ -347,8 +386,13 @@ let rec run (globals : (string, V.t) Hashtbl.t) (frames0 : frame list) : V.t =
   loop ()
 
 (** Run a single chunk with the given initial environment (the program [main] or a
-    CAF), on a fresh stack. *)
-let run_chunk (globals : (string, V.t) Hashtbl.t) (chunk : B.chunk) (env0 : V.t SMap.t)
+    CAF), on a fresh stack. [foreigns] resolves native leaves (ADR-0032); default is
+    none, for the pure core. *)
+let run_chunk
+      ?(foreigns = fun _ -> None)
+      (globals : (string, V.t) Hashtbl.t)
+      (chunk : B.chunk)
+      (env0 : V.t SMap.t)
   : V.t
   =
-  run globals [ Code { chunk; ip = 0; env = ref env0; share = false } ]
+  run globals ~foreigns [ Code { chunk; ip = 0; env = ref env0; share = false } ]

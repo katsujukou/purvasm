@@ -619,7 +619,7 @@ let test_opt_effect_ref () =
    reproduces byte-identically (ADR-0030). *)
 let same_on_vm (label : string) (t : C.term) =
   let oracle = Cesk.Machine.eval ~host:Ffi.host t in
-  let vm = Vm.eval t in
+  let vm = Vm.eval ~host:Ffi.host t in
   Alcotest.(check string) label (V.to_string oracle) (Vm.Value.to_string vm)
 
 let test_vm_fixture () =
@@ -758,6 +758,38 @@ let test_vm_naive_guard () =
   in
   same_on_vm_naive "naive guard 20" (prog 20);
   same_on_vm_naive "naive guard 5" (prog 5)
+
+(* Native foreign rung (ADR-0032): the pure `Data.Show.*` leaves resolve through the
+   host registry on the VM, exactly as on the oracle. *)
+let test_vm_show_int () = same_on_vm "shownInt" (prelude_term "shownInt")
+let test_vm_show_number () = same_on_vm "shownNum" (prelude_term "shownNum")
+let test_vm_show_char () = same_on_vm "shownChar" (prelude_term "shownChar")
+let test_vm_show_string () = same_on_vm "shownStr" (prelude_term "shownStr")
+
+(* Effect (ADR-0032): run `main` on the VM via the same thunk-forcing driver as the
+   oracle. [Effect.Ref] is observed as a returned value; [Effect.Console.log] as the
+   stdout it writes — the latter asserts effect *order* (the soundness contract). *)
+let effect_term ~(outdir : string) ~(entry_module : string list) : C.term =
+  Link.link_program ~resolver:Ffi.resolver ~outdir ~entry_module ~entry:"main" ()
+
+let test_vm_effect_ref () =
+  let t = effect_term ~outdir:"../fixtures/effect_ref" ~entry_module:[ "RefMain" ] in
+  Alcotest.(check string)
+    "effect ref"
+    (V.to_string (Cesk.Machine.run_effect ~host:Ffi.host t))
+    (Vm.Value.to_string (Vm.run_effect ~host:Ffi.host t))
+
+let test_vm_effect_console () =
+  let t =
+    effect_term ~outdir:"../fixtures/effect_console" ~entry_module:[ "ConsoleMain" ]
+  in
+  let oracle_out =
+    with_captured_stdout (fun () -> ignore (Cesk.Machine.run_effect ~host:Ffi.host t))
+  in
+  let vm_out =
+    with_captured_stdout (fun () -> ignore (Vm.run_effect ~host:Ffi.host t))
+  in
+  Alcotest.(check string) "console stdout (order)" oracle_out vm_out
 
 let test_vm_app () = same_on_vm "app.result" (program "result")
 
@@ -920,6 +952,12 @@ let () =
         ; Alcotest.test_case "dt_guard_chain" `Quick test_vm_dt_guard_chain
         ; Alcotest.test_case "dt_guard_ctor" `Quick test_vm_dt_guard_ctor
         ; Alcotest.test_case "naive_guard" `Quick test_vm_naive_guard
+        ; Alcotest.test_case "show_int" `Quick test_vm_show_int
+        ; Alcotest.test_case "show_number" `Quick test_vm_show_number
+        ; Alcotest.test_case "show_char" `Quick test_vm_show_char
+        ; Alcotest.test_case "show_string" `Quick test_vm_show_string
+        ; Alcotest.test_case "effect_ref" `Quick test_vm_effect_ref
+        ; Alcotest.test_case "effect_console" `Quick test_vm_effect_console
         ] )
     ; ( "prelude"
       , [ Alcotest.test_case "answer" `Quick test_prelude_answer

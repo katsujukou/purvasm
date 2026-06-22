@@ -20,6 +20,24 @@ type t =
   | Vclosure of closure
   (* An under-applied closure: the closure and the args collected so far. *)
   | Vpap of closure * t list
+  (* A native foreign (ADR-0022/0032): name, arity, args collected so far (in order),
+     and a first-order host implementation over VM values. Collects like [Vctor]; on
+     reaching arity, [call] runs (performing IO for an effectful leaf). The [call] is
+     the boundary-wrapped reuse of the oracle's host registry (see [Foreign]). *)
+  | Vforeign of string * int * t list * (t list -> t)
+  (* A by-need cell for the top-level recursive-binding group (ADR-0024 in the oracle;
+     here the VM realisation, ADR-0030/0032). A CAF is published as [Vindirect] before
+     it is built, so a cyclic instance-dictionary group can refer to siblings; forcing
+     an [Unbuilt] cell builds it once and memoises ([Machine.force]). The cycle closes
+     because the only *forced* edge (a curried dict projection) leads to a sibling
+     whose construction merely *stores* the back-reference (a record field), not forces
+     it; a genuinely self-forcing cycle hits [Building] — a black hole. *)
+  | Vindirect of indirect ref
+
+and indirect =
+  | Unbuilt of (unit -> t)
+  | Building
+  | Built of t
 
 (* A function value: its body chunk, its arity, and the environment captured where
    the lambda was built (lexical scope), held in a ref so a recursive group can tie
@@ -51,3 +69,6 @@ let rec to_string : t -> string = function
       tag ^ "(" ^ String.concat ", " (List.map to_string (Array.to_list fields)) ^ ")"
   | Vctor (tag, arity, _) -> "<ctor " ^ tag ^ "/" ^ string_of_int arity ^ ">"
   | Vclosure _ | Vpap _ -> "<closure>"
+  | Vforeign (name, arity, _, _) -> "<foreign " ^ name ^ "/" ^ string_of_int arity ^ ">"
+  | Vindirect { contents = Built v } -> to_string v
+  | Vindirect { contents = Unbuilt _ | Building } -> "<thunk>"

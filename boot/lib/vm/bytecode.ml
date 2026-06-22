@@ -14,6 +14,9 @@ type instr =
   | Push_string of string
   (* A variable: resolved against the frame environment, then the global table. *)
   | Load of string
+  (* A native foreign leaf (ADR-0022/0032): materialise a [Vforeign] by looking the
+     name up in the host registry passed to the VM. Stuck if the name is not native. *)
+  | Foreign_ref of string
   (* Pop the top value and bind it to a name in the frame environment (a `let`). *)
   | Bind of string
   (* params, body — capture the current frame environment into a closure value. *)

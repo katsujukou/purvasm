@@ -13,11 +13,14 @@ module A = Middle_end.Anf
 module C = Cesk.Ast
 module B = Bytecode
 
-(** A top-level binding: a function (installed as a global closure, so it sees the
-    whole global table — recursion included) or a CAF (evaluated once at start-up). *)
+(** A top-level binding: a function (a global closure, seeing the whole table —
+    recursion included); a non-recursive CAF ([Gcaf], built strictly once at start-up,
+    in spine order); or a recursive-group CAF ([Grec], built by-need so a cyclic
+    instance-dictionary group can close, mirroring the oracle's ADR-0024). *)
 type gdef =
   | Gfun of string list * B.chunk
   | Gcaf of B.chunk
+  | Grec of B.chunk
 
 let len = List.length
 
@@ -27,9 +30,9 @@ let gen_atom : A.atom -> B.instr = function
   | A.ALit (C.LNumber f) -> B.Push_number f
   | A.ALit (C.LBool b) -> B.Push_bool b
   | A.ALit (C.LString s) -> B.Push_string s
-  (* A native foreign is out of slice 1 (pure core); emit a load that is only stuck
-     if actually forced — pure programs never reach it (ADR-0030 scope). *)
-  | A.AForeign s -> B.Load s
+  (* A native foreign leaf (ADR-0032): materialised from the host registry at runtime;
+     stuck if the program reaches one the host does not provide. *)
+  | A.AForeign s -> B.Foreign_ref s
 
 let gen_atoms atoms = List.map gen_atom atoms
 
@@ -83,24 +86,26 @@ and gen_case (tail : bool) (scruts : A.atom list) (alts : A.alt list) : B.instr 
   Match_compile.compile ~atom:gen_atom ~body:gen_expr ~tail scruts alts
 
 (** Split the top-level spine into global definitions (in dependency order) and the
-    [main] chunk. Top-level functions (including recursive groups) become [Gfun]s;
-    other bindings become [Gcaf]s; the first non-binding expression is [main]. *)
+    [main] chunk. A function becomes a [Gfun]; a non-recursive `let` value a strict
+    [Gcaf]; a recursive group's non-function member a by-need [Grec] (so a cyclic
+    instance-dictionary group can close, ADR-0024/0032); the first non-binding
+    expression is [main]. *)
 let program (e : A.expr) : (string * gdef) list * B.chunk =
   let rec walk acc = function
     | A.Let (k, A.CLam (ps, b), rest) -> walk ((k, Gfun (ps, fn_chunk b)) :: acc) rest
     | A.Let (k, c, rest) ->
       walk ((k, Gcaf (Array.of_list (gen_cexpr true c))) :: acc) rest
     | A.LetRec (binds, rest) ->
-      (* A top-level recursive group is closed by the global table: a function finds
-         itself (and its peers) there at call time, and a recursive *value* (e.g.
-         `fibAnd = Fib … \n -> … fibAnd …`) is a CAF whose inner closure resolves the
-         group through the table once the CAF result is installed. *)
+      (* A recursive group: a function member is closed by the global table (it finds
+         its peers there at call time); a value member (e.g. an `Effect` instance
+         dictionary, or `fibAnd = Fib … \n -> … fibAnd …`) is built by-need so a
+         strict reference within the cycle resolves once a sibling is forced. *)
       let defs =
         List.map
           (fun (name, def) ->
             match def with
             | A.Ret (A.CLam (ps, b)) -> (name, Gfun (ps, fn_chunk b))
-            | _ -> (name, Gcaf (Array.of_list (gen_expr true def))))
+            | _ -> (name, Grec (Array.of_list (gen_expr true def))))
           binds
       in
       walk (List.rev_append defs acc) rest
