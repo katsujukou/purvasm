@@ -52,14 +52,6 @@ type instr =
   | Switch_ctor of (string * int) list * int
   | Switch_lit of (Cesk.Ast.lit * int) list * int
   | Switch_len of (int * int) list * int
-  (* One alternative of a *guarded* `case` (ADR-0013): peek (do not pop) the nscrut
-     scrutinees, match the binders; on success bind them and fall through to the
-     guard/body code; on failure jump (relative) to the next alternative. The
-     scrutinees stay on the stack so the next alternative can re-match. *)
-  | Test of int * Cesk.Ast.binder list * int
-  (* Discard the top n operands — used to drop a guarded `case`'s scrutinees once an
-     alternative's body is finally chosen. *)
-  | Drop of int
   (* No alternative matched (or every guard fell through): a stuck program. *)
   | Fail of string
 

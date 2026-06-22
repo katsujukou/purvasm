@@ -2,10 +2,13 @@
     the one closed responsibility of turning ANF alternatives into explicit control
     flow — kept out of the surrounding ANF→bytecode walk ([Codegen]).
 
-    An *unconditional* `case` compiles to a Maranget decision tree of discriminant
-    switches ([compile_tree]); a *guarded* `case` (ADR-0013) to a [Test]/guard chain
-    ([compile_guarded]). [compile_naive] is the per-alternative re-testing baseline the
-    decision tree is measured against; [use_naive_matching] selects it.
+    A `case` compiles to a Maranget decision tree of discriminant switches
+    ([compile_tree]), handling unconditional and guarded alternatives alike: a guard
+    chain (ADR-0013) is evaluated at the matched leaf, and if every guard is false
+    control falls through to the rows below — recompiled against the same occurrences,
+    which keeps a guarded row's successors reachable. [compile_naive] is the
+    per-alternative re-testing baseline the tree is measured against;
+    [use_naive_matching] selects it.
 
     The compilers are parameterised by [atom] (compile a scrutinee atom) and [body]
     (compile an alternative's right-hand side, tail-aware), supplied by [Codegen], so
@@ -16,8 +19,6 @@
 module A = Middle_end.Anf
 module C = Cesk.Ast
 module B = Bytecode
-
-let len = List.length
 
 (* A binder's "head", with the variable names it binds at this occurrence peeled off
    (`BVar`/`BNamed`). [Cwild] imposes no test (matches anything); the others impose a
@@ -42,11 +43,12 @@ let rec peel : C.binder -> string list * core = function
 
 (* One clause of the pattern matrix: the binders still to test (aligned to the
    current occurrences), the variable→occurrence bindings collected so far on the way
-   down, and the right-hand side to run when this row is selected. *)
+   down, and the right-hand side to run when this row is selected (unconditional, or a
+   guard chain — ADR-0013). *)
 type dt_row =
   { pats : C.binder list
   ; binds : (string * string) list
-  ; body : A.expr
+  ; rhs : A.rhs
   }
 
 (* Splice [news] in for the element at index [c]; remove the element at index [c]. *)
@@ -62,6 +64,7 @@ let remove_col xs c = List.filteri (fun i _ -> i <> c) xs
 type pseudo =
   | Pinstr of B.instr
   | Pjump of int
+  | Pjump_unless of int (* pop a bool; jump to the label when false (guard fall-through) *)
   | Pswitch_ctor of (string * int) list * int
   | Pswitch_lit of (C.lit * int) list * int
   | Pswitch_len of (int * int) list * int
@@ -91,6 +94,7 @@ let resolve (pseudos : pseudo list) : B.instr list =
           (match ps with
            | Pinstr i -> i
            | Pjump l -> B.Jump (rel l)
+           | Pjump_unless l -> B.Jump_unless (rel l)
            | Pswitch_ctor (cs, d) ->
              B.Switch_ctor (List.map (fun (t, l) -> (t, rel l)) cs, rel d)
            | Pswitch_lit (cs, d) ->
@@ -139,14 +143,37 @@ let compile_tree ~atom ~body (tail : bool) (scruts : A.atom list) (alts : A.alt 
     in
     go 0 cores
   in
+  (* Emit a fully-matched right-hand side. An unconditional body commits (the rows
+     below are dead). A guard chain (ADR-0013) is evaluated top to bottom: the first
+     true guard runs its body; if every guard is false, control falls through to
+     [on_fail] — which, in the tree, recompiles the rows below this one against the
+     same occurrences (keeping a guarded row's successors reachable). *)
+  let emit_body e =
+    List.iter (fun i -> emit (Pinstr i)) (body tail e);
+    if not tail then emit (Pjump end_lbl)
+  in
+  let emit_rhs rhs ~on_fail =
+    match rhs with
+    | A.Uncond e -> emit_body e
+    | A.Guarded clauses ->
+      List.iter
+        (fun (guard, gbody) ->
+          List.iter (fun i -> emit (Pinstr i)) (body false guard);
+          let gnext = fresh_lbl () in
+          emit (Pjump_unless gnext);
+          emit_body gbody;
+          emit (Plabel gnext))
+        clauses;
+      on_fail ()
+  in
   let rec compile occs rows =
     match rows with
     | [] -> emit (Pinstr (B.Fail "case: no matching alternative"))
-    | row0 :: _ ->
+    | row0 :: rest ->
       let cores0 = List.map (fun p -> snd (peel p)) row0.pats in
       if List.for_all (fun c -> c = Cwild) cores0
       then (
-        (* Leaf: row0 is irrefutable, so it matches; bind and run its body. *)
+        (* Leaf: row0's binders all match; bind, then run its right-hand side. *)
         let leaf_binds =
           row0.binds
           @ List.concat
@@ -157,8 +184,7 @@ let compile_tree ~atom ~body (tail : bool) (scruts : A.atom list) (alts : A.alt 
             emit (Pinstr (B.Load occ));
             emit (Pinstr (B.Bind name)))
           leaf_binds;
-        List.iter (fun i -> emit (Pinstr i)) (body tail row0.body);
-        if not tail then emit (Pjump end_lbl))
+        emit_rhs row0.rhs ~on_fail:(fun () -> compile occs rest))
       else (
         let c = first_refutable cores0 in
         let occ_c = List.nth occs c in
@@ -217,7 +243,7 @@ let compile_tree ~atom ~body (tail : bool) (scruts : A.atom list) (alts : A.alt 
                 (fun subs ->
                   { pats = replace_col row.pats c subs
                   ; binds = row.binds @ binds_of names occ_c
-                  ; body = row.body
+                  ; rhs = row.rhs
                   })
                 subpats)
             rows
@@ -311,7 +337,7 @@ let compile_tree ~atom ~body (tail : bool) (scruts : A.atom list) (alts : A.alt 
                 (fun subs ->
                   { pats = replace_col row.pats c subs
                   ; binds = row.binds @ binds_of names occ_c
-                  ; body = row.body
+                  ; rhs = row.rhs
                   })
                 subpats)
             rows
@@ -353,7 +379,7 @@ let compile_tree ~atom ~body (tail : bool) (scruts : A.atom list) (alts : A.alt 
           in
           { pats = replace_col row.pats c subpats
           ; binds = row.binds @ binds_of names occ_c
-          ; body = row.body
+          ; rhs = row.rhs
           })
         rows
     in
@@ -374,7 +400,7 @@ let compile_tree ~atom ~body (tail : bool) (scruts : A.atom list) (alts : A.alt 
       (fun (alt : A.alt) ->
         { pats = alt.A.binders
         ; binds = []
-        ; body = (match alt.A.result with A.Uncond e -> e | A.Guarded _ -> assert false)
+        ; rhs = alt.A.result
         })
       alts
   in
@@ -450,100 +476,38 @@ let compile_naive ~atom ~body (tail : bool) (scruts : A.atom list) (alts : A.alt
         o)
       scruts
   in
+  let emit_body e =
+    List.iter (fun i -> emit (Pinstr i)) (body tail e);
+    if not tail then emit (Pjump end_lbl)
+  in
   List.iter
     (fun (alt : A.alt) ->
       let next = fresh_lbl () in
       List.iter2 (fun o b -> test o b next) occ0 alt.A.binders;
       (match alt.A.result with
-       | A.Uncond e -> List.iter (fun i -> emit (Pinstr i)) (body tail e)
-       | A.Guarded _ -> assert false);
-      if not tail then emit (Pjump end_lbl);
+       | A.Uncond e -> emit_body e
+       | A.Guarded clauses ->
+         (* Guards top to bottom (ADR-0013); all false falls through to [next]. *)
+         List.iter
+           (fun (guard, gbody) ->
+             List.iter (fun i -> emit (Pinstr i)) (body false guard);
+             let gnext = fresh_lbl () in
+             emit (Pjump_unless gnext);
+             emit_body gbody;
+             emit (Plabel gnext))
+           clauses);
       emit (Plabel next))
     alts;
   emit (Pinstr (B.Fail "case: no matching alternative"));
   emit (Plabel end_lbl);
   resolve (List.rev !buf)
 
-(* A `case` with at least one guarded alternative (ADR-0013). Each alternative is a
-   [Test] (peek + match binders, jump to the next alternative on failure) followed by
-   its guard chain; a guard that is false tries the next guard, and the last guard
-   falling through goes to the next alternative — so scrutinees stay on the stack
-   across alternatives and are dropped only when a body is finally chosen. Emitted
-   through a small backpatching assembler (placeholder offsets resolved to relative
-   jumps at the end); spliced guard/body chunks keep their own internal jumps. *)
-let compile_guarded ~atom ~body (tail : bool) (scruts : A.atom list) (alts : A.alt list)
-  : B.instr list
-  =
-  let n = len scruts in
-  let buf = ref [] (* reversed *) and pos = ref 0 in
-  let labels : (string, int) Hashtbl.t = Hashtbl.create 16 in
-  let fixups = ref [] (* (position, target-label) for Jump / Jump_unless / Test *) in
-  let emit instr =
-    buf := instr :: !buf;
-    incr pos
-  in
-  let emit_list = List.iter emit in
-  let mark lbl = Hashtbl.replace labels lbl !pos in
-  let to_lbl lbl instr =
-    fixups := (!pos, lbl) :: !fixups;
-    emit instr
-  in
-  emit_list (List.map atom scruts);
-  let finish_body e =
-    emit (B.Drop n);
-    emit_list (body tail e);
-    if not tail then to_lbl "end" (B.Jump 0)
-  in
-  List.iteri
-    (fun i (alt : A.alt) ->
-      mark (Printf.sprintf "alt%d" i);
-      let next = Printf.sprintf "alt%d" (i + 1) in
-      to_lbl next (B.Test (n, alt.A.binders, 0));
-      match alt.A.result with
-      | A.Uncond e -> finish_body e
-      | A.Guarded clauses ->
-        let nc = List.length clauses in
-        List.iteri
-          (fun j (guard, bdy) ->
-            mark (Printf.sprintf "alt%d_g%d" i j);
-            emit_list (body false guard);
-            let on_false =
-              if j = nc - 1 then next else Printf.sprintf "alt%d_g%d" i (j + 1)
-            in
-            to_lbl on_false (B.Jump_unless 0);
-            finish_body bdy)
-          clauses)
-    alts;
-  mark (Printf.sprintf "alt%d" (List.length alts));
-  emit (B.Fail "case: no matching alternative");
-  mark "end";
-  let arr = Array.of_list (List.rev !buf) in
-  List.iter
-    (fun (p, lbl) ->
-      let rel = Hashtbl.find labels lbl - (p + 1) in
-      arr.(p)
-      <- (match arr.(p) with
-          | B.Jump _ -> B.Jump rel
-          | B.Jump_unless _ -> B.Jump_unless rel
-          | B.Test (nn, bs, _) -> B.Test (nn, bs, rel)
-          | other -> other))
-    !fixups;
-  Array.to_list arr
-
 (** Compile a `case` to bytecode. [atom] compiles a scrutinee atom and [body]
     compiles an alternative's right-hand side (tail-aware); both are supplied by
-    [Codegen]. An all-unconditional `case` takes the decision tree (or the naive
-    matcher when [use_naive_matching] is set); any guarded alternative routes to the
-    guard-chain compiler. *)
+    [Codegen]. The decision tree handles unconditional and guarded alternatives alike
+    (ADR-0013 guard sequencing preserved); [use_naive_matching] selects the
+    per-alternative baseline instead. *)
 let compile ~atom ~body ~tail (scruts : A.atom list) (alts : A.alt list) : B.instr list
   =
-  let unconditional =
-    List.for_all
-      (fun (a : A.alt) -> match a.A.result with A.Uncond _ -> true | _ -> false)
-      alts
-  in
-  if unconditional
-  then
-    (if !use_naive_matching then compile_naive else compile_tree) ~atom ~body tail scruts
-      alts
-  else compile_guarded ~atom ~body tail scruts alts
+  (if !use_naive_matching then compile_naive else compile_tree) ~atom ~body tail scruts
+    alts

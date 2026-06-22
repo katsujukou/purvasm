@@ -711,6 +711,54 @@ let test_vm_dt_array () =
   same_on_vm "dt array [2,3]" (prog [ int 2; int 3 ]);
   same_on_vm "dt array [1,2,3](default)" (prog [ int 1; int 2; int 3 ])
 
+(* Guarded alternatives folded into the decision tree (ADR-0031 fast-follow): guard
+   chains evaluated at the leaf, all-false falling through to the rows below. *)
+let altg bs clauses = { C.binders = bs; result = C.Guarded clauses }
+let gt n var = C.Prim (C.LtInt, [ int n; C.Var var ]) (* var > n *)
+
+(* Multi-guard chain in one alternative, then fall-through to a later alternative. *)
+let test_vm_dt_guard_chain () =
+  let prog n =
+    case
+      [ int n ]
+      [ altg [ C.BVar "x" ] [ (gt 10 "x", int 1); (gt 5 "x", int 2) ]
+      ; alt [ C.BNull ] (int 3)
+      ]
+  in
+  same_on_vm "guard chain 20" (prog 20);
+  same_on_vm "guard chain 7" (prog 7);
+  same_on_vm "guard chain 3" (prog 3)
+
+(* A guarded row inside a constructor branch whose guard fails falls through to the
+   next row of the same branch (the tree's [compile occs rest] under a switch). *)
+let test_vm_dt_guard_ctor () =
+  let prog s =
+    case
+      [ s ]
+      [ altg [ C.BCtor ("Just", [ C.BVar "x" ]) ] [ (gt 0 "x", C.Var "x") ]
+      ; alt [ C.BCtor ("Just", [ C.BNull ]) ] (int (-1))
+      ; alt [ C.BCtor ("Nothing", []) ] (int (-2))
+      ]
+  in
+  same_on_vm "guard ctor Just 5" (prog (just (int 5)));
+  same_on_vm "guard ctor Just -3" (prog (just (int (-3))));
+  same_on_vm "guard ctor Nothing" (prog nothing)
+
+(* The naive matcher also handles guards; check it differentially against the oracle. *)
+let same_on_vm_naive (label : string) (t : C.term) =
+  let oracle = Cesk.Machine.eval ~host:Ffi.host t in
+  let v, _ = Vm.eval_anf_counted ~naive:true (Middle_end.Transl.transl t) in
+  Alcotest.(check string) label (V.to_string oracle) (Vm.Value.to_string v)
+
+let test_vm_naive_guard () =
+  let prog n =
+    case
+      [ int n ]
+      [ altg [ C.BVar "x" ] [ (gt 10 "x", int 1) ]; alt [ C.BNull ] (int 0) ]
+  in
+  same_on_vm_naive "naive guard 20" (prog 20);
+  same_on_vm_naive "naive guard 5" (prog 5)
+
 let test_vm_app () = same_on_vm "app.result" (program "result")
 
 let test_vm_prelude_answer () = same_on_vm "prelude.answer" (prelude_term "answer")
@@ -869,6 +917,9 @@ let () =
         ; Alcotest.test_case "dt_aspat" `Quick test_vm_dt_aspat
         ; Alcotest.test_case "dt_shared" `Quick test_vm_dt_shared
         ; Alcotest.test_case "dt_array" `Quick test_vm_dt_array
+        ; Alcotest.test_case "dt_guard_chain" `Quick test_vm_dt_guard_chain
+        ; Alcotest.test_case "dt_guard_ctor" `Quick test_vm_dt_guard_ctor
+        ; Alcotest.test_case "naive_guard" `Quick test_vm_naive_guard
         ] )
     ; ( "prelude"
       , [ Alcotest.test_case "answer" `Quick test_prelude_answer

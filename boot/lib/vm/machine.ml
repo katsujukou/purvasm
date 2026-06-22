@@ -83,50 +83,6 @@ let eval_prim (op : C.primop) (args : V.t list) : V.t =
     else stuck ("array set out of bounds: " ^ string_of_int i)
   | _ -> stuck ("primop " ^ C.primop_to_string op ^ ": ill-typed arguments")
 
-(* --- Pattern matching: the oracle's [Cesk.Pmatch], over VM values. *)
-let rec match_binder (b : C.binder) (v : V.t) acc : (string * V.t) list option =
-  match b, v with
-  | C.BNull, _ -> Some acc
-  | C.BVar x, _ -> Some ((x, v) :: acc)
-  | C.BNamed (x, inner), _ -> match_binder inner v ((x, v) :: acc)
-  | C.BLit (C.LInt n), V.Vint m -> if n = m then Some acc else None
-  | C.BLit (C.LBool b'), V.Vbool m -> if Bool.equal b' m then Some acc else None
-  | C.BLit (C.LString s), V.Vstring m -> if String.equal s m then Some acc else None
-  | C.BLit (C.LNumber f), V.Vnumber m -> if f = m then Some acc else None
-  | C.BCtor (tag, subs), V.Vdata (vtag, fields) ->
-    if String.equal tag vtag
-    then
-      if List.length subs = Array.length fields
-      then match_binders subs (Array.to_list fields) acc
-      else stuck ("constructor pattern arity mismatch: " ^ tag)
-    else None
-  | C.BArray subs, V.Varray arr ->
-    if List.length subs = Array.length arr
-    then match_binders subs (Array.to_list arr) acc
-    else None
-  | C.BRecord fields, V.Vrecord m -> match_fields fields m acc
-  | (C.BLit _ | C.BCtor _ | C.BArray _ | C.BRecord _), _ ->
-    stuck "pattern matched against a value of the wrong shape"
-
-and match_binders binders values acc =
-  match binders, values with
-  | [], [] -> Some acc
-  | b :: bs, v :: vs ->
-    (match match_binder b v acc with
-     | Some acc' -> match_binders bs vs acc'
-     | None -> None)
-  | _ -> stuck "pattern arity mismatch"
-
-and match_fields fields m acc =
-  match fields with
-  | [] -> Some acc
-  | (label, p) :: rest ->
-    (match SMap.find_opt label m with
-     | Some value ->
-       (match match_binder p value acc with
-        | Some acc' -> match_fields rest m acc'
-        | None -> None)
-     | None -> stuck ("record pattern: missing label " ^ label))
 
 (** Take/drop helpers for the eval/apply over-application split. *)
 let rec take n = function
@@ -385,20 +341,6 @@ let rec run (globals : (string, V.t) Hashtbl.t) (frames0 : frame list) : V.t =
              <- fr.ip
                 + (match List.assoc_opt n cases with Some rel -> rel | None -> default)
            | _ -> stuck "array-length switch on a non-array value");
-          loop ()
-        | B.Test (nscrut, binders, fail_rel) ->
-          (* Peek (do not pop) the scrutinees so the next alternative can re-match. *)
-          let scruts = List.rev (take nscrut !stack) in
-          (match match_binders binders scruts [] with
-           | Some bindings ->
-             fr.env
-             := List.fold_left (fun e (x, v) -> SMap.add x v e) !(fr.env) bindings
-           | None -> fr.ip <- fr.ip + fail_rel);
-          loop ()
-        | B.Drop k ->
-          for _ = 1 to k do
-            ignore (pop ())
-          done;
           loop ()
         | B.Fail msg -> stuck msg)
   in

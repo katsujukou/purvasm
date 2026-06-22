@@ -18,6 +18,21 @@
 > (bintree-bfs 0.92, quicksort 0.96, map-fold 0.96), all still oracle-agreeing.
 > Guards-into-tree remains the fast-follow.
 
+> **Progress (2026-06-22, fast-follow done).** The fast-follow is implemented:
+> guarded alternatives are now folded into the decision tree. A guard chain
+> (ADR-0013) is evaluated at the matched leaf (top to bottom); if every guard is
+> false, control falls through to the rows below this one, recompiled against the
+> same occurrences (`emit_rhs … ~on_fail:(fun () -> compile occs rest)`) — Maranget's
+> "keep the successors reachable" — so sequencing and fall-through are exactly
+> ADR-0013. With one matching path for every `case`, the slice-1 `Test`/`Drop`
+> instructions and the `Test`-chain compiler are retired, and the now-unused
+> host-side `Pmatch`-style matcher is removed from `Machine`. The compiler module is
+> `Match_compile` (`compile ~atom ~body ~tail`), called by `Codegen.gen_case`; the
+> naive baseline handles guards too (fall-through to the next alternative). New e2e
+> guard cases (multi-guard chain, guard-failure fall-through inside a constructor
+> branch, naive+guards) pass; full differential (fixtures + benches) and the no-opt
+> baseline are unchanged.
+
 ## Context
 
 The slice-1 VM (ADR-0030) matches `case` **host-side**: an unconditional `case`
