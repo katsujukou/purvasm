@@ -6,10 +6,9 @@
     the CAFs in dependency (spine) order. Recursion is closed by the global table
     (top-level) and by [Make_rec] (local groups). *)
 
+(* [Value] is re-exported so callers can name the result type ([Vm.Value.t]); the
+   other submodules ([Bytecode]/[Codegen]/[Match_compile]/[Machine]) are internal. *)
 module Value = Value
-module Bytecode = Bytecode
-module Codegen = Codegen
-module Machine = Machine
 
 (** Run a lower-IR (ANF) program to a value. *)
 let eval_anf (program : Middle_end.Anf.expr) : Value.t =
@@ -40,8 +39,16 @@ let eval_anf (program : Middle_end.Anf.expr) : Value.t =
 let eval (t : Cesk.Ast.term) : Value.t = eval_anf (Middle_end.Transl.transl t)
 
 (** Run an ANF program and also return the number of instructions executed — the
-    deterministic VM cost metric (ADR-0030) reported by the benchmark harness. *)
-let eval_anf_counted (program : Middle_end.Anf.expr) : Value.t * int =
-  Machine.executed := 0;
-  let v = eval_anf program in
-  (v, !Machine.executed)
+    deterministic VM cost metric (ADR-0030) reported by the benchmark harness.
+    [naive] selects the naive explicit matcher over the decision tree (ADR-0031), so
+    the harness can measure the tree's win without reaching into the matcher's
+    internal flag; it is saved and restored around the run. *)
+let eval_anf_counted ?(naive = false) (program : Middle_end.Anf.expr) : Value.t * int =
+  let saved = !Match_compile.use_naive_matching in
+  Match_compile.use_naive_matching := naive;
+  Fun.protect
+    ~finally:(fun () -> Match_compile.use_naive_matching := saved)
+    (fun () ->
+      Machine.executed := 0;
+      let v = eval_anf program in
+      (v, !Machine.executed))

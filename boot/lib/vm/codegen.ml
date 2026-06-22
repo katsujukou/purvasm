@@ -1,7 +1,8 @@
 (** ANF → PURVASM bytecode (ADR-0030 slice 1), by postorder emit (ADR-0003): a
     subexpression's operands are pushed first, so it leaves exactly one value on the
-    operand stack. Control flow (`if`/`case`) compiles to *relative* jumps within a
-    chunk; calls in tail position become [Tail_call] (TCE), elsewhere [Call].
+    operand stack. An `if` compiles to *relative* jumps within a chunk; calls in tail
+    position become [Tail_call] (TCE), elsewhere [Call]; a `case` is delegated to
+    [Match_compile] (ADR-0031), supplied with this module's atom/expr compilers.
 
     The top-level spine (the linked program is one big let-/letrec-spine, ADR-0016)
     is split into global definitions — a function becomes a [Gfun] closure, any other
@@ -79,107 +80,7 @@ and gen_value (c : A.cexpr) : B.instr list =
   | A.CApp _ | A.CIf _ | A.CCase _ -> assert false (* handled in gen_cexpr *)
 
 and gen_case (tail : bool) (scruts : A.atom list) (alts : A.alt list) : B.instr list =
-  if List.for_all (fun (a : A.alt) -> match a.A.result with A.Uncond _ -> true | _ -> false) alts
-  then gen_case_simple tail scruts alts
-  else gen_case_guarded tail scruts alts
-
-(* An unconditional `case`: one host-side [Match] selects and binds, then jumps to
-   the chosen body. The benchmarks take this fast path. *)
-and gen_case_simple (tail : bool) (scruts : A.atom list) (alts : A.alt list)
-  : B.instr list
-  =
-  let n = len scruts in
-  let bodies =
-    List.map
-      (fun (alt : A.alt) ->
-        match alt.A.result with
-        | A.Uncond e -> gen_expr tail e
-        | A.Guarded _ -> assert false)
-      alts
-  in
-  (* Targets are relative to the position right after [Match] (the bodies area). In
-     non-tail position each body leaves a value then jumps to the join point; in
-     tail position each body ends with Return/Tail_call (no jump needed). *)
-  let body_len body = len body + if tail then 0 else 1 in
-  let total = List.fold_left (fun acc b -> acc + body_len b) 0 bodies in
-  let _, alts_rev, code_rev =
-    List.fold_left2
-      (fun (off, alts_acc, code_acc) (alt : A.alt) body ->
-        let alt' = { B.binders = alt.A.binders; target = off } in
-        let after = off + body_len body in
-        let code = if tail then body else body @ [ B.Jump (total - after) ] in
-        (after, alt' :: alts_acc, code :: code_acc))
-      (0, [], []) alts bodies
-  in
-  let match_alts = Array.of_list (List.rev alts_rev) in
-  let bodies_code = List.concat (List.rev code_rev) in
-  gen_atoms scruts @ (B.Match (n, match_alts) :: bodies_code)
-
-(* A `case` with at least one guarded alternative (ADR-0013). Each alternative is a
-   [Test] (peek + match binders, jump to the next alternative on failure) followed by
-   its guard chain; a guard that is false tries the next guard, and the last guard
-   falling through goes to the next alternative — so scrutinees stay on the stack
-   across alternatives and are dropped only when a body is finally chosen. Emitted
-   through a small backpatching assembler (placeholder offsets resolved to relative
-   jumps at the end); spliced guard/body chunks keep their own internal jumps. *)
-and gen_case_guarded (tail : bool) (scruts : A.atom list) (alts : A.alt list)
-  : B.instr list
-  =
-  let n = len scruts in
-  let buf = ref [] (* reversed *) and pos = ref 0 in
-  let labels : (string, int) Hashtbl.t = Hashtbl.create 16 in
-  let fixups = ref [] (* (position, target-label) for Jump / Jump_unless / Test *) in
-  let emit instr =
-    buf := instr :: !buf;
-    incr pos
-  in
-  let emit_list = List.iter emit in
-  let mark lbl = Hashtbl.replace labels lbl !pos in
-  let to_lbl lbl instr =
-    fixups := (!pos, lbl) :: !fixups;
-    emit instr
-  in
-  emit_list (gen_atoms scruts);
-  let finish_body e =
-    emit (B.Drop n);
-    emit_list (gen_expr tail e);
-    if not tail then to_lbl "end" (B.Jump 0)
-  in
-  List.iteri
-    (fun i (alt : A.alt) ->
-      mark (Printf.sprintf "alt%d" i);
-      let next = Printf.sprintf "alt%d" (i + 1) in
-      to_lbl next (B.Test (n, alt.A.binders, 0));
-      match alt.A.result with
-      | A.Uncond e -> finish_body e
-      | A.Guarded clauses ->
-        let nc = List.length clauses in
-        List.iteri
-          (fun j (guard, body) ->
-            mark (Printf.sprintf "alt%d_g%d" i j);
-            emit_list (gen_expr false guard);
-            let on_false =
-              if j = nc - 1 then next else Printf.sprintf "alt%d_g%d" i (j + 1)
-            in
-            to_lbl on_false (B.Jump_unless 0);
-            finish_body body)
-          clauses)
-    alts;
-  mark (Printf.sprintf "alt%d" (List.length alts));
-  emit (B.Fail "case: no matching alternative");
-  mark "end";
-  let arr = Array.of_list (List.rev !buf) in
-  List.iter
-    (fun (p, lbl) ->
-      let rel = Hashtbl.find labels lbl - (p + 1) in
-      arr.(p)
-      <- (match arr.(p) with
-          | B.Jump _ -> B.Jump rel
-          | B.Jump_unless _ -> B.Jump_unless rel
-          | B.Test (nn, bs, _) -> B.Test (nn, bs, rel)
-          | other -> other))
-    !fixups;
-  Array.to_list arr
+  Match_compile.compile ~atom:gen_atom ~body:gen_expr ~tail scruts alts
 
 (** Split the top-level spine into global definitions (in dependency order) and the
     [main] chunk. Top-level functions (including recursive groups) become [Gfun]s;

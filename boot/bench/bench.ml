@@ -135,6 +135,7 @@ let () =
    | Unix.Unix_error (Unix.EEXIST, _, _) -> ());
   Printf.printf "purvasm benchmark sweep (ADR-0026) — deterministic oracle cost\n";
   Printf.printf "fixtures: %s   output: %s\n\n" fixtures outdir;
+  let comparisons = ref [] (* (label, (opt tree instrs, opt naive instrs)) at max size *) in
   List.iter
     (fun (label, entry_module, entry, sizes) ->
        (* The entry is an `Int -> Int`; link it once and apply each swept size. *)
@@ -149,13 +150,17 @@ let () =
              "# size"
              variants
          in
-         List.fold_left
-           (fun s (v, _) -> s ^ Printf.sprintf "  %s_vinstrs  %s_vms" v v)
-           oracle
-           vm_variants
+         let vm =
+           List.fold_left
+             (fun s (v, _) -> s ^ Printf.sprintf "  %s_vinstrs  %s_vms" v v)
+             oracle
+             vm_variants
+         in
+         vm ^ "  opt_naive_vinstrs"
        in
        Buffer.add_string buf (header ^ "\n");
        let last = ref (0, 0) in
+       let last_cmp = ref (0, 0) (* (opt tree instrs, opt naive instrs) at last size *) in
        List.iter
          (fun n ->
             let term = C.App (base, C.Lit (C.LInt n)) in
@@ -168,9 +173,11 @@ let () =
               variants;
             (* Differential check (ADR-0030): the VM result must match the oracle. *)
             let oracle = V.to_string (Cesk.Machine.eval ~host:Ffi.host term) in
+            let opt_tree = ref 0 in
             List.iter
               (fun (vname, transform) ->
                  let v, instrs, ms = vm_measure (transform term) in
+                 if String.equal vname "opt" then opt_tree := instrs;
                  if not (String.equal (Vm.Value.to_string v) oracle)
                  then (
                    incr mismatches;
@@ -183,8 +190,27 @@ let () =
                      oracle);
                  Buffer.add_string buf (Printf.sprintf "  %d  %.3f" instrs ms))
               vm_variants;
+            (* ADR-0031 measurement: recompile the opt pipeline with the naive
+               explicit matcher and re-run, to quantify the decision tree's win. *)
+            let opt_anf =
+              Middle_end.Passes.Simplify.run
+                (Middle_end.Passes.Dict_elim.run (T.transl term))
+            in
+            let nv, opt_naive = Vm.eval_anf_counted ~naive:true opt_anf in
+            if not (String.equal (Vm.Value.to_string nv) oracle)
+            then (
+              incr mismatches;
+              Printf.printf
+                "  !! VM MISMATCH %s/opt-naive n=%d: vm=%s oracle=%s\n"
+                label
+                n
+                (Vm.Value.to_string nv)
+                oracle);
+            last_cmp := (!opt_tree, opt_naive);
+            Buffer.add_string buf (Printf.sprintf "  %d" opt_naive);
             Buffer.add_char buf '\n')
          sizes;
+       comparisons := (label, !last_cmp) :: !comparisons;
        write_file (Filename.concat outdir (label ^ ".dat")) (Buffer.contents buf);
        let n = List.nth sizes (List.length sizes - 1) in
        let steps, allocs = !last in
@@ -203,6 +229,17 @@ let () =
   if !mismatches = 0
   then Printf.printf "\nVM differential: all benchmarks agree with the oracle\n"
   else Printf.printf "\nVM differential: %d MISMATCH(es) — see above\n" !mismatches;
+  (* ADR-0031: decision tree vs naive explicit matcher, opt pipeline, at max size. *)
+  Printf.printf "\ndecision tree vs naive matcher (opt, vm_instrs @ max size):\n";
+  List.iter
+    (fun (label, (tree, naive)) ->
+       Printf.printf
+         "  %-12s tree=%-10d naive=%-10d  tree/naive=%.3f\n"
+         label
+         tree
+         naive
+         (if naive = 0 then 1.0 else float_of_int tree /. float_of_int naive))
+    (List.rev !comparisons);
   if rc = 0
   then
     Printf.printf

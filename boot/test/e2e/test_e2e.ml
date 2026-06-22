@@ -640,6 +640,77 @@ let test_vm_first_of () =
 let test_vm_via_record () =
   same_on_vm_app "viaRecord {x:5}" "viaRecord" (C.Record [ "x", int 5 ])
 
+(* Hand-built `case` terms that exercise the decision-tree compiler (ADR-0031)
+   directly — literal switches, nested constructors, as-patterns, shared prefixes,
+   default edges, array-length switches — each checked against the oracle. *)
+let alt bs body = { C.binders = bs; result = C.Unconditional body }
+let case scruts alts = C.Case (scruts, alts)
+let cons h t = C.App (C.App (C.Ctor ("Cons", 2), h), t)
+let nil = C.Ctor ("Nil", 0)
+
+(* Literal switch with a default edge. *)
+let test_vm_dt_lit () =
+  let prog n =
+    case [ int n ] [ alt [ C.BLit (C.LInt 0) ] (int 10); alt [ C.BNull ] (int 20) ]
+  in
+  same_on_vm "dt lit 0" (prog 0);
+  same_on_vm "dt lit 7" (prog 7)
+
+(* Nested constructors, exhaustive (no default). *)
+let test_vm_dt_nested () =
+  let prog s =
+    case
+      [ s ]
+      [ alt [ C.BCtor ("Just", [ C.BCtor ("Just", [ C.BVar "y" ]) ]) ] (C.Var "y")
+      ; alt [ C.BCtor ("Just", [ C.BCtor ("Nothing", []) ]) ] (int (-1))
+      ; alt [ C.BCtor ("Nothing", []) ] (int (-2))
+      ]
+  in
+  same_on_vm "dt nested Just(Just 5)" (prog (just (just (int 5))));
+  same_on_vm "dt nested Just Nothing" (prog (just nothing));
+  same_on_vm "dt nested Nothing" (prog nothing)
+
+(* As-pattern binds the whole occurrence; constructor default edge. *)
+let test_vm_dt_aspat () =
+  let prog s =
+    case
+      [ s ]
+      [ alt [ C.BNamed ("x", C.BCtor ("Just", [ C.BNull ])) ] (C.Var "x")
+      ; alt [ C.BNull ] (int 99)
+      ]
+  in
+  same_on_vm "dt as Just 3" (prog (just (int 3)));
+  same_on_vm "dt as Nothing(default)" (prog nothing)
+
+(* Shared `Cons` prefix with a literal nested inside it, plus a default within the
+   specialised sub-matrix and an exhaustive outer Nil. *)
+let test_vm_dt_shared () =
+  let prog s =
+    case
+      [ s ]
+      [ alt [ C.BCtor ("Cons", [ C.BLit (C.LInt 1); C.BNull ]) ] (int 100)
+      ; alt [ C.BCtor ("Cons", [ C.BVar "x"; C.BNull ]) ] (C.Var "x")
+      ; alt [ C.BCtor ("Nil", []) ] (int 0)
+      ]
+  in
+  same_on_vm "dt shared Cons 1" (prog (cons (int 1) nil));
+  same_on_vm "dt shared Cons 2" (prog (cons (int 2) nil));
+  same_on_vm "dt shared Nil" (prog nil)
+
+(* Array-length switch with multiple heads and a default. *)
+let test_vm_dt_array () =
+  let prog xs =
+    case
+      [ C.Array xs ]
+      [ alt [ C.BArray [ C.BVar "a" ] ] (C.Var "a")
+      ; alt [ C.BArray [ C.BVar "a"; C.BVar "b" ] ] (C.Prim (C.AddInt, [ C.Var "a"; C.Var "b" ]))
+      ; alt [ C.BNull ] (int 0)
+      ]
+  in
+  same_on_vm "dt array [5]" (prog [ int 5 ]);
+  same_on_vm "dt array [2,3]" (prog [ int 2; int 3 ]);
+  same_on_vm "dt array [1,2,3](default)" (prog [ int 1; int 2; int 3 ])
+
 let test_vm_app () = same_on_vm "app.result" (program "result")
 
 let test_vm_prelude_answer () = same_on_vm "prelude.answer" (prelude_term "answer")
@@ -793,6 +864,11 @@ let () =
         ; Alcotest.test_case "pick_false" `Quick test_vm_pick_false
         ; Alcotest.test_case "first_of" `Quick test_vm_first_of
         ; Alcotest.test_case "via_record" `Quick test_vm_via_record
+        ; Alcotest.test_case "dt_lit" `Quick test_vm_dt_lit
+        ; Alcotest.test_case "dt_nested" `Quick test_vm_dt_nested
+        ; Alcotest.test_case "dt_aspat" `Quick test_vm_dt_aspat
+        ; Alcotest.test_case "dt_shared" `Quick test_vm_dt_shared
+        ; Alcotest.test_case "dt_array" `Quick test_vm_dt_array
         ] )
     ; ( "prelude"
       , [ Alcotest.test_case "answer" `Quick test_prelude_answer

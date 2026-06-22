@@ -37,13 +37,19 @@ Everything lands in `bench/out/` (git-ignored):
 
 - `<bench>.dat` — whitespace columns: `size`, then `steps allocs` per oracle
   variant, then `vm_instrs vm_ms` per VM variant (the ANF transforms `anf`,
-  `dictelim`, `opt`). The oracle columns come first, so the baseline regression check
-  (below) is unaffected by the appended VM columns.
+  `dictelim`, `opt`), then `opt_naive_vinstrs` (the `opt` pipeline recompiled with the
+  naive explicit matcher — the ADR-0031 decision-tree baseline). The oracle columns
+  come first, so the baseline regression check (below) is unaffected by the appended
+  VM columns.
 - `steps.png`, `allocs.png` — oracle proxy: one panel per bench, one curve per
   variant, log y.
 - `vm_instrs.png`, `vm_ms.png` — VM ground truth (ADR-0030): instructions executed
   (log y) and wall-clock (linear y), one curve per VM variant.
 - `plot.gp` — the generated gnuplot script.
+
+The run also prints a **decision tree vs naive matcher** table (ADR-0031): `opt`
+pipeline `vm_instrs` at the max size under the decision-tree matcher vs the naive
+explicit matcher, with their ratio — how much the tree saves by sharing tests.
 
 ## Reading the numbers
 

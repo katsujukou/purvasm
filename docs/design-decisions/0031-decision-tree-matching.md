@@ -3,6 +3,21 @@
 - Status: Accepted
 - Date: 2026-06-22
 
+> **Progress (2026-06-22).** Implemented in `boot/lib/vm/`: unconditional `case`
+> compiles to a Maranget decision tree (`Codegen.gen_case_simple`) of explicit
+> `Switch_ctor`/`Switch_lit`/`Switch_len` + `Proj`/`Proj_arr`/`Get_field` extraction,
+> occurrences bound to fresh locals, assembled via a label-backpatching pass
+> (`resolve`). The host-side `Match` is removed; guarded `case` keeps the `Test`
+> chain. Differential equivalence holds on every fixture, benchmark, and a new
+> decision-tree fixture set (literal/nested-ctor/as-pattern/shared-prefix/default/
+> array-length — e2e `vm` group, 23 cases). As predicted, `vm_instrs` *rises* on
+> simple cases (matching cost now explicit, not a hidden host step). The naive
+> explicit matcher (`gen_case_naive`, toggled by `use_naive_matching`) is wired into
+> the bench as the comparison baseline: the tree is byte-for-byte equal on `fib`
+> (no shared structure) and saves up to ~8% `vm_instrs` on case-heavy benches
+> (bintree-bfs 0.92, quicksort 0.96, map-fold 0.96), all still oracle-agreeing.
+> Guards-into-tree remains the fast-follow.
+
 ## Context
 
 The slice-1 VM (ADR-0030) matches `case` **host-side**: an unconditional `case`

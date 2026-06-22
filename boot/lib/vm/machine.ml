@@ -136,6 +136,26 @@ let rec take n = function
 
 let rec drop n l = if n = 0 then l else match l with _ :: xs -> drop (n - 1) xs | [] -> []
 
+(* Scalar-literal comparison for [Switch_lit] (ADR-0031): [lit_eq] is value-level
+   equality (same kind and value) used to select a case; [lit_kind_eq] tells "wrong
+   value, same kind" (→ default edge) from "wrong kind" (→ stuck), matching the
+   oracle's [Pmatch] on `BLit`. *)
+let lit_eq (l : C.lit) (v : V.t) : bool =
+  match l, v with
+  | C.LInt n, V.Vint m -> n = m
+  | C.LBool b, V.Vbool m -> Bool.equal b m
+  | C.LString s, V.Vstring m -> String.equal s m
+  | C.LNumber f, V.Vnumber m -> f = m
+  | _ -> false
+
+let lit_kind_eq (l : C.lit) (v : V.t) : bool =
+  match l, v with
+  | C.LInt _, V.Vint _
+  | C.LBool _, V.Vbool _
+  | C.LString _, V.Vstring _
+  | C.LNumber _, V.Vnumber _ -> true
+  | _ -> false
+
 (** Run a frame stack to completion on a fresh operand stack, resolving free names
     through [globals]; returns the lone value left on the operand stack. Reentrant:
     [make_rec] calls it again to build each member of a recursive group. *)
@@ -223,21 +243,6 @@ let rec run (globals : (string, V.t) Hashtbl.t) (frames0 : frame list) : V.t =
     r := grp;
     fr.env := grp
   in
-  let do_match (fr : code_frame) nscrut (alts : B.matchalt array) =
-    let scruts = popn nscrut in
-    let rec try_alts i =
-      if i >= Array.length alts
-      then stuck "case: no matching alternative"
-      else (
-        let alt = alts.(i) in
-        match match_binders alt.B.binders scruts [] with
-        | Some bindings ->
-          fr.env := List.fold_left (fun e (x, v) -> SMap.add x v e) !(fr.env) bindings;
-          fr.ip <- fr.ip + alt.B.target
-        | None -> try_alts (i + 1))
-    in
-    try_alts 0
-  in
   let rec loop () =
     match !frames with
     | [] -> pop () (* the program's result is the lone value on the stack *)
@@ -306,6 +311,16 @@ let rec run (globals : (string, V.t) Hashtbl.t) (frames0 : frame list) : V.t =
               | None -> stuck ("accessor: missing label " ^ label))
            | _ -> stuck "accessor: not a record");
           loop ()
+        | B.Proj i ->
+          (match pop () with
+           | V.Vdata (_, fields) -> push fields.(i)
+           | _ -> stuck "projection: not a data value");
+          loop ()
+        | B.Proj_arr i ->
+          (match pop () with
+           | V.Varray a -> push a.(i)
+           | _ -> stuck "array projection: not an array");
+          loop ()
         | B.Update labels ->
           let vs = popn (List.length labels) in
           (match pop () with
@@ -340,8 +355,36 @@ let rec run (globals : (string, V.t) Hashtbl.t) (frames0 : frame list) : V.t =
            | V.Vbool true -> ()
            | _ -> stuck "if: non-boolean condition");
           loop ()
-        | B.Match (nscrut, alts) ->
-          do_match fr nscrut alts;
+        | B.Switch_ctor (cases, default) ->
+          (match pop () with
+           | V.Vdata (tag, _) ->
+             fr.ip
+             <- fr.ip
+                + (match List.assoc_opt tag cases with
+                   | Some rel -> rel
+                   | None -> default)
+           | _ -> stuck "switch on a non-data value");
+          loop ()
+        | B.Switch_lit (cases, default) ->
+          let v = pop () in
+          (match cases with
+           | (l, _) :: _ when not (lit_kind_eq l v) ->
+             stuck "literal switch on a wrong-kind value"
+           | _ ->
+             fr.ip
+             <- fr.ip
+                + (match List.find_opt (fun (l, _) -> lit_eq l v) cases with
+                   | Some (_, rel) -> rel
+                   | None -> default));
+          loop ()
+        | B.Switch_len (cases, default) ->
+          (match pop () with
+           | V.Varray a ->
+             let n = Array.length a in
+             fr.ip
+             <- fr.ip
+                + (match List.assoc_opt n cases with Some rel -> rel | None -> default)
+           | _ -> stuck "array-length switch on a non-array value");
           loop ()
         | B.Test (nscrut, binders, fail_rel) ->
           (* Peek (do not pop) the scrutinees so the next alternative can re-match. *)
