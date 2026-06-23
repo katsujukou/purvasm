@@ -30,7 +30,7 @@
 > groups, full suite green, no benchmark regression. The `.pvmi`-hash *cascade*
 > (downstream skip) is in place structurally but dormant — slice 1 has no cross-module
 > compile dependency on `.pvmi`; it activates with the deferred cross-module optimiser.
-
+>
 > **Convention (2026-06-22) — `Image.format_version` is the artifact-compatibility
 > stamp; bump it on ANY change that alters a `.pvmo`/`.pvmi`/`.pvm`'s meaning.** This
 > includes changes to the JSON *encoding* **and**, crucially, changes to *codegen* (the
