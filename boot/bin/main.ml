@@ -131,9 +131,163 @@ let trace_arg =
   let open Cmdliner in
   Arg.(value & flag & info [ "t"; "trace" ] ~doc:"Print every CESK transition.")
 
+(* --- the PURVASM AOT toolchain (ADR-0033): compile / link / run ------------ *)
+
+let read_file path =
+  let ic = open_in_bin path in
+  let s = really_input_string ic (in_channel_length ic) in
+  close_in ic;
+  s
+
+let write_file path s =
+  let oc = open_out_bin path in
+  output_string oc s;
+  close_out oc
+
+let split_module s = String.split_on_char '.' s
+let mtime p = (Unix.stat p).Unix.st_mtime
+
+(* Create a directory and any missing parents. *)
+let rec mkdir_p dir =
+  if not (Sys.file_exists dir)
+  then (
+    mkdir_p (Filename.dirname dir);
+    try Unix.mkdir dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ())
+
+(* Layout (ADR-0033): the corefn dir holds `purs` output; the output dir holds the
+   image at its root and intermediate `.pvmo`/`.pvmi` under `_build/`. *)
+let build_dir output = Filename.concat output "_build"
+let pvmo_path output name = Filename.concat (build_dir output) (name ^ ".pvmo")
+let pvmi_path output name = Filename.concat (build_dir output) (name ^ ".pvmi")
+let image_path output = Filename.concat output "app.pvm"
+
+let emit_artifact output (a : Pvm.Artifact.module_artifact) : unit =
+  write_file (pvmo_path output a.name) (Pvm.Artifact.module_to_string a);
+  write_file
+    (pvmi_path output a.name)
+    (Pvm.Artifact.interface_to_string (Pvm.Artifact.interface_of a))
+
+(* Compile one module, reusing a fresh `.pvmo` (recompilation avoidance, ADR-0033):
+   skip the compile when the object is newer than the source AND still loads at the
+   current artifact version. The version check makes a toolchain update that bumps
+   [Image.format_version] (which must be bumped on any codegen/encoding change)
+   invalidate stale objects rather than silently reuse them. The `.pvmi`-hash
+   cross-module cascade activates once cross-module optimisation exists. *)
+let compile_incremental ~corefn_dir ~output (m : Corefn.Module.t) : Pvm.Artifact.module_artifact =
+  let name = Link.name_key m.name in
+  let obj = pvmo_path output name in
+  let pvmi = pvmi_path output name in
+  let mtime_ok =
+    Sys.file_exists obj
+    && (try mtime obj >= mtime (Link.module_path corefn_dir m.name) with _ -> false)
+  in
+  (* Reuse only if the object both is newer than the source and parses at the current
+     version (a version/format mismatch raises, dropping to recompile). *)
+  let reused =
+    if mtime_ok
+    then (
+      try
+        let a = Pvm.Artifact.module_of_string (read_file obj) in
+        if not (Sys.file_exists pvmi)
+        then write_file pvmi (Pvm.Artifact.interface_to_string (Pvm.Artifact.interface_of a));
+        Some a
+      with _ -> None)
+    else None
+  in
+  match reused with
+  | Some a -> a
+  | None ->
+    let a = Pvm.Compile.compile_module m in
+    emit_artifact output a;
+    a
+
+(* The entry's run mode: an `Effect` (default — apply to unit, perform); a swept
+   `Int -> Int` ([--arg]); or a bare value ([--value]). *)
+let entry_main ~value ~arg entry_key : term * bool =
+  match value, arg with
+  | true, _ -> (Var entry_key, false)
+  | false, Some n -> (App (Var entry_key, Lit (LInt n)), false)
+  | false, None -> (App (Var entry_key, Lit (LInt 0)), true)
+
+let build_action corefn_dir output entry_module entry arg value =
+  mkdir_p (build_dir output);
+  let em = split_module entry_module in
+  let modules = Link.load ~outdir:corefn_dir ~entry_module:em in
+  let artifacts = List.map (compile_incremental ~corefn_dir ~output) modules in
+  let main_term, is_effect = entry_main ~value ~arg (Lower.qualified_key em entry) in
+  let img =
+    { (Pvm.Plink.link artifacts ~resolver:Ffi.resolver ~main_term) with
+      Pvm.Image.is_effect = is_effect
+    }
+  in
+  Pvm.Image.write_file (image_path output) img;
+  Stdlib.Printf.printf
+    "wrote %s (%d definitions)\n"
+    (image_path output)
+    (List.length img.Pvm.Image.gdefs)
+
+let compile_action corefn output =
+  mkdir_p (build_dir output);
+  let m = Corefn.Decode.module_of_file corefn in
+  emit_artifact output (Pvm.Compile.compile_module m);
+  Stdlib.Printf.printf "compiled %s\n" (Link.name_key m.name)
+
+(* Run the image. An `Effect` entry is performed for its effects and its `Unit`
+   result is suppressed; a value entry's result is printed. *)
+let run_action image =
+  let img = Pvm.Image.read_file image in
+  let v = Pvm.Image.run ~host:Ffi.host img in
+  if not img.Pvm.Image.is_effect then Stdlib.print_endline (Vm.Value.to_string v)
+
+(* --- command-line surface ------------------------------------------------- *)
+
+let demo_cmd =
+  let open Cmdliner in
+  Cmd.v
+    (Cmd.info "demo" ~doc:"Run built-in sample programs on the CESK machine.")
+    Term.(const run_all $ trace_arg)
+
+let corefn_dir_arg =
+  let open Cmdliner in
+  Arg.(value & opt string "./output" & info [ "corefn-dir" ] ~docv:"DIR"
+       ~doc:"Directory of `purs` CoreFn output (per-module subdirs).")
+
+let output_arg =
+  let open Cmdliner in
+  Arg.(value & opt string "output-purvm" & info [ "output"; "o" ] ~docv:"DIR"
+       ~doc:"Output directory: the image at its root, intermediates under _build/.")
+
+let build_cmd =
+  let open Cmdliner in
+  let em = Arg.(value & opt string "Main" & info [ "entry-module"; "m" ] ~docv:"MODULE") in
+  let e = Arg.(value & opt string "main" & info [ "entry"; "e" ] ~docv:"NAME") in
+  let arg = Arg.(value & opt (some int) None & info [ "arg" ] ~docv:"INT"
+                 ~doc:"Apply the entry to this Int (an Int -> Int entry).") in
+  let value = Arg.(value & flag & info [ "value" ]
+                   ~doc:"Entry is a plain value (do not apply); default treats it as Effect.") in
+  Cmd.v
+    (Cmd.info "build" ~doc:"Compile a CoreFn dir's modules (incrementally) and link an image.")
+    Term.(const build_action $ corefn_dir_arg $ output_arg $ em $ e $ arg $ value)
+
+let compile_cmd =
+  let open Cmdliner in
+  Cmd.v
+    (Cmd.info "compile" ~doc:"Compile one module's corefn.json to .pvmo + .pvmi.")
+    Term.(
+      const compile_action
+      $ Arg.(required & pos 0 (some string) None & info [] ~docv:"COREFN_JSON")
+      $ output_arg)
+
+let run_cmd =
+  let open Cmdliner in
+  Cmd.v
+    (Cmd.info "run" ~doc:"Run a linked .pvm image.")
+    Term.(const run_action $ Arg.(required & pos 0 (some string) None & info [] ~docv:"IMAGE"))
+
 let cmd =
   let open Cmdliner in
-  let doc = "Run sample programs on the CESK machine." in
-  Cmd.v (Cmd.info "cesk" ~version:"0.1.0" ~doc) Term.(const run_all $ trace_arg)
+  Cmd.group
+    (Cmd.info "purvm" ~version:"0.1.0" ~doc:"The PURVASM bytecode toolchain.")
+    [ build_cmd; compile_cmd; run_cmd; demo_cmd ]
 
 let () = Stdlib.exit (Cmdliner.Cmd.eval cmd)

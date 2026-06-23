@@ -3,6 +3,44 @@
 - Status: Accepted
 - Date: 2026-06-22
 
+> **Progress (2026-06-22).** Slice 1 implemented as a new `pvm` library
+> (`boot/lib/pvm/`) + the `purvm` executable (`boot/bin/`). `Image` is the runnable
+> form (gdefs + main) with an explicit, versioned JSON encoding of bytecode/`gdef`;
+> `Artifact` adds the per-module `.pvmo` (binding groups as bytecode) and `.pvmi`
+> (exports + imports + a content hash over the export surface). `Compile.compile_module`
+> compiles one CoreFn module in isolation (cross-module/foreign refs left as names);
+> `Plink.link` does name-graph reachability DCE and merges the reached definitions,
+> compiling reached *structural* foreigns into shared runtime definitions and leaving
+> *native* leaves to the host. Two enabling refinements: `Codegen.gdef_of_expr` (the
+> per-binding classifier shared with the whole-program `program`), and a **host
+> fall-through in `Machine`'s name lookup** so a separately-compiled module can name a
+> native leaf as a plain `Load` (no resolver ran). `purvm` has `compile` / `build`
+> (incremental: a `.pvmo` is reused only if it is newer than its source *and* still
+> loads at the current artifact version) / `run` (+ the old sample `demo`). CLI
+> layout: `--corefn-dir` (default `./output`) is read; `-o` /
+> `--output` (default `output-purvm`) holds `app.pvm` at its root and `.pvmo`/`.pvmi`
+> under `_build/`; `--entry-module`/`--entry` default to `Main`/`main`. The entry is
+> treated as an `Effect` by default (applied to unit, performed, its `Unit` result
+> suppressed via an `is_effect` flag in the image); `--arg N` runs an `Int -> Int`
+> entry and `--value` a bare value, both printing the result.
+> Differential equivalence holds for the image path and full separate
+> compilation — per-module compile → serialize/deserialize → link → run equals the
+> oracle — including cross-module fixtures (trans, diamond), `show` (native), and
+> `Effect` (Ref by value, Console by stdout order); e2e `image` (5) + `sepcomp` (7)
+> groups, full suite green, no benchmark regression. The `.pvmi`-hash *cascade*
+> (downstream skip) is in place structurally but dormant — slice 1 has no cross-module
+> compile dependency on `.pvmi`; it activates with the deferred cross-module optimiser.
+
+> **Convention (2026-06-22) — `Image.format_version` is the artifact-compatibility
+> stamp; bump it on ANY change that alters a `.pvmo`/`.pvmi`/`.pvm`'s meaning.** This
+> includes changes to the JSON *encoding* **and**, crucially, changes to *codegen* (the
+> emitted bytecode) even when the encoding is untouched — incremental reuse keys off
+> this version (a `.pvmo` that no longer loads at the current version is recompiled), so
+> a codegen change without a bump would silently serve stale bytecode. Until a derived
+> compiler fingerprint exists, this is a manual discipline: editing `Codegen` /
+> `Bytecode` / `Match_compile` output ⇒ bump `format_version`. (A future improvement is
+> to derive the stamp from a hash of the codegen so it cannot be forgotten.)
+
 ## Context
 
 The VM runs every program the oracle does (ADR-0030/0031/0032), but only as an

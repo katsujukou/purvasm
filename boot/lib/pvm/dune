@@ -1,0 +1,4 @@
+(library
+ (name pvm)
+ (public_name purvasm.pvm)
+ (libraries cesk corefn lower link middle_end vm yojson))

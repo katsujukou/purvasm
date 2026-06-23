@@ -159,7 +159,17 @@ let rec run
     | None ->
       (match Hashtbl.find_opt globals x with
        | Some v -> v
-       | None -> stuck ("unbound variable: " ^ x))
+       | None ->
+         (* Native-foreign fall-through (ADR-0032/0033): under separate compilation a
+            module references a native leaf by plain name (no resolver ran), so a
+            global miss is resolved through the host registry before giving up. The
+            materialised foreign is cached in the global table, so a leaf referenced in
+            a hot loop is allocated once, not per reference. *)
+         (match foreigns x with
+          | Some v ->
+            Hashtbl.replace globals x v;
+            v
+          | None -> stuck ("unbound variable: " ^ x)))
   in
   let do_return () = frames := List.tl !frames in
   (* A computed value (partial application / saturated constructor) is pushed; in

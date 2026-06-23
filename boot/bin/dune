@@ -1,4 +1,14 @@
 (executable
  (name main)
  (public_name purvm)
- (libraries purvasm.cesk cmdliner))
+ (libraries
+  purvasm.cesk
+  purvasm.corefn
+  purvasm.lower
+  purvasm.link
+  purvasm.middle_end
+  purvasm.vm
+  purvasm.pvm
+  purvasm.ffi
+  cmdliner
+  unix))

@@ -791,6 +791,149 @@ let test_vm_effect_console () =
   in
   Alcotest.(check string) "console stdout (order)" oracle_out vm_out
 
+(* --- separate-compilation image (ADR-0033): serialize -> deserialize -> run --- *)
+
+(* A program survives the round-trip through a serialized image iff running the
+   reloaded image equals the oracle. Compiles the term to an image, serializes it to
+   JSON text and back (exercising the on-disk format), then runs it. *)
+let same_on_image (label : string) (t : C.term) =
+  let img = Pvm.Image.of_string (Pvm.Image.to_string (Pvm.Image.of_term t)) in
+  Alcotest.(check string)
+    label
+    (V.to_string (Cesk.Machine.eval ~host:Ffi.host t))
+    (Vm.Value.to_string (Pvm.Image.run ~host:Ffi.host img))
+
+(* A non-round double must survive the text image bit-for-bit (IEEE-bits encoding),
+   checked exactly rather than via the cross-printer string form. *)
+let test_image_float_bits () =
+  let f = 1.0 /. 3.0 in
+  let img = Pvm.Image.of_string (Pvm.Image.to_string (Pvm.Image.of_term (C.Lit (C.LNumber f)))) in
+  match Pvm.Image.run ~host:Ffi.host img with
+  | Vm.Value.Vnumber g ->
+    Alcotest.(check bool)
+      "float bits round-trip"
+      true
+      (Int64.equal (Int64.bits_of_float g) (Int64.bits_of_float f))
+  | _ -> Alcotest.fail "expected Vnumber"
+
+let test_image_answer () = same_on_image "image.answer" (prelude_term "answer")
+let test_image_doubled () = same_on_image "image.doubled" (prelude_term "doubled")
+let test_image_show () = same_on_image "image.shownStr" (prelude_term "shownStr")
+
+let test_image_fib () =
+  same_on_image
+    "image.fib 10"
+    (C.App
+       ( Link.link_program
+           ~resolver:Ffi.resolver
+           ~outdir:"../fixtures/fib"
+           ~entry_module:[ "FibAnd" ]
+           ~entry:"fib"
+           ()
+       , int 10 ))
+
+(* Effect through an image: the entry is forced by applying `main` to unit (as
+   `run_effect` does), and the side effects must occur in order on the reloaded
+   image. *)
+let test_image_effect_console () =
+  let t =
+    effect_term ~outdir:"../fixtures/effect_console" ~entry_module:[ "ConsoleMain" ]
+  in
+  let img =
+    Pvm.Image.of_string
+      (Pvm.Image.to_string (Pvm.Image.of_term (C.App (t, C.Lit (C.LInt 0)))))
+  in
+  let oracle_out =
+    with_captured_stdout (fun () -> ignore (Cesk.Machine.run_effect ~host:Ffi.host t))
+  in
+  let img_out = with_captured_stdout (fun () -> ignore (Pvm.Image.run ~host:Ffi.host img)) in
+  Alcotest.(check string) "image console stdout (order)" oracle_out img_out
+
+(* --- separate compilation (ADR-0033): per-module artifacts -> link -> run ----- *)
+
+(* Compile each module of a program to its own `.pvmo`, round-trip every artifact
+   through the on-disk format, link the reachable definitions for the entry, and run
+   the resulting image. This exercises true separate compilation (one module at a
+   time) and cross-module linking — the heart of ADR-0033. *)
+let sepcomp_image ~outdir ~entry_module ~entry ?arg () : Pvm.Image.t =
+  let artifacts =
+    Link.load ~outdir ~entry_module
+    |> List.map (fun m ->
+         Pvm.Artifact.module_of_string
+           (Pvm.Artifact.module_to_string (Pvm.Compile.compile_module m)))
+  in
+  let entry_key = Lower.qualified_key entry_module entry in
+  let main_term =
+    match arg with None -> C.Var entry_key | Some a -> C.App (C.Var entry_key, a)
+  in
+  Pvm.Plink.link artifacts ~resolver:Ffi.resolver ~main_term
+
+let oracle_value ~outdir ~entry_module ~entry ?arg () : V.t =
+  let base =
+    Link.link_program ~resolver:Ffi.resolver ~outdir ~entry_module ~entry ()
+  in
+  let t = match arg with None -> base | Some a -> C.App (base, a) in
+  Cesk.Machine.eval ~host:Ffi.host t
+
+let same_on_sepcomp label ~outdir ~entry_module ~entry ?arg () =
+  Alcotest.(check string)
+    label
+    (V.to_string (oracle_value ~outdir ~entry_module ~entry ?arg ()))
+    (Vm.Value.to_string
+       (Pvm.Image.run ~host:Ffi.host (sepcomp_image ~outdir ~entry_module ~entry ?arg ())))
+
+let test_sc_answer () =
+  same_on_sepcomp "sc.answer" ~outdir:"../fixtures/prelude" ~entry_module:[ "Main" ]
+    ~entry:"answer" ()
+
+let test_sc_doubled () =
+  same_on_sepcomp "sc.doubled" ~outdir:"../fixtures/prelude" ~entry_module:[ "Main" ]
+    ~entry:"doubled" ()
+
+let test_sc_show () =
+  same_on_sepcomp "sc.shownStr" ~outdir:"../fixtures/prelude" ~entry_module:[ "Main" ]
+    ~entry:"shownStr" ()
+
+let test_sc_fib () =
+  same_on_sepcomp "sc.fib 10" ~outdir:"../fixtures/fib" ~entry_module:[ "FibAnd" ]
+    ~entry:"fib" ~arg:(int 10) ()
+
+(* Cross-module linking: the entry's value is defined in terms of other modules'
+   exports, so the image must merge several `.pvmo`s. *)
+let test_sc_transitive () =
+  same_on_sepcomp "sc.trans.a" ~outdir:"../fixtures/trans" ~entry_module:[ "TransA" ]
+    ~entry:"a" ()
+
+let test_sc_diamond () =
+  same_on_sepcomp "sc.diamond.both" ~outdir:"../fixtures/diamond" ~entry_module:[ "DiaA" ]
+    ~entry:"both" ()
+
+(* The `.pvmi` interface carries each public export's kind/arity and a hash over that
+   surface, and survives serialization (ADR-0033). *)
+let test_sc_interface () =
+  let modules = Link.load ~outdir:"../fixtures/fib" ~entry_module:[ "FibAnd" ] in
+  let m =
+    List.find (fun (mm : Corefn.Module.t) -> String.equal (Link.name_key mm.name) "FibAnd") modules
+  in
+  let i = Pvm.Artifact.interface_of (Pvm.Compile.compile_module m) in
+  let i2 = Pvm.Artifact.interface_of_string (Pvm.Artifact.interface_to_string i) in
+  Alcotest.(check string) "interface hash stable through serde" i.Pvm.Artifact.hash i2.Pvm.Artifact.hash;
+  match List.assoc_opt "FibAnd.fib" i.Pvm.Artifact.exports with
+  | Some (Pvm.Artifact.Efn 1) -> ()
+  | _ -> Alcotest.fail "FibAnd.fib should be exported as a fn/1"
+
+let test_sc_effect_console () =
+  let t = effect_term ~outdir:"../fixtures/effect_console" ~entry_module:[ "ConsoleMain" ] in
+  let img =
+    sepcomp_image ~outdir:"../fixtures/effect_console" ~entry_module:[ "ConsoleMain" ]
+      ~entry:"main" ~arg:(int 0) ()
+  in
+  let oracle_out =
+    with_captured_stdout (fun () -> ignore (Cesk.Machine.run_effect ~host:Ffi.host t))
+  in
+  let img_out = with_captured_stdout (fun () -> ignore (Pvm.Image.run ~host:Ffi.host img)) in
+  Alcotest.(check string) "sc console stdout (order)" oracle_out img_out
+
 let test_vm_app () = same_on_vm "app.result" (program "result")
 
 let test_vm_prelude_answer () = same_on_vm "prelude.answer" (prelude_term "answer")
@@ -958,6 +1101,24 @@ let () =
         ; Alcotest.test_case "show_string" `Quick test_vm_show_string
         ; Alcotest.test_case "effect_ref" `Quick test_vm_effect_ref
         ; Alcotest.test_case "effect_console" `Quick test_vm_effect_console
+        ] )
+    ; ( "image"
+      , [ Alcotest.test_case "float_bits" `Quick test_image_float_bits
+        ; Alcotest.test_case "answer" `Quick test_image_answer
+        ; Alcotest.test_case "doubled" `Quick test_image_doubled
+        ; Alcotest.test_case "show" `Quick test_image_show
+        ; Alcotest.test_case "fib" `Quick test_image_fib
+        ; Alcotest.test_case "effect_console" `Quick test_image_effect_console
+        ] )
+    ; ( "sepcomp"
+      , [ Alcotest.test_case "answer" `Quick test_sc_answer
+        ; Alcotest.test_case "doubled" `Quick test_sc_doubled
+        ; Alcotest.test_case "show" `Quick test_sc_show
+        ; Alcotest.test_case "fib" `Quick test_sc_fib
+        ; Alcotest.test_case "transitive" `Quick test_sc_transitive
+        ; Alcotest.test_case "diamond" `Quick test_sc_diamond
+        ; Alcotest.test_case "interface" `Quick test_sc_interface
+        ; Alcotest.test_case "effect_console" `Quick test_sc_effect_console
         ] )
     ; ( "prelude"
       , [ Alcotest.test_case "answer" `Quick test_prelude_answer

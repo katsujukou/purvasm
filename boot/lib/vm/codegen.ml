@@ -85,28 +85,28 @@ and gen_value (c : A.cexpr) : B.instr list =
 and gen_case (tail : bool) (scruts : A.atom list) (alts : A.alt list) : B.instr list =
   Match_compile.compile ~atom:gen_atom ~body:gen_expr ~tail scruts alts
 
-(** Split the top-level spine into global definitions (in dependency order) and the
-    [main] chunk. A function becomes a [Gfun]; a non-recursive `let` value a strict
-    [Gcaf]; a recursive group's non-function member a by-need [Grec] (so a cyclic
-    instance-dictionary group can close, ADR-0024/0032); the first non-binding
-    expression is [main]. *)
+(** Classify a binding's ANF right-hand side into a global definition: a syntactic
+    lambda is a [Gfun]; otherwise a CAF — strict ([Gcaf]) or, in a recursive group,
+    by-need ([Grec], ADR-0032). Shared by [program] (whole-program spine) and
+    separate compilation (ADR-0033, one binding at a time). A recursive *function*
+    member is closed by the global table; a recursive *value* member by [Grec]. *)
+let gdef_of_expr ~(recursive : bool) (e : A.expr) : gdef =
+  match e with
+  | A.Ret (A.CLam (ps, b)) -> Gfun (ps, fn_chunk b)
+  | _ ->
+    let chunk = Array.of_list (gen_expr true e) in
+    if recursive then Grec chunk else Gcaf chunk
+
+(** Split the top-level spine into global definitions (dependency order) and the
+    [main] chunk (the first non-binding expression). The whole-program path; separate
+    compilation (ADR-0033) instead compiles one binding at a time via [gdef_of_expr]. *)
 let program (e : A.expr) : (string * gdef) list * B.chunk =
   let rec walk acc = function
-    | A.Let (k, A.CLam (ps, b), rest) -> walk ((k, Gfun (ps, fn_chunk b)) :: acc) rest
     | A.Let (k, c, rest) ->
-      walk ((k, Gcaf (Array.of_list (gen_cexpr true c))) :: acc) rest
+      walk ((k, gdef_of_expr ~recursive:false (A.Ret c)) :: acc) rest
     | A.LetRec (binds, rest) ->
-      (* A recursive group: a function member is closed by the global table (it finds
-         its peers there at call time); a value member (e.g. an `Effect` instance
-         dictionary, or `fibAnd = Fib … \n -> … fibAnd …`) is built by-need so a
-         strict reference within the cycle resolves once a sibling is forced. *)
       let defs =
-        List.map
-          (fun (name, def) ->
-            match def with
-            | A.Ret (A.CLam (ps, b)) -> (name, Gfun (ps, fn_chunk b))
-            | _ -> (name, Grec (Array.of_list (gen_expr true def))))
-          binds
+        List.map (fun (name, def) -> (name, gdef_of_expr ~recursive:true def)) binds
       in
       walk (List.rev_append defs acc) rest
     | main -> (List.rev acc, Array.of_list (gen_expr true main))

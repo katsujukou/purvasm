@@ -8,16 +8,25 @@
     the CAFs in dependency (spine) order. Recursion is closed by the global table
     (top-level) and by [Make_rec] (local groups). *)
 
-(* [Value] is re-exported so callers can name the result type ([Vm.Value.t]); the
-   other submodules ([Bytecode]/[Codegen]/[Match_compile]/[Machine]/[Foreign]) are
-   internal. *)
+(* [Value] is re-exported for the result type ([Vm.Value.t]); [Bytecode]/[Codegen] for
+   the separate-compilation toolchain (ADR-0033) which serializes their data;
+   [Match_compile]/[Machine]/[Foreign] stay internal. *)
 module Value = Value
+module Bytecode = Bytecode
+module Codegen = Codegen
 
-(** Run a lower-IR (ANF) program to a value, resolving native foreigns through [host]
-    (default: none, for the pure core). *)
-let eval_anf ?(host = Cesk.Machine.no_host) (program : Middle_end.Anf.expr) : Value.t =
+(** Run a linked image — global definitions plus a [main] chunk — to a value,
+    resolving native foreigns through [host]. Start-up is ADR-0030/0032's: install
+    function closures, publish recursive-CAF by-need cells, build non-recursive CAFs
+    strictly in dependency order, then run [main]. Shared by [eval_anf] and the
+    [purvm] runner. *)
+let run_image
+      ?(host = Cesk.Machine.no_host)
+      (gdefs : (string * Codegen.gdef) list)
+      (main : Bytecode.chunk)
+  : Value.t
+  =
   let foreigns = Foreign.lookup host in
-  let gdefs, main = Codegen.program program in
   let globals : (string, Value.t) Hashtbl.t = Hashtbl.create 64 in
   (* Pass 1: install every top-level function as a global closure (it resolves the
      rest of the table at call time, so order is irrelevant). *)
@@ -62,6 +71,12 @@ let eval_anf ?(host = Cesk.Machine.no_host) (program : Middle_end.Anf.expr) : Va
       | Codegen.Gfun _ | Codegen.Grec _ -> ())
     gdefs;
   Machine.run_chunk ~foreigns globals main Value.SMap.empty
+
+(** Run a lower-IR (ANF) program to a value, resolving native foreigns through [host]
+    (default: none, for the pure core). *)
+let eval_anf ?(host = Cesk.Machine.no_host) (program : Middle_end.Anf.expr) : Value.t =
+  let gdefs, main = Codegen.program program in
+  run_image ~host gdefs main
 
 (** Run a [Cesk.Ast.term] by translating it to the lower IR (ADR-0025) and executing
     it on the VM — the bridge used by the differential check against the oracle. *)
