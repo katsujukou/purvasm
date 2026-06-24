@@ -557,11 +557,13 @@ let test_de_effect_ref () =
 
 (* --- DictElim + Simplify (ADR-0028) preserves semantics ------------------ *)
 
-(* The full optimiser pipeline so far; sound iff it agrees with the oracle. *)
+(* The full optimiser pipeline so far; sound iff it agrees with the oracle. DBE
+   (ADR-0034) runs last, consuming the effect analysis fed by [Ffi]'s leaf bits. *)
 let opt (t : C.term) : C.term =
   Middle_end.Transl.rev_transl
-    (Middle_end.Passes.Simplify.run
-       (Middle_end.Passes.Dict_elim.run (Middle_end.Transl.transl t)))
+    (Middle_end.Passes.Dbe.run ~effectful_leaf:Ffi.effectful ~foreign_arity:Ffi.foreign_arity
+       (Middle_end.Passes.Simplify.run
+          (Middle_end.Passes.Dict_elim.run (Middle_end.Transl.transl t))))
 
 let same_after_opt (label : string) (t : C.term) =
   Alcotest.(check string)
@@ -610,6 +612,49 @@ let test_opt_effect_ref () =
     "effect ref via opt"
     (as_int (Cesk.Machine.run_effect ~host:Ffi.host t))
     (as_int (Cesk.Machine.run_effect ~host:Ffi.host (opt t)))
+
+(* Count [let]/[letrec] bindings in an ANF program — a structural proxy for "did DBE
+   actually remove dead bindings", which a behaviour-only differential test cannot see
+   (an optimiser that silently became a no-op still passes every differential). *)
+let count_lets (e : Middle_end.Anf.expr) : int =
+  let open Middle_end.Anf in
+  let rec ex = function
+    | Ret c -> cx c
+    | Let (_, c, b) -> 1 + cx c + ex b
+    | LetRec (g, b) -> List.fold_left (fun a (_, r) -> a + ex r) (List.length g) g |> fun n -> n + ex b
+  and cx = function
+    | CLam (_, b) -> ex b
+    | CIf (_, t, e) -> ex t + ex e
+    | CCase (_, alts) ->
+      List.fold_left
+        (fun a (al : alt) ->
+          a
+          + (match al.result with
+             | Uncond e -> ex e
+             | Guarded gs -> List.fold_left (fun a (g, e) -> a + ex g + ex e) 0 gs))
+        0 alts
+    | _ -> 0
+  in
+  ex e
+
+let opt_pre (t : C.term) =
+  Middle_end.Passes.Simplify.run (Middle_end.Passes.Dict_elim.run (Middle_end.Transl.transl t))
+
+let opt_post (t : C.term) =
+  Middle_end.Passes.Dbe.run ~effectful_leaf:Ffi.effectful ~foreign_arity:Ffi.foreign_arity (opt_pre t)
+
+(* Effectiveness, not just soundness: assert DBE *actually fires* through the full
+   pipeline. A behaviour-only differential test would still pass if the pass silently
+   became a no-op; this fails unless dead pure bindings are removed. The whole-module
+   lowering keeps the module's private bindings (no cross-module reachability DCE here,
+   as in per-module compile), so an entry like `classify` leaves many dead pure
+   helpers that DBE must drop. *)
+let dbe_fires (label : string) (t : C.term) =
+  let pre = count_lets (opt_pre t) and post = count_lets (opt_post t) in
+  Alcotest.(check bool) (Printf.sprintf "%s: DBE drops dead lets (pre=%d post=%d)" label pre post) true (post < pre)
+
+let test_dbe_fires_classify () = dbe_fires "classify" (Lower.module_ fixture ~entry:"classify")
+let test_dbe_fires_anint () = dbe_fires "anInt" (Lower.module_ fixture ~entry:"anInt")
 
 (* --- PURVASM bytecode VM (ADR-0030) differential equivalence -------------- *)
 
@@ -1067,6 +1112,8 @@ let () =
         ; Alcotest.test_case "newtype" `Quick test_opt_newtype
         ; Alcotest.test_case "fib" `Quick test_opt_fib
         ; Alcotest.test_case "effect_ref" `Quick test_opt_effect_ref
+        ; Alcotest.test_case "dbe_fires_classify" `Quick test_dbe_fires_classify
+        ; Alcotest.test_case "dbe_fires_anint" `Quick test_dbe_fires_anint
         ] )
     ; ( "vm"
       , [ Alcotest.test_case "fixture" `Quick test_vm_fixture

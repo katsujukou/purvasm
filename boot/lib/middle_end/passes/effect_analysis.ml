@@ -61,6 +61,43 @@ let join a b =
   ; ret_vsat = a.ret_vsat || b.ret_vsat
   }
 
+(* Local-name uniqueness invariant: PureScript's CoreFn renames shadowed locals to
+   distinct names (e.g. `case Just x of Just x -> …` emits the inner binder as `x1`),
+   and lowering/[Transl] keep source names verbatim (only ANF's own `$a…` are fresh).
+   So a case binder or lambda parameter never collides with an outer in-scope binding,
+   and a name not in [env] is genuinely free — [atom_sum]'s [unknown] default is
+   therefore correct without explicitly inserting binders. (The other passes, e.g.
+   [Simplify], rely on the same invariant.) *)
+
+(* Does [x] occur in an atom position anywhere in [e]? The dead-binding eliminator
+   keeps a binding that is still referenced. Shadowing is ignored — an occurrence under
+   an inner binder of the same name is still counted, which can only *keep* a binding,
+   never drop a live one (sound). *)
+let occurs (x : string) (e : expr) : bool =
+  let in_atom = function AVar y -> String.equal x y | _ -> false in
+  let any = List.exists in_atom in
+  let rec ex = function
+    | Ret c -> cx c
+    | Let (_, c, body) -> cx c || ex body
+    | LetRec (g, body) -> List.exists (fun (_, r) -> ex r) g || ex body
+  and cx = function
+    | CAtom a -> in_atom a
+    | CApp (h, args) -> in_atom h || any args
+    | CPrim (_, args) | CArray args -> any args
+    | CCtor (_, _, args) -> any args
+    | CRecord fs -> any (List.map snd fs)
+    | CAccessor (a, _) -> in_atom a
+    | CUpdate (a, ups) -> in_atom a || any (List.map snd ups)
+    | CLam (_, body) -> ex body
+    | CIf (a, t, e) -> in_atom a || ex t || ex e
+    | CCase (ats, alts) -> any ats || List.exists alt alts
+  and alt (a : alt) =
+    match a.result with
+    | Uncond e -> ex e
+    | Guarded gs -> List.exists (fun (g, e) -> ex g || ex e) gs
+  in
+  ex e
+
 (* The arity to *seed* a recursive-group member with before the fixpoint: its
    parameter count when it is a (possibly let-wrapped) lambda. A point-free binding
    (e.g. [inc = add 1], a partial application) has no syntactic lambda, so it seeds 0
@@ -81,6 +118,9 @@ let rec rhs_arity (e : expr) : int =
 type t =
   { analyze : expr -> vsum M.t
   ; eperf : expr -> bool
+  ; dbe : expr -> expr
+        (* Dead-binding elimination (ADR-0034's partial-correctness DBE): drop a
+           [let x = c in body] when [c] cannot perform and [x] is unused in [body]. *)
   }
 
 (** Build the analysis for a given native-leaf classification: [effectful_leaf] (does
@@ -204,6 +244,46 @@ let create ~(effectful_leaf : string -> bool) ~(foreign_arity : string -> int) :
     | Let (x, c, rest) -> collect (M.add x (vsum_c env c) env) rest
     | LetRec (g, rest) -> collect (fix_group env g) rest
   in
+  (* Rewrite, threading the same scope env the analysis uses, dropping dead pure lets.
+     The body is rewritten first so a binding becomes droppable once the rewrite has
+     removed its last use. *)
+  let rec dbe env (e : expr) : expr =
+    match e with
+    | Ret c -> Ret (dbe_c env c)
+    | Let (x, c, body) ->
+      let pure = not (eperf_c env c) in
+      let env' = M.add x (vsum_c env c) env in
+      let body' = dbe env' body in
+      if pure && not (occurs x body') then body' else Let (x, dbe_c env c, body')
+    | LetRec (g, body) ->
+      let env' = fix_group env g in
+      let body' = dbe env' body in
+      if List.for_all (fun (n, _) -> not (occurs n body')) g
+         && not (List.exists (fun (_, rhs) -> eperf_expr env' rhs) g)
+      then body' (* whole group unused and pure to build: drop it *)
+      else LetRec (List.map (fun (n, rhs) -> (n, dbe env' rhs)) g, body')
+  and dbe_c env (c : cexpr) : cexpr =
+    match c with
+    | CLam (ps, body) ->
+      let env' = List.fold_left (fun e p -> M.add p unknown e) env ps in
+      CLam (ps, dbe env' body)
+    | CIf (a, t, e) -> CIf (a, dbe env t, dbe env e)
+    | CCase (ats, alts) ->
+      CCase
+        ( ats
+        , List.map
+            (fun (al : alt) ->
+              { al with
+                result =
+                  (match al.result with
+                   | Uncond e -> Uncond (dbe env e)
+                   | Guarded gs -> Guarded (List.map (fun (g, e) -> dbe env g, dbe env e) gs))
+              })
+            alts )
+    | CAtom _ | CApp _ | CPrim _ | CCtor _ | CArray _ | CRecord _ | CAccessor _ | CUpdate _ ->
+      c
+  in
   { analyze = (fun program -> collect M.empty program)
   ; eperf = (fun program -> eperf_expr M.empty program)
+  ; dbe = (fun program -> dbe M.empty program)
   }

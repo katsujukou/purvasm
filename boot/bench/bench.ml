@@ -29,12 +29,17 @@ let measure ?(host = Cesk.Machine.no_host) (t : C.term) : int * int =
    step/alloc are now the *proxy* this replaces. Each VM variant is an ANF transform
    (the VM runs the lower IR directly), so the optimiser passes' effect is visible in
    true VM-instruction terms — the decision the oracle proxy could not make. *)
+(* Dead-binding elimination (ADR-0034), wired with [Ffi]'s native-leaf classification;
+   the last pass of the [opt] pipeline. *)
+let dbe : Middle_end.Anf.expr -> Middle_end.Anf.expr =
+  Middle_end.Passes.Dbe.run ~effectful_leaf:Ffi.effectful ~foreign_arity:Ffi.foreign_arity
+
 let vm_variants : (string * (C.term -> Middle_end.Anf.expr)) list =
   [ ("anf", fun t -> T.transl t)
   ; ("dictelim", fun t -> Middle_end.Passes.Dict_elim.run (T.transl t))
   ; ( "opt"
-    , fun t ->
-        Middle_end.Passes.Simplify.run (Middle_end.Passes.Dict_elim.run (T.transl t)) )
+    , fun t -> dbe (Middle_end.Passes.Simplify.run (Middle_end.Passes.Dict_elim.run (T.transl t)))
+    )
   ]
 
 (* Instructions executed (deterministic), wall-clock milliseconds, and the result
@@ -62,8 +67,9 @@ let variants : (string * (C.term -> C.term)) list =
   ; ( "opt"
     , fun t ->
         Middle_end.Transl.rev_transl
-          (Middle_end.Passes.Simplify.run
-             (Middle_end.Passes.Dict_elim.run (Middle_end.Transl.transl t))) )
+          (dbe
+             (Middle_end.Passes.Simplify.run
+                (Middle_end.Passes.Dict_elim.run (Middle_end.Transl.transl t)))) )
   ]
 
 (* label, entry module, entry (an `Int -> Int`), and the input sizes to sweep. *)
@@ -193,8 +199,7 @@ let () =
             (* ADR-0031 measurement: recompile the opt pipeline with the naive
                explicit matcher and re-run, to quantify the decision tree's win. *)
             let opt_anf =
-              Middle_end.Passes.Simplify.run
-                (Middle_end.Passes.Dict_elim.run (T.transl term))
+              dbe (Middle_end.Passes.Simplify.run (Middle_end.Passes.Dict_elim.run (T.transl term)))
             in
             let nv, opt_naive = Vm.eval_anf_counted ~naive:true opt_anf in
             if not (String.equal (Vm.Value.to_string nv) oracle)

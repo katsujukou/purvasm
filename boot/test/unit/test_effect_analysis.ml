@@ -159,6 +159,44 @@ let test_point_free_arity () =
   check_eperf "forcing point-free logIt performs" true
     (with_log (A.Let ("u", A.CApp (A.AVar "logIt", [ i 0 ]), A.Ret (A.CAtom (A.AVar "u")))))
 
+(* --- dead-binding elimination (the analysis' consumer) -------------------- *)
+
+module D = Middle_end.Passes.Dbe
+
+let dbe = D.run ~effectful_leaf:Ffi.effectful ~foreign_arity:Ffi.foreign_arity
+let ret0 = A.Ret (A.CAtom (A.ALit (LInt 0)))
+let is_ret0 = function A.Ret (A.CAtom (A.ALit (LInt 0))) -> true | _ -> false
+let is_let name = function A.Let (n, _, _) -> String.equal n name | _ -> false
+let add12 = A.CPrim (AddInt, [ A.ALit (LInt 1); A.ALit (LInt 2) ])
+
+(* A dead, pure binding is dropped. *)
+let test_dbe_drops_dead_pure () =
+  Alcotest.(check bool) "drop dead pure let" true (is_ret0 (dbe (A.Let ("x", add12, ret0))))
+
+(* A used binding is kept. *)
+let test_dbe_keeps_used () =
+  Alcotest.(check bool) "keep used let" true
+    (is_let "x" (dbe (A.Let ("x", add12, A.Ret (A.CAtom (A.AVar "x"))))))
+
+(* A dead binding that *performs* is kept (forced log). *)
+let test_dbe_keeps_effectful () =
+  Alcotest.(check bool) "keep dead effectful let" true
+    (is_let "u"
+       (dbe
+          (A.Let
+             ("u", A.CApp (A.AForeign "Effect.Console.log", [ A.ALit (LString "x"); A.ALit (LInt 0) ]), ret0))))
+
+(* I1: a dead binding that only *builds* an Effect (never forces it) is droppable. *)
+let test_dbe_drops_effect_build () =
+  Alcotest.(check bool) "drop dead Effect build (I1)" true (is_ret0 (dbe (A.Let ("p", log_app "x", ret0))))
+
+let dbe_suite =
+  [ Alcotest.test_case "drops dead pure" `Quick test_dbe_drops_dead_pure
+  ; Alcotest.test_case "keeps used" `Quick test_dbe_keeps_used
+  ; Alcotest.test_case "keeps dead effectful" `Quick test_dbe_keeps_effectful
+  ; Alcotest.test_case "drops dead Effect build (I1)" `Quick test_dbe_drops_effect_build
+  ]
+
 let suite =
   [ Alcotest.test_case "log build is pure (I1)" `Quick test_log_build_is_pure
   ; Alcotest.test_case "log force performs" `Quick test_log_force_performs
@@ -172,4 +210,4 @@ let suite =
   ; Alcotest.test_case "point-free arity" `Quick test_point_free_arity
   ]
 
-let () = Alcotest.run "effect_analysis" [ "effect_analysis", suite ]
+let () = Alcotest.run "effect_analysis" [ "effect_analysis", suite; "dbe", dbe_suite ]
