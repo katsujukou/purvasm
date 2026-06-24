@@ -455,6 +455,23 @@ let host : Cesk.Machine.host =
            | _ -> Cesk.Errors.stuck "log: not a String"))
     | _ -> None
 
+(** Whether applying a native leaf yields an *effectful* value — one whose force (its
+    `Effect` thunk run to saturation) performs an observable effect (ADR-0034's leaf
+    bits). Only `Effect.Console.log` does real IO; the `Data.Show` leaves are pure.
+    This is the source of truth the effect analysis ([Middle_end.Effect_analysis])
+    consumes for foreign leaves; structural mutation (`Ref` → `NewArray`/`SetArray`)
+    is recognised by the analysis from the primops themselves. *)
+let effectful (key : string) : bool = String.equal key "Effect.Console.log"
+
+(** A native leaf's declared arity (the [host] entry's). The effect analysis needs the
+    real arity, not an assumed 1, to tell a partial application (a pure build) from a
+    saturated call: a multi-argument effectful leaf such as a future [runEffectFnN]
+    ([EffectFnN -> ... -> Effect c], arity N+1) returns its `Effect` thunk only when
+    fully applied, so assuming arity 1 would mis-place the effect. Unknown keys default
+    to 1 (a truly unbound foreign is handled conservatively in the analysis). *)
+let foreign_arity (key : string) : int =
+  match host key with Some (ar, _) -> ar | None -> 1
+
 (** The native rung: a name is bound to an opaque [Foreign] reference exactly when
     the host registry implements it, so the two never drift apart. *)
 let native_provider : provider = fun key -> Option.map (fun _ -> C.Foreign key) (host key)
