@@ -613,45 +613,90 @@ let test_opt_effect_ref () =
     (as_int (Cesk.Machine.run_effect ~host:Ffi.host t))
     (as_int (Cesk.Machine.run_effect ~host:Ffi.host (opt t)))
 
-(* Count [let]/[letrec] bindings in an ANF program — a structural proxy for "did DBE
-   actually remove dead bindings", which a behaviour-only differential test cannot see
-   (an optimiser that silently became a no-op still passes every differential). *)
-let count_lets (e : Middle_end.Anf.expr) : int =
+(* Structural node counts — the basis for "effectiveness" tests: a behaviour-only
+   differential test can verify an optimiser is *sound* but not that it *fired* (a pass
+   that silently became a no-op still passes every differential). Each pass below is
+   asserted to move the metric it uniquely owns. Returns (lets, accessors, prims,
+   apps). *)
+let node_counts (e : Middle_end.Anf.expr) : int * int * int * int =
   let open Middle_end.Anf in
+  let l = ref 0 and acc = ref 0 and pr = ref 0 and ap = ref 0 in
   let rec ex = function
     | Ret c -> cx c
-    | Let (_, c, b) -> 1 + cx c + ex b
-    | LetRec (g, b) -> List.fold_left (fun a (_, r) -> a + ex r) (List.length g) g |> fun n -> n + ex b
+    | Let (_, c, b) ->
+      incr l;
+      cx c;
+      ex b
+    | LetRec (g, b) ->
+      List.iter
+        (fun (_, r) ->
+          incr l;
+          ex r)
+        g;
+      ex b
   and cx = function
+    | CAccessor _ -> incr acc
+    | CPrim (_, _) -> incr pr
+    | CApp (_, _) -> incr ap
     | CLam (_, b) -> ex b
-    | CIf (_, t, e) -> ex t + ex e
+    | CIf (_, t, e) ->
+      ex t;
+      ex e
     | CCase (_, alts) ->
-      List.fold_left
-        (fun a (al : alt) ->
-          a
-          + (match al.result with
-             | Uncond e -> ex e
-             | Guarded gs -> List.fold_left (fun a (g, e) -> a + ex g + ex e) 0 gs))
-        0 alts
-    | _ -> 0
+      List.iter
+        (fun (al : alt) ->
+          match al.result with
+          | Uncond e -> ex e
+          | Guarded gs ->
+            List.iter
+              (fun (g, e) ->
+                ex g;
+                ex e)
+              gs)
+        alts
+    | _ -> ()
   in
-  ex e
+  ex e;
+  (!l, !acc, !pr, !ap)
 
-let opt_pre (t : C.term) =
-  Middle_end.Passes.Simplify.run (Middle_end.Passes.Dict_elim.run (Middle_end.Transl.transl t))
+let n_lets e = let l, _, _, _ = node_counts e in l
+let n_apps e = let _, _, _, a = node_counts e in a
+let transl = Middle_end.Transl.transl
+let dictelim t = Middle_end.Passes.Dict_elim.run (transl t)
+let simplify t = Middle_end.Passes.Simplify.run (dictelim t)
+
+let opt_pre (t : C.term) = simplify t
 
 let opt_post (t : C.term) =
   Middle_end.Passes.Dbe.run ~effectful_leaf:Ffi.effectful ~foreign_arity:Ffi.foreign_arity (opt_pre t)
 
-(* Effectiveness, not just soundness: assert DBE *actually fires* through the full
-   pipeline. A behaviour-only differential test would still pass if the pass silently
-   became a no-op; this fails unless dead pure bindings are removed. The whole-module
-   lowering keeps the module's private bindings (no cross-module reachability DCE here,
-   as in per-module compile), so an entry like `classify` leaves many dead pure
-   helpers that DBE must drop. *)
+(* The fib program (Ord + Semiring dictionaries) — a rich witness for every pass. *)
+let fib10 () =
+  C.App
+    ( Link.link_program ~resolver:Ffi.resolver ~outdir:"../fixtures/fib" ~entry_module:[ "FibAnd" ] ~entry:"fib" ()
+    , int 10 )
+
+(* DictElim (ADR-0027) collapses statically-known dictionary dispatch, removing the
+   dictionary-method *applications* (it leaves the let-count untouched — that is
+   Simplify's job below, so the two metrics attribute cleanly). *)
+let test_dictelim_fires () =
+  let t = fib10 () in
+  let before = n_apps (transl t) and after = n_apps (dictelim t) in
+  Alcotest.(check bool) (Printf.sprintf "DictElim removes dispatch apps (%d -> %d)" before after) true (after < before)
+
+(* Simplify (ADR-0028) copy-propagates, dropping the alias [let]s DictElim leaves; the
+   let-count strictly drops (DictElim did not move it). *)
+let test_simplify_fires () =
+  let t = fib10 () in
+  let before = n_lets (dictelim t) and after = n_lets (simplify t) in
+  Alcotest.(check bool) (Printf.sprintf "Simplify drops alias lets (%d -> %d)" before after) true (after < before)
+
+(* DBE (ADR-0034) drops dead pure bindings. The whole-module lowering keeps a module's
+   private bindings (no cross-module reachability DCE here, as in per-module compile),
+   so an entry like `classify` leaves dead pure helpers DBE must remove. *)
 let dbe_fires (label : string) (t : C.term) =
-  let pre = count_lets (opt_pre t) and post = count_lets (opt_post t) in
-  Alcotest.(check bool) (Printf.sprintf "%s: DBE drops dead lets (pre=%d post=%d)" label pre post) true (post < pre)
+  let pre = n_lets (opt_pre t) and post = n_lets (opt_post t) in
+  Alcotest.(check bool) (Printf.sprintf "%s: DBE drops dead lets (%d -> %d)" label pre post) true (post < pre)
 
 let test_dbe_fires_classify () = dbe_fires "classify" (Lower.module_ fixture ~entry:"classify")
 let test_dbe_fires_anint () = dbe_fires "anInt" (Lower.module_ fixture ~entry:"anInt")
@@ -1103,6 +1148,7 @@ let () =
         ; Alcotest.test_case "prelude_show" `Quick test_de_prelude_show
         ; Alcotest.test_case "fib" `Quick test_de_fib
         ; Alcotest.test_case "effect_ref" `Quick test_de_effect_ref
+        ; Alcotest.test_case "fires" `Quick test_dictelim_fires
         ] )
     ; ( "opt"
       , [ Alcotest.test_case "prelude_answer" `Quick test_opt_prelude_answer
@@ -1112,6 +1158,7 @@ let () =
         ; Alcotest.test_case "newtype" `Quick test_opt_newtype
         ; Alcotest.test_case "fib" `Quick test_opt_fib
         ; Alcotest.test_case "effect_ref" `Quick test_opt_effect_ref
+        ; Alcotest.test_case "simplify_fires" `Quick test_simplify_fires
         ; Alcotest.test_case "dbe_fires_classify" `Quick test_dbe_fires_classify
         ; Alcotest.test_case "dbe_fires_anint" `Quick test_dbe_fires_anint
         ] )
