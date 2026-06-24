@@ -3,6 +3,32 @@
 - Status: Accepted
 - Date: 2026-06-22
 
+> **Progress (2026-06-25).** The structural effect analysis
+> ([Middle_end.Effect_analysis]) and dead-binding elimination
+> ([Middle_end.Passes.Dbe]) are implemented and wired into the `opt` pipeline. The
+> force/saturation model (I1–I4) is realised as a dual per-value summary — `vsat`
+> (does saturating this value perform) and `ret_vsat` (is its saturated result an
+> effect-thunk) — plus `eperf` (the DBE predicate). Sound on every fixture and
+> benchmark (oracle differential, including `Effect` order). Cross-review hardened it:
+> over-application is conservatively may-perform (a 2-level summary cannot see effects
+> buried ≥2 levels deep in a let-returned closure chain), `foreign_sum` uses the host's
+> real arity (multi-arg leaves like a future `runEffectFnN`), and a redundant
+> case-binder shadowing guard was dropped once purs's Renamer was confirmed to make
+> locals unique. Effectiveness is asserted structurally — each pass (DictElim,
+> Simplify, DBE) has a "fires" test, since a behaviour-only differential cannot detect
+> a pass that silently became a no-op.
+>
+> **Impurification (GER) is deferred** (decided 2026-06-25). It needs the `Effect`
+> monad as a recognisable `bindE`/`pureE` tree to flatten, but in the current `opt`
+> ANF the do-block dispatch does not resolve that far: it stalls at the nested
+> `Monad → Bind → bind` dictionaries (`Control.Bind.bind dictBind`,
+> `Effect.monadEffect`/`bindEffect`, … never collapse to `Effect.bindE`, because the
+> current DictElim copy-propagates neither the local dict nor the nested dict fields).
+> Resolving that is exactly what caller-homed specialisation (the roadmap's step after
+> the optimiser study) provides — building GER now would only ever *decline*. So GER
+> waits for specialisation; the analysis and DBE already run soundly without it. See
+> [[optimizer-roadmap]].
+
 ## Context
 
 The optimiser will need to know which expressions **perform** an effect — to do a
