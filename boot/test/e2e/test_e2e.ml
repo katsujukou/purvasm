@@ -832,6 +832,39 @@ let test_i4_foreach () =
   i4_effect "foreachE"
     (C.App (C.App (foreign_ref "Effect.foreachE", C.Array [ int 10; int 20; int 30 ]), log_show_body "x"))
 
+(* whileE/untilE terminate via a Ref condition (mutable state), so these exercise the
+   loop combinators *together with* Ref + bindE sequencing across all backends. *)
+let bindE m k = C.App (C.App (foreign_ref "Effect.bindE", m), k)
+let pureE x = C.App (foreign_ref "Effect.pureE", x)
+let new_ref v = C.App (foreign_ref "Effect.Ref._new", v)
+let read_ref r = C.App (foreign_ref "Effect.Ref.read", r)
+let write_ref v r = C.App (C.App (foreign_ref "Effect.Ref.write", v), r)
+let log_show n = C.App (C.Foreign "Effect.Console.log", C.App (C.Foreign "Data.Show.showIntImpl", n))
+
+(* count 0..4, printing each, while the Ref is < 5. *)
+let test_i4_while () =
+  let prog =
+    bindE (new_ref (int 0)) (C.Lam ("ref",
+      C.App
+        ( C.App
+            ( foreign_ref "Effect.whileE"
+            , bindE (read_ref (C.Var "ref")) (C.Lam ("v", pureE (C.Prim (C.LtInt, [ C.Var "v"; int 5 ])))) )
+        , bindE (read_ref (C.Var "ref")) (C.Lam ("v",
+            bindE (log_show (C.Var "v")) (C.Lam ("_", write_ref (C.Prim (C.AddInt, [ C.Var "v"; int 1 ])) (C.Var "ref"))))) )))
+  in
+  i4_effect "whileE" prog
+
+(* run the body until the Ref reaches 3, printing 0,1,2. *)
+let test_i4_until () =
+  let body =
+    bindE (read_ref (C.Var "ref")) (C.Lam ("v",
+      bindE (log_show (C.Var "v")) (C.Lam ("_",
+        bindE (write_ref (C.Prim (C.AddInt, [ C.Var "v"; int 1 ])) (C.Var "ref"))
+          (C.Lam ("_", pureE (C.Prim (C.NotBool, [ C.Prim (C.LtInt, [ C.Prim (C.AddInt, [ C.Var "v"; int 1 ]); int 3 ]) ]))))))))
+  in
+  let prog = bindE (new_ref (int 0)) (C.Lam ("ref", C.App (foreign_ref "Effect.untilE", body))) in
+  i4_effect "untilE" prog
+
 (* --- PURVASM bytecode VM (ADR-0030) differential equivalence -------------- *)
 
 (* The VM is sound iff its result equals the oracle's on every pure program. The
@@ -1319,6 +1352,8 @@ let () =
     ; ( "i4"
       , [ Alcotest.test_case "forE" `Quick test_i4_fore
         ; Alcotest.test_case "foreachE" `Quick test_i4_foreach
+        ; Alcotest.test_case "whileE" `Quick test_i4_while
+        ; Alcotest.test_case "untilE" `Quick test_i4_until
         ] )
     ; ( "vm"
       , [ Alcotest.test_case "fixture" `Quick test_vm_fixture
