@@ -3,6 +3,37 @@
 - Status: Accepted
 - Date: 2026-06-25
 
+> **Progress (2026-06-25).** Implemented in `lib/ocaml_backend/codegen_ml.ml`: the `Rt`
+> prelude (`value`, `app`, primitives, `to_string` mirroring VM `Value.to_string`) + an
+> ANF→OCaml emitter, driven end-to-end (codegen → `ocamlopt` → run) against the oracle
+> in the e2e `ocaml` group. Covered: the pure subset; recursive *value* bindings via
+> OCaml `lazy` (forced on reference; ADR-0024); all binder kinds — incl. record and
+> number — via a CPS cascade matcher (`emit_match`); and the **foreign boundary** + an
+> Effect runner (force the entry to unit, perform, print the result).
+>
+> **Refinement to the foreign decision.** The Decision's foreign bullet proposed an
+> `Rt.value` ↔ oracle *bridge* onto `Ffi.host`. In practice the generated program is a
+> **self-contained `ocamlopt` executable** (stdlib only; it does *not* link the boot
+> libraries), so the native leaves are **re-implemented in the `Rt` prelude over
+> `Rt.value`** (`showInt`/`showString`/`showNumber`/`log`, added on demand — the
+> minimal-FFI policy), with the differential enforcing parity with `Ffi.host`. This is a
+> better fit for the self-contained-native goal than linking the compiler's host.
+>
+> **Update — the hybrid calling convention (option 2) is implemented.** A known-arity
+> function (a directly-lambda binding) emits a native multi-arg `fn_<x>` plus a `VClos`
+> wrapper `<x>`; an exactly-saturated call compiles to a *direct* `fn_x a b c` (no `app`,
+> no `VClos` — `ocamlopt` optimises it), while partial/over/unknown application falls
+> back to `app` (over-application saturates natively then `app`s the rest). Verified: a
+> recursive `fact`/`fib` compiles its self-calls as direct native calls (zero `app`),
+> preserving uncurrying.
+>
+> **Update — `case` decision-tree lowering.** A case whose binders are all *friendly*
+> (no record binder; a number literal rides a `VNumber v` binding + `when v = f` guard)
+> compiles to an OCaml `match`, so `ocamlopt` builds the decision tree (each scrutinee
+> examined once). A case containing a record binder falls back to the CPS cascade.
+> Verified: `classify`/`pick` compile to OCaml `match`, `viaRecord` to the cascade. The
+> remaining perf items (unboxing, arity-tagged native closures) stay deferred.
+
 ## Context
 
 ADR-0035 chose **OCaml 5 codegen** for boot's native backend: lower optimised ANF
