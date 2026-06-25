@@ -1,5 +1,9 @@
 module Purvasm.Compiler.Bytecode.Instruction where
 
+import Prelude
+
+import Data.Generic.Rep (class Generic)
+import Data.Show.Generic (genericShow)
 import Data.Tuple.Nested (type (/\))
 import Purvasm.Compiler.Literal (Literal)
 import Purvasm.Compiler.Primitive (PrimOp)
@@ -57,3 +61,8 @@ data Instruction
 
 
 type CodeBlock = Array Instruction
+
+derive instance Eq Instruction
+derive instance Generic Instruction _
+instance Show Instruction where
+  show i = genericShow i

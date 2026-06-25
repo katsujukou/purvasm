@@ -20,6 +20,19 @@
             "spec-node"
           ]
         }
+      },
+      "sample": {
+        "path": "sample",
+        "core": {
+          "dependencies": [
+            "console",
+            "effect",
+            "prelude"
+          ]
+        },
+        "test": {
+          "dependencies": []
+        }
       }
     },
     "package_set": {

@@ -1,7 +1,7 @@
--- | End-to-end of the implemented frontend: a CoreFn `Expr` through `translExpr`
--- | (CoreFn → CESK AST) then `normalize` (CESK AST → ANF). The full pipeline to runnable
--- | code awaits the `lower` (ANF → CodeBlock) backend; until then this exercises the two
--- | bridges together (ADR-0037 thin vertical slice).
+-- | End-to-end of the implemented pipeline as a black box: a CoreFn `Expr` in, the
+-- | lowered bytecode `CodeBlock` out — `translExpr` (CoreFn → CESK AST) ≫ `normalize`
+-- | (CESK AST → ANF) ≫ `lowerExpr` (ANF → bytecode). Asserting observable I/O, not
+-- | intermediate structure. (Becomes compile-and-run once a bytecode VM lands; ADR-0037.)
 module Test.E2E.Purvasm.Compiler where
 
 import Prelude
@@ -12,10 +12,9 @@ import PureScript.CoreFn.Ann (Ann)
 import PureScript.CoreFn.Expr (Expr(..)) as CF
 import PureScript.CoreFn.Literal (Literal(..)) as CF
 import PureScript.CoreFn.Names (Qualified(..)) as CF
+import Purvasm.Compiler.Bytecode.Instruction (CodeBlock, Instruction(..))
+import Purvasm.Compiler.Bytecode.Lower (lowerExpr)
 import Purvasm.Compiler.CESK.Translate (translExpr)
-import Purvasm.Compiler.Literal (Literal(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr)
-import Purvasm.Compiler.MiddleEnd.ANF as ANF
 import Purvasm.Compiler.MiddleEnd.Normalize (normalize)
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
@@ -34,18 +33,19 @@ local x = CF.Var nullAnn (CF.Qualified Nothing x)
 int :: Int -> CF.Expr
 int = CF.Literal nullAnn <<< CF.LitInt
 
-compileExpr :: CF.Expr -> Expr
-compileExpr = translExpr >>> normalize
+-- | The whole front-to-back lowering of a top-level (tail-position) expression.
+compile :: CF.Expr -> CodeBlock
+compile = translExpr >>> normalize >>> lowerExpr true
 
 main :: Effect Unit
 main = runSpecAndExitProcess [ consoleReporter ] spec
 
 spec :: Spec Unit
-spec = describe "frontend pipeline: CoreFn → CESK (transl) → ANF (normalize)" do
-  it "uncurries a curried application: f 1 2" do
-    compileExpr (CF.App nullAnn (CF.App nullAnn (local "f") (int 1)) (int 2))
-      `shouldEqual` ANF.Ret (CApp (AtomVar "f") [ AtomLit (LInt 1), AtomLit (LInt 2) ])
+spec = describe "pipeline: CoreFn → CESK → ANF → bytecode" do
+  it "lowers a curried application to one uncurried tail call" do
+    compile (CF.App nullAnn (CF.App nullAnn (local "f") (int 1)) (int 2))
+      `shouldEqual` [ Load "f", PushInt 1, PushInt 2, TailCall 2 ]
 
-  it "lowers an identity abstraction" do
-    compileExpr (CF.Abs nullAnn "x" (local "x"))
-      `shouldEqual` ANF.Ret (CLam [ "x" ] (ANF.Ret (CAtom (AtomVar "x"))))
+  it "lowers an identity abstraction to a returning closure" do
+    compile (CF.Abs nullAnn "x" (local "x"))
+      `shouldEqual` [ Closure [ "x" ] [ Load "x", Return ], Return ]
