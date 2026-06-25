@@ -13,6 +13,7 @@
 module A = Middle_end.Anf
 module C = Cesk.Ast
 module SS = Set.Make (String)
+module IM = Map.Make (String) (* name → arity, for known-arity functions (hybrid calls) *)
 
 (* The runtime-support module, emitted verbatim as the program's prelude. Kept in a
    raw string (no escaping). It must not contain the sequence that closes the literal. *)
@@ -206,11 +207,22 @@ let prim (lz : SS.t) (op : C.primop) (args : A.atom list) : string =
   Printf.sprintf "(%s %s)" (prim_fn op)
     (String.concat " " (List.map (fun a -> "(" ^ atom lz a ^ ")") args))
 
-(* A recursive-group member is emitted as a plain `let rec` binding when it is a
-   function (the knot ties through the closure), else as a `lazy` cell forced on use
-   (ADR-0024). Function = a (let-wrapped) lambda RHS. *)
-let rec is_fun (e : A.expr) : bool =
-  match e with Ret (CLam _) -> true | Let (_, _, b) -> is_fun b | LetRec (_, b) -> is_fun b | _ -> false
+(* Hybrid calling convention (ADR-0036, option 2). A binding whose RHS is *directly* a
+   lambda is a known-arity function: it gets a native multi-arg definition [native_name]
+   (for direct, uncurried calls) and a [VClos] wrapper under its own name (for use as a
+   value). Anything else recursive is a `lazy` cell (ADR-0024). *)
+let as_lam : A.expr -> (string list * A.expr) option = function
+  | Ret (CLam (ps, b)) -> Some (ps, b)
+  | _ -> None
+
+let native_name (x : string) : string = "fn_" ^ mangle x
+
+(* [VClos (fun p0 -> VClos (fun p1 -> … native p0 p1 …))] — the value-form of an
+   arity-[n] native function. *)
+let recurry (native : string) (n : int) : string =
+  let ps = List.init n (fun i -> Printf.sprintf "_p%d" i) in
+  let call = Printf.sprintf "(%s %s)" native (String.concat " " ps) in
+  List.fold_right (fun p acc -> Printf.sprintf "(VClos (fun %s -> %s))" p acc) ps call
 
 let fresh =
   let c = ref 0 in
@@ -252,27 +264,58 @@ let rec emit_match (b : C.binder) (scrut : string) (succ : string) (fail : strin
     in
     Printf.sprintf "(match %s with VRecord %s -> %s | _ -> %s)" scrut m (nest fields) fail
 
-let rec expr (lz : SS.t) (e : A.expr) : string =
+(* [ae] maps a known-arity function's name to its arity; [lz] the lazily-bound names.
+   The two are disjoint (a lazy member is never a direct lambda) given unique names. *)
+let rec expr (ae : int IM.t) (lz : SS.t) (e : A.expr) : string =
   match e with
-  | A.Ret c -> cexpr lz c
-  | A.Let (x, c, body) -> Printf.sprintf "(let %s = %s in %s)" (mangle x) (cexpr lz c) (expr lz body)
+  | A.Ret c -> cexpr ae lz c
+  | A.Let (x, c, body) ->
+    (match c with
+     | A.CLam (ps, lbody) ->
+       (* emit both the native multi-arg fn and the VClos wrapper; the body sees x as
+          known-arity. (Non-recursive: [lbody] does not see x.) *)
+       let n = List.length ps in
+       Printf.sprintf "(let %s %s = %s in let %s = %s in %s)" (native_name x)
+         (String.concat " " (List.map mangle ps)) (expr ae lz lbody) (mangle x) (recurry (native_name x) n)
+         (expr (IM.add x n ae) lz body)
+     | _ -> Printf.sprintf "(let %s = %s in %s)" (mangle x) (cexpr ae lz c) (expr ae lz body))
   | A.LetRec (binds, body) ->
-    (* value members become `lazy`; extend [lz] so references force them. *)
-    let lz' = List.fold_left (fun s (x, rhs) -> if is_fun rhs then s else SS.add x s) lz binds in
-    let one (x, rhs) =
-      if is_fun rhs then Printf.sprintf "%s = %s" (mangle x) (expr lz' rhs)
-      else Printf.sprintf "%s = lazy %s" (mangle x) (expr lz' rhs)
+    (* function members → native fn + VClos wrapper (both in the `let rec`); other
+       members → `lazy`. Extend [ae]/[lz] accordingly for every RHS and the body. *)
+    let ae' = List.fold_left (fun m (x, rhs) -> match as_lam rhs with Some (ps, _) -> IM.add x (List.length ps) m | None -> m) ae binds in
+    let lz' = List.fold_left (fun s (x, rhs) -> match as_lam rhs with Some _ -> s | None -> SS.add x s) lz binds in
+    let bindings =
+      List.concat_map
+        (fun (x, rhs) ->
+          match as_lam rhs with
+          | Some (ps, lbody) ->
+            [ Printf.sprintf "%s %s = %s" (native_name x) (String.concat " " (List.map mangle ps)) (expr ae' lz' lbody)
+            ; Printf.sprintf "%s = %s" (mangle x) (recurry (native_name x) (List.length ps)) ]
+          | None -> [ Printf.sprintf "%s = lazy %s" (mangle x) (expr ae' lz' rhs) ])
+        binds
     in
-    Printf.sprintf "(let rec %s in %s)" (String.concat " and " (List.map one binds)) (expr lz' body)
+    Printf.sprintf "(let rec %s in %s)" (String.concat " and " bindings) (expr ae' lz' body)
 
-and cexpr (lz : SS.t) (c : A.cexpr) : string =
+and cexpr (ae : int IM.t) (lz : SS.t) (c : A.cexpr) : string =
   let atom = atom lz in
+  let app_chain head args = List.fold_left (fun acc a -> Printf.sprintf "(app %s (%s))" acc (atom a)) head args in
   match c with
   | A.CAtom a -> atom a
   | A.CLam (ps, body) ->
-    List.fold_right (fun p acc -> Printf.sprintf "(VClos (fun %s -> %s))" (mangle p) acc) ps (expr lz body)
-  | A.CApp (f, args) ->
-    List.fold_left (fun acc a -> Printf.sprintf "(app %s (%s))" acc (atom a)) (atom f) args
+    List.fold_right (fun p acc -> Printf.sprintf "(VClos (fun %s -> %s))" (mangle p) acc) ps (expr ae lz body)
+  | A.CApp (A.AVar x, args) when IM.mem x ae && not (SS.mem x lz) ->
+    let n = List.length args and ar = IM.find x ae in
+    if n = ar
+    then (* exact saturation: a direct, uncurried native call *)
+      Printf.sprintf "(%s %s)" (native_name x) (String.concat " " (List.map (fun a -> "(" ^ atom a ^ ")") args))
+    else if n < ar
+    then app_chain (mangle x) args (* partial: via the VClos wrapper *)
+    else (
+      (* over-application: saturate natively, then apply the rest through [app] *)
+      let take = List.filteri (fun i _ -> i < ar) args and drop = List.filteri (fun i _ -> i >= ar) args in
+      let sat = Printf.sprintf "(%s %s)" (native_name x) (String.concat " " (List.map (fun a -> "(" ^ atom a ^ ")") take)) in
+      app_chain sat drop)
+  | A.CApp (f, args) -> app_chain (atom f) args
   | A.CPrim (op, args) -> prim lz op args
   | A.CCtor (tag, arity, args) ->
     if List.length args >= arity
@@ -288,15 +331,15 @@ and cexpr (lz : SS.t) (c : A.cexpr) : string =
   | A.CUpdate (a, ups) ->
     Printf.sprintf "(update (%s) [%s])" (atom a)
       (String.concat "; " (List.map (fun (l, x) -> Printf.sprintf "(%s, (%s))" (ocaml_string l) (atom x)) ups))
-  | A.CIf (a, t, e) -> Printf.sprintf "(if as_bool (%s) then %s else %s)" (atom a) (expr lz t) (expr lz e)
-  | A.CCase (scruts, alts) -> case lz scruts alts
+  | A.CIf (a, t, e) -> Printf.sprintf "(if as_bool (%s) then %s else %s)" (atom a) (expr ae lz t) (expr ae lz e)
+  | A.CCase (scruts, alts) -> case ae lz scruts alts
 
 (* case as a CPS cascade over the alternatives. Scrutinees are bound once; each alt is
    tried in order, its failure jumping to a shared thunk that runs the next alt (so the
    rest is not duplicated). Within an alt, the binders match left-to-right, then the
    body (or guards, falling through on all-false) runs. All binder kinds are handled
    uniformly via [emit_match]. *)
-and case (lz : SS.t) (scruts : A.atom list) (alts : A.alt list) : string =
+and case (ae : int IM.t) (lz : SS.t) (scruts : A.atom list) (alts : A.alt list) : string =
   let svars = List.map (fun _ -> fresh "_s") scruts in
   let lets =
     String.concat "" (List.map2 (fun v s -> Printf.sprintf "let %s = %s in " v (atom lz s)) svars scruts)
@@ -304,10 +347,10 @@ and case (lz : SS.t) (scruts : A.atom list) (alts : A.alt list) : string =
   let alt_code (a : A.alt) (fail : string) : string =
     let succ =
       match a.result with
-      | A.Uncond e -> expr lz e
+      | A.Uncond e -> expr ae lz e
       | A.Guarded gs ->
         List.fold_right
-          (fun (g, e) acc -> Printf.sprintf "(if as_bool (%s) then %s else %s)" (expr lz g) (expr lz e) acc)
+          (fun (g, e) acc -> Printf.sprintf "(if as_bool (%s) then %s else %s)" (expr ae lz g) (expr ae lz e) acc)
           gs fail
     in
     let rec nest bs vs =
@@ -337,4 +380,4 @@ let program ?(is_effect = false) (e : A.expr) : string =
     if is_effect then "print_string (to_string (app result (VInt 0)))"
     else "print_string (to_string result)"
   in
-  Printf.sprintf "[@@@warning \"-a\"]\n%s\nlet result = %s\nlet () = %s\n" rt (expr SS.empty e) runner
+  Printf.sprintf "[@@@warning \"-a\"]\n%s\nlet result = %s\nlet () = %s\n" rt (expr IM.empty SS.empty e) runner
