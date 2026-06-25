@@ -174,6 +174,22 @@ let ocaml_string (s : string) : string = "\"" ^ String.concat "" (List.map (fun 
     match c with '"' -> "\\\"" | '\\' -> "\\\\" | '\n' -> "\\n" | c -> String.make 1 c)
     (List.init (String.length s) (String.get s))) ^ "\""
 
+(* The names a binder binds. *)
+let rec binder_vars : C.binder -> string list = function
+  | C.BNull | C.BLit _ -> []
+  | C.BVar x -> [ x ]
+  | C.BNamed (x, i) -> x :: binder_vars i
+  | C.BCtor (_, subs) | C.BArray subs -> List.concat_map binder_vars subs
+  | C.BRecord fs -> List.concat_map (fun (_, b) -> binder_vars b) fs
+
+(* Every name bound anywhere in the program (top-level, λ, let, letrec, case binders).
+   Names are unique (purs's Renamer + qualified top-level keys + ANF's fresh `$a…`), so
+   "bound somewhere" = "in scope here" — enough to tell a local/known reference from an
+   *unresolved foreign* (a qualified key the resolver never bound), which is then emitted
+   as `(foreign k)` → a clear `stuck "unbound foreign: k"` instead of an `ocamlopt`
+   "Unbound value". Set once per program in [program]. *)
+let bound_names : SS.t ref = ref SS.empty
+
 (* --- emit -------------------------------------------------------------------- *)
 
 let lit : C.lit -> string = function
@@ -186,7 +202,10 @@ let lit : C.lit -> string = function
    ADR-0024) — a reference to one must be [Lazy.force]d to a [value]. Names are unique
    (purs's Renamer), so no shadow removal is needed. *)
 let atom (lz : SS.t) : A.atom -> string = function
-  | A.AVar x -> if SS.mem x lz then Printf.sprintf "(Lazy.force %s)" (mangle x) else mangle x
+  | A.AVar x ->
+    if SS.mem x !bound_names
+    then if SS.mem x lz then Printf.sprintf "(Lazy.force %s)" (mangle x) else mangle x
+    else Printf.sprintf "(foreign %s)" (ocaml_string x) (* an unresolved foreign import *)
   | A.ALit l -> lit l
   | A.AForeign k -> Printf.sprintf "(foreign %s)" (ocaml_string k)
 
@@ -442,7 +461,33 @@ and case_cascade (ae : int IM.t) (lz : SS.t) (scruts : A.atom list) (alts : A.al
     forced — applied to unit (the `VInt 0` convention, ADR-0032) — performing its
     effects, with the (`Unit`) result suppressed (as `purvm run` does for the bytecode
     image). So an Effect program's stdout is exactly its observable effects. *)
+(* Collect every bound name (see [bound_names]). *)
+let collect_bound (e : A.expr) : SS.t =
+  let acc = ref SS.empty in
+  let add x = acc := SS.add x !acc in
+  let rec ex = function
+    | A.Ret c -> cx c
+    | A.Let (x, c, b) -> add x; cx c; ex b
+    | A.LetRec (g, b) -> List.iter (fun (x, r) -> add x; ex r) g; ex b
+  and cx = function
+    | A.CLam (ps, b) -> List.iter add ps; ex b
+    | A.CIf (_, t, e) -> ex t; ex e
+    | A.CCase (_, alts) ->
+      List.iter
+        (fun (a : A.alt) ->
+          List.iter (fun bd -> List.iter add (binder_vars bd)) a.binders;
+          match a.result with
+          | A.Uncond e -> ex e
+          | A.Guarded gs -> List.iter (fun (g, e) -> ex g; ex e) gs)
+        alts
+    | A.CAtom _ | A.CApp _ | A.CPrim _ | A.CCtor _ | A.CArray _ | A.CRecord _ | A.CAccessor _ | A.CUpdate _ ->
+      ()
+  in
+  ex e;
+  !acc
+
 let program ?(is_effect = false) (e : A.expr) : string =
+  bound_names := collect_bound e;
   let runner =
     if is_effect then "ignore (app result (VInt 0))"
     else "print_string (to_string result)"
