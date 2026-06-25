@@ -8,16 +8,20 @@ open Ast
    host `int` is 63-bit, so wrap every int result back to signed 32 bits. *)
 let w32 (n : int) : int = Int32.to_int (Int32.of_int n)
 
+(* Euclidean division / remainder — `Prelude`'s `EuclideanRing Int` (4.x+): a non-negative
+   remainder `0 <= r < |b|`; `0` on a zero divisor. (Truncating is `quot`/`rem`.) *)
+let emod a b = if b = 0 then 0 else (let m = abs b in let r = a mod m in if r < 0 then r + m else r)
+let ediv a b = if b = 0 then 0 else (a - emod a b) / b
+
 let eval (op : primop) (args : Value.t list) : Value.t =
   match op, args with
   | AddInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (w32 (a + b))
   | SubInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (w32 (a - b))
   | MulInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (w32 (a * b))
-  (* Truncating integer division / remainder, matching the JS FFI `intDiv`/`intMod`
-     (`(a / b) | 0`, `a % b`); division or modulo by zero yields 0 there, so we
-     guard rather than raise (ADR-0017). *)
-  | DivInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (if b = 0 then 0 else w32 (a / b))
-  | ModInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (if b = 0 then 0 else w32 (a mod b))
+  (* Euclidean division / remainder (PureScript `EuclideanRing Int`, 4.x+); zero divisor
+     yields 0 (guarded, not raised — ADR-0017). *)
+  | DivInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (w32 (ediv a b))
+  | ModInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (w32 (emod a b))
   | AddNumber, [ Value.VNumber a; Value.VNumber b ] -> Value.VNumber (a +. b)
   | SubNumber, [ Value.VNumber a; Value.VNumber b ] -> Value.VNumber (a -. b)
   | MulNumber, [ Value.VNumber a; Value.VNumber b ] -> Value.VNumber (a *. b)

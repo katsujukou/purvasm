@@ -69,6 +69,15 @@ let intrinsics : (string * C.term) list =
        it; never inspected, so any value works — the immediate [0]. (It is not a
        module `foreign import`, so linking must resolve it as a free reference.) *)
   ; "Prim.undefined", C.Lit (C.LInt 0)
+    (* The `purvasm-base` primitive layer (ADR-0038): `Purvasm.*` foreigns the backend
+       recognises as intrinsics — the seam the `ulib` reimplementations build on. *)
+  ; p "Purvasm.Int.add" C.AddInt 2
+  ; p "Purvasm.Int.sub" C.SubInt 2
+  ; p "Purvasm.Int.mul" C.MulInt 2
+  ; p "Purvasm.Int.eq" C.EqInt 2
+  ; p "Purvasm.Int.lt" C.LtInt 2
+  ; p "Purvasm.Int.div" C.DivInt 2
+  ; p "Purvasm.Int.mod" C.ModInt 2
   ]
 
 (** The intrinsic rung as a provider. *)

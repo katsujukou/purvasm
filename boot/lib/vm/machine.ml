@@ -61,16 +61,18 @@ type frame =
   | Apply_more of V.t list
 
 (* --- Primitives: the same operations as the oracle's [Cesk.Prim], over VM values. *)
-(* PureScript `Int` is signed 32-bit with wrapping (see [Cesk.Prim]); wrap each result. *)
+(* PureScript `Int` is signed 32-bit with wrapping; div/mod are Euclidean (see [Cesk.Prim]). *)
 let w32 (n : int) : int = Int32.to_int (Int32.of_int n)
+let emod a b = if b = 0 then 0 else (let m = abs b in let r = a mod m in if r < 0 then r + m else r)
+let ediv a b = if b = 0 then 0 else (a - emod a b) / b
 
 let eval_prim (op : C.primop) (args : V.t list) : V.t =
   match op, args with
   | C.AddInt, [ V.Vint a; V.Vint b ] -> V.Vint (w32 (a + b))
   | C.SubInt, [ V.Vint a; V.Vint b ] -> V.Vint (w32 (a - b))
   | C.MulInt, [ V.Vint a; V.Vint b ] -> V.Vint (w32 (a * b))
-  | C.DivInt, [ V.Vint a; V.Vint b ] -> V.Vint (if b = 0 then 0 else w32 (a / b))
-  | C.ModInt, [ V.Vint a; V.Vint b ] -> V.Vint (if b = 0 then 0 else w32 (a mod b))
+  | C.DivInt, [ V.Vint a; V.Vint b ] -> V.Vint (w32 (ediv a b))
+  | C.ModInt, [ V.Vint a; V.Vint b ] -> V.Vint (w32 (emod a b))
   | C.AddNumber, [ V.Vnumber a; V.Vnumber b ] -> V.Vnumber (a +. b)
   | C.SubNumber, [ V.Vnumber a; V.Vnumber b ] -> V.Vnumber (a -. b)
   | C.MulNumber, [ V.Vnumber a; V.Vnumber b ] -> V.Vnumber (a *. b)
