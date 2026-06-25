@@ -226,6 +226,42 @@ let build_action corefn_dir output entry_module entry arg value =
     (image_path output)
     (List.length img.Pvm.Image.gdefs)
 
+let abspath p = if Filename.is_relative p then Filename.concat (Sys.getcwd ()) p else p
+
+(* Compile a program to a *native* executable via the OCaml backend (ADR-0035/0036):
+   link the CoreFn closure to one term, normalise to optimised ANF, emit OCaml source,
+   and hand it to `ocamlopt`. The entry is treated as an `Effect` by default (the
+   generated runner forces it to unit); `--arg N` applies an `Int -> Int` entry and
+   `--value` takes a bare value. *)
+let native_action corefn_dir output entry_module entry arg value =
+  mkdir_p (build_dir output);
+  let em = split_module entry_module in
+  let term0 = Link.link_program ~resolver:Ffi.resolver ~outdir:corefn_dir ~entry_module:em ~entry () in
+  let main_term, is_effect =
+    match value, arg with
+    | true, _ -> (term0, false)
+    | false, Some n -> (App (term0, Lit (LInt n)), false)
+    | false, None -> (term0, true)
+  in
+  let anf =
+    Middle_end.Passes.Dbe.run ~effectful_leaf:Ffi.effectful ~foreign_arity:Ffi.foreign_arity
+      (Middle_end.Passes.Simplify.run
+         (Middle_end.Passes.Dict_elim.run (Middle_end.Transl.transl main_term)))
+  in
+  let bdir = build_dir output in
+  write_file (Filename.concat bdir "app.ml") (Ocaml_backend.Codegen_ml.program ~is_effect anf);
+  let exe = abspath (Filename.concat output "app") in
+  let rc =
+    Sys.command
+      (Stdlib.Printf.sprintf "cd %s && ocamlfind ocamlopt app.ml -o %s 2>ocamlopt.log"
+         (Filename.quote (abspath bdir)) (Filename.quote exe))
+  in
+  if rc <> 0
+  then (
+    Stdlib.Printf.eprintf "ocamlopt failed; see %s\n" (Filename.concat bdir "ocamlopt.log");
+    Stdlib.exit 1);
+  Stdlib.Printf.printf "wrote %s\n" exe
+
 let compile_action corefn output =
   mkdir_p (build_dir output);
   let m = Corefn.Decode.module_of_file corefn in
@@ -269,6 +305,18 @@ let build_cmd =
     (Cmd.info "build" ~doc:"Compile a CoreFn dir's modules (incrementally) and link an image.")
     Term.(const build_action $ corefn_dir_arg $ output_arg $ em $ e $ arg $ value)
 
+let native_cmd =
+  let open Cmdliner in
+  let em = Arg.(value & opt string "Main" & info [ "entry-module"; "m" ] ~docv:"MODULE") in
+  let e = Arg.(value & opt string "main" & info [ "entry"; "e" ] ~docv:"NAME") in
+  let arg = Arg.(value & opt (some int) None & info [ "arg" ] ~docv:"INT"
+                 ~doc:"Apply the entry to this Int (an Int -> Int entry).") in
+  let value = Arg.(value & flag & info [ "value" ]
+                   ~doc:"Entry is a plain value (do not apply); default treats it as Effect.") in
+  Cmd.v
+    (Cmd.info "native" ~doc:"Compile a CoreFn dir to a native executable via the OCaml backend (ocamlopt).")
+    Term.(const native_action $ corefn_dir_arg $ output_arg $ em $ e $ arg $ value)
+
 let compile_cmd =
   let open Cmdliner in
   Cmd.v
@@ -288,6 +336,6 @@ let cmd =
   let open Cmdliner in
   Cmd.group
     (Cmd.info "purvm" ~version:"0.1.0" ~doc:"The PURVASM bytecode toolchain.")
-    [ build_cmd; compile_cmd; run_cmd; demo_cmd ]
+    [ build_cmd; native_cmd; compile_cmd; run_cmd; demo_cmd ]
 
 let () = Stdlib.exit (Cmdliner.Cmd.eval cmd)

@@ -438,14 +438,13 @@ and case_cascade (ae : int IM.t) (lz : SS.t) (scruts : A.atom list) (alts : A.al
   Printf.sprintf "(%s%s)" lets (build alts)
 
 (** Emit a whole ANF program as a self-contained OCaml source string. A *pure* entry is
-    printed directly; an *Effect* entry (`Unit -> a`, ADR-0023) is forced — applied to
-    unit (the `VInt 0` force convention, ADR-0032) — performing its effects, then its
-    result value is printed. So the program's stdout is "effects, then result value",
-    which the differential compares against the oracle's captured stdout + `run_effect`
-    result. *)
+    printed in `Value.to_string` form; an *Effect* entry (`Unit -> a`, ADR-0023) is
+    forced — applied to unit (the `VInt 0` convention, ADR-0032) — performing its
+    effects, with the (`Unit`) result suppressed (as `purvm run` does for the bytecode
+    image). So an Effect program's stdout is exactly its observable effects. *)
 let program ?(is_effect = false) (e : A.expr) : string =
   let runner =
-    if is_effect then "print_string (to_string (app result (VInt 0)))"
+    if is_effect then "ignore (app result (VInt 0))"
     else "print_string (to_string result)"
   in
   Printf.sprintf "[@@@warning \"-a\"]\n%s\nlet result = %s\nlet () = %s\n" rt (expr IM.empty SS.empty e) runner

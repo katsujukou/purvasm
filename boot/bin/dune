@@ -9,6 +9,7 @@
   purvasm.middle_end
   purvasm.vm
   purvasm.pvm
+  purvasm.ocaml_backend
   purvasm.ffi
   cmdliner
   unix))

@@ -725,14 +725,12 @@ let ocaml_run ?(is_effect = false) (t : C.term) : string =
 let same_on_ocaml (label : string) (t : C.term) =
   Alcotest.(check string) label (V.to_string (Cesk.Machine.eval ~host:Ffi.host t)) (ocaml_run t)
 
-(* For an Effect entry, the observable is the effects (stdout) *and* the result value.
-   The generated program emits "effects then result"; the oracle mirrors it as captured
-   stdout ++ the `run_effect` result, so console (stdout-bearing) and Ref (value-bearing)
-   programs are both covered. *)
+(* An Effect entry's observable is its effects (stdout); the native runner performs them
+   and suppresses the (`Unit`) result, matching `purvm run`. So compare the generated
+   program's stdout to the oracle's captured `run_effect` stdout. *)
 let same_on_ocaml_effect (label : string) (t : C.term) =
-  let result = ref (V.VInt 0) in
-  let out = with_captured_stdout (fun () -> result := Cesk.Machine.run_effect ~host:Ffi.host t) in
-  Alcotest.(check string) label (out ^ V.to_string !result) (ocaml_run ~is_effect:true t)
+  let out = with_captured_stdout (fun () -> ignore (Cesk.Machine.run_effect ~host:Ffi.host t)) in
+  Alcotest.(check string) label out (ocaml_run ~is_effect:true t)
 
 (* Slice 1 (ADR-0036): the pure first-order subset, uniform calling convention. A real
    purs-compiled fixture (`prelude_answer`) plus controlled terms covering each node
