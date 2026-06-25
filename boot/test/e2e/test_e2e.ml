@@ -701,6 +701,65 @@ let dbe_fires (label : string) (t : C.term) =
 let test_dbe_fires_classify () = dbe_fires "classify" (Lower.module_ fixture ~entry:"classify")
 let test_dbe_fires_anint () = dbe_fires "anInt" (Lower.module_ fixture ~entry:"anInt")
 
+(* --- OCaml native backend (ADR-0036) differential equivalence ------------- *)
+
+(* Compile a term through the OCaml backend to a real native executable and run it:
+   ANF (ADR-0025) → OCaml source → `ocamlopt` → run → its printed value. This is the
+   full native path — a purs-compiled `corefn.json` fixture, lowered and codegen'd to
+   native, must print what the CESK oracle computes. *)
+let ocaml_run (t : C.term) : string =
+  let dir = Filename.concat (Filename.get_temp_dir_name ()) (Printf.sprintf "purvasm_ml_%x" (Hashtbl.hash t)) in
+  (try Sys.mkdir dir 0o755 with Sys_error _ -> ());
+  let src = Ocaml_backend.Codegen_ml.program (Middle_end.Transl.transl t) in
+  let oc = open_out (Filename.concat dir "gen.ml") in
+  output_string oc src;
+  close_out oc;
+  if Sys.command (Printf.sprintf "cd %s && ocamlfind ocamlopt gen.ml -o gen 2>err" dir) <> 0
+  then Alcotest.failf "ocamlopt failed; see %s/err and %s/gen.ml" dir dir;
+  if Sys.command (Printf.sprintf "%s/gen > %s/out" dir dir) <> 0 then Alcotest.fail "generated program crashed";
+  let ic = open_in (Filename.concat dir "out") in
+  let s = In_channel.input_all ic in
+  close_in ic;
+  s
+
+let same_on_ocaml (label : string) (t : C.term) =
+  Alcotest.(check string) label (V.to_string (Cesk.Machine.eval t)) (ocaml_run t)
+
+(* Slice 1 (ADR-0036): the pure first-order subset, uniform calling convention. A real
+   purs-compiled fixture (`prelude_answer`) plus controlled terms covering each node
+   kind. (Value-recursive `let rec` → `lazy`, record binders, foreigns, and Effect are
+   later slices — see the ADR's named follow-ups.) *)
+let test_ml_prelude_answer () = same_on_ocaml "answer" (prelude_term "answer")
+let test_ml_arith () = same_on_ocaml "(1+2)*3" (C.Prim (C.MulInt, [ C.Prim (C.AddInt, [ int 1; int 2 ]); int 3 ]))
+let test_ml_app () = same_on_ocaml "app" (C.App (C.Lam ("x", C.Prim (C.AddInt, [ C.Var "x"; int 1 ])), int 41))
+let test_ml_if () = same_on_ocaml "if" (C.If (C.Prim (C.LtInt, [ int 1; int 2 ]), int 10, int 20))
+let test_ml_ctor () = same_on_ocaml "ctor" (C.App (C.Ctor ("Just", 1), int 7))
+
+let classify_term scrut =
+  C.Case
+    ( [ scrut ]
+    , [ { C.binders = [ C.BCtor ("Just", [ C.BVar "x" ]) ]
+        ; result = C.Unconditional (C.Prim (C.AddInt, [ C.Var "x"; int 1 ])) }
+      ; { C.binders = [ C.BCtor ("Nothing", []) ]; result = C.Unconditional (int 0) }
+      ] )
+
+let test_ml_case_just () = same_on_ocaml "case Just 5" (classify_term (C.App (C.Ctor ("Just", 1), int 5)))
+let test_ml_case_nothing () = same_on_ocaml "case Nothing" (classify_term (C.Ctor ("Nothing", 0)))
+
+let test_ml_recursion () =
+  let fact =
+    C.Lam
+      ( "n"
+      , C.If
+          ( C.Prim (C.LtInt, [ C.Var "n"; int 1 ])
+          , int 1
+          , C.Prim (C.MulInt, [ C.Var "n"; C.App (C.Var "fact", C.Prim (C.SubInt, [ C.Var "n"; int 1 ])) ]) ) )
+  in
+  same_on_ocaml "fact 5" (C.Letrec ([ "fact", fact ], C.App (C.Var "fact", int 5)))
+
+let test_ml_record () = same_on_ocaml "record.x" (C.Accessor (C.Record [ "x", int 5; "y", int 9 ], "x"))
+let test_ml_array () = same_on_ocaml "array" (C.Array [ int 10; int 20; int 30 ])
+
 (* --- PURVASM bytecode VM (ADR-0030) differential equivalence -------------- *)
 
 (* The VM is sound iff its result equals the oracle's on every pure program. The
@@ -1161,6 +1220,18 @@ let () =
         ; Alcotest.test_case "simplify_fires" `Quick test_simplify_fires
         ; Alcotest.test_case "dbe_fires_classify" `Quick test_dbe_fires_classify
         ; Alcotest.test_case "dbe_fires_anint" `Quick test_dbe_fires_anint
+        ] )
+    ; ( "ocaml"
+      , [ Alcotest.test_case "prelude_answer" `Quick test_ml_prelude_answer
+        ; Alcotest.test_case "arith" `Quick test_ml_arith
+        ; Alcotest.test_case "app" `Quick test_ml_app
+        ; Alcotest.test_case "if" `Quick test_ml_if
+        ; Alcotest.test_case "ctor" `Quick test_ml_ctor
+        ; Alcotest.test_case "case_just" `Quick test_ml_case_just
+        ; Alcotest.test_case "case_nothing" `Quick test_ml_case_nothing
+        ; Alcotest.test_case "recursion" `Quick test_ml_recursion
+        ; Alcotest.test_case "record" `Quick test_ml_record
+        ; Alcotest.test_case "array" `Quick test_ml_array
         ] )
     ; ( "vm"
       , [ Alcotest.test_case "fixture" `Quick test_vm_fixture
