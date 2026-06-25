@@ -1,0 +1,22 @@
+{
+  "name": "purvasm-cli",
+  "version": "0.1.0",
+  "description": "An experimental bytecode compiler and interprter for PureScript",
+  "keywords": [
+    "purescript",
+    "compiler",
+    "backend"
+  ],
+  "license": "MIT",
+  "author": "Katsujukou Kineya",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "compile": "spago build -p cli",
+    "test:unit": "spago test -p cli",
+    "test": "npm run test:unit",
+    "format": "purs-tidy format-in-place src test",
+    "check": "purs-tidy check src test",
+    "version": "echo 'export const version = \"v'$npm_package_version'\";' > ./src/Purvasm/CLI/Version.js && git add ."
+  }
+}

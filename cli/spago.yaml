@@ -1,0 +1,14 @@
+package:
+  name: cli
+  dependencies:
+    - argonaut
+    - argparse-basic
+    - compiler
+    - console
+    - effect
+    - either
+    - fmt
+    - node-buffer
+    - node-fs
+    - node-process
+    - prelude
