@@ -22,6 +22,17 @@ let eval (op : primop) (args : Value.t list) : Value.t =
      yields 0 (guarded, not raised — ADR-0017). *)
   | DivInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (w32 (ediv a b))
   | ModInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (w32 (emod a b))
+  (* Bitwise ops on the signed 32-bit `Int` (`Data.Int.Bits`). Shift counts are taken
+     mod 32 (JS `<<`/`>>`/`>>>` mask the count to its low 5 bits); `zshr` is the logical
+     (zero-fill) right shift, computed on the unsigned 32-bit value then re-wrapped to
+     signed via [w32], so e.g. `zshr (-1) 1 = 2147483647`. *)
+  | AndInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (w32 (a land b))
+  | OrInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (w32 (a lor b))
+  | XorInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (w32 (a lxor b))
+  | ShlInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (w32 (a lsl (b land 31)))
+  | ShrInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (a asr (b land 31))
+  | ZshrInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (w32 ((a land 0xFFFFFFFF) lsr (b land 31)))
+  | ComplementInt, [ Value.VInt a ] -> Value.VInt (w32 (lnot a))
   | AddNumber, [ Value.VNumber a; Value.VNumber b ] -> Value.VNumber (a +. b)
   | SubNumber, [ Value.VNumber a; Value.VNumber b ] -> Value.VNumber (a -. b)
   | MulNumber, [ Value.VNumber a; Value.VNumber b ] -> Value.VNumber (a *. b)

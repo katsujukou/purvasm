@@ -9,6 +9,13 @@ let mul_int a b = Prim (MulInt, [ a; b ])
 let lt_int a b = Prim (LtInt, [ a; b ])
 let lt_string a b = Prim (LtString, [ a; b ])
 let eq_int a b = Prim (EqInt, [ a; b ])
+let and_int a b = Prim (AndInt, [ a; b ])
+let or_int a b = Prim (OrInt, [ a; b ])
+let xor_int a b = Prim (XorInt, [ a; b ])
+let shl_int a b = Prim (ShlInt, [ a; b ])
+let shr_int a b = Prim (ShrInt, [ a; b ])
+let zshr_int a b = Prim (ZshrInt, [ a; b ])
+let complement_int a = Prim (ComplementInt, [ a ])
 let eq_string a b = Prim (EqString, [ a; b ])
 let str s = Lit (LString s)
 let append a b = Prim (Append, [ a; b ])
@@ -330,6 +337,44 @@ let test_number_lt_nan () =
     "nan<1.0 is false"
     false
     (eval_bool (lt_num (numf nan) (numf 1.0)))
+
+(* Bitwise (Data.Int.Bits over the signed 32-bit Int) ----------------------- *)
+
+let test_bit_and () = Alcotest.(check int) "12 & 10" 8 (eval_int (and_int (num 12) (num 10)))
+let test_bit_or () = Alcotest.(check int) "12 | 10" 14 (eval_int (or_int (num 12) (num 10)))
+let test_bit_xor () = Alcotest.(check int) "12 ^ 10" 6 (eval_int (xor_int (num 12) (num 10)))
+let test_bit_shl () = Alcotest.(check int) "1 << 4" 16 (eval_int (shl_int (num 1) (num 4)))
+
+(* A shift into the sign bit wraps to the minimum 32-bit int. *)
+let test_bit_shl_sign () =
+  Alcotest.(check int) "1 << 31" (-2147483648) (eval_int (shl_int (num 1) (num 31)))
+
+(* The shift count is taken mod 32 (matching JS `<<`), so a shift by 32 is the identity. *)
+let test_bit_shl_count_wrap () =
+  Alcotest.(check int) "1 << 32" 1 (eval_int (shl_int (num 1) (num 32)))
+
+(* Arithmetic right shift propagates the sign bit. *)
+let test_bit_shr_signed () =
+  Alcotest.(check int) "-8 >> 1" (-4) (eval_int (shr_int (num (-8)) (num 1)))
+
+(* Logical right shift zero-fills, so a value with the sign bit set becomes positive. *)
+let test_bit_zshr_fill () =
+  Alcotest.(check int) "-1 >>> 1" 2147483647 (eval_int (zshr_int (num (-1)) (num 1)))
+
+(* A logical shift by 0 is the identity, even for a value with the sign bit set
+   (`-1 >>> 0` is `-1`, not the unsigned `4294967295`). *)
+let test_bit_zshr_zero () =
+  Alcotest.(check int) "-1 >>> 0" (-1) (eval_int (zshr_int (num (-1)) (num 0)))
+
+let test_bit_complement () =
+  Alcotest.(check int) "~0" (-1) (eval_int (complement_int (num 0)))
+
+(* `complement top == bottom` — the identity the `Data.Bounded` Int instance relies on. *)
+let test_bit_complement_top () =
+  Alcotest.(check int)
+    "~2147483647"
+    (-2147483648)
+    (eval_int (complement_int (num 2147483647)))
 
 (* Arrays ------------------------------------------------------------------- *)
 
@@ -1020,6 +1065,17 @@ let () =
         ; Alcotest.test_case "number_eq_nan" `Quick test_number_eq_nan
         ; Alcotest.test_case "number_lt" `Quick test_number_lt
         ; Alcotest.test_case "number_lt_nan" `Quick test_number_lt_nan
+        ; Alcotest.test_case "bit_and" `Quick test_bit_and
+        ; Alcotest.test_case "bit_or" `Quick test_bit_or
+        ; Alcotest.test_case "bit_xor" `Quick test_bit_xor
+        ; Alcotest.test_case "bit_shl" `Quick test_bit_shl
+        ; Alcotest.test_case "bit_shl_sign" `Quick test_bit_shl_sign
+        ; Alcotest.test_case "bit_shl_count_wrap" `Quick test_bit_shl_count_wrap
+        ; Alcotest.test_case "bit_shr_signed" `Quick test_bit_shr_signed
+        ; Alcotest.test_case "bit_zshr_fill" `Quick test_bit_zshr_fill
+        ; Alcotest.test_case "bit_zshr_zero" `Quick test_bit_zshr_zero
+        ; Alcotest.test_case "bit_complement" `Quick test_bit_complement
+        ; Alcotest.test_case "bit_complement_top" `Quick test_bit_complement_top
         ; Alcotest.test_case "array_length" `Quick test_array_length
         ; Alcotest.test_case "array_empty_length" `Quick test_array_empty_length
         ; Alcotest.test_case "array_index" `Quick test_array_index

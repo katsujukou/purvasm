@@ -13,3 +13,13 @@ export const mod = (a) => (b) => {
   const m = Math.abs(b);
   return ((a % m) + m) % m;
 };
+// Bitwise ops. JS `<<`/`>>`/`>>>`/`&`/`|`/`^`/`~` already operate on signed 32-bit ints
+// (the count is masked to 5 bits), matching the purvasm intrinsics; `>>>` yields an unsigned
+// result, so re-wrap to signed 32 with `| 0` to keep `Int`'s invariant.
+export const and = (a) => (b) => a & b;
+export const or = (a) => (b) => a | b;
+export const xor = (a) => (b) => a ^ b;
+export const shl = (a) => (b) => a << b;
+export const shr = (a) => (b) => a >> b;
+export const zshr = (a) => (b) => (a >>> b) | 0;
+export const complement = (a) => ~a;

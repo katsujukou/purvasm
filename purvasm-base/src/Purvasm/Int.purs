@@ -9,6 +9,13 @@ module Purvasm.Int
   , lt
   , div
   , mod
+  , and
+  , or
+  , xor
+  , shl
+  , shr
+  , zshr
+  , complement
   ) where
 
 foreign import add :: Int -> Int -> Int
@@ -24,3 +31,20 @@ foreign import lt :: Int -> Int -> Boolean
 -- | `quot`/`rem`, not these). On purvasm: the `DivInt` / `ModInt` intrinsics.
 foreign import div :: Int -> Int -> Int
 foreign import mod :: Int -> Int -> Int
+
+-- | Bitwise operations on the signed 32-bit `Int` — the seam `Data.Int.Bits` is built over.
+-- | On purvasm: the `AndInt` / `OrInt` / `XorInt` intrinsics.
+foreign import and :: Int -> Int -> Int
+foreign import or :: Int -> Int -> Int
+foreign import xor :: Int -> Int -> Int
+
+-- | Bitwise shifts. The shift count is taken mod 32. `shr` is arithmetic (sign-propagating)
+-- | and `zshr` is logical (zero-fill). On purvasm: the `ShlInt` / `ShrInt` / `ZshrInt`
+-- | intrinsics.
+foreign import shl :: Int -> Int -> Int
+foreign import shr :: Int -> Int -> Int
+foreign import zshr :: Int -> Int -> Int
+
+-- | Bitwise complement (one's complement). `complement n == -n - 1`, so `complement top`
+-- | yields `bottom`. On purvasm: the `ComplementInt` intrinsic.
+foreign import complement :: Int -> Int

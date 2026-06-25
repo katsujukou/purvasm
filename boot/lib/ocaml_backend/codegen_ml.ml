@@ -59,6 +59,13 @@ let p_sub_int a b = VInt (w32 (as_int a - as_int b))
 let p_mul_int a b = VInt (w32 (as_int a * as_int b))
 let p_div_int a b = VInt (w32 (ediv (as_int a) (as_int b)))
 let p_mod_int a b = VInt (w32 (emod (as_int a) (as_int b)))
+let p_and_int a b = VInt (w32 (as_int a land as_int b))
+let p_or_int a b = VInt (w32 (as_int a lor as_int b))
+let p_xor_int a b = VInt (w32 (as_int a lxor as_int b))
+let p_shl_int a b = VInt (w32 (as_int a lsl (as_int b land 31)))
+let p_shr_int a b = VInt (as_int a asr (as_int b land 31))
+let p_zshr_int a b = VInt (w32 ((as_int a land 0xFFFFFFFF) lsr (as_int b land 31)))
+let p_complement_int a = VInt (w32 (lnot (as_int a)))
 let p_add_num a b = VNumber (as_num a +. as_num b)
 let p_sub_num a b = VNumber (as_num a -. as_num b)
 let p_mul_num a b = VNumber (as_num a *. as_num b)
@@ -226,6 +233,9 @@ let atom (lz : SS.t) : A.atom -> string = function
 let prim_fn : C.primop -> string = function
   | C.AddInt -> "p_add_int" | C.SubInt -> "p_sub_int" | C.MulInt -> "p_mul_int"
   | C.DivInt -> "p_div_int" | C.ModInt -> "p_mod_int"
+  | C.AndInt -> "p_and_int" | C.OrInt -> "p_or_int" | C.XorInt -> "p_xor_int"
+  | C.ShlInt -> "p_shl_int" | C.ShrInt -> "p_shr_int" | C.ZshrInt -> "p_zshr_int"
+  | C.ComplementInt -> "p_complement_int"
   | C.AddNumber -> "p_add_num" | C.SubNumber -> "p_sub_num" | C.MulNumber -> "p_mul_num"
   | C.DivNumber -> "p_div_num"
   | C.EqInt -> "p_eq_int" | C.EqNumber -> "p_eq_num" | C.EqString -> "p_eq_str"

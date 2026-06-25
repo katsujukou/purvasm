@@ -17,6 +17,13 @@ type primop =
   | MulInt
   | DivInt
   | ModInt
+  | AndInt
+  | OrInt
+  | XorInt
+  | ShlInt
+  | ShrInt
+  | ZshrInt
+  | ComplementInt
   | AddNumber
   | SubNumber
   | MulNumber
@@ -112,6 +119,13 @@ let primop_to_string : primop -> string = function
   | MulInt -> "*i"
   | DivInt -> "/i"
   | ModInt -> "%i"
+  | AndInt -> "&i"
+  | OrInt -> "|i"
+  | XorInt -> "^i"
+  | ShlInt -> "<<i"
+  | ShrInt -> ">>i"
+  | ZshrInt -> ">>>i"
+  | ComplementInt -> "~i"
   | AddNumber -> "+n"
   | SubNumber -> "-n"
   | MulNumber -> "*n"

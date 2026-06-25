@@ -27,7 +27,10 @@ let err msg = raise (Bad_image msg)
 
 let prim_tags : (C.primop * string) list =
   [ C.AddInt, "AddInt"; C.SubInt, "SubInt"; C.MulInt, "MulInt"; C.DivInt, "DivInt"
-  ; C.ModInt, "ModInt"; C.AddNumber, "AddNumber"; C.SubNumber, "SubNumber"
+  ; C.ModInt, "ModInt"
+  ; C.AndInt, "AndInt"; C.OrInt, "OrInt"; C.XorInt, "XorInt"; C.ShlInt, "ShlInt"
+  ; C.ShrInt, "ShrInt"; C.ZshrInt, "ZshrInt"; C.ComplementInt, "ComplementInt"
+  ; C.AddNumber, "AddNumber"; C.SubNumber, "SubNumber"
   ; C.MulNumber, "MulNumber"; C.DivNumber, "DivNumber"; C.EqInt, "EqInt"
   ; C.EqString, "EqString"; C.EqNumber, "EqNumber"; C.EqBool, "EqBool"; C.LtInt, "LtInt"
   ; C.LtString, "LtString"; C.LtNumber, "LtNumber"; C.AndBool, "AndBool"

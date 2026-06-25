@@ -78,6 +78,13 @@ let intrinsics : (string * C.term) list =
   ; p "Purvasm.Int.lt" C.LtInt 2
   ; p "Purvasm.Int.div" C.DivInt 2
   ; p "Purvasm.Int.mod" C.ModInt 2
+  ; p "Purvasm.Int.and" C.AndInt 2
+  ; p "Purvasm.Int.or" C.OrInt 2
+  ; p "Purvasm.Int.xor" C.XorInt 2
+  ; p "Purvasm.Int.shl" C.ShlInt 2
+  ; p "Purvasm.Int.shr" C.ShrInt 2
+  ; p "Purvasm.Int.zshr" C.ZshrInt 2
+  ; p "Purvasm.Int.complement" C.ComplementInt 1
   ; p "Purvasm.Number.add" C.AddNumber 2
   ; p "Purvasm.Number.sub" C.SubNumber 2
   ; p "Purvasm.Number.mul" C.MulNumber 2
