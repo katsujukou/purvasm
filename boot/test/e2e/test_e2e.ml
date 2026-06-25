@@ -760,6 +760,23 @@ let test_ml_recursion () =
 let test_ml_record () = same_on_ocaml "record.x" (C.Accessor (C.Record [ "x", int 5; "y", int 9 ], "x"))
 let test_ml_array () = same_on_ocaml "array" (C.Array [ int 10; int 20; int 30 ])
 
+(* Whole-module fixtures (no DCE) — the spine now includes record binders (`viaRecord`)
+   and guards (`pick`), which the CPS cascade matcher handles. *)
+let test_ml_anint () = same_on_ocaml "anInt" (Lower.module_ fixture ~entry:"anInt")
+let test_ml_classify () = same_on_ocaml "classify (Just 0)" (C.App (Lower.module_ fixture ~entry:"classify", just (int 0)))
+let test_ml_firstof () = same_on_ocaml "firstOf [10,20]" (C.App (Lower.module_ fixture ~entry:"firstOf", C.Array [ int 10; int 20 ]))
+let test_ml_via_record () = same_on_ocaml "viaRecord {x:5}" (C.App (Lower.module_ fixture ~entry:"viaRecord", C.Record [ "x", int 5 ]))
+let test_ml_pick () = same_on_ocaml "pick true" (C.App (Lower.module_ fixture ~entry:"pick", C.Lit (C.LBool true)))
+
+(* number-literal binder (OCaml float patterns are disallowed; the cascade uses `=`) *)
+let test_ml_number_binder () =
+  same_on_ocaml "case 3.5"
+    (C.Case
+       ( [ C.Lit (C.LNumber 3.5) ]
+       , [ { C.binders = [ C.BLit (C.LNumber 3.5) ]; result = C.Unconditional (int 1) }
+         ; { C.binders = [ C.BNull ]; result = C.Unconditional (int 0) }
+         ] ))
+
 (* A recursive *value* binding (ADR-0024): `FibAnd.fibAnd` is the recursive `Fib` data
    value, so its `let rec` member lowers to OCaml `lazy` and uses force. *)
 let test_ml_fib () =
@@ -1240,6 +1257,12 @@ let () =
         ; Alcotest.test_case "recursion" `Quick test_ml_recursion
         ; Alcotest.test_case "record" `Quick test_ml_record
         ; Alcotest.test_case "array" `Quick test_ml_array
+        ; Alcotest.test_case "anInt" `Quick test_ml_anint
+        ; Alcotest.test_case "classify" `Quick test_ml_classify
+        ; Alcotest.test_case "firstOf" `Quick test_ml_firstof
+        ; Alcotest.test_case "via_record" `Quick test_ml_via_record
+        ; Alcotest.test_case "pick" `Quick test_ml_pick
+        ; Alcotest.test_case "number_binder" `Quick test_ml_number_binder
         ; Alcotest.test_case "fib" `Quick test_ml_fib
         ] )
     ; ( "vm"
