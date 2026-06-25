@@ -81,5 +81,6 @@ language and are kept out of version control.)
 | [0032](0032-vm-native-foreign-effect.md) | PURVASM bytecode VM (slice 2): native foreign rung and Effect | Accepted |
 | [0033](0033-separate-compilation.md) | Separate compilation: per-module artifacts (`.pvmo`/`.pvmi`), linker, and the `purvm` executable | Accepted |
 | [0034](0034-effect-analysis-impurification.md) | Effect-aware optimisation: structural effect analysis, the force/saturation soundness model, and impurification (GER) | Accepted |
+| [0035](0035-native-backend-ocaml5-concurrency.md) | Native backend via OCaml 5 codegen; an M:N effect-handler concurrency runtime | Accepted |
 
 ## Scope
