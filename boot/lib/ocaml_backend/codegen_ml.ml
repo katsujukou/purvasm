@@ -264,6 +264,41 @@ let rec emit_match (b : C.binder) (scrut : string) (succ : string) (fail : strin
     in
     Printf.sprintf "(match %s with VRecord %s -> %s | _ -> %s)" scrut m (nest fields) fail
 
+(* A binder is "friendly" (compilable to an OCaml pattern, so a case can use OCaml's
+   `match` and inherit `ocamlopt`'s decision tree) iff it contains no record binder — a
+   record is an `SMap`, not key-matchable in a pattern. A number literal is friendly:
+   bound as `VNumber v` with a `when v = f` guard (OCaml forbids only float literal
+   patterns, not bindings). *)
+let rec friendly (b : C.binder) : bool =
+  match b with
+  | C.BRecord _ -> false
+  | C.BNamed (_, i) -> friendly i
+  | C.BCtor (_, subs) | C.BArray subs -> List.for_all friendly subs
+  | _ -> true
+
+(* A friendly binder → an OCaml pattern plus the side guard conditions it needs (number
+   equalities), combined with `&&` at the arm. *)
+let rec ocaml_pat (b : C.binder) : string * string list =
+  match b with
+  | C.BNull -> "_", []
+  | C.BVar x -> mangle x, []
+  | C.BNamed (x, inner) ->
+    let p, g = ocaml_pat inner in
+    Printf.sprintf "(%s as %s)" p (mangle x), g
+  | C.BLit (C.LInt n) -> Printf.sprintf "(VInt %d)" n, []
+  | C.BLit (C.LBool b) -> Printf.sprintf "(VBool %b)" b, []
+  | C.BLit (C.LString s) -> Printf.sprintf "(VString %s)" (ocaml_string s), []
+  | C.BLit (C.LNumber f) ->
+    let v = fresh "_n" in
+    Printf.sprintf "(VNumber %s)" v, [ Printf.sprintf "(%s = %h)" v f ]
+  | C.BCtor (tag, subs) ->
+    let ps, gs = List.split (List.map ocaml_pat subs) in
+    Printf.sprintf "(VData (%s, [| %s |]))" (ocaml_string tag) (String.concat "; " ps), List.concat gs
+  | C.BArray subs ->
+    let ps, gs = List.split (List.map ocaml_pat subs) in
+    Printf.sprintf "(VArray [| %s |])" (String.concat "; " ps), List.concat gs
+  | C.BRecord _ -> failwith "ocaml_pat: record binder is not friendly"
+
 (* [ae] maps a known-arity function's name to its arity; [lz] the lazily-bound names.
    The two are disjoint (a lazy member is never a direct lambda) given unique names. *)
 let rec expr (ae : int IM.t) (lz : SS.t) (e : A.expr) : string =
@@ -334,12 +369,45 @@ and cexpr (ae : int IM.t) (lz : SS.t) (c : A.cexpr) : string =
   | A.CIf (a, t, e) -> Printf.sprintf "(if as_bool (%s) then %s else %s)" (atom a) (expr ae lz t) (expr ae lz e)
   | A.CCase (scruts, alts) -> case ae lz scruts alts
 
-(* case as a CPS cascade over the alternatives. Scrutinees are bound once; each alt is
-   tried in order, its failure jumping to a shared thunk that runs the next alt (so the
-   rest is not duplicated). Within an alt, the binders match left-to-right, then the
-   body (or guards, falling through on all-false) runs. All binder kinds are handled
-   uniformly via [emit_match]. *)
+(* A case whose every binder is friendly compiles to an OCaml `match` — `ocamlopt` turns
+   that into a decision tree (each scrutinee examined once, tags switched), far better
+   than re-testing per alternative. A case containing a record binder falls back to the
+   CPS cascade ([case_cascade]). *)
 and case (ae : int IM.t) (lz : SS.t) (scruts : A.atom list) (alts : A.alt list) : string =
+  if List.for_all (fun (a : A.alt) -> List.for_all friendly a.binders) alts
+  then case_decision ae lz scruts alts
+  else case_cascade ae lz scruts alts
+
+and case_decision (ae : int IM.t) (lz : SS.t) (scruts : A.atom list) (alts : A.alt list) : string =
+  let scrut =
+    match scruts with [ s ] -> atom lz s | ss -> "(" ^ String.concat ", " (List.map (atom lz) ss) ^ ")"
+  in
+  let n = List.length scruts in
+  let pat_of (a : A.alt) =
+    let ps, gs = List.split (List.map ocaml_pat a.binders) in
+    (if n = 1 then List.hd ps else "(" ^ String.concat ", " ps ^ ")"), List.concat gs
+  in
+  let arms (a : A.alt) =
+    let pat, pg = pat_of a in
+    let whenc (extra : string) =
+      match List.filter (fun s -> s <> "") (pg @ [ extra ]) with
+      | [] -> ""
+      | cs -> " when " ^ String.concat " && " cs
+    in
+    match a.result with
+    | A.Uncond e -> [ Printf.sprintf "  | %s%s -> %s" pat (whenc "") (expr ae lz e) ]
+    | A.Guarded gs ->
+      List.map
+        (fun (g, e) -> Printf.sprintf "  | %s%s -> %s" pat (whenc (Printf.sprintf "as_bool (%s)" (expr ae lz g))) (expr ae lz e))
+        gs
+  in
+  Printf.sprintf "(match %s with\n%s\n  | _ -> stuck \"no match\")" scrut
+    (String.concat "\n" (List.concat_map arms alts))
+
+(* The general fallback: a CPS cascade. Scrutinees are bound once; each alt is tried in
+   order, its failure jumping to a shared thunk that runs the next alt (so the rest is
+   not duplicated). Handles every binder kind (records, etc.) via [emit_match]. *)
+and case_cascade (ae : int IM.t) (lz : SS.t) (scruts : A.atom list) (alts : A.alt list) : string =
   let svars = List.map (fun _ -> fresh "_s") scruts in
   let lets =
     String.concat "" (List.map2 (fun v s -> Printf.sprintf "let %s = %s in " v (atom lz s)) svars scruts)
