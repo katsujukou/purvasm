@@ -78,6 +78,10 @@ let intrinsics : (string * C.term) list =
   ; p "Purvasm.Int.lt" C.LtInt 2
   ; p "Purvasm.Int.div" C.DivInt 2
   ; p "Purvasm.Int.mod" C.ModInt 2
+  ; p "Purvasm.Array.length" C.LengthArray 1
+  ; p "Purvasm.Array.unsafeIndex" C.IndexArray 2
+  ; p "Purvasm.Array.unsafeNew" C.NewArray 1
+  ; p "Purvasm.Array.unsafeSet" C.SetArray 3
   ]
 
 (** The intrinsic rung as a provider. *)

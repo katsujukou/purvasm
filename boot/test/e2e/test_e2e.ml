@@ -164,7 +164,7 @@ let test_link_loads_closure () =
   Alcotest.(check int)
     "loaded module count"
     2
-    (List.length (Link.load ~outdir:app_outdir ~entry_module:[ "Main" ]))
+    (List.length (Link.load ~outdir:app_outdir ~entry_module:[ "Main" ] ()))
 
 (* `usesForeign` is a function, so the program links and loads; applying it forces
    the foreign `native`, which the empty resolver leaves unbound -> stuck (the
@@ -188,7 +188,7 @@ let run_at ~(outdir : string) ~(entry_module : string list) (entry : string) : V
   Cesk.Machine.eval (Link.link_program ~outdir ~entry_module ~entry ())
 
 let closure_size ~(outdir : string) ~(entry_module : string list) : int =
-  List.length (Link.load ~outdir ~entry_module)
+  List.length (Link.load ~outdir ~entry_module ())
 
 (* Transitive: TransA -> TransB -> TransC; the value threads through all three. *)
 let test_transitive () =
@@ -1111,7 +1111,7 @@ let test_image_effect_console () =
    time) and cross-module linking — the heart of ADR-0033. *)
 let sepcomp_image ~outdir ~entry_module ~entry ?arg () : Pvm.Image.t =
   let artifacts =
-    Link.load ~outdir ~entry_module
+    Link.load ~outdir ~entry_module ()
     |> List.map (fun m ->
          Pvm.Artifact.module_of_string
            (Pvm.Artifact.module_to_string (Pvm.Compile.compile_module m)))
@@ -1165,7 +1165,7 @@ let test_sc_diamond () =
 (* The `.pvmi` interface carries each public export's kind/arity and a hash over that
    surface, and survives serialization (ADR-0033). *)
 let test_sc_interface () =
-  let modules = Link.load ~outdir:"../fixtures/fib" ~entry_module:[ "FibAnd" ] in
+  let modules = Link.load ~outdir:"../fixtures/fib" ~entry_module:[ "FibAnd" ] () in
   let m =
     List.find (fun (mm : Corefn.Module.t) -> String.equal (Link.name_key mm.name) "FibAnd") modules
   in

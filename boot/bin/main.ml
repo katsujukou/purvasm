@@ -212,7 +212,7 @@ let entry_main ~value ~arg entry_key : term * bool =
 let build_action corefn_dir output entry_module entry arg value =
   mkdir_p (build_dir output);
   let em = split_module entry_module in
-  let modules = Link.load ~outdir:corefn_dir ~entry_module:em in
+  let modules = Link.load ~outdir:corefn_dir ~entry_module:em () in
   let artifacts = List.map (compile_incremental ~corefn_dir ~output) modules in
   let main_term, is_effect = entry_main ~value ~arg (Lower.qualified_key em entry) in
   let img =
@@ -233,10 +233,12 @@ let abspath p = if Filename.is_relative p then Filename.concat (Sys.getcwd ()) p
    and hand it to `ocamlopt`. The entry is treated as an `Effect` by default (the
    generated runner forces it to unit); `--arg N` applies an `Int -> Int` entry and
    `--value` takes a bare value. *)
-let native_action corefn_dir output entry_module entry arg value =
+let native_action corefn_dir output entry_module entry arg value ulib =
   mkdir_p (build_dir output);
   let em = split_module entry_module in
-  let term0 = Link.link_program ~resolver:Ffi.resolver ~outdir:corefn_dir ~entry_module:em ~entry () in
+  let term0 =
+    Link.link_program ~resolver:Ffi.resolver ?ulib_dir:ulib ~outdir:corefn_dir ~entry_module:em ~entry ()
+  in
   let main_term, is_effect =
     match value, arg with
     | true, _ -> (term0, false)
@@ -313,9 +315,11 @@ let native_cmd =
                  ~doc:"Apply the entry to this Int (an Int -> Int entry).") in
   let value = Arg.(value & flag & info [ "value" ]
                    ~doc:"Entry is a plain value (do not apply); default treats it as Effect.") in
+  let ulib = Arg.(value & opt (some string) None & info [ "ulib" ] ~docv:"DIR"
+                  ~doc:"A ulib corefn dir of registry-package patches, overlaid over --corefn-dir (ADR-0038).") in
   Cmd.v
     (Cmd.info "native" ~doc:"Compile a CoreFn dir to a native executable via the OCaml backend (ocamlopt).")
-    Term.(const native_action $ corefn_dir_arg $ output_arg $ em $ e $ arg $ value)
+    Term.(const native_action $ corefn_dir_arg $ output_arg $ em $ e $ arg $ value $ ulib)
 
 let compile_cmd =
   let open Cmdliner in

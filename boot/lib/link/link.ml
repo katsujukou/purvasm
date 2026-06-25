@@ -72,14 +72,26 @@ let module_path (outdir : string) (n : N.module_name) : string =
 
 (** Load the entry module and its transitive imports from a CoreFn output
     directory. A module with no [corefn.json] (Prim and other builtins) is
-    skipped — it contributes no runtime bindings. *)
-let load ~(outdir : string) ~(entry_module : N.module_name) : M.t list =
+    skipped — it contributes no runtime bindings.
+
+    [ulib_dir], when given, is a corefn directory of registry-package *patches*
+    (ADR-0038): a module is taken from there iff it ships a [corefn.json] (a
+    presence-driven, last-wins overlay over [outdir]). boot cannot read externs, so it
+    *assumes* the patch is interface-compatible with the user's module. *)
+let load ?ulib_dir ~(outdir : string) ~(entry_module : N.module_name) () : M.t list =
   let loaded : (string, M.t) Hashtbl.t = Hashtbl.create 32 in
+  let resolve (n : N.module_name) : string =
+    match ulib_dir with
+    | Some ud ->
+      let up = module_path ud n in
+      if Sys.file_exists up then up else module_path outdir n
+    | None -> module_path outdir n
+  in
   let rec go (n : N.module_name) : unit =
     let k = name_key n in
     if not (Hashtbl.mem loaded k)
     then (
-      let path = module_path outdir n in
+      let path = resolve n in
       if Sys.file_exists path
       then (
         let m = Corefn.Decode.module_of_file path in
@@ -228,10 +240,11 @@ let link
 (** Convenience: load then link from a CoreFn output directory. *)
 let link_program
       ?(resolver : string -> C.term option = fun _ -> None)
+      ?ulib_dir
       ~(outdir : string)
       ~(entry_module : N.module_name)
       ~(entry : N.ident)
       ()
   : C.term
   =
-  link ~resolver (load ~outdir ~entry_module) ~entry_module ~entry
+  link ~resolver (load ?ulib_dir ~outdir ~entry_module ()) ~entry_module ~entry
