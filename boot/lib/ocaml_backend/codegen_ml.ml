@@ -76,10 +76,62 @@ let p_append a b =
 let p_index a i = (match a with VArray ar -> let i = as_int i in
     if i >= 0 && i < Array.length ar then ar.(i) else stuck "index out of bounds" | _ -> stuck "index")
 let p_length a = (match a with VArray ar -> VInt (Array.length ar) | _ -> stuck "length")
-let p_new_array n fill = let n = as_int n in
-    if n < 0 then stuck "newArray: negative length" else VArray (Array.make n fill)
+let p_new_array n = let n = as_int n in
+    if n < 0 then stuck "newArray: negative length" else VArray (Array.make n (VInt 0))
 let p_set_array a i v = (match a with VArray ar -> let i = as_int i in
     if i >= 0 && i < Array.length ar then (ar.(i) <- v; a) else stuck "set out of bounds" | _ -> stuck "set")
+
+(* Native foreign leaves, re-implemented over [value]. The generated program is a
+   standalone executable and cannot link Cesk's host registry, so the leaves live here;
+   their behaviour must match `Ffi.host` and the differential enforces it. Leaves are
+   added on demand (the minimal-FFI policy). [log] returns the `#perform` thunk that
+   does the IO when forced (ADR-0023). *)
+(* Faithful copies of Cesk's Ffi show formatting (the differential enforces parity). *)
+let control_escape = function
+  | 7 -> Some "\\a" | 8 -> Some "\\b" | 12 -> Some "\\f" | 10 -> Some "\\n"
+  | 13 -> Some "\\r" | 9 -> Some "\\t" | 11 -> Some "\\v" | _ -> None
+let show_string_impl s =
+  let buf = Buffer.create (String.length s + 2) in
+  Buffer.add_char buf '"';
+  let n = String.length s in
+  for i = 0 to n - 1 do
+    let c = s.[i] in
+    let code = Char.code c in
+    match c with
+    | '"' -> Buffer.add_string buf "\\\""
+    | '\\' -> Buffer.add_string buf "\\\\"
+    | _ ->
+      (match control_escape code with
+       | Some e -> Buffer.add_string buf e
+       | None ->
+         if code < 0x20 || code = 0x7F
+         then (
+           Buffer.add_string buf ("\\" ^ string_of_int code);
+           if i + 1 < n && s.[i + 1] >= '0' && s.[i + 1] <= '9' then Buffer.add_string buf "\\&")
+         else Buffer.add_char buf c)
+  done;
+  Buffer.add_char buf '"';
+  Buffer.contents buf
+let show_number_impl f =
+  if Float.is_nan f then "NaN"
+  else if f = Float.infinity then "Infinity"
+  else if f = Float.neg_infinity then "-Infinity"
+  else if f = 0.0 then "0.0"
+  else if Float.is_integer f && Float.abs f < 1e21 then Printf.sprintf "%.0f" f ^ ".0"
+  else (
+    let rec shortest p =
+      if p > 17 then Printf.sprintf "%.17g" f
+      else (let s = Printf.sprintf "%.*g" p f in if float_of_string s = f then s else shortest (p + 1))
+    in
+    shortest 1)
+
+let foreign = function
+  | "Data.Show.showIntImpl" -> VClos (fun v -> VString (string_of_int (as_int v)))
+  | "Data.Show.showStringImpl" -> VClos (fun v -> VString (show_string_impl (as_str v)))
+  | "Data.Show.showNumberImpl" -> VClos (fun v -> VString (show_number_impl (as_num v)))
+  | "Effect.Console.log" ->
+    VClos (fun s -> VClos (fun _u -> print_string (as_str s); print_newline (); flush stdout; VInt 0))
+  | k -> stuck ("unbound foreign: " ^ k)
 
 let accessor v l = match v with VRecord m -> SMap.find l m | _ -> stuck "accessor: not a record"
 let update v ups =
@@ -135,7 +187,7 @@ let lit : C.lit -> string = function
 let atom (lz : SS.t) : A.atom -> string = function
   | A.AVar x -> if SS.mem x lz then Printf.sprintf "(Lazy.force %s)" (mangle x) else mangle x
   | A.ALit l -> lit l
-  | A.AForeign k -> failwith ("codegen_ml: foreign not supported in slice 1: " ^ k)
+  | A.AForeign k -> Printf.sprintf "(foreign %s)" (ocaml_string k)
 
 let prim_fn : C.primop -> string = function
   | C.AddInt -> "p_add_int" | C.SubInt -> "p_sub_int" | C.MulInt -> "p_mul_int"
@@ -274,8 +326,15 @@ and case (lz : SS.t) (scruts : A.atom list) (alts : A.alt list) : string =
   in
   Printf.sprintf "(%s%s)" lets (build alts)
 
-(** Emit a whole ANF program as a self-contained OCaml source string that, when run,
-    prints the entry value in `Value.to_string` form (pure entries; Effect later). *)
-let program (e : A.expr) : string =
-  Printf.sprintf "[@@@warning \"-a\"]\n%s\nlet result = %s\nlet () = print_string (to_string result)\n"
-    rt (expr SS.empty e)
+(** Emit a whole ANF program as a self-contained OCaml source string. A *pure* entry is
+    printed directly; an *Effect* entry (`Unit -> a`, ADR-0023) is forced — applied to
+    unit (the `VInt 0` force convention, ADR-0032) — performing its effects, then its
+    result value is printed. So the program's stdout is "effects, then result value",
+    which the differential compares against the oracle's captured stdout + `run_effect`
+    result. *)
+let program ?(is_effect = false) (e : A.expr) : string =
+  let runner =
+    if is_effect then "print_string (to_string (app result (VInt 0)))"
+    else "print_string (to_string result)"
+  in
+  Printf.sprintf "[@@@warning \"-a\"]\n%s\nlet result = %s\nlet () = %s\n" rt (expr SS.empty e) runner

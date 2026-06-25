@@ -707,10 +707,10 @@ let test_dbe_fires_anint () = dbe_fires "anInt" (Lower.module_ fixture ~entry:"a
    ANF (ADR-0025) → OCaml source → `ocamlopt` → run → its printed value. This is the
    full native path — a purs-compiled `corefn.json` fixture, lowered and codegen'd to
    native, must print what the CESK oracle computes. *)
-let ocaml_run (t : C.term) : string =
+let ocaml_run ?(is_effect = false) (t : C.term) : string =
   let dir = Filename.concat (Filename.get_temp_dir_name ()) (Printf.sprintf "purvasm_ml_%x" (Hashtbl.hash t)) in
   (try Sys.mkdir dir 0o755 with Sys_error _ -> ());
-  let src = Ocaml_backend.Codegen_ml.program (Middle_end.Transl.transl t) in
+  let src = Ocaml_backend.Codegen_ml.program ~is_effect (Middle_end.Transl.transl t) in
   let oc = open_out (Filename.concat dir "gen.ml") in
   output_string oc src;
   close_out oc;
@@ -723,7 +723,16 @@ let ocaml_run (t : C.term) : string =
   s
 
 let same_on_ocaml (label : string) (t : C.term) =
-  Alcotest.(check string) label (V.to_string (Cesk.Machine.eval t)) (ocaml_run t)
+  Alcotest.(check string) label (V.to_string (Cesk.Machine.eval ~host:Ffi.host t)) (ocaml_run t)
+
+(* For an Effect entry, the observable is the effects (stdout) *and* the result value.
+   The generated program emits "effects then result"; the oracle mirrors it as captured
+   stdout ++ the `run_effect` result, so console (stdout-bearing) and Ref (value-bearing)
+   programs are both covered. *)
+let same_on_ocaml_effect (label : string) (t : C.term) =
+  let result = ref (V.VInt 0) in
+  let out = with_captured_stdout (fun () -> result := Cesk.Machine.run_effect ~host:Ffi.host t) in
+  Alcotest.(check string) label (out ^ V.to_string !result) (ocaml_run ~is_effect:true t)
 
 (* Slice 1 (ADR-0036): the pure first-order subset, uniform calling convention. A real
    purs-compiled fixture (`prelude_answer`) plus controlled terms covering each node
@@ -784,6 +793,19 @@ let test_ml_fib () =
     (C.App
        ( Link.link_program ~resolver:Ffi.resolver ~outdir:"../fixtures/fib" ~entry_module:[ "FibAnd" ] ~entry:"fib" ()
        , int 10 ))
+
+(* Foreign boundary (ADR-0036): the native leaf `Data.Show.showIntImpl` (pure) and
+   `Effect.Console.log` (effectful), re-implemented in the Rt prelude over `value`. *)
+let test_ml_show () = same_on_ocaml "shownStr" (prelude_term "shownStr")
+let test_ml_doubled () = same_on_ocaml "doubled" (prelude_term "doubled")
+
+let test_ml_effect_console () =
+  same_on_ocaml_effect "console"
+    (Link.link_program ~resolver:Ffi.resolver ~outdir:"../fixtures/effect_console" ~entry_module:[ "ConsoleMain" ] ~entry:"main" ())
+
+let test_ml_effect_ref () =
+  same_on_ocaml_effect "effect_ref"
+    (Link.link_program ~resolver:Ffi.resolver ~outdir:"../fixtures/effect_ref" ~entry_module:[ "RefMain" ] ~entry:"main" ())
 
 (* --- PURVASM bytecode VM (ADR-0030) differential equivalence -------------- *)
 
@@ -1264,6 +1286,10 @@ let () =
         ; Alcotest.test_case "pick" `Quick test_ml_pick
         ; Alcotest.test_case "number_binder" `Quick test_ml_number_binder
         ; Alcotest.test_case "fib" `Quick test_ml_fib
+        ; Alcotest.test_case "show" `Quick test_ml_show
+        ; Alcotest.test_case "doubled" `Quick test_ml_doubled
+        ; Alcotest.test_case "effect_console" `Quick test_ml_effect_console
+        ; Alcotest.test_case "effect_ref" `Quick test_ml_effect_ref
         ] )
     ; ( "vm"
       , [ Alcotest.test_case "fixture" `Quick test_vm_fixture
