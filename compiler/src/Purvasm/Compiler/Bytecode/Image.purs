@@ -13,7 +13,6 @@ import Data.String.CodeUnits (singleton, toCharArray)
 import Data.Monoid (power)
 import Data.String.Common (joinWith)
 import Data.Tuple.Nested (type (/\), (/\))
-import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.Compiler.Bytecode.Codegen (Gdef(..))
 import Purvasm.Compiler.Bytecode.Instruction (CodeBlock, Instruction(..))
 import Purvasm.Compiler.Literal (Literal(..))
@@ -66,8 +65,10 @@ strs = JArr <<< map JStr
 
 -- | A `Number` literal is stored as its exact IEEE-754 bits in a decimal string (boot's
 -- | `float_to_json`), so it round-trips bit-for-bit through the text format.
+foreign import floatBitsDecimalImpl :: Number -> String
+
 floatToJson :: Number -> Json
-floatToJson _ = unsafeCrashWith "floatToJson: IEEE-bits encoding not yet implemented"
+floatToJson f = JStr (floatBitsDecimalImpl f)
 
 litToJson :: Literal -> Json
 litToJson = case _ of
@@ -144,3 +145,25 @@ gdefToJson = case _ of
   Gfun ps c -> JArr [ JStr "fn", strs ps, chunkToJson c ]
   Gcaf c -> JArr [ JStr "caf", chunkToJson c ]
   Grec c -> JArr [ JStr "rec", chunkToJson c ]
+
+-- --- the linked image (app.pvm) -----------------------------------------------------
+
+-- | A linked, runnable program (boot's `Image.t`): its global definitions (in dependency
+-- | order), the `main` chunk that runs the entry, and whether the entry is an `Effect`
+-- | (so the runner performs it and suppresses the `Unit` result).
+type Image =
+  { gdefs :: Array (String /\ Gdef)
+  , main :: CodeBlock
+  , isEffect :: Boolean
+  }
+
+imageToJson :: Image -> Json
+imageToJson img = JObj
+  [ "version" /\ JInt formatVersion
+  , "gdefs" /\ JArr (map (\(n /\ g) -> JArr [ JStr n, gdefToJson g ]) img.gdefs)
+  , "main" /\ chunkToJson img.main
+  , "effect" /\ JBool img.isEffect
+  ]
+
+imageToString :: Image -> String
+imageToString = stringify <<< imageToJson

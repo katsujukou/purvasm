@@ -5,17 +5,20 @@
         "path": "cli",
         "core": {
           "dependencies": [
+            "ansi",
             "argonaut",
             "argparse-basic",
             "compiler",
             "console",
+            "dodo-printer",
             "effect",
             "either",
             "fmt",
             "node-buffer",
             "node-fs",
             "node-process",
-            "prelude"
+            "prelude",
+            "run"
           ]
         },
         "test": {
@@ -976,6 +979,25 @@
         "type-equality"
       ]
     },
+    "dodo-printer": {
+      "type": "registry",
+      "version": "2.2.3",
+      "integrity": "sha256-z6LZV9tXQPBZvHqzUYyCYGB7zHq6u7TOgV6Pr0wiobs=",
+      "dependencies": [
+        "ansi",
+        "either",
+        "foldable-traversable",
+        "integers",
+        "lists",
+        "maybe",
+        "newtype",
+        "partial",
+        "prelude",
+        "safe-coerce",
+        "strings",
+        "tuples"
+      ]
+    },
     "effect": {
       "type": "registry",
       "version": "4.0.0",
@@ -1660,6 +1682,28 @@
         "prelude"
       ]
     },
+    "run": {
+      "type": "registry",
+      "version": "5.0.0",
+      "integrity": "sha256-zGCyG7IamjYWypKMXTP9PFis2ShnoZJKZiu3SbXMc+M=",
+      "dependencies": [
+        "aff",
+        "control",
+        "effect",
+        "either",
+        "free",
+        "maybe",
+        "newtype",
+        "partial",
+        "prelude",
+        "tailrec",
+        "tuples",
+        "type-equality",
+        "typelevel-prelude",
+        "unsafe-coerce",
+        "variant"
+      ]
+    },
     "safe-coerce": {
       "type": "registry",
       "version": "2.0.0",
@@ -1848,6 +1892,22 @@
       "version": "6.0.0",
       "integrity": "sha256-0L1QsaY20OILjfU5TV72d3U/tSjhmL9hJ32WMp857Lk=",
       "dependencies": []
+    },
+    "variant": {
+      "type": "registry",
+      "version": "8.0.0",
+      "integrity": "sha256-Ydrgl8liWEwYQOWW76PdZtg3vxKpoKgsnmFyTLgZkoU=",
+      "dependencies": [
+        "control",
+        "enums",
+        "foldable-traversable",
+        "lists",
+        "maybe",
+        "partial",
+        "prelude",
+        "type-equality",
+        "unsafe-coerce"
+      ]
     }
   }
 }

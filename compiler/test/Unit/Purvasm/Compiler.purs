@@ -9,6 +9,7 @@ import Effect (Effect)
 import Test.Spec.Reporter (consoleReporter)
 import Test.Spec.Runner.Node (runSpecAndExitProcess)
 import Test.Unit.Purvasm.Compiler.Bytecode.Artifact as Bytecode.Artifact
+import Test.Unit.Purvasm.Compiler.Bytecode.Image as Bytecode.Image
 import Test.Unit.Purvasm.Compiler.Bytecode.Lower as Bytecode.Lower
 import Test.Unit.Purvasm.Compiler.Bytecode.Lower.Match as Bytecode.Lower.Match
 import Test.Unit.Purvasm.Compiler.CESK.Translate as CESK.Translate
@@ -22,6 +23,7 @@ main = runSpecAndExitProcess [ consoleReporter ] do
   CESK.Translate.spec
   Bytecode.Lower.spec
   Bytecode.Lower.Match.spec
+  Bytecode.Image.spec
   Bytecode.Artifact.spec
   Compile.spec
   Util.MD5.spec

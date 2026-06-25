@@ -72,9 +72,12 @@ normalize term = evalState (anfTail term) 0
         normAtoms (map _.term ups) \atoms ->
           k (CUpdate a (Array.zipWith (\u v -> { prop: u.prop, val: v }) ups atoms))
     TmIf c t1 t2 ->
+      -- boot builds `CIf (ca, anf_tail t1, anf_tail t2)`; OCaml evaluates a constructor's
+      -- arguments right-to-left, so the *else* branch's fresh names are allocated before
+      -- the *then* branch's. Match that order for byte-identical `$a…` numbering.
       normAtom c \ca -> do
-        e1 <- anfTail t1
         e2 <- anfTail t2
+        e1 <- anfTail t1
         k (CIf ca e1 e2)
     TmLet x e1 e2 -> normCe e1 \c1 -> Let x c1 <$> normCe e2 k
     TmLetrec binds body -> do
@@ -108,6 +111,13 @@ normalize term = evalState (anfTail term) 0
   anfAlt a = do
     result <- case a.result of
       Cesk.Unconditional e -> Uncond <$> anfTail e
+      -- boot builds the tuple `(anf_tail g, anf_tail e)`; OCaml's right-to-left evaluation
+      -- allocates the rhs's fresh names before the guard's. Match that for byte-identity.
       Cesk.Guarded gs ->
-        Guarded <$> traverse (\g -> { guard: _, rhs: _ } <$> anfTail g.guard <*> anfTail g.rhs) gs
+        Guarded <$> traverse
+          (\g -> do
+            rhs <- anfTail g.rhs
+            guard <- anfTail g.guard
+            pure { guard, rhs })
+          gs
     pure { binders: a.binders, result }
