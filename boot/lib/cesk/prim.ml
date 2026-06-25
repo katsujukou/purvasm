@@ -4,16 +4,20 @@ open Ast
    machine (see Cont.Prim_args); this module only defines the operations on
    fully-evaluated values. *)
 
+(* PureScript `Int` is a signed 32-bit integer with wrapping arithmetic (JS `| 0`); the
+   host `int` is 63-bit, so wrap every int result back to signed 32 bits. *)
+let w32 (n : int) : int = Int32.to_int (Int32.of_int n)
+
 let eval (op : primop) (args : Value.t list) : Value.t =
   match op, args with
-  | AddInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (a + b)
-  | SubInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (a - b)
-  | MulInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (a * b)
+  | AddInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (w32 (a + b))
+  | SubInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (w32 (a - b))
+  | MulInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (w32 (a * b))
   (* Truncating integer division / remainder, matching the JS FFI `intDiv`/`intMod`
      (`(a / b) | 0`, `a % b`); division or modulo by zero yields 0 there, so we
      guard rather than raise (ADR-0017). *)
-  | DivInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (if b = 0 then 0 else a / b)
-  | ModInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (if b = 0 then 0 else a mod b)
+  | DivInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (if b = 0 then 0 else w32 (a / b))
+  | ModInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (if b = 0 then 0 else w32 (a mod b))
   | AddNumber, [ Value.VNumber a; Value.VNumber b ] -> Value.VNumber (a +. b)
   | SubNumber, [ Value.VNumber a; Value.VNumber b ] -> Value.VNumber (a -. b)
   | MulNumber, [ Value.VNumber a; Value.VNumber b ] -> Value.VNumber (a *. b)

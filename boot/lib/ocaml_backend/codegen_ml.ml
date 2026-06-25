@@ -49,12 +49,14 @@ let as_num = function VNumber n -> n | _ -> stuck "expected Number"
 let as_bool = function VBool b -> b | _ -> stuck "expected Bool"
 let as_str = function VString s -> s | _ -> stuck "expected String"
 
-(* Primitives (mirror Cesk.Prim / VM): int div/mod by zero yield 0 (ADR semantics). *)
-let p_add_int a b = VInt (as_int a + as_int b)
-let p_sub_int a b = VInt (as_int a - as_int b)
-let p_mul_int a b = VInt (as_int a * as_int b)
-let p_div_int a b = let d = as_int b in VInt (if d = 0 then 0 else as_int a / d)
-let p_mod_int a b = let d = as_int b in VInt (if d = 0 then 0 else as_int a mod d)
+(* Primitives (mirror Cesk.Prim / VM): int div/mod by zero yield 0 (ADR semantics).
+   PureScript `Int` is signed 32-bit with wrapping, so wrap each int result. *)
+let w32 n = Int32.to_int (Int32.of_int n)
+let p_add_int a b = VInt (w32 (as_int a + as_int b))
+let p_sub_int a b = VInt (w32 (as_int a - as_int b))
+let p_mul_int a b = VInt (w32 (as_int a * as_int b))
+let p_div_int a b = let d = as_int b in VInt (if d = 0 then 0 else w32 (as_int a / d))
+let p_mod_int a b = let d = as_int b in VInt (if d = 0 then 0 else w32 (as_int a mod d))
 let p_add_num a b = VNumber (as_num a +. as_num b)
 let p_sub_num a b = VNumber (as_num a -. as_num b)
 let p_mul_num a b = VNumber (as_num a *. as_num b)
