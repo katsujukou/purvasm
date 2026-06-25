@@ -33,6 +33,14 @@
 > examined once). A case containing a record binder falls back to the CPS cascade.
 > Verified: `classify`/`pick` compile to OCaml `match`, `viaRecord` to the cascade. The
 > remaining perf items (unboxing, arity-tagged native closures) stay deferred.
+>
+> **Update — unresolved foreigns are a clear error.** A foreign import the resolver
+> never binds (e.g. `Data.Array.rangeImpl`) used to surface as a cryptic `ocamlopt`
+> "Unbound value". Codegen now collects every bound name in one pass (names are unique)
+> and emits any unbound reference as `(foreign k)`, so it becomes a clean
+> `stuck "unbound foreign: k"` at run time — turning native coverage gaps (library FFI)
+> into legible errors. The clean way to *fill* such a gap is a structural guest term
+> (resolver-inlined, runs on every backend — like `arrayMap`), not an `Rt`-only leaf.
 
 ## Context
 
