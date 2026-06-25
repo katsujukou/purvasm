@@ -1,4 +1,11 @@
-**/.DS_Store
-_draft
 _build
+**/node_modules
+**/.DS_Store
+
+/.spago
+/output
+/dist
 .psc-ide-port
+.spec-results
+_draft
+.claude-session
