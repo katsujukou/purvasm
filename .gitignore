@@ -4,6 +4,7 @@ _build
 
 /.spago
 /output
+/output-pvm
 /dist
 .psc-ide-port
 .spec-results

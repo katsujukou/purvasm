@@ -136,6 +136,16 @@ let foreign = function
   | "Data.Show.showNumberImpl" -> VClos (fun v -> VString (show_number_impl (as_num v)))
   | "Effect.Console.log" ->
     VClos (fun s -> VClos (fun _u -> print_string (as_str s); print_newline (); flush stdout; VInt 0))
+  (* purvasm-base String byte primitives (ADR-0038): a String is a byte sequence. *)
+  | "Purvasm.String.byteLength" -> VClos (fun s -> VInt (String.length (as_str s)))
+  | "Purvasm.String.byteAt" ->
+    VClos (fun s -> VClos (fun i -> VInt (Char.code (String.get (as_str s) (as_int i)))))
+  | "Purvasm.String.unsafeNew" -> VClos (fun n -> VString (String.make (as_int n) '\000'))
+  | "Purvasm.String.unsafeSetByte" ->
+    VClos (fun s -> VClos (fun i -> VClos (fun b ->
+      let bs = Bytes.of_string (as_str s) in
+      Bytes.set bs (as_int i) (Char.chr (as_int b land 0xff));
+      VString (Bytes.to_string bs))))
   | k -> stuck ("unbound foreign: " ^ k)
 
 let accessor v l = match v with VRecord m -> SMap.find l m | _ -> stuck "accessor: not a record"

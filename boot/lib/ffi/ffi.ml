@@ -78,10 +78,20 @@ let intrinsics : (string * C.term) list =
   ; p "Purvasm.Int.lt" C.LtInt 2
   ; p "Purvasm.Int.div" C.DivInt 2
   ; p "Purvasm.Int.mod" C.ModInt 2
+  ; p "Purvasm.Number.add" C.AddNumber 2
+  ; p "Purvasm.Number.sub" C.SubNumber 2
+  ; p "Purvasm.Number.mul" C.MulNumber 2
+  ; p "Purvasm.Number.div" C.DivNumber 2
+  ; p "Purvasm.Number.eq" C.EqNumber 2
+  ; p "Purvasm.Number.lt" C.LtNumber 2
   ; p "Purvasm.Array.length" C.LengthArray 1
   ; p "Purvasm.Array.unsafeIndex" C.IndexArray 2
   ; p "Purvasm.Array.unsafeNew" C.NewArray 1
   ; p "Purvasm.Array.unsafeSet" C.SetArray 3
+  ; p "Purvasm.Boolean.not" C.NotBool 1
+    (* `Char` is `Int` (ADR-0006), so the char-code conversions are the identity. *)
+  ; "Purvasm.Char.toCodePoint", C.Lam ("$0", C.Var "$0")
+  ; "Purvasm.Char.fromCodePoint", C.Lam ("$0", C.Var "$0")
   ]
 
 (** The intrinsic rung as a provider. *)

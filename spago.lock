@@ -45,6 +45,15 @@
           ]
         }
       },
+      "purvasm-base": {
+        "path": "purvasm-base",
+        "core": {
+          "dependencies": []
+        },
+        "test": {
+          "dependencies": []
+        }
+      },
       "sample": {
         "path": "sample",
         "core": {
