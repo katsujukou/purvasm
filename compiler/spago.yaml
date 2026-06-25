@@ -1,0 +1,15 @@
+package:
+  name: compiler
+  dependencies:
+    - argonaut
+    - console
+    - effect
+    - filterable
+    - fmt
+    - foreign-object
+    - prelude
+  test:
+    main: Test.Unit.Purvasm.Compiler
+    dependencies: 
+      - spec
+      - spec-node

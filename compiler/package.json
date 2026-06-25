@@ -1,0 +1,11 @@
+{
+  "type": "module",
+  "scripts": {
+    "compile": "cd .. && spago build -p compiler",
+    "test:e2e": "cd .. && spago test -p compiler -m Test.E2E.Purvasm.Compiler",
+    "test:unit": "cd .. && spago test -p compiler -m Test.Unit.Purvasm.Compiler",
+    "test": "pnpm run test:unit && pnpm run test:e2e",
+    "format": "purs-tidy format-in-place src test",
+    "check": "purs-tidy check src test"
+  }
+}
