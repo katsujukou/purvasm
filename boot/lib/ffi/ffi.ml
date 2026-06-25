@@ -99,6 +99,10 @@ let intrinsics : (string * C.term) list =
     (* `Char` is `Int` (ADR-0006), so the char-code conversions are the identity. *)
   ; "Purvasm.Char.toCodePoint", C.Lam ("$0", C.Var "$0")
   ; "Purvasm.Char.fromCodePoint", C.Lam ("$0", C.Var "$0")
+    (* `unsafeCoerce` is a representation-preserving cast — at runtime the identity,
+       exactly like an erased newtype constructor (ADR-0018). The optimizer
+       beta-reduces the resulting [(\x -> x) e] away (ADR-0028). *)
+  ; "Unsafe.Coerce.unsafeCoerce", C.Lam ("$0", C.Var "$0")
   ]
 
 (** The intrinsic rung as a provider. *)
