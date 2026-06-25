@@ -760,6 +760,14 @@ let test_ml_recursion () =
 let test_ml_record () = same_on_ocaml "record.x" (C.Accessor (C.Record [ "x", int 5; "y", int 9 ], "x"))
 let test_ml_array () = same_on_ocaml "array" (C.Array [ int 10; int 20; int 30 ])
 
+(* A recursive *value* binding (ADR-0024): `FibAnd.fibAnd` is the recursive `Fib` data
+   value, so its `let rec` member lowers to OCaml `lazy` and uses force. *)
+let test_ml_fib () =
+  same_on_ocaml "fib 10"
+    (C.App
+       ( Link.link_program ~resolver:Ffi.resolver ~outdir:"../fixtures/fib" ~entry_module:[ "FibAnd" ] ~entry:"fib" ()
+       , int 10 ))
+
 (* --- PURVASM bytecode VM (ADR-0030) differential equivalence -------------- *)
 
 (* The VM is sound iff its result equals the oracle's on every pure program. The
@@ -1232,6 +1240,7 @@ let () =
         ; Alcotest.test_case "recursion" `Quick test_ml_recursion
         ; Alcotest.test_case "record" `Quick test_ml_record
         ; Alcotest.test_case "array" `Quick test_ml_array
+        ; Alcotest.test_case "fib" `Quick test_ml_fib
         ] )
     ; ( "vm"
       , [ Alcotest.test_case "fixture" `Quick test_vm_fixture
