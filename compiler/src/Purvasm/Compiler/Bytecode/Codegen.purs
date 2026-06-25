@@ -8,8 +8,10 @@ module Purvasm.Compiler.Bytecode.Codegen where
 
 import Prelude
 
+import Data.Array as Array
 import Data.Generic.Rep (class Generic)
 import Data.Show.Generic (genericShow)
+import Data.Tuple.Nested (type (/\), (/\))
 import Purvasm.Compiler.Bytecode.Instruction (CodeBlock)
 import Purvasm.Compiler.Bytecode.Lower (fnChunk, lowerExpr)
 import Purvasm.Compiler.MiddleEnd.ANF (CExpr(..), Expr(..))
@@ -30,3 +32,14 @@ gdefOfExpr :: Boolean -> Expr -> Gdef
 gdefOfExpr recursive = case _ of
   Ret (CLam ps b) -> Gfun ps (fnChunk b)
   e -> let chunk = lowerExpr true e in if recursive then Grec chunk else Gcaf chunk
+
+-- | Split a whole-program ANF spine (the linked term, ADR-0016) into its global
+-- | definitions and the `main` chunk (the first non-binding expression). Ported from
+-- | boot's `Vm.Codegen.program`.
+program :: Expr -> { gdefs :: Array (String /\ Gdef), main :: CodeBlock }
+program = go []
+  where
+  go acc = case _ of
+    Let k c rest -> go (Array.snoc acc (k /\ gdefOfExpr false (Ret c))) rest
+    LetRec binds rest -> go (acc <> map (\b -> b.var /\ gdefOfExpr true b.rhs) binds) rest
+    e -> { gdefs: acc, main: lowerExpr true e }
