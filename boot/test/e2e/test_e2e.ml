@@ -805,6 +805,33 @@ let test_ml_effect_ref () =
   same_on_ocaml_effect "effect_ref"
     (Link.link_program ~resolver:Ffi.resolver ~outdir:"../fixtures/effect_ref" ~entry_module:[ "RefMain" ] ~entry:"main" ())
 
+(* --- I4: loop combinator × effect body (ADR-0034) ------------------------- *)
+
+(* I4 is the soundness invariant that an effect *body*'s arity must match the
+   saturation convention of the loop combinator (`forE`/`foreachE`/…) driving it — a
+   mismatch is a *silent wrong result* (purs-wasm's hardest GER spot). GER is deferred,
+   but the combinators already run as inlined guest code through eval/apply across every
+   backend, and the OCaml backend applies the body as a `VClos` value (the hybrid path),
+   so this checks all three agree. *)
+let foreign_ref k = Option.get (Ffi.resolver k)
+let log_show_body var =
+  C.Lam (var, C.App (C.Foreign "Effect.Console.log", C.App (C.Foreign "Data.Show.showIntImpl", C.Var var)))
+
+let i4_effect (label : string) (t : C.term) =
+  let oracle = with_captured_stdout (fun () -> ignore (Cesk.Machine.run_effect ~host:Ffi.host t)) in
+  let vm = with_captured_stdout (fun () -> ignore (Vm.run_effect ~host:Ffi.host t)) in
+  Alcotest.(check string) (label ^ ": oracle/vm") oracle vm;
+  Alcotest.(check string) (label ^ ": oracle/ocaml") oracle (ocaml_run ~is_effect:true t)
+
+(* forE lo hi (\i -> log (show i)) — the index-arg body, applied then forced each step. *)
+let test_i4_fore () =
+  i4_effect "forE" (C.App (C.App (C.App (foreign_ref "Effect.forE", int 0), int 4), log_show_body "i"))
+
+(* foreachE [..] (\x -> log (show x)) — the element-arg body. *)
+let test_i4_foreach () =
+  i4_effect "foreachE"
+    (C.App (C.App (foreign_ref "Effect.foreachE", C.Array [ int 10; int 20; int 30 ]), log_show_body "x"))
+
 (* --- PURVASM bytecode VM (ADR-0030) differential equivalence -------------- *)
 
 (* The VM is sound iff its result equals the oracle's on every pure program. The
@@ -1288,6 +1315,10 @@ let () =
         ; Alcotest.test_case "doubled" `Quick test_ml_doubled
         ; Alcotest.test_case "effect_console" `Quick test_ml_effect_console
         ; Alcotest.test_case "effect_ref" `Quick test_ml_effect_ref
+        ] )
+    ; ( "i4"
+      , [ Alcotest.test_case "forE" `Quick test_i4_fore
+        ; Alcotest.test_case "foreachE" `Quick test_i4_foreach
         ] )
     ; ( "vm"
       , [ Alcotest.test_case "fixture" `Quick test_vm_fixture
