@@ -6,10 +6,9 @@ import Data.Array (length)
 import Data.Either (Either(..))
 import Data.Enum (fromEnum)
 import Data.Foldable (foldr)
-import Data.Maybe (Maybe(..), fromJust)
+import Data.Maybe (Maybe(..))
 import Data.String (joinWith)
 import Data.Tuple.Nested ((/\))
-import Partial.Unsafe (unsafeCrashWith, unsafePartial)
 import PureScript.CoreFn.Ann (Meta(..)) as CF
 import PureScript.CoreFn.Expr (Bind(..), Binder(..), Expr(..)) as CF
 import PureScript.CoreFn.Literal (Literal(..)) as CF
@@ -19,6 +18,10 @@ import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.CESK.AST (Rhs(..), Term(..))
 import Purvasm.Compiler.CESK.AST as Cesk
 import Purvasm.Compiler.Literal (Literal(..))
+
+-- | A dotted module name, e.g. `["Data", "Maybe"]` → `"Data.Maybe"` (boot's `name_key`).
+nameKey :: CF.ModuleName -> String
+nameKey = joinWith "."
 
 qualifiedKey :: CF.ModuleName -> CF.Ident -> String
 qualifiedKey mn id = joinWith "." mn <> "." <> id
@@ -54,7 +57,8 @@ translExpr = case _ of
   CF.App _ f x -> TmApp (translExpr f) (translExpr x)
   CF.Var _ q -> translVar q
   CF.Case _ scrutinees alts -> TmCase (translExpr <$> scrutinees) (translAlt <$> alts)
-  _ -> unsafeCrashWith "Not implemenetd"
+  -- a `let` expression: its bindings are local, so keys stay bare (boot's `id`).
+  CF.Let _ binds body -> translBinds identity binds (translExpr body)
 
   where
   translAlt alt =
@@ -74,14 +78,12 @@ translExpr = case _ of
     CF.NullBinder _ -> BNull
     CF.VarBinder _ id -> BVar id
     CF.LiteralBinder _ lit -> litBinder lit
-    CF.ConstructorBinder ann _ (CF.Qualified q ctor) subs
+    -- A constructor binder matches on the *bare* constructor name (boot's `BCtor (ctor,
+    -- …)`), to agree with the bare tag a `Constructor` expression lowers to.
+    CF.ConstructorBinder ann _ (CF.Qualified _ ctor) subs
       | { meta: Just CF.IsNewtype } <- ann
       , [ sub ] <- subs -> translBinder sub
-      | otherwise ->
-          let
-            mn = unsafePartial $ fromJust q
-          in
-            BCtor (qualifiedKey mn ctor) (translBinder <$> subs)
+      | otherwise -> BCtor ctor (translBinder <$> subs)
     CF.NamedBinder _ id inner -> BNamed id (translBinder inner)
 
     where

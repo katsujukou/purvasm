@@ -6,4 +6,6 @@ settings:
 
 importers:
 
+  cli: {}
+
   compiler: {}

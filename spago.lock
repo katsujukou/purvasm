@@ -1,6 +1,27 @@
 {
   "workspace": {
     "packages": {
+      "cli": {
+        "path": "cli",
+        "core": {
+          "dependencies": [
+            "argonaut",
+            "argparse-basic",
+            "compiler",
+            "console",
+            "effect",
+            "either",
+            "fmt",
+            "node-buffer",
+            "node-fs",
+            "node-process",
+            "prelude"
+          ]
+        },
+        "test": {
+          "dependencies": []
+        }
+      },
       "compiler": {
         "path": "compiler",
         "core": {
@@ -787,6 +808,28 @@
         "profunctor-lenses",
         "strings",
         "tailrec",
+        "tuples",
+        "unfoldable"
+      ]
+    },
+    "argparse-basic": {
+      "type": "registry",
+      "version": "2.0.0",
+      "integrity": "sha256-j0HDYapdh4HCvJgt1xBF5Xp2ZU9Pyd5n6spEgPZYkDk=",
+      "dependencies": [
+        "arrays",
+        "bifunctors",
+        "control",
+        "either",
+        "foldable-traversable",
+        "integers",
+        "lists",
+        "maybe",
+        "newtype",
+        "numbers",
+        "prelude",
+        "record",
+        "strings",
         "tuples",
         "unfoldable"
       ]
