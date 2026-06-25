@@ -21,8 +21,13 @@ import Purvasm.CLI.Effect.Filesystem as FS
 import Purvasm.CLI.Effect.Log (LOG)
 import Purvasm.CLI.Effect.Log as Log
 import Purvasm.Compiler.Bytecode.Artifact (interfaceOf, interfaceToString, moduleToString)
+import Purvasm.Compiler.Bytecode.Image (imageToString)
+import Purvasm.Compiler.CESK.AST (Term(..))
 import Purvasm.Compiler.CESK.Translate (nameKey)
 import Purvasm.Compiler.Compile (compileModule)
+import Purvasm.Compiler.Ffi as Ffi
+import Purvasm.Compiler.Link (link)
+import Purvasm.Compiler.Literal (Literal(..))
 import Run (EFFECT, Run)
 import Run.Except (EXCEPT, throw)
 import Type.Row (type (+))
@@ -94,13 +99,20 @@ cmd :: forall r. Options -> Run (LOG + FS + EXCEPT String + EFFECT + r) Unit
 cmd opts = do
   Log.info $ Fmt.fmt @"Building from entry {entry}" { entry: opts.entryModule }
   mods <- loadClosure opts.corefnDir opts.entryModule
+  let artifacts = map compileModule (depOrder mods)
   buildDir <- FS.joinPath [ opts.outDir, "_build" ]
   FS.mkdirP buildDir
-  for_ (depOrder mods) \m -> do
-    let artifact = compileModule m
+  for_ artifacts \artifact -> do
     pmoPath <- FS.joinPath [ buildDir, artifact.name <> ".pmo" ]
     pmiPath <- FS.joinPath [ buildDir, artifact.name <> ".pmi" ]
     FS.writeText pmoPath (moduleToString artifact)
     FS.writeText pmiPath (interfaceToString (interfaceOf artifact))
     Log.info $ Fmt.fmt @"  compiled {name}" { name: artifact.name }
-  Log.info "✓ Build finished"
+  -- link the closure into a runnable app.pvm; the entry `<module>.main` is an Effect,
+  -- forced by applying it to unit (the `0` convention) at run.
+  let
+    mainTerm = TmApp (TmVar (opts.entryModule <> ".main")) (TmLit (LInt 0))
+    image = (link artifacts Ffi.resolver mainTerm) { isEffect = true }
+  appPath <- FS.joinPath [ opts.outDir, "app.pvm" ]
+  FS.writeText appPath (imageToString image)
+  Log.info $ Fmt.fmt @"✓ Build finished → {app}" { app: appPath }

@@ -14,6 +14,7 @@ import Test.Unit.Purvasm.Compiler.Bytecode.Lower as Bytecode.Lower
 import Test.Unit.Purvasm.Compiler.Bytecode.Lower.Match as Bytecode.Lower.Match
 import Test.Unit.Purvasm.Compiler.CESK.Translate as CESK.Translate
 import Test.Unit.Purvasm.Compiler.Compile as Compile
+import Test.Unit.Purvasm.Compiler.Ffi as Ffi
 import Test.Unit.Purvasm.Compiler.Link as Link
 import Test.Unit.Purvasm.Compiler.MiddleEnd.Normalize as MiddleEnd.Normalize
 import Test.Unit.Purvasm.Compiler.Util.MD5 as Util.MD5
@@ -27,5 +28,6 @@ main = runSpecAndExitProcess [ consoleReporter ] do
   Bytecode.Image.spec
   Bytecode.Artifact.spec
   Compile.spec
+  Ffi.spec
   Link.spec
   Util.MD5.spec
