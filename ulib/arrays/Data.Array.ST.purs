@@ -15,7 +15,7 @@
 -- | fed through `mkSTFn3` without impredicative instantiation, and these are not exported, so the
 -- | public interface (`pop`/`shift`) is unaffected.
 module Data.Array.ST
-  ( STArray(..)
+  ( STArray
   , Assoc
   , run
   , withArray
@@ -424,8 +424,11 @@ sortBuf :: forall a. (a -> a -> Boolean) -> Array a -> Int -> Array a
 sortBuf le buf n =
   if n <= 1 then buf else passes 1 buf (PA.unsafeNew n)
   where
+  -- Ping-pong between the two buffers: feed the just-merged result as the next `src` and reuse the
+  -- old `src` as scratch. `merge` reads `src` while writing `dst`, so the two must stay distinct —
+  -- passing `aux` here again would collapse them into one buffer and corrupt the merge.
   passes width src aux =
-    if width >= n then src else passes (width * 2) (mergePass src aux width) aux
+    if width >= n then src else passes (width * 2) (mergePass src aux width) src
 
   mergePass src dst width = go 0 dst
     where
