@@ -74,6 +74,12 @@ let emod a b =
 
 let ediv a b = if b = 0 then 0 else (a - emod a b) / b
 
+(* ECMAScript `ToInt32` (JS `n | 0`), total — see [Cesk.Prim.to_int32] (ADR-0041). *)
+let to_int32 (f : float) : int =
+  if not (Stdlib.Float.is_finite f)
+  then 0
+  else w32 (Stdlib.int_of_float (Stdlib.Float.rem (Stdlib.Float.trunc f) 4294967296.0))
+
 let eval_prim (op : C.primop) (args : V.t list) : V.t =
   match op, args with
   | C.AddInt, [ V.Vint a; V.Vint b ] -> V.Vint (w32 (a + b))
@@ -95,6 +101,9 @@ let eval_prim (op : C.primop) (args : V.t list) : V.t =
   | C.SubNumber, [ V.Vnumber a; V.Vnumber b ] -> V.Vnumber (a -. b)
   | C.MulNumber, [ V.Vnumber a; V.Vnumber b ] -> V.Vnumber (a *. b)
   | C.DivNumber, [ V.Vnumber a; V.Vnumber b ] -> V.Vnumber (a /. b)
+  (* Cross-representation conversions (ADR-0041), mirroring [Cesk.Prim]. *)
+  | C.IntToNumber, [ V.Vint a ] -> V.Vnumber (float_of_int a)
+  | C.NumberToInt, [ V.Vnumber f ] -> V.Vint (to_int32 f)
   | C.EqInt, [ V.Vint a; V.Vint b ] -> V.Vbool (a = b)
   | C.EqString, [ V.Vstring a; V.Vstring b ] -> V.Vbool (String.equal a b)
   | C.EqNumber, [ V.Vnumber a; V.Vnumber b ] -> V.Vbool (a = b)

@@ -70,6 +70,14 @@ let p_add_num a b = VNumber (as_num a +. as_num b)
 let p_sub_num a b = VNumber (as_num a -. as_num b)
 let p_mul_num a b = VNumber (as_num a *. as_num b)
 let p_div_num a b = VNumber (as_num a /. as_num b)
+(* Cross-representation conversions (ADR-0041): `Int`->`Number` widening, and the
+   ECMAScript `ToInt32` coercion (JS `n | 0`) for `Number`->`Int` (NaN/inf -> 0). *)
+let p_int_to_number a = VNumber (float_of_int (as_int a))
+let p_number_to_int a =
+  let f = as_num a in
+  if not (Float.is_finite f)
+  then VInt 0
+  else VInt (w32 (int_of_float (Float.rem (Float.trunc f) 4294967296.0)))
 let p_eq_int a b = VBool (as_int a = as_int b)
 let p_eq_num a b = VBool (as_num a = as_num b)
 let p_eq_str a b = VBool (as_str a = as_str b)
@@ -137,6 +145,12 @@ let show_number_impl f =
     in
     shortest 1)
 
+(* ECMAScript `Math.round` (ADR-0042): half toward +inf, not OCaml's half-away-from-zero;
+   NaN/±inf preserved, -0 for inputs in [-0.5, 0). Mirrors `Ffi.js_round`. *)
+let js_round f =
+  if not (Float.is_finite f) then f
+  else (let r = Float.floor (f +. 0.5) in if r = 0.0 && Float.sign_bit f then -0.0 else r)
+
 let foreign = function
   | "Data.Show.showIntImpl" -> VClos (fun v -> VString (string_of_int (as_int v)))
   | "Data.Show.showStringImpl" -> VClos (fun v -> VString (show_string_impl (as_str v)))
@@ -156,6 +170,12 @@ let foreign = function
       let bs = Bytes.of_string (as_str s) in
       Bytes.set bs (as_int i) (Char.chr (as_int b land 0xff));
       VString (Bytes.to_string bs))))
+  (* `Data.Number` math family as native leaves (ADR-0042); mirror `Ffi.host`. *)
+  | "Data.Number.abs" -> VClos (fun v -> VNumber (Float.abs (as_num v)))
+  | "Data.Number.floor" -> VClos (fun v -> VNumber (Float.floor (as_num v)))
+  | "Data.Number.ceil" -> VClos (fun v -> VNumber (Float.ceil (as_num v)))
+  | "Data.Number.round" -> VClos (fun v -> VNumber (js_round (as_num v)))
+  | "Data.Number.sin" -> VClos (fun v -> VNumber (Float.sin (as_num v)))
   | k -> stuck ("unbound foreign: " ^ k)
 
 let accessor v l = match v with VRecord m -> SMap.find l m | _ -> stuck "accessor: not a record"
@@ -260,6 +280,8 @@ let prim_fn : C.primop -> string = function
   | C.SubNumber -> "p_sub_num"
   | C.MulNumber -> "p_mul_num"
   | C.DivNumber -> "p_div_num"
+  | C.IntToNumber -> "p_int_to_number"
+  | C.NumberToInt -> "p_number_to_int"
   | C.EqInt -> "p_eq_int"
   | C.EqNumber -> "p_eq_num"
   | C.EqString -> "p_eq_str"

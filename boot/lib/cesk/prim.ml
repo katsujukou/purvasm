@@ -20,6 +20,15 @@ let emod a b =
 
 let ediv a b = if b = 0 then 0 else (a - emod a b) / b
 
+(* ECMAScript `ToInt32` — the JS `n | 0` coercion (ADR-0041): NaN/±inf -> 0; otherwise
+   truncate toward zero, reduce modulo 2^32, interpret as signed 32-bit. Total for every
+   double (the [Stdlib.Float.rem] keeps the value in (-2^32, 2^32) so [int_of_float] never
+   overflows the host int, and [w32] does the final signed-32 wrap). *)
+let to_int32 (f : float) : int =
+  if not (Stdlib.Float.is_finite f)
+  then 0
+  else w32 (Stdlib.int_of_float (Stdlib.Float.rem (Stdlib.Float.trunc f) 4294967296.0))
+
 let eval (op : primop) (args : Value.t list) : Value.t =
   match op, args with
   | AddInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (w32 (a + b))
@@ -46,6 +55,10 @@ let eval (op : primop) (args : Value.t list) : Value.t =
   | MulNumber, [ Value.VNumber a; Value.VNumber b ] -> Value.VNumber (a *. b)
   (* Number division is total (1.0/.0.0 = inf, 0.0/.0.0 = nan); no exception. *)
   | DivNumber, [ Value.VNumber a; Value.VNumber b ] -> Value.VNumber (a /. b)
+  (* Cross-representation conversions (ADR-0041): widen `Int`->`Number`, and `ToInt32` for
+     `Number`->`Int` (the engine of `Data.Int.fromNumber`'s `(n | 0) === n` check). *)
+  | IntToNumber, [ Value.VInt a ] -> Value.VNumber (float_of_int a)
+  | NumberToInt, [ Value.VNumber f ] -> Value.VInt (to_int32 f)
   | EqInt, [ Value.VInt a; Value.VInt b ] -> Value.VBool (a = b)
   | EqString, [ Value.VString a; Value.VString b ] -> Value.VBool (String.equal a b)
   (* IEEE equality: the polymorphic = gives nan <> nan and -0.0 = 0.0 on floats,

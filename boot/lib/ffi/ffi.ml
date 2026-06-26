@@ -85,6 +85,10 @@ let intrinsics : (string * C.term) list =
   ; p "Purvasm.Int.shr" C.ShrInt 2
   ; p "Purvasm.Int.zshr" C.ZshrInt 2
   ; p "Purvasm.Int.complement" C.ComplementInt 1
+    (* Cross-representation conversions (ADR-0041): `Int`<->`Number` casts that JS never
+       needed (there `Int` and `Number` are one value). `fromNumber` is `ToInt32`. *)
+  ; p "Purvasm.Int.toNumber" C.IntToNumber 1
+  ; p "Purvasm.Int.fromNumber" C.NumberToInt 1
   ; p "Purvasm.Number.add" C.AddNumber 2
   ; p "Purvasm.Number.sub" C.SubNumber 2
   ; p "Purvasm.Number.mul" C.MulNumber 2
@@ -510,12 +514,24 @@ let show_number (f : float) : string =
     in
     shortest 1)
 
+(* ECMAScript `Math.round` (ADR-0042): round half **toward +inf** — NOT OCaml's
+   [Float.round] (half away from zero), which differs on negative halves
+   (`Math.round (-2.5) = -2`, not `-3`). `NaN`/`±inf` are preserved, and an input in
+   `[-0.5, 0)` (or `-0`) yields `-0`, per ECMAScript. *)
+
 (** The host registry (ADR-0022): the native foreign leaves, each an arity and a
     first-order host implementation over evaluated values. The pure leaves
     (`Data.Show`) are faithful to the `prelude` JS FFI; the one effectful leaf
     (`Effect.Console.log`, ADR-0023) performs real IO when its `Effect` thunk is
     forced. This is the single source of truth for which names are native —
     [native_provider] derives from it. *)
+let js_round (f : float) : float =
+  if not (Stdlib.Float.is_finite f)
+  then f
+  else (
+    let r = Stdlib.Float.floor (f +. 0.5) in
+    if r = 0.0 && Stdlib.Float.sign_bit f then -0.0 else r)
+
 let host : Cesk.Machine.host =
   let unary (f : V.t -> V.t) =
     ( 1
@@ -575,6 +591,34 @@ let host : Cesk.Machine.host =
         (unary (function
            | V.VString msg -> Cesk.Errors.stuck ("Partial.crashWith: " ^ msg)
            | _ -> Cesk.Errors.stuck "crashWith: not a String"))
+    (* `Data.Number` math family as native leaves (ADR-0042): pure libm/`Math.*` ops,
+       JS-faithful (`round` half-toward-+inf). Added on demand — the closure reaches
+       these via the pure-PureScript MD5. *)
+    | "Data.Number.abs" ->
+      Some
+        (unary (function
+           | V.VNumber f -> V.VNumber (Stdlib.Float.abs f)
+           | _ -> Cesk.Errors.stuck "abs: not a Number"))
+    | "Data.Number.floor" ->
+      Some
+        (unary (function
+           | V.VNumber f -> V.VNumber (Stdlib.Float.floor f)
+           | _ -> Cesk.Errors.stuck "floor: not a Number"))
+    | "Data.Number.ceil" ->
+      Some
+        (unary (function
+           | V.VNumber f -> V.VNumber (Stdlib.Float.ceil f)
+           | _ -> Cesk.Errors.stuck "ceil: not a Number"))
+    | "Data.Number.round" ->
+      Some
+        (unary (function
+           | V.VNumber f -> V.VNumber (js_round f)
+           | _ -> Cesk.Errors.stuck "round: not a Number"))
+    | "Data.Number.sin" ->
+      Some
+        (unary (function
+           | V.VNumber f -> V.VNumber (Stdlib.Float.sin f)
+           | _ -> Cesk.Errors.stuck "sin: not a Number"))
     | _ -> None
 
 (** Whether applying a native leaf yields an *effectful* value — one whose force (its

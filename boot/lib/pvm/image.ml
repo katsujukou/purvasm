@@ -42,6 +42,8 @@ let prim_tags : (C.primop * string) list =
   ; C.SubNumber, "SubNumber"
   ; C.MulNumber, "MulNumber"
   ; C.DivNumber, "DivNumber"
+  ; C.IntToNumber, "IntToNumber"
+  ; C.NumberToInt, "NumberToInt"
   ; C.EqInt, "EqInt"
   ; C.EqString, "EqString"
   ; C.EqNumber, "EqNumber"

@@ -28,6 +28,11 @@ type primop =
   | SubNumber
   | MulNumber
   | DivNumber
+  (* Cross-representation scalar conversions (ADR-0041). [IntToNumber] widens an `Int`
+     to a `Number` (`float_of_int`); [NumberToInt] is the ECMAScript `ToInt32` coercion
+     (the JS `n | 0`): truncate toward zero, reduce mod 2^32, signed; NaN/inf -> 0. *)
+  | IntToNumber
+  | NumberToInt
   | EqInt
   | EqString
   | EqNumber
@@ -130,6 +135,8 @@ let primop_to_string : primop -> string = function
   | SubNumber -> "-n"
   | MulNumber -> "*n"
   | DivNumber -> "/n"
+  | IntToNumber -> "i->n"
+  | NumberToInt -> "n->i"
   | EqInt -> "==i"
   | EqString -> "==s"
   | EqNumber -> "==n"
