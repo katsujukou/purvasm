@@ -36,7 +36,7 @@ options = ArgParser.fromRecord
         \Defaults to './output'."
         # ArgParser.default "output"
   , outDir:
-      ArgParser.argument ["--outdir"]
+      ArgParser.argument [ "--outdir" ]
         "Path to the output directory the compiled artifacts are placed in.\n\
         \Defaults to './output-pvm'."
         # ArgParser.default "output-pvm"
@@ -47,26 +47,26 @@ options = ArgParser.fromRecord
       ArgParser.flag [ "--quiet" ]
         "Suppress any message output to stdout"
         # ArgParser.boolean
-  } 
+  }
 
 -- | Compile a single module to its `.pmo`/`.pmi` objects (boot's `purvm compile`):
 -- | read `<corefnDir>/<entryModule>/corefn.json`, decode it, run `compileModule`, and
 -- | write the artifacts (byte-identical to boot) under `<outDir>/_build`.
 cmd :: forall r. Options -> Run (LOG + FS + EXCEPT String + EFFECT + r) Unit
 cmd opts = do
-  info $ Fmt.fmt @"Compiling {modname}" { modname: opts.targetModule } 
+  info $ Fmt.fmt @"Compiling {modname}" { modname: opts.targetModule }
   let corefnPath = opts.corefnDir <> "/" <> opts.targetModule <> "/corefn.json"
   src <- FS.readText corefnPath >>= maybe
-      (throw $ Fmt.fmt @"Failed to read corefn.json at {corefnPath}" { corefnPath })
-      pure 
+    (throw $ Fmt.fmt @"Failed to read corefn.json at {corefnPath}" { corefnPath })
+    pure
   case parseModule src of
     Left err -> throw err
     Right m -> do
       let artifact = compileModule m
-      buildDir <- FS.joinPath [opts.outDir, "_build"]
+      buildDir <- FS.joinPath [ opts.outDir, "_build" ]
       FS.mkdirP buildDir
-      pmofilePath <- FS.joinPath [buildDir, artifact.name <> ".pmo" ]
-      pmifilePath <- FS.joinPath [buildDir, artifact.name <> ".pmi" ]
+      pmofilePath <- FS.joinPath [ buildDir, artifact.name <> ".pmo" ]
+      pmifilePath <- FS.joinPath [ buildDir, artifact.name <> ".pmi" ]
       FS.writeText pmofilePath (moduleToString artifact)
       FS.writeText pmifilePath (interfaceToString (interfaceOf artifact))
       info "✓ Compile finished"

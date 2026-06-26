@@ -6,6 +6,7 @@ _build
 /output
 /output-pvm
 /dist
+purvasm_lib
 .psc-ide-port
 .spec-results
 _draft

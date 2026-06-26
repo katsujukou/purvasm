@@ -22,10 +22,10 @@ main = do
     Right cmd -> runNode case cmd of
       Options.Compile opts -> Compile.cmd opts
       Options.Build opts -> Build.cmd opts
-  
-  where 
+
+  where
   runNode program = do
-    res <- Node.runNode program 
-    case res of 
+    res <- Node.runNode program
+    case res of
       Right a -> pure a
       Left err -> Console.error $ Fmt.fmt @"purvasm: {err}" { err }

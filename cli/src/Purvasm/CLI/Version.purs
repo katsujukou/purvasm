@@ -7,5 +7,5 @@ foreign import version :: String
 
 versionString :: String
 versionString = Fmt.fmt
-  @"""purs-wasm {version} (compat with purs={pursVersion})"""
+  @"""purvasm {version} (compat with purs={pursVersion})"""
   { version, pursVersion: pursVersion }

@@ -13,13 +13,13 @@ data Command
   | Build Build.Options
 
 command :: ArgParser.ArgParser Command
-command = 
+command =
   ArgParser.choose "COMMAND"
     [ ArgParser.command [ "build" ]
         "Build a whole program and emit a single executable"
         ((Build <$> Build.options) <* ArgParser.flagHelp)
     , ArgParser.command [ "compile" ]
-        "Precompile a package set's whole closure into $PURS_WASM_STORE for cross-project reuse"
+        "Compile a single module and emit pmi/pmo files"
         ((Compile <$> Compile.options) <* ArgParser.flagHelp)
     ]
     <* ArgParser.flagHelp
@@ -27,6 +27,6 @@ command =
 
 parse :: Array String -> Either ArgParser.ArgError Command
 parse =
-  ArgParser.parseArgs "purs-wasm"
+  ArgParser.parseArgs "purvasm"
     "A bytecode compiler and interpreter for PureScript"
     command
