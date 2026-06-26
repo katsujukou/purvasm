@@ -23,3 +23,7 @@ export const shl = (a) => (b) => a << b;
 export const shr = (a) => (b) => a >> b;
 export const zshr = (a) => (b) => (a >>> b) | 0;
 export const complement = (a) => ~a;
+// Int<->Number casts (ADR-0041). On JS they are one value: `toNumber` is the identity and
+// `fromNumber` is the `n | 0` (ToInt32) coercion — matching the registry `Data.Int`'s own JS.
+export const toNumber = (n) => n;
+export const fromNumber = (n) => n | 0;

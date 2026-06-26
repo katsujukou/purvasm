@@ -16,6 +16,8 @@ module Purvasm.Int
   , shr
   , zshr
   , complement
+  , toNumber
+  , fromNumber
   ) where
 
 foreign import add :: Int -> Int -> Int
@@ -48,3 +50,14 @@ foreign import zshr :: Int -> Int -> Int
 -- | Bitwise complement (one's complement). `complement n == -n - 1`, so `complement top`
 -- | yields `bottom`. On purvasm: the `ComplementInt` intrinsic.
 foreign import complement :: Int -> Int
+
+-- | Widen an `Int` to a `Number`; every `Int` is representable exactly. On purvasm: the
+-- | `IntToNumber` intrinsic (ADR-0041). (On JS `Int` and `Number` are one value, so the
+-- | foreign is the identity.)
+foreign import toNumber :: Int -> Number
+
+-- | Narrow a `Number` to an `Int` by the ECMAScript `ToInt32` coercion (the JS `n | 0`):
+-- | truncate toward zero, reduce mod 2^32, signed; `NaN`/`Infinity` give `0`. Total — it
+-- | does NOT check integrality or range (that is the caller's job, e.g. `Data.Int.fromNumber`
+-- | tests `toNumber (fromNumber n) == n`). On purvasm: the `NumberToInt` intrinsic (ADR-0041).
+foreign import fromNumber :: Number -> Int
