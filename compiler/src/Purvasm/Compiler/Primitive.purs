@@ -15,6 +15,10 @@ data PrimOp
   | SubNumber
   | MulNumber
   | DivNumber
+  -- Cross-representation scalar conversions (ADR-0041): Int->Number widening and the
+  -- ECMAScript ToInt32 coercion (JS `n | 0`) for Number->Int.
+  | IntToNumber
+  | NumberToInt
   | EqInt
   | EqString
   | EqNumber

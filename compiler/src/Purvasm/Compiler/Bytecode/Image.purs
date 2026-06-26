@@ -88,6 +88,8 @@ primTag = case _ of
   SubNumber -> "SubNumber"
   MulNumber -> "MulNumber"
   DivNumber -> "DivNumber"
+  IntToNumber -> "IntToNumber"
+  NumberToInt -> "NumberToInt"
   EqInt -> "EqInt"
   EqString -> "EqString"
   EqNumber -> "EqNumber"
