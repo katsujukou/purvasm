@@ -216,10 +216,10 @@ let entry_main ~value ~arg entry_key : term * bool =
   | false, Some n -> App (Var entry_key, Lit (LInt n)), false
   | false, None -> App (Var entry_key, Lit (LInt 0)), true
 
-let build_action corefn_dir output entry_module entry arg value =
+let build_action corefn_dir output entry_module entry arg value ulib =
   mkdir_p (build_dir output);
   let em = split_module entry_module in
-  let modules = Link.load ~outdir:corefn_dir ~entry_module:em () in
+  let modules = Link.load ?ulib_dir:ulib ~outdir:corefn_dir ~entry_module:em () in
   let artifacts = List.map (compile_incremental ~corefn_dir ~output) modules in
   let main_term, is_effect = entry_main ~value ~arg (Lower.qualified_key em entry) in
   let img =
@@ -349,11 +349,22 @@ let build_cmd =
           [ "value" ]
           ~doc:"Entry is a plain value (do not apply); default treats it as Effect.")
   in
+  let ulib =
+    Arg.(
+      value
+      & opt (some string) None
+      & info
+          [ "ulib" ]
+          ~docv:"DIR"
+          ~doc:
+            "A ulib corefn dir of registry-package patches, overlaid over --corefn-dir \
+             (ADR-0038).")
+  in
   Cmd.v
     (Cmd.info
        "build"
        ~doc:"Compile a CoreFn dir's modules (incrementally) and link an image.")
-    Term.(const build_action $ corefn_dir_arg $ output_arg $ em $ e $ arg $ value)
+    Term.(const build_action $ corefn_dir_arg $ output_arg $ em $ e $ arg $ value $ ulib)
 
 let native_cmd =
   let open Cmdliner in
