@@ -85,5 +85,6 @@ language and are kept out of version control.)
 | [0036](0036-anf-to-ocaml-value-representation.md) | ANF → OCaml codegen: value representation and calling convention | Accepted |
 | [0037](0037-self-hosting-purescript.md) | Self-hosting: reimplement purvasm in PureScript on the boot native backend | Accepted |
 | [0038](0038-base-package-and-ulib-patches.md) | A minimal native base (`Purvasm.*`) and a `ulib` of registry-package patches | Accepted |
+| [0039](0039-ulib-st-array-and-st-uncurried.md) | `ulib` `Data.Array.ST` over the fixed-length primitive; `ST.Uncurried` structural | Accepted |
 
 ## Scope
