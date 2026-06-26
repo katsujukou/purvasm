@@ -160,7 +160,7 @@ import Data.Array.ST as STA
 import Data.Array.ST.Iterator as STAI
 import Data.Foldable (class Foldable, traverse_)
 import Data.Foldable as F
-import Data.Function.Uncurried (Fn2, Fn3, Fn4, runFn2, runFn3, runFn4)
+import Data.Function.Uncurried (Fn2, Fn3, Fn4, mkFn2, mkFn3, mkFn4, runFn2, runFn3, runFn4)
 import Data.FunctorWithIndex as FWI
 import Data.Maybe (Maybe(..), maybe, isJust, fromJust, isNothing)
 import Data.Traversable (sequence, traverse)
@@ -188,9 +188,33 @@ toUnfoldable xs = unfoldr f 0
 fromFoldable :: forall f. Foldable f => f ~> Array
 fromFoldable = runFn2 fromFoldableImpl F.foldr
 
-foreign import fromFoldableImpl
+-- ulib shadow: fold the `Foldable` into a private cons-list (O(1) prepend, in order), then
+-- materialise an exact-length `Purvasm.Array` (was a foreign). The private signature is monomorphic
+-- in `b := ConsList a` (the rank-2 `foldr` cannot pass through `mkFn2`); `fromFoldable` is unaffected
+-- since `Data.Foldable.foldr`, being `forall b. …`, instantiates to it.
+fromFoldableImpl
   :: forall f a
-   . Fn2 (forall b. (a -> b -> b) -> b -> f a -> b) (f a) (Array a)
+   . Fn2 ((a -> ConsList a -> ConsList a) -> ConsList a -> f a -> ConsList a) (f a) (Array a)
+fromFoldableImpl = mkFn2 \foldr xs -> consListToArray (foldr CCons CNil xs)
+
+-- A private, in-order cons list used only as the accumulator of `fromFoldableImpl`.
+data ConsList a = CNil | CCons a (ConsList a)
+
+consListToArray :: forall a. ConsList a -> Array a
+consListToArray l = fillL l 0 (PA.unsafeNew (clen l 0))
+  where
+  clen ll acc = case ll of
+    CNil -> acc
+    CCons _ t -> clen t (acc + 1)
+  fillL ll i out = case ll of
+    CNil -> out
+    CCons x t -> fillL t (i + 1) (PA.unsafeSet out i x)
+
+-- Fresh copy of `xs[start .. start + n)`.
+subArray :: forall a. Array a -> Int -> Int -> Array a
+subArray xs start n = go 0 (PA.unsafeNew n)
+  where
+  go i acc = if i == n then acc else go (i + 1) (PA.unsafeSet acc i (PA.unsafeIndex xs (start + i)))
 
 -- | Create an array of one element
 -- | ```purescript
@@ -206,7 +230,15 @@ singleton a = [ a ]
 range :: Int -> Int -> Array Int
 range = runFn2 rangeImpl
 
-foreign import rangeImpl :: Fn2 Int Int (Array Int)
+-- ulib shadow: an inclusive integer range, ascending or descending (was a foreign).
+rangeImpl :: Fn2 Int Int (Array Int)
+rangeImpl = mkFn2 \start end ->
+  let
+    step = if end >= start then 1 else -1
+    n = (if end >= start then end - start else start - end) + 1
+    go i v acc = if i == n then acc else go (i + 1) (v + step) (PA.unsafeSet acc i v)
+  in
+    go 0 start (PA.unsafeNew n)
 
 -- | Create an array containing a value repeated the specified number of times.
 -- | ```purescript
@@ -255,7 +287,9 @@ null xs = length xs == 0
 -- | ```purescript
 -- | length ["Hello", "World"] = 2
 -- | ```
-foreign import length :: forall a. Array a -> Int
+-- ulib shadow: the `Purvasm.Array` length primitive (was a foreign).
+length :: forall a. Array a -> Int
+length = PA.length
 
 --------------------------------------------------------------------------------
 -- Extending arrays ------------------------------------------------------------
@@ -385,9 +419,12 @@ init xs
 uncons :: forall a. Array a -> Maybe { head :: a, tail :: Array a }
 uncons = runFn3 unconsImpl (const Nothing) \x xs -> Just { head: x, tail: xs }
 
-foreign import unconsImpl
-  :: forall a b
-   . Fn3 (Unit -> b) (a -> Array a -> b) (Array a) b
+-- ulib shadow: split head/tail over `Purvasm.Array`; the tail is a fresh sub-array (was a foreign).
+unconsImpl :: forall a b. Fn3 (Unit -> b) (a -> Array a -> b) (Array a) b
+unconsImpl = mkFn3 \empty next xs ->
+  let n = PA.length xs in
+  if n == 0 then empty unit
+  else next (PA.unsafeIndex xs 0) (subArray xs 1 (n - 1))
 
 -- | Break an array into its last element and all preceding elements.
 -- |
@@ -417,9 +454,12 @@ unsnoc xs = { init: _, last: _ } <$> init xs <*> last xs
 index :: forall a. Array a -> Int -> Maybe a
 index = runFn4 indexImpl Just Nothing
 
-foreign import indexImpl
-  :: forall a
-   . Fn4 (forall r. r -> Maybe r) (forall r. Maybe r) (Array a) Int (Maybe a)
+-- ulib shadow: bounds-checked index (was a foreign). The private signature is monomorphic
+-- (`a -> Maybe a`, not the rank-2 `forall r. r -> Maybe r`), since the rank-2 argument cannot pass
+-- through `mkFn4`; `index = runFn4 indexImpl Just Nothing` is unaffected.
+indexImpl :: forall a. Fn4 (a -> Maybe a) (Maybe a) (Array a) Int (Maybe a)
+indexImpl = mkFn4 \just nothing xs i ->
+  if 0 <= i && i < PA.length xs then just (PA.unsafeIndex xs i) else nothing
 
 -- | An infix version of `index`.
 -- |
@@ -640,7 +680,12 @@ intersperse a arr = case length arr of
 -- | reverse [1, 2, 3] = [3, 2, 1]
 -- | ```
 -- |
-foreign import reverse :: forall a. Array a -> Array a
+-- ulib shadow: build the reversed array in place over `Purvasm.Array` (was a foreign).
+reverse :: forall a. Array a -> Array a
+reverse xs = go 0 (PA.unsafeNew n)
+  where
+  n = PA.length xs
+  go i acc = if i == n then acc else go (i + 1) (PA.unsafeSet acc i (PA.unsafeIndex xs (n - 1 - i)))
 
 -- | Flatten an array of arrays, creating a new array.
 -- |
@@ -996,7 +1041,17 @@ sortWith f = sortBy (comparing f)
 slice :: forall a. Int -> Int -> Array a -> Array a
 slice = runFn3 sliceImpl
 
-foreign import sliceImpl :: forall a. Fn3 Int Int (Array a) (Array a)
+-- ulib shadow: `Array.prototype.slice` semantics — negative indices count from the end, both
+-- bounds clamp to `[0, length]` (was a foreign).
+sliceImpl :: forall a. Fn3 Int Int (Array a) (Array a)
+sliceImpl = mkFn3 \start end xs ->
+  let
+    len = PA.length xs
+    norm i = if i < 0 then (let j = len + i in if j < 0 then 0 else j) else (if i > len then len else i)
+    s = norm start
+    e = norm end
+  in
+    subArray xs s (if e > s then e - s else 0)
 
 -- | Keep only a number of elements from the start of an array, creating a new
 -- | array.
@@ -1440,4 +1495,6 @@ foldRecM f b array = tailRecM2 go b 0
 unsafeIndex :: forall a. Partial => Array a -> Int -> a
 unsafeIndex = runFn2 unsafeIndexImpl
 
-foreign import unsafeIndexImpl :: forall a. Fn2 (Array a) Int a
+-- ulib shadow: unchecked index over the `Purvasm.Array` primitive (was a foreign).
+unsafeIndexImpl :: forall a. Fn2 (Array a) Int a
+unsafeIndexImpl = mkFn2 \xs i -> PA.unsafeIndex xs i
