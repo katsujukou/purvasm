@@ -22,18 +22,21 @@ let group_of_bind (key : Corefn.Names.ident -> string) (b : E.bind) : Artifact.g
     let t = Lower.expr e in
     { Artifact.keys = [ k ]
     ; deps = SSet.elements (Link.free_vars t)
-    ; members = [ (k, gdef ~recursive:false t) ]
+    ; members = [ k, gdef ~recursive:false t ]
     }
   | E.Rec rbs ->
     let pairs =
-      List.map (fun (rb : E.rec_binding) -> (key rb.ident, Lower.expr rb.expr)) rbs
+      List.map (fun (rb : E.rec_binding) -> key rb.ident, Lower.expr rb.expr) rbs
     in
     let deps =
-      List.fold_left (fun acc (_, t) -> SSet.union acc (Link.free_vars t)) SSet.empty pairs
+      List.fold_left
+        (fun acc (_, t) -> SSet.union acc (Link.free_vars t))
+        SSet.empty
+        pairs
     in
     { Artifact.keys = List.map fst pairs
     ; deps = SSet.elements deps
-    ; members = List.map (fun (k, t) -> (k, gdef ~recursive:true t)) pairs
+    ; members = List.map (fun (k, t) -> k, gdef ~recursive:true t) pairs
     }
 
 (** Compile a module to its `.pvmo` artifact. The interface's [exports] are the
@@ -44,7 +47,9 @@ let group_of_bind (key : Corefn.Names.ident -> string) (b : E.bind) : Artifact.g
 let compile_module (m : M.t) : Artifact.module_artifact =
   let key id = Lower.qualified_key m.name id in
   let groups = List.map (group_of_bind key) m.decls in
-  let defined = SSet.of_list (List.concat_map (fun (g : Artifact.group) -> g.keys) groups) in
+  let defined =
+    SSet.of_list (List.concat_map (fun (g : Artifact.group) -> g.keys) groups)
+  in
   { Artifact.name = Link.name_key m.name
   ; imports = List.map (fun (i : M.import) -> Link.name_key i.module_name) m.imports
   ; exports = List.filter (fun k -> SSet.mem k defined) (List.map key m.exports)

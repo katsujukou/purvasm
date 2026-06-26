@@ -72,7 +72,7 @@ let interface_of (a : module_artifact) : interface =
   let exports =
     a.exports
     |> List.filter_map (fun k ->
-         Option.map (fun gd -> (k, kind_of_gdef gd)) (Hashtbl.find_opt defs k))
+      Option.map (fun gd -> k, kind_of_gdef gd) (Hashtbl.find_opt defs k))
     |> List.sort (fun (a, _) (b, _) -> String.compare a b)
   in
   let surface = List.map (fun (k, kd) -> k ^ ":" ^ kind_to_tag kd) exports in
@@ -89,13 +89,17 @@ let group_to_json (g : group) : J.t =
     [ "keys", I.strs g.keys
     ; "deps", I.strs g.deps
     ; ( "members"
-      , `List
-          (List.map (fun (n, gd) -> `List [ `String n; I.gdef_to_json gd ]) g.members) )
+      , `List (List.map (fun (n, gd) -> `List [ `String n; I.gdef_to_json gd ]) g.members)
+      )
     ]
 
 let group_of_json : J.t -> group = function
   | `Assoc fields ->
-    let get k = match List.assoc_opt k fields with Some v -> v | None -> err ("group: missing " ^ k) in
+    let get k =
+      match List.assoc_opt k fields with
+      | Some v -> v
+      | None -> err ("group: missing " ^ k)
+    in
     { keys = I.strs_of (get "keys")
     ; deps = I.strs_of (get "deps")
     ; members =
@@ -103,7 +107,7 @@ let group_of_json : J.t -> group = function
          | `List xs ->
            List.map
              (function
-               | `List [ `String n; gd ] -> (n, I.gdef_of_json gd)
+               | `List [ `String n; gd ] -> n, I.gdef_of_json gd
                | _ -> err "bad group member")
              xs
          | _ -> err "members: expected array")
@@ -121,11 +125,20 @@ let module_to_json (a : module_artifact) : J.t =
 
 let module_of_json : J.t -> module_artifact = function
   | `Assoc fields ->
-    let get k = match List.assoc_opt k fields with Some v -> v | None -> err ("pvmo: missing " ^ k) in
-    (match get "version" with `Int v when v = I.format_version -> () | _ -> err "pvmo: version");
+    let get k =
+      match List.assoc_opt k fields with
+      | Some v -> v
+      | None -> err ("pvmo: missing " ^ k)
+    in
+    (match get "version" with
+     | `Int v when v = I.format_version -> ()
+     | _ -> err "pvmo: version");
     { name = I.str_of (get "name")
     ; imports = I.strs_of (get "imports")
-    ; exports = (match List.assoc_opt "exports" fields with Some v -> I.strs_of v | None -> [])
+    ; exports =
+        (match List.assoc_opt "exports" fields with
+         | Some v -> I.strs_of v
+         | None -> [])
     ; groups =
         (match get "groups" with
          | `List xs -> List.map group_of_json xs
@@ -156,15 +169,21 @@ let interface_to_json (i : interface) : J.t =
 
 let interface_of_json : J.t -> interface = function
   | `Assoc fields ->
-    let get k = match List.assoc_opt k fields with Some v -> v | None -> err ("pvmi: missing " ^ k) in
-    (match get "version" with `Int v when v = I.format_version -> () | _ -> err "pvmi: version");
+    let get k =
+      match List.assoc_opt k fields with
+      | Some v -> v
+      | None -> err ("pvmi: missing " ^ k)
+    in
+    (match get "version" with
+     | `Int v when v = I.format_version -> ()
+     | _ -> err "pvmi: version");
     { iface_name = I.str_of (get "name")
     ; exports =
         (match get "exports" with
          | `List xs ->
            List.map
              (function
-               | `List [ `String k; kd ] -> (k, kind_of_json kd)
+               | `List [ `String k; kd ] -> k, kind_of_json kd
                | _ -> err "pvmi: bad export")
              xs
          | _ -> err "pvmi: exports expected array")

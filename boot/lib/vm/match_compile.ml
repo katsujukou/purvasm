@@ -31,15 +31,15 @@ type core =
   | Crec of (string * C.binder) list
 
 let rec peel : C.binder -> string list * core = function
-  | C.BNull -> ([], Cwild)
-  | C.BVar x -> ([ x ], Cwild)
+  | C.BNull -> [], Cwild
+  | C.BVar x -> [ x ], Cwild
   | C.BNamed (x, inner) ->
     let ns, c = peel inner in
-    (x :: ns, c)
-  | C.BLit l -> ([], Clit l)
-  | C.BCtor (tag, subs) -> ([], Cctor (tag, subs))
-  | C.BArray subs -> ([], Carr subs)
-  | C.BRecord fields -> ([], Crec fields)
+    x :: ns, c
+  | C.BLit l -> [], Clit l
+  | C.BCtor (tag, subs) -> [], Cctor (tag, subs)
+  | C.BArray subs -> [], Carr subs
+  | C.BRecord fields -> [], Crec fields
 
 (* One clause of the pattern matrix: the binders still to test (aligned to the
    current occurrences), the variable→occurrence bindings collected so far on the way
@@ -64,7 +64,8 @@ let remove_col xs c = List.filteri (fun i _ -> i <> c) xs
 type pseudo =
   | Pinstr of B.instr
   | Pjump of int
-  | Pjump_unless of int (* pop a bool; jump to the label when false (guard fall-through) *)
+  | Pjump_unless of
+      int (* pop a bool; jump to the label when false (guard fall-through) *)
   | Pswitch_ctor of (string * int) list * int
   | Pswitch_lit of (C.lit * int) list * int
   | Pswitch_len of (int * int) list * int
@@ -84,24 +85,24 @@ let resolve (pseudos : pseudo list) : B.instr list =
   let p = ref 0 in
   List.filter_map
     (fun ps ->
-      match ps with
-      | Plabel _ -> None
-      | _ ->
-        let self = !p in
-        incr p;
-        let rel l = Hashtbl.find labelpos l - (self + 1) in
-        Some
-          (match ps with
-           | Pinstr i -> i
-           | Pjump l -> B.Jump (rel l)
-           | Pjump_unless l -> B.Jump_unless (rel l)
-           | Pswitch_ctor (cs, d) ->
-             B.Switch_ctor (List.map (fun (t, l) -> (t, rel l)) cs, rel d)
-           | Pswitch_lit (cs, d) ->
-             B.Switch_lit (List.map (fun (x, l) -> (x, rel l)) cs, rel d)
-           | Pswitch_len (cs, d) ->
-             B.Switch_len (List.map (fun (x, l) -> (x, rel l)) cs, rel d)
-           | Plabel _ -> assert false))
+       match ps with
+       | Plabel _ -> None
+       | _ ->
+         let self = !p in
+         incr p;
+         let rel l = Hashtbl.find labelpos l - (self + 1) in
+         Some
+           (match ps with
+            | Pinstr i -> i
+            | Pjump l -> B.Jump (rel l)
+            | Pjump_unless l -> B.Jump_unless (rel l)
+            | Pswitch_ctor (cs, d) ->
+              B.Switch_ctor (List.map (fun (t, l) -> t, rel l) cs, rel d)
+            | Pswitch_lit (cs, d) ->
+              B.Switch_lit (List.map (fun (x, l) -> x, rel l) cs, rel d)
+            | Pswitch_len (cs, d) ->
+              B.Switch_len (List.map (fun (x, l) -> x, rel l) cs, rel d)
+            | Plabel _ -> assert false))
     pseudos
 
 (* Matching strategy for unconditional `case` (ADR-0031). Default is the decision
@@ -115,7 +116,10 @@ let use_naive_matching = ref false
 let compile_tree ~atom ~body (tail : bool) (scruts : A.atom list) (alts : A.alt list)
   : B.instr list
   =
-  let buf = ref [] (* pseudo-instructions, reversed *) in
+  let buf =
+    ref []
+    (* pseudo-instructions, reversed *)
+  in
   let emit p = buf := p :: !buf in
   let lbl_ctr = ref 0 in
   let fresh_lbl () =
@@ -135,7 +139,7 @@ let compile_tree ~atom ~body (tail : bool) (scruts : A.atom list) (alts : A.alt 
     emit (Pinstr proj);
     emit (Pinstr (B.Bind name))
   in
-  let binds_of names occ = List.map (fun n -> (n, occ)) names in
+  let binds_of names occ = List.map (fun n -> n, occ) names in
   let first_refutable cores =
     let rec go i = function
       | [] -> assert false (* a non-leaf row has a refutable column *)
@@ -158,11 +162,11 @@ let compile_tree ~atom ~body (tail : bool) (scruts : A.atom list) (alts : A.alt 
     | A.Guarded clauses ->
       List.iter
         (fun (guard, gbody) ->
-          List.iter (fun i -> emit (Pinstr i)) (body false guard);
-          let gnext = fresh_lbl () in
-          emit (Pjump_unless gnext);
-          emit_body gbody;
-          emit (Plabel gnext))
+           List.iter (fun i -> emit (Pinstr i)) (body false guard);
+           let gnext = fresh_lbl () in
+           emit (Pjump_unless gnext);
+           emit_body gbody;
+           emit (Plabel gnext))
         clauses;
       on_fail ()
   in
@@ -181,8 +185,8 @@ let compile_tree ~atom ~body (tail : bool) (scruts : A.atom list) (alts : A.alt 
         in
         List.iter
           (fun (name, occ) ->
-            emit (Pinstr (B.Load occ));
-            emit (Pinstr (B.Bind name)))
+             emit (Pinstr (B.Load occ));
+             emit (Pinstr (B.Bind name)))
           leaf_binds;
         emit_rhs row0.rhs ~on_fail:(fun () -> compile occs rest))
       else (
@@ -200,55 +204,56 @@ let compile_tree ~atom ~body (tail : bool) (scruts : A.atom list) (alts : A.alt 
     let heads =
       List.fold_left
         (fun acc row ->
-          match snd (peel (List.nth row.pats c)) with
-          | Cctor (tag, subs) when not (List.mem_assoc tag acc) ->
-            acc @ [ (tag, List.length subs) ]
-          | _ -> acc)
-        [] rows
+           match snd (peel (List.nth row.pats c)) with
+           | Cctor (tag, subs) when not (List.mem_assoc tag acc) ->
+             acc @ [ tag, List.length subs ]
+           | _ -> acc)
+        []
+        rows
     in
     let default_rows =
       List.filter_map
         (fun row ->
-          let names, core = peel (List.nth row.pats c) in
-          match core with
-          | Cwild ->
-            Some
-              { row with
-                pats = remove_col row.pats c
-              ; binds = row.binds @ binds_of names occ_c
-              }
-          | _ -> None)
+           let names, core = peel (List.nth row.pats c) in
+           match core with
+           | Cwild ->
+             Some
+               { row with
+                 pats = remove_col row.pats c
+               ; binds = row.binds @ binds_of names occ_c
+               }
+           | _ -> None)
         rows
     in
     let default_lbl = fresh_lbl () in
-    let head_lbls = List.map (fun (tag, _) -> (tag, fresh_lbl ())) heads in
+    let head_lbls = List.map (fun (tag, _) -> tag, fresh_lbl ()) heads in
     emit (Pinstr (B.Load occ_c));
     emit (Pswitch_ctor (head_lbls, default_lbl));
     List.iter
       (fun (tag, arity) ->
-        emit (Plabel (List.assoc tag head_lbls));
-        let sub_occs = List.init arity (fun _ -> fresh_occ ()) in
-        List.iteri (fun j o -> extract occ_c (B.Proj j) o) sub_occs;
-        let rows' =
-          List.filter_map
-            (fun row ->
-              let names, core = peel (List.nth row.pats c) in
-              let subpats =
-                match core with
-                | Cctor (t, subs) when String.equal t tag -> Some subs
-                | Cwild -> Some (List.init arity (fun _ -> C.BNull))
-                | _ -> None
-              in
-              Option.map
-                (fun subs ->
-                  { pats = replace_col row.pats c subs
-                  ; binds = row.binds @ binds_of names occ_c
-                  ; rhs = row.rhs
-                  })
-                subpats)
-            rows
-        in
-        compile (replace_col occs c sub_occs) rows')
+         emit (Plabel (List.assoc tag head_lbls));
+         let sub_occs = List.init arity (fun _ -> fresh_occ ()) in
+         List.iteri (fun j o -> extract occ_c (B.Proj j) o) sub_occs;
+         let rows' =
+           List.filter_map
+             (fun row ->
+                let names, core = peel (List.nth row.pats c) in
+                let subpats =
+                  match core with
+                  | Cctor (t, subs) when String.equal t tag -> Some subs
+                  | Cwild -> Some (List.init arity (fun _ -> C.BNull))
+                  | _ -> None
+                in
+                Option.map
+                  (fun subs ->
+                     { pats = replace_col row.pats c subs
+                     ; binds = row.binds @ binds_of names occ_c
+                     ; rhs = row.rhs
+                     })
+                  subpats)
+             rows
+         in
+         compile (replace_col occs c sub_occs) rows')
       heads;
     emit (Plabel default_lbl);
     compile (remove_col occs c) default_rows
@@ -257,34 +262,35 @@ let compile_tree ~atom ~body (tail : bool) (scruts : A.atom list) (alts : A.alt 
     let heads =
       List.fold_left
         (fun acc row ->
-          match snd (peel (List.nth row.pats c)) with
-          | Clit l when not (List.mem l acc) -> acc @ [ l ]
-          | _ -> acc)
-        [] rows
+           match snd (peel (List.nth row.pats c)) with
+           | Clit l when not (List.mem l acc) -> acc @ [ l ]
+           | _ -> acc)
+        []
+        rows
     in
     let occs' = remove_col occs c in
     let select_rows keep =
       List.filter_map
         (fun row ->
-          let names, core = peel (List.nth row.pats c) in
-          if keep core
-          then
-            Some
-              { row with
-                pats = remove_col row.pats c
-              ; binds = row.binds @ binds_of names occ_c
-              }
-          else None)
+           let names, core = peel (List.nth row.pats c) in
+           if keep core
+           then
+             Some
+               { row with
+                 pats = remove_col row.pats c
+               ; binds = row.binds @ binds_of names occ_c
+               }
+           else None)
         rows
     in
     let default_lbl = fresh_lbl () in
-    let head_lbls = List.map (fun l -> (l, fresh_lbl ())) heads in
+    let head_lbls = List.map (fun l -> l, fresh_lbl ()) heads in
     emit (Pinstr (B.Load occ_c));
     emit (Pswitch_lit (head_lbls, default_lbl));
     List.iter
       (fun l ->
-        emit (Plabel (List.assoc l head_lbls));
-        compile occs' (select_rows (fun core -> core = Clit l || core = Cwild)))
+         emit (Plabel (List.assoc l head_lbls));
+         compile occs' (select_rows (fun core -> core = Clit l || core = Cwild)))
       heads;
     emit (Plabel default_lbl);
     compile occs' (select_rows (fun core -> core = Cwild))
@@ -294,55 +300,56 @@ let compile_tree ~atom ~body (tail : bool) (scruts : A.atom list) (alts : A.alt 
     let heads =
       List.fold_left
         (fun acc row ->
-          match snd (peel (List.nth row.pats c)) with
-          | Carr subs when not (List.mem (List.length subs) acc) ->
-            acc @ [ List.length subs ]
-          | _ -> acc)
-        [] rows
+           match snd (peel (List.nth row.pats c)) with
+           | Carr subs when not (List.mem (List.length subs) acc) ->
+             acc @ [ List.length subs ]
+           | _ -> acc)
+        []
+        rows
     in
     let default_rows =
       List.filter_map
         (fun row ->
-          let names, core = peel (List.nth row.pats c) in
-          match core with
-          | Cwild ->
-            Some
-              { row with
-                pats = remove_col row.pats c
-              ; binds = row.binds @ binds_of names occ_c
-              }
-          | _ -> None)
+           let names, core = peel (List.nth row.pats c) in
+           match core with
+           | Cwild ->
+             Some
+               { row with
+                 pats = remove_col row.pats c
+               ; binds = row.binds @ binds_of names occ_c
+               }
+           | _ -> None)
         rows
     in
     let default_lbl = fresh_lbl () in
-    let head_lbls = List.map (fun len -> (len, fresh_lbl ())) heads in
+    let head_lbls = List.map (fun len -> len, fresh_lbl ()) heads in
     emit (Pinstr (B.Load occ_c));
     emit (Pswitch_len (head_lbls, default_lbl));
     List.iter
       (fun arity ->
-        emit (Plabel (List.assoc arity head_lbls));
-        let sub_occs = List.init arity (fun _ -> fresh_occ ()) in
-        List.iteri (fun j o -> extract occ_c (B.Proj_arr j) o) sub_occs;
-        let rows' =
-          List.filter_map
-            (fun row ->
-              let names, core = peel (List.nth row.pats c) in
-              let subpats =
-                match core with
-                | Carr subs when List.length subs = arity -> Some subs
-                | Cwild -> Some (List.init arity (fun _ -> C.BNull))
-                | _ -> None
-              in
-              Option.map
-                (fun subs ->
-                  { pats = replace_col row.pats c subs
-                  ; binds = row.binds @ binds_of names occ_c
-                  ; rhs = row.rhs
-                  })
-                subpats)
-            rows
-        in
-        compile (replace_col occs c sub_occs) rows')
+         emit (Plabel (List.assoc arity head_lbls));
+         let sub_occs = List.init arity (fun _ -> fresh_occ ()) in
+         List.iteri (fun j o -> extract occ_c (B.Proj_arr j) o) sub_occs;
+         let rows' =
+           List.filter_map
+             (fun row ->
+                let names, core = peel (List.nth row.pats c) in
+                let subpats =
+                  match core with
+                  | Carr subs when List.length subs = arity -> Some subs
+                  | Cwild -> Some (List.init arity (fun _ -> C.BNull))
+                  | _ -> None
+                in
+                Option.map
+                  (fun subs ->
+                     { pats = replace_col row.pats c subs
+                     ; binds = row.binds @ binds_of names occ_c
+                     ; rhs = row.rhs
+                     })
+                  subpats)
+             rows
+         in
+         compile (replace_col occs c sub_occs) rows')
       heads;
     emit (Plabel default_lbl);
     compile (remove_col occs c) default_rows
@@ -353,34 +360,38 @@ let compile_tree ~atom ~body (tail : bool) (scruts : A.atom list) (alts : A.alt 
     let labels =
       List.fold_left
         (fun acc row ->
-          match snd (peel (List.nth row.pats c)) with
-          | Crec fields ->
-            List.fold_left
-              (fun acc (l, _) -> if List.mem l acc then acc else acc @ [ l ])
-              acc
-              fields
-          | _ -> acc)
-        [] rows
+           match snd (peel (List.nth row.pats c)) with
+           | Crec fields ->
+             List.fold_left
+               (fun acc (l, _) -> if List.mem l acc then acc else acc @ [ l ])
+               acc
+               fields
+           | _ -> acc)
+        []
+        rows
     in
     let sub_occs = List.map (fun _ -> fresh_occ ()) labels in
     List.iter2 (fun l o -> extract occ_c (B.Get_field l) o) labels sub_occs;
     let rows' =
       List.map
         (fun row ->
-          let names, core = peel (List.nth row.pats c) in
-          let subpats =
-            match core with
-            | Crec fields ->
-              List.map
-                (fun l -> match List.assoc_opt l fields with Some b -> b | None -> C.BNull)
-                labels
-            | Cwild -> List.map (fun _ -> C.BNull) labels
-            | _ -> assert false (* a record column holds only records / wildcards *)
-          in
-          { pats = replace_col row.pats c subpats
-          ; binds = row.binds @ binds_of names occ_c
-          ; rhs = row.rhs
-          })
+           let names, core = peel (List.nth row.pats c) in
+           let subpats =
+             match core with
+             | Crec fields ->
+               List.map
+                 (fun l ->
+                    match List.assoc_opt l fields with
+                    | Some b -> b
+                    | None -> C.BNull)
+                 labels
+             | Cwild -> List.map (fun _ -> C.BNull) labels
+             | _ -> assert false (* a record column holds only records / wildcards *)
+           in
+           { pats = replace_col row.pats c subpats
+           ; binds = row.binds @ binds_of names occ_c
+           ; rhs = row.rhs
+           })
         rows
     in
     compile (replace_col occs c sub_occs) rows'
@@ -389,19 +400,15 @@ let compile_tree ~atom ~body (tail : bool) (scruts : A.atom list) (alts : A.alt 
   let occ0 =
     List.map
       (fun a ->
-        let o = fresh_occ () in
-        emit (Pinstr (atom a));
-        emit (Pinstr (B.Bind o));
-        o)
+         let o = fresh_occ () in
+         emit (Pinstr (atom a));
+         emit (Pinstr (B.Bind o));
+         o)
       scruts
   in
   let rows0 =
     List.map
-      (fun (alt : A.alt) ->
-        { pats = alt.A.binders
-        ; binds = []
-        ; rhs = alt.A.result
-        })
+      (fun (alt : A.alt) -> { pats = alt.A.binders; binds = []; rhs = alt.A.result })
       alts
   in
   compile occ0 rows0;
@@ -450,30 +457,29 @@ let compile_naive ~atom ~body (tail : bool) (scruts : A.atom list) (alts : A.alt
     | C.BLit l ->
       let cont = fresh_lbl () in
       emit (Pinstr (B.Load o));
-      emit (Pswitch_lit ([ (l, cont) ], fail));
+      emit (Pswitch_lit ([ l, cont ], fail));
       emit (Plabel cont)
     | C.BCtor (tag, subs) ->
       let cont = fresh_lbl () in
       emit (Pinstr (B.Load o));
-      emit (Pswitch_ctor ([ (tag, cont) ], fail));
+      emit (Pswitch_ctor ([ tag, cont ], fail));
       emit (Plabel cont);
       List.iteri (fun j sub -> extract (B.Proj j) sub) subs
     | C.BArray subs ->
       let cont = fresh_lbl () in
       emit (Pinstr (B.Load o));
-      emit (Pswitch_len ([ (List.length subs, cont) ], fail));
+      emit (Pswitch_len ([ List.length subs, cont ], fail));
       emit (Plabel cont);
       List.iteri (fun j sub -> extract (B.Proj_arr j) sub) subs
-    | C.BRecord fields ->
-      List.iter (fun (l, sub) -> extract (B.Get_field l) sub) fields
+    | C.BRecord fields -> List.iter (fun (l, sub) -> extract (B.Get_field l) sub) fields
   in
   let occ0 =
     List.map
       (fun a ->
-        let o = fresh_occ () in
-        emit (Pinstr (atom a));
-        emit (Pinstr (B.Bind o));
-        o)
+         let o = fresh_occ () in
+         emit (Pinstr (atom a));
+         emit (Pinstr (B.Bind o));
+         o)
       scruts
   in
   let emit_body e =
@@ -482,21 +488,21 @@ let compile_naive ~atom ~body (tail : bool) (scruts : A.atom list) (alts : A.alt
   in
   List.iter
     (fun (alt : A.alt) ->
-      let next = fresh_lbl () in
-      List.iter2 (fun o b -> test o b next) occ0 alt.A.binders;
-      (match alt.A.result with
-       | A.Uncond e -> emit_body e
-       | A.Guarded clauses ->
-         (* Guards top to bottom (ADR-0013); all false falls through to [next]. *)
-         List.iter
-           (fun (guard, gbody) ->
-             List.iter (fun i -> emit (Pinstr i)) (body false guard);
-             let gnext = fresh_lbl () in
-             emit (Pjump_unless gnext);
-             emit_body gbody;
-             emit (Plabel gnext))
-           clauses);
-      emit (Plabel next))
+       let next = fresh_lbl () in
+       List.iter2 (fun o b -> test o b next) occ0 alt.A.binders;
+       (match alt.A.result with
+        | A.Uncond e -> emit_body e
+        | A.Guarded clauses ->
+          (* Guards top to bottom (ADR-0013); all false falls through to [next]. *)
+          List.iter
+            (fun (guard, gbody) ->
+               List.iter (fun i -> emit (Pinstr i)) (body false guard);
+               let gnext = fresh_lbl () in
+               emit (Pjump_unless gnext);
+               emit_body gbody;
+               emit (Plabel gnext))
+            clauses);
+       emit (Plabel next))
     alts;
   emit (Pinstr (B.Fail "case: no matching alternative"));
   emit (Plabel end_lbl);
@@ -507,7 +513,10 @@ let compile_naive ~atom ~body (tail : bool) (scruts : A.atom list) (alts : A.alt
     [Codegen]. The decision tree handles unconditional and guarded alternatives alike
     (ADR-0013 guard sequencing preserved); [use_naive_matching] selects the
     per-alternative baseline instead. *)
-let compile ~atom ~body ~tail (scruts : A.atom list) (alts : A.alt list) : B.instr list
-  =
-  (if !use_naive_matching then compile_naive else compile_tree) ~atom ~body tail scruts
+let compile ~atom ~body ~tail (scruts : A.atom list) (alts : A.alt list) : B.instr list =
+  (if !use_naive_matching then compile_naive else compile_tree)
+    ~atom
+    ~body
+    tail
+    scruts
     alts

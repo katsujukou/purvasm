@@ -152,7 +152,8 @@ let rec mkdir_p dir =
   if not (Sys.file_exists dir)
   then (
     mkdir_p (Filename.dirname dir);
-    try Unix.mkdir dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ())
+    try Unix.mkdir dir 0o755 with
+    | Unix.Unix_error (Unix.EEXIST, _, _) -> ())
 
 (* Layout (ADR-0033): the corefn dir holds `purs` output; the output dir holds the
    image at its root and intermediate `.pvmo`/`.pvmi` under `_build/`. *)
@@ -173,13 +174,17 @@ let emit_artifact output (a : Pvm.Artifact.module_artifact) : unit =
    [Image.format_version] (which must be bumped on any codegen/encoding change)
    invalidate stale objects rather than silently reuse them. The `.pvmi`-hash
    cross-module cascade activates once cross-module optimisation exists. *)
-let compile_incremental ~corefn_dir ~output (m : Corefn.Module.t) : Pvm.Artifact.module_artifact =
+let compile_incremental ~corefn_dir ~output (m : Corefn.Module.t)
+  : Pvm.Artifact.module_artifact
+  =
   let name = Link.name_key m.name in
   let obj = pvmo_path output name in
   let pvmi = pvmi_path output name in
   let mtime_ok =
     Sys.file_exists obj
-    && (try mtime obj >= mtime (Link.module_path corefn_dir m.name) with _ -> false)
+    &&
+    try mtime obj >= mtime (Link.module_path corefn_dir m.name) with
+    | _ -> false
   in
   (* Reuse only if the object both is newer than the source and parses at the current
      version (a version/format mismatch raises, dropping to recompile). *)
@@ -189,9 +194,11 @@ let compile_incremental ~corefn_dir ~output (m : Corefn.Module.t) : Pvm.Artifact
       try
         let a = Pvm.Artifact.module_of_string (read_file obj) in
         if not (Sys.file_exists pvmi)
-        then write_file pvmi (Pvm.Artifact.interface_to_string (Pvm.Artifact.interface_of a));
+        then
+          write_file pvmi (Pvm.Artifact.interface_to_string (Pvm.Artifact.interface_of a));
         Some a
-      with _ -> None)
+      with
+      | _ -> None)
     else None
   in
   match reused with
@@ -205,9 +212,9 @@ let compile_incremental ~corefn_dir ~output (m : Corefn.Module.t) : Pvm.Artifact
    `Int -> Int` ([--arg]); or a bare value ([--value]). *)
 let entry_main ~value ~arg entry_key : term * bool =
   match value, arg with
-  | true, _ -> (Var entry_key, false)
-  | false, Some n -> (App (Var entry_key, Lit (LInt n)), false)
-  | false, None -> (App (Var entry_key, Lit (LInt 0)), true)
+  | true, _ -> Var entry_key, false
+  | false, Some n -> App (Var entry_key, Lit (LInt n)), false
+  | false, None -> App (Var entry_key, Lit (LInt 0)), true
 
 let build_action corefn_dir output entry_module entry arg value =
   mkdir_p (build_dir output);
@@ -217,7 +224,7 @@ let build_action corefn_dir output entry_module entry arg value =
   let main_term, is_effect = entry_main ~value ~arg (Lower.qualified_key em entry) in
   let img =
     { (Pvm.Plink.link artifacts ~resolver:Ffi.resolver ~main_term) with
-      Pvm.Image.is_effect = is_effect
+      Pvm.Image.is_effect
     }
   in
   Pvm.Image.write_file (image_path output) img;
@@ -237,30 +244,44 @@ let native_action corefn_dir output entry_module entry arg value ulib =
   mkdir_p (build_dir output);
   let em = split_module entry_module in
   let term0 =
-    Link.link_program ~resolver:Ffi.resolver ?ulib_dir:ulib ~outdir:corefn_dir ~entry_module:em ~entry ()
+    Link.link_program
+      ~resolver:Ffi.resolver
+      ?ulib_dir:ulib
+      ~outdir:corefn_dir
+      ~entry_module:em
+      ~entry
+      ()
   in
   let main_term, is_effect =
     match value, arg with
-    | true, _ -> (term0, false)
-    | false, Some n -> (App (term0, Lit (LInt n)), false)
-    | false, None -> (term0, true)
+    | true, _ -> term0, false
+    | false, Some n -> App (term0, Lit (LInt n)), false
+    | false, None -> term0, true
   in
   let anf =
-    Middle_end.Passes.Dbe.run ~effectful_leaf:Ffi.effectful ~foreign_arity:Ffi.foreign_arity
+    Middle_end.Passes.Dbe.run
+      ~effectful_leaf:Ffi.effectful
+      ~foreign_arity:Ffi.foreign_arity
       (Middle_end.Passes.Simplify.run
          (Middle_end.Passes.Dict_elim.run (Middle_end.Transl.transl main_term)))
   in
   let bdir = build_dir output in
-  write_file (Filename.concat bdir "app.ml") (Ocaml_backend.Codegen_ml.program ~is_effect anf);
+  write_file
+    (Filename.concat bdir "app.ml")
+    (Ocaml_backend.Codegen_ml.program ~is_effect anf);
   let exe = abspath (Filename.concat output "app") in
   let rc =
     Sys.command
-      (Stdlib.Printf.sprintf "cd %s && ocamlfind ocamlopt app.ml -o %s 2>ocamlopt.log"
-         (Filename.quote (abspath bdir)) (Filename.quote exe))
+      (Stdlib.Printf.sprintf
+         "cd %s && ocamlfind ocamlopt app.ml -o %s 2>ocamlopt.log"
+         (Filename.quote (abspath bdir))
+         (Filename.quote exe))
   in
   if rc <> 0
   then (
-    Stdlib.Printf.eprintf "ocamlopt failed; see %s\n" (Filename.concat bdir "ocamlopt.log");
+    Stdlib.Printf.eprintf
+      "ocamlopt failed; see %s\n"
+      (Filename.concat bdir "ocamlopt.log");
     Stdlib.exit 1);
   Stdlib.Printf.printf "wrote %s\n" exe
 
@@ -287,38 +308,92 @@ let demo_cmd =
 
 let corefn_dir_arg =
   let open Cmdliner in
-  Arg.(value & opt string "./output" & info [ "corefn-dir" ] ~docv:"DIR"
-       ~doc:"Directory of `purs` CoreFn output (per-module subdirs).")
+  Arg.(
+    value
+    & opt string "./output"
+    & info
+        [ "corefn-dir" ]
+        ~docv:"DIR"
+        ~doc:"Directory of `purs` CoreFn output (per-module subdirs).")
 
 let output_arg =
   let open Cmdliner in
-  Arg.(value & opt string "output-purvm" & info [ "output"; "o" ] ~docv:"DIR"
-       ~doc:"Output directory: the image at its root, intermediates under _build/.")
+  Arg.(
+    value
+    & opt string "output-purvm"
+    & info
+        [ "output"; "o" ]
+        ~docv:"DIR"
+        ~doc:"Output directory: the image at its root, intermediates under _build/.")
 
 let build_cmd =
   let open Cmdliner in
-  let em = Arg.(value & opt string "Main" & info [ "entry-module"; "m" ] ~docv:"MODULE") in
+  let em =
+    Arg.(value & opt string "Main" & info [ "entry-module"; "m" ] ~docv:"MODULE")
+  in
   let e = Arg.(value & opt string "main" & info [ "entry"; "e" ] ~docv:"NAME") in
-  let arg = Arg.(value & opt (some int) None & info [ "arg" ] ~docv:"INT"
-                 ~doc:"Apply the entry to this Int (an Int -> Int entry).") in
-  let value = Arg.(value & flag & info [ "value" ]
-                   ~doc:"Entry is a plain value (do not apply); default treats it as Effect.") in
+  let arg =
+    Arg.(
+      value
+      & opt (some int) None
+      & info
+          [ "arg" ]
+          ~docv:"INT"
+          ~doc:"Apply the entry to this Int (an Int -> Int entry).")
+  in
+  let value =
+    Arg.(
+      value
+      & flag
+      & info
+          [ "value" ]
+          ~doc:"Entry is a plain value (do not apply); default treats it as Effect.")
+  in
   Cmd.v
-    (Cmd.info "build" ~doc:"Compile a CoreFn dir's modules (incrementally) and link an image.")
+    (Cmd.info
+       "build"
+       ~doc:"Compile a CoreFn dir's modules (incrementally) and link an image.")
     Term.(const build_action $ corefn_dir_arg $ output_arg $ em $ e $ arg $ value)
 
 let native_cmd =
   let open Cmdliner in
-  let em = Arg.(value & opt string "Main" & info [ "entry-module"; "m" ] ~docv:"MODULE") in
+  let em =
+    Arg.(value & opt string "Main" & info [ "entry-module"; "m" ] ~docv:"MODULE")
+  in
   let e = Arg.(value & opt string "main" & info [ "entry"; "e" ] ~docv:"NAME") in
-  let arg = Arg.(value & opt (some int) None & info [ "arg" ] ~docv:"INT"
-                 ~doc:"Apply the entry to this Int (an Int -> Int entry).") in
-  let value = Arg.(value & flag & info [ "value" ]
-                   ~doc:"Entry is a plain value (do not apply); default treats it as Effect.") in
-  let ulib = Arg.(value & opt (some string) None & info [ "ulib" ] ~docv:"DIR"
-                  ~doc:"A ulib corefn dir of registry-package patches, overlaid over --corefn-dir (ADR-0038).") in
+  let arg =
+    Arg.(
+      value
+      & opt (some int) None
+      & info
+          [ "arg" ]
+          ~docv:"INT"
+          ~doc:"Apply the entry to this Int (an Int -> Int entry).")
+  in
+  let value =
+    Arg.(
+      value
+      & flag
+      & info
+          [ "value" ]
+          ~doc:"Entry is a plain value (do not apply); default treats it as Effect.")
+  in
+  let ulib =
+    Arg.(
+      value
+      & opt (some string) None
+      & info
+          [ "ulib" ]
+          ~docv:"DIR"
+          ~doc:
+            "A ulib corefn dir of registry-package patches, overlaid over --corefn-dir \
+             (ADR-0038).")
+  in
   Cmd.v
-    (Cmd.info "native" ~doc:"Compile a CoreFn dir to a native executable via the OCaml backend (ocamlopt).")
+    (Cmd.info
+       "native"
+       ~doc:
+         "Compile a CoreFn dir to a native executable via the OCaml backend (ocamlopt).")
     Term.(const native_action $ corefn_dir_arg $ output_arg $ em $ e $ arg $ value $ ulib)
 
 let compile_cmd =
@@ -334,7 +409,8 @@ let run_cmd =
   let open Cmdliner in
   Cmd.v
     (Cmd.info "run" ~doc:"Run a linked .pvm image.")
-    Term.(const run_action $ Arg.(required & pos 0 (some string) None & info [] ~docv:"IMAGE"))
+    Term.(
+      const run_action $ Arg.(required & pos 0 (some string) None & info [] ~docv:"IMAGE"))
 
 let cmd =
   let open Cmdliner in

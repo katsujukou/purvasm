@@ -32,13 +32,13 @@ let run_image
      rest of the table at call time, so order is irrelevant). *)
   List.iter
     (fun (name, gdef) ->
-      match gdef with
-      | Codegen.Gfun (ps, body) ->
-        Hashtbl.replace
-          globals
-          name
-          (Value.Vclosure { Value.params = ps; body; env = ref Value.SMap.empty })
-      | Codegen.Gcaf _ | Codegen.Grec _ -> ())
+       match gdef with
+       | Codegen.Gfun (ps, body) ->
+         Hashtbl.replace
+           globals
+           name
+           (Value.Vclosure { Value.params = ps; body; env = ref Value.SMap.empty })
+       | Codegen.Gcaf _ | Codegen.Grec _ -> ())
     gdefs;
   (* Pass 2: publish a by-need cell for every recursive-group value, *before* building
      any, so a cyclic instance-dictionary group can refer to siblings not yet built
@@ -46,29 +46,28 @@ let run_image
      first force and memoises; a genuine self-forcing cycle hits [Building]. *)
   List.iter
     (fun (name, gdef) ->
-      match gdef with
-      | Codegen.Grec chunk ->
-        Hashtbl.replace
-          globals
-          name
-          (Value.Vindirect
-             (ref
-                (Value.Unbuilt
-                   (fun () ->
-                     Machine.run_chunk ~foreigns globals chunk Value.SMap.empty))))
-      | Codegen.Gfun _ | Codegen.Gcaf _ -> ())
+       match gdef with
+       | Codegen.Grec chunk ->
+         Hashtbl.replace
+           globals
+           name
+           (Value.Vindirect
+              (ref
+                 (Value.Unbuilt
+                    (fun () -> Machine.run_chunk ~foreigns globals chunk Value.SMap.empty))))
+       | Codegen.Gfun _ | Codegen.Gcaf _ -> ())
     gdefs;
   (* Pass 3: build the non-recursive CAFs strictly, in dependency (spine) order — each
      reduces to a value, exactly as the oracle's strict `let`. *)
   List.iter
     (fun (name, gdef) ->
-      match gdef with
-      | Codegen.Gcaf chunk ->
-        Hashtbl.replace
-          globals
-          name
-          (Machine.run_chunk ~foreigns globals chunk Value.SMap.empty)
-      | Codegen.Gfun _ | Codegen.Grec _ -> ())
+       match gdef with
+       | Codegen.Gcaf chunk ->
+         Hashtbl.replace
+           globals
+           name
+           (Machine.run_chunk ~foreigns globals chunk Value.SMap.empty)
+       | Codegen.Gfun _ | Codegen.Grec _ -> ())
     gdefs;
   Machine.run_chunk ~foreigns globals main Value.SMap.empty
 
@@ -100,6 +99,6 @@ let eval_anf_counted ?(naive = false) (program : Middle_end.Anf.expr) : Value.t 
   Fun.protect
     ~finally:(fun () -> Match_compile.use_naive_matching := saved)
     (fun () ->
-      Machine.executed := 0;
-      let v = eval_anf program in
-      (v, !Machine.executed))
+       Machine.executed := 0;
+       let v = eval_anf program in
+       v, !Machine.executed)

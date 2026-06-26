@@ -143,6 +143,9 @@ let foreign = function
   | "Data.Show.showNumberImpl" -> VClos (fun v -> VString (show_number_impl (as_num v)))
   | "Effect.Console.log" ->
     VClos (fun s -> VClos (fun _u -> print_string (as_str s); print_newline (); flush stdout; VInt 0))
+  (* `_crashWith msg :: a` — a pure partial crash; forcing it halts with the message
+     (mirrors `Ffi.host` and the prelude JS `throw new Error(msg)`). *)
+  | "Partial._crashWith" -> VClos (fun msg -> stuck ("Partial.crashWith: " ^ as_str msg))
   (* purvasm-base String byte primitives (ADR-0038): a String is a byte sequence. *)
   | "Purvasm.String.byteLength" -> VClos (fun s -> VInt (String.length (as_str s)))
   | "Purvasm.String.byteAt" ->
@@ -184,16 +187,26 @@ let mangle (name : string) : string =
   Buffer.add_string buf "v_";
   String.iter
     (fun c ->
-      match c with
-      | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' -> Buffer.add_char buf c
-      | '.' -> Buffer.add_string buf "_"
-      | _ -> Buffer.add_string buf (Printf.sprintf "_x%02x_" (Char.code c)))
+       match c with
+       | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' -> Buffer.add_char buf c
+       | '.' -> Buffer.add_string buf "_"
+       | _ -> Buffer.add_string buf (Printf.sprintf "_x%02x_" (Char.code c)))
     name;
   Buffer.contents buf
 
-let ocaml_string (s : string) : string = "\"" ^ String.concat "" (List.map (fun c ->
-    match c with '"' -> "\\\"" | '\\' -> "\\\\" | '\n' -> "\\n" | c -> String.make 1 c)
-    (List.init (String.length s) (String.get s))) ^ "\""
+let ocaml_string (s : string) : string =
+  "\""
+  ^ String.concat
+      ""
+      (List.map
+         (fun c ->
+            match c with
+            | '"' -> "\\\""
+            | '\\' -> "\\\\"
+            | '\n' -> "\\n"
+            | c -> String.make 1 c)
+         (List.init (String.length s) (String.get s)))
+  ^ "\""
 
 (* The names a binder binds. *)
 let rec binder_vars : C.binder -> string list = function
@@ -231,23 +244,42 @@ let atom (lz : SS.t) : A.atom -> string = function
   | A.AForeign k -> Printf.sprintf "(foreign %s)" (ocaml_string k)
 
 let prim_fn : C.primop -> string = function
-  | C.AddInt -> "p_add_int" | C.SubInt -> "p_sub_int" | C.MulInt -> "p_mul_int"
-  | C.DivInt -> "p_div_int" | C.ModInt -> "p_mod_int"
-  | C.AndInt -> "p_and_int" | C.OrInt -> "p_or_int" | C.XorInt -> "p_xor_int"
-  | C.ShlInt -> "p_shl_int" | C.ShrInt -> "p_shr_int" | C.ZshrInt -> "p_zshr_int"
+  | C.AddInt -> "p_add_int"
+  | C.SubInt -> "p_sub_int"
+  | C.MulInt -> "p_mul_int"
+  | C.DivInt -> "p_div_int"
+  | C.ModInt -> "p_mod_int"
+  | C.AndInt -> "p_and_int"
+  | C.OrInt -> "p_or_int"
+  | C.XorInt -> "p_xor_int"
+  | C.ShlInt -> "p_shl_int"
+  | C.ShrInt -> "p_shr_int"
+  | C.ZshrInt -> "p_zshr_int"
   | C.ComplementInt -> "p_complement_int"
-  | C.AddNumber -> "p_add_num" | C.SubNumber -> "p_sub_num" | C.MulNumber -> "p_mul_num"
+  | C.AddNumber -> "p_add_num"
+  | C.SubNumber -> "p_sub_num"
+  | C.MulNumber -> "p_mul_num"
   | C.DivNumber -> "p_div_num"
-  | C.EqInt -> "p_eq_int" | C.EqNumber -> "p_eq_num" | C.EqString -> "p_eq_str"
+  | C.EqInt -> "p_eq_int"
+  | C.EqNumber -> "p_eq_num"
+  | C.EqString -> "p_eq_str"
   | C.EqBool -> "p_eq_bool"
-  | C.LtInt -> "p_lt_int" | C.LtNumber -> "p_lt_num" | C.LtString -> "p_lt_str"
-  | C.AndBool -> "p_and" | C.OrBool -> "p_or" | C.NotBool -> "p_not"
+  | C.LtInt -> "p_lt_int"
+  | C.LtNumber -> "p_lt_num"
+  | C.LtString -> "p_lt_str"
+  | C.AndBool -> "p_and"
+  | C.OrBool -> "p_or"
+  | C.NotBool -> "p_not"
   | C.Append -> "p_append"
-  | C.IndexArray -> "p_index" | C.LengthArray -> "p_length"
-  | C.NewArray -> "p_new_array" | C.SetArray -> "p_set_array"
+  | C.IndexArray -> "p_index"
+  | C.LengthArray -> "p_length"
+  | C.NewArray -> "p_new_array"
+  | C.SetArray -> "p_set_array"
 
 let prim (lz : SS.t) (op : C.primop) (args : A.atom list) : string =
-  Printf.sprintf "(%s %s)" (prim_fn op)
+  Printf.sprintf
+    "(%s %s)"
+    (prim_fn op)
     (String.concat " " (List.map (fun a -> "(" ^ atom lz a ^ ")") args))
 
 (* Hybrid calling convention (ADR-0036, option 2). A binding whose RHS is *directly* a
@@ -269,19 +301,27 @@ let recurry (native : string) (n : int) : string =
 
 let fresh =
   let c = ref 0 in
-  fun (p : string) -> incr c; Printf.sprintf "%s%d" p !c
+  fun (p : string) ->
+    incr c;
+    Printf.sprintf "%s%d" p !c
 
 (* The matcher, emitted in continuation-passing style: code that matches binder [b]
    against the value-expression [scrut], runs [succ] on success and [fail] on failure.
    This handles every binder kind — records via `SMap.find`, number/string literals via
    structural equality — which OCaml patterns alone cannot. (A naive linear cascade; a
    decision-tree lowering is a later perf slice, cf. ADR-0036.) *)
-let rec emit_match (b : C.binder) (scrut : string) (succ : string) (fail : string) : string =
+let rec emit_match (b : C.binder) (scrut : string) (succ : string) (fail : string)
+  : string
+  =
   match b with
   | C.BNull -> succ
   | C.BVar x -> Printf.sprintf "(let %s = %s in %s)" (mangle x) scrut succ
   | C.BNamed (x, inner) ->
-    Printf.sprintf "(let %s = %s in %s)" (mangle x) scrut (emit_match inner scrut succ fail)
+    Printf.sprintf
+      "(let %s = %s in %s)"
+      (mangle x)
+      scrut
+      (emit_match inner scrut succ fail)
   | C.BLit l -> Printf.sprintf "(if %s = %s then %s else %s)" scrut (lit l) succ fail
   | C.BCtor (tag, subs) ->
     let f = fresh "_f" in
@@ -289,21 +329,35 @@ let rec emit_match (b : C.binder) (scrut : string) (succ : string) (fail : strin
       | [] -> succ
       | s :: r -> emit_match s (Printf.sprintf "%s.(%d)" f i) (nest (i + 1) r) fail
     in
-    Printf.sprintf "(match %s with VData (%s, %s) when Array.length %s = %d -> %s | _ -> %s)" scrut
-      (ocaml_string tag) f f (List.length subs) (nest 0 subs) fail
+    Printf.sprintf
+      "(match %s with VData (%s, %s) when Array.length %s = %d -> %s | _ -> %s)"
+      scrut
+      (ocaml_string tag)
+      f
+      f
+      (List.length subs)
+      (nest 0 subs)
+      fail
   | C.BArray subs ->
     let f = fresh "_a" in
     let rec nest i = function
       | [] -> succ
       | s :: r -> emit_match s (Printf.sprintf "%s.(%d)" f i) (nest (i + 1) r) fail
     in
-    Printf.sprintf "(match %s with VArray %s when Array.length %s = %d -> %s | _ -> %s)" scrut f f
-      (List.length subs) (nest 0 subs) fail
+    Printf.sprintf
+      "(match %s with VArray %s when Array.length %s = %d -> %s | _ -> %s)"
+      scrut
+      f
+      f
+      (List.length subs)
+      (nest 0 subs)
+      fail
   | C.BRecord fields ->
     let m = fresh "_m" in
     let rec nest = function
       | [] -> succ
-      | (l, s) :: r -> emit_match s (Printf.sprintf "(SMap.find %s %s)" (ocaml_string l) m) (nest r) fail
+      | (l, s) :: r ->
+        emit_match s (Printf.sprintf "(SMap.find %s %s)" (ocaml_string l) m) (nest r) fail
     in
     Printf.sprintf "(match %s with VRecord %s -> %s | _ -> %s)" scrut m (nest fields) fail
 
@@ -336,7 +390,8 @@ let rec ocaml_pat (b : C.binder) : string * string list =
     Printf.sprintf "(VNumber %s)" v, [ Printf.sprintf "(%s = %h)" v f ]
   | C.BCtor (tag, subs) ->
     let ps, gs = List.split (List.map ocaml_pat subs) in
-    Printf.sprintf "(VData (%s, [| %s |]))" (ocaml_string tag) (String.concat "; " ps), List.concat gs
+    ( Printf.sprintf "(VData (%s, [| %s |]))" (ocaml_string tag) (String.concat "; " ps)
+    , List.concat gs )
   | C.BArray subs ->
     let ps, gs = List.split (List.map ocaml_pat subs) in
     Printf.sprintf "(VArray [| %s |])" (String.concat "; " ps), List.concat gs
@@ -353,63 +408,135 @@ let rec expr (ae : int IM.t) (lz : SS.t) (e : A.expr) : string =
        (* emit both the native multi-arg fn and the VClos wrapper; the body sees x as
           known-arity. (Non-recursive: [lbody] does not see x.) *)
        let n = List.length ps in
-       Printf.sprintf "(let %s %s = %s in let %s = %s in %s)" (native_name x)
-         (String.concat " " (List.map mangle ps)) (expr ae lz lbody) (mangle x) (recurry (native_name x) n)
+       Printf.sprintf
+         "(let %s %s = %s in let %s = %s in %s)"
+         (native_name x)
+         (String.concat " " (List.map mangle ps))
+         (expr ae lz lbody)
+         (mangle x)
+         (recurry (native_name x) n)
          (expr (IM.add x n ae) lz body)
-     | _ -> Printf.sprintf "(let %s = %s in %s)" (mangle x) (cexpr ae lz c) (expr ae lz body))
+     | _ ->
+       Printf.sprintf "(let %s = %s in %s)" (mangle x) (cexpr ae lz c) (expr ae lz body))
   | A.LetRec (binds, body) ->
     (* function members → native fn + VClos wrapper (both in the `let rec`); other
        members → `lazy`. Extend [ae]/[lz] accordingly for every RHS and the body. *)
-    let ae' = List.fold_left (fun m (x, rhs) -> match as_lam rhs with Some (ps, _) -> IM.add x (List.length ps) m | None -> m) ae binds in
-    let lz' = List.fold_left (fun s (x, rhs) -> match as_lam rhs with Some _ -> s | None -> SS.add x s) lz binds in
+    let ae' =
+      List.fold_left
+        (fun m (x, rhs) ->
+           match as_lam rhs with
+           | Some (ps, _) -> IM.add x (List.length ps) m
+           | None -> m)
+        ae
+        binds
+    in
+    let lz' =
+      List.fold_left
+        (fun s (x, rhs) ->
+           match as_lam rhs with
+           | Some _ -> s
+           | None -> SS.add x s)
+        lz
+        binds
+    in
     let bindings =
       List.concat_map
         (fun (x, rhs) ->
-          match as_lam rhs with
-          | Some (ps, lbody) ->
-            [ Printf.sprintf "%s %s = %s" (native_name x) (String.concat " " (List.map mangle ps)) (expr ae' lz' lbody)
-            ; Printf.sprintf "%s = %s" (mangle x) (recurry (native_name x) (List.length ps)) ]
-          | None -> [ Printf.sprintf "%s = lazy %s" (mangle x) (expr ae' lz' rhs) ])
+           match as_lam rhs with
+           | Some (ps, lbody) ->
+             [ Printf.sprintf
+                 "%s %s = %s"
+                 (native_name x)
+                 (String.concat " " (List.map mangle ps))
+                 (expr ae' lz' lbody)
+             ; Printf.sprintf
+                 "%s = %s"
+                 (mangle x)
+                 (recurry (native_name x) (List.length ps))
+             ]
+           | None -> [ Printf.sprintf "%s = lazy %s" (mangle x) (expr ae' lz' rhs) ])
         binds
     in
-    Printf.sprintf "(let rec %s in %s)" (String.concat " and " bindings) (expr ae' lz' body)
+    Printf.sprintf
+      "(let rec %s in %s)"
+      (String.concat " and " bindings)
+      (expr ae' lz' body)
 
 and cexpr (ae : int IM.t) (lz : SS.t) (c : A.cexpr) : string =
   let atom = atom lz in
-  let app_chain head args = List.fold_left (fun acc a -> Printf.sprintf "(app %s (%s))" acc (atom a)) head args in
+  let app_chain head args =
+    List.fold_left (fun acc a -> Printf.sprintf "(app %s (%s))" acc (atom a)) head args
+  in
   match c with
   | A.CAtom a -> atom a
   | A.CLam (ps, body) ->
-    List.fold_right (fun p acc -> Printf.sprintf "(VClos (fun %s -> %s))" (mangle p) acc) ps (expr ae lz body)
+    List.fold_right
+      (fun p acc -> Printf.sprintf "(VClos (fun %s -> %s))" (mangle p) acc)
+      ps
+      (expr ae lz body)
   | A.CApp (A.AVar x, args) when IM.mem x ae && not (SS.mem x lz) ->
-    let n = List.length args and ar = IM.find x ae in
+    let n = List.length args
+    and ar = IM.find x ae in
     if n = ar
     then (* exact saturation: a direct, uncurried native call *)
-      Printf.sprintf "(%s %s)" (native_name x) (String.concat " " (List.map (fun a -> "(" ^ atom a ^ ")") args))
+      Printf.sprintf
+        "(%s %s)"
+        (native_name x)
+        (String.concat " " (List.map (fun a -> "(" ^ atom a ^ ")") args))
     else if n < ar
     then app_chain (mangle x) args (* partial: via the VClos wrapper *)
     else (
       (* over-application: saturate natively, then apply the rest through [app] *)
-      let take = List.filteri (fun i _ -> i < ar) args and drop = List.filteri (fun i _ -> i >= ar) args in
-      let sat = Printf.sprintf "(%s %s)" (native_name x) (String.concat " " (List.map (fun a -> "(" ^ atom a ^ ")") take)) in
+      let take = List.filteri (fun i _ -> i < ar) args
+      and drop = List.filteri (fun i _ -> i >= ar) args in
+      let sat =
+        Printf.sprintf
+          "(%s %s)"
+          (native_name x)
+          (String.concat " " (List.map (fun a -> "(" ^ atom a ^ ")") take))
+      in
       app_chain sat drop)
   | A.CApp (f, args) -> app_chain (atom f) args
   | A.CPrim (op, args) -> prim lz op args
   | A.CCtor (tag, arity, args) ->
     if List.length args >= arity
-    then Printf.sprintf "(VData (%s, [| %s |]))" (ocaml_string tag) (String.concat "; " (List.map atom args))
-    else
-      Printf.sprintf "(VCtor (%s, %d, [%s]))" (ocaml_string tag) arity
+    then
+      Printf.sprintf
+        "(VData (%s, [| %s |]))"
+        (ocaml_string tag)
         (String.concat "; " (List.map atom args))
-  | A.CArray xs -> Printf.sprintf "(VArray [| %s |])" (String.concat "; " (List.map atom xs))
+    else
+      Printf.sprintf
+        "(VCtor (%s, %d, [%s]))"
+        (ocaml_string tag)
+        arity
+        (String.concat "; " (List.map atom args))
+  | A.CArray xs ->
+    Printf.sprintf "(VArray [| %s |])" (String.concat "; " (List.map atom xs))
   | A.CRecord fs ->
-    Printf.sprintf "(VRecord (List.fold_left (fun m (k,v) -> SMap.add k v m) SMap.empty [%s]))"
-      (String.concat "; " (List.map (fun (l, a) -> Printf.sprintf "(%s, (%s))" (ocaml_string l) (atom a)) fs))
+    Printf.sprintf
+      "(VRecord (List.fold_left (fun m (k,v) -> SMap.add k v m) SMap.empty [%s]))"
+      (String.concat
+         "; "
+         (List.map
+            (fun (l, a) -> Printf.sprintf "(%s, (%s))" (ocaml_string l) (atom a))
+            fs))
   | A.CAccessor (a, l) -> Printf.sprintf "(accessor (%s) %s)" (atom a) (ocaml_string l)
   | A.CUpdate (a, ups) ->
-    Printf.sprintf "(update (%s) [%s])" (atom a)
-      (String.concat "; " (List.map (fun (l, x) -> Printf.sprintf "(%s, (%s))" (ocaml_string l) (atom x)) ups))
-  | A.CIf (a, t, e) -> Printf.sprintf "(if as_bool (%s) then %s else %s)" (atom a) (expr ae lz t) (expr ae lz e)
+    Printf.sprintf
+      "(update (%s) [%s])"
+      (atom a)
+      (String.concat
+         "; "
+         (List.map
+            (fun (l, x) -> Printf.sprintf "(%s, (%s))" (ocaml_string l) (atom x))
+            ups))
+  | A.CIf (a, t, e) ->
+    Printf.sprintf
+      "(if as_bool (%s) then %s else %s)"
+      (atom a)
+      (expr ae lz t)
+      (expr ae lz e)
   | A.CCase (scruts, alts) -> case ae lz scruts alts
 
 (* A case whose every binder is friendly compiles to an OCaml `match` — `ocamlopt` turns
@@ -421,9 +548,13 @@ and case (ae : int IM.t) (lz : SS.t) (scruts : A.atom list) (alts : A.alt list) 
   then case_decision ae lz scruts alts
   else case_cascade ae lz scruts alts
 
-and case_decision (ae : int IM.t) (lz : SS.t) (scruts : A.atom list) (alts : A.alt list) : string =
+and case_decision (ae : int IM.t) (lz : SS.t) (scruts : A.atom list) (alts : A.alt list)
+  : string
+  =
   let scrut =
-    match scruts with [ s ] -> atom lz s | ss -> "(" ^ String.concat ", " (List.map (atom lz) ss) ^ ")"
+    match scruts with
+    | [ s ] -> atom lz s
+    | ss -> "(" ^ String.concat ", " (List.map (atom lz) ss) ^ ")"
   in
   let n = List.length scruts in
   let pat_of (a : A.alt) =
@@ -441,19 +572,30 @@ and case_decision (ae : int IM.t) (lz : SS.t) (scruts : A.atom list) (alts : A.a
     | A.Uncond e -> [ Printf.sprintf "  | %s%s -> %s" pat (whenc "") (expr ae lz e) ]
     | A.Guarded gs ->
       List.map
-        (fun (g, e) -> Printf.sprintf "  | %s%s -> %s" pat (whenc (Printf.sprintf "as_bool (%s)" (expr ae lz g))) (expr ae lz e))
+        (fun (g, e) ->
+           Printf.sprintf
+             "  | %s%s -> %s"
+             pat
+             (whenc (Printf.sprintf "as_bool (%s)" (expr ae lz g)))
+             (expr ae lz e))
         gs
   in
-  Printf.sprintf "(match %s with\n%s\n  | _ -> stuck \"no match\")" scrut
+  Printf.sprintf
+    "(match %s with\n%s\n  | _ -> stuck \"no match\")"
+    scrut
     (String.concat "\n" (List.concat_map arms alts))
 
 (* The general fallback: a CPS cascade. Scrutinees are bound once; each alt is tried in
    order, its failure jumping to a shared thunk that runs the next alt (so the rest is
    not duplicated). Handles every binder kind (records, etc.) via [emit_match]. *)
-and case_cascade (ae : int IM.t) (lz : SS.t) (scruts : A.atom list) (alts : A.alt list) : string =
+and case_cascade (ae : int IM.t) (lz : SS.t) (scruts : A.atom list) (alts : A.alt list)
+  : string
+  =
   let svars = List.map (fun _ -> fresh "_s") scruts in
   let lets =
-    String.concat "" (List.map2 (fun v s -> Printf.sprintf "let %s = %s in " v (atom lz s)) svars scruts)
+    String.concat
+      ""
+      (List.map2 (fun v s -> Printf.sprintf "let %s = %s in " v (atom lz s)) svars scruts)
   in
   let alt_code (a : A.alt) (fail : string) : string =
     let succ =
@@ -461,8 +603,14 @@ and case_cascade (ae : int IM.t) (lz : SS.t) (scruts : A.atom list) (alts : A.al
       | A.Uncond e -> expr ae lz e
       | A.Guarded gs ->
         List.fold_right
-          (fun (g, e) acc -> Printf.sprintf "(if as_bool (%s) then %s else %s)" (expr ae lz g) (expr ae lz e) acc)
-          gs fail
+          (fun (g, e) acc ->
+             Printf.sprintf
+               "(if as_bool (%s) then %s else %s)"
+               (expr ae lz g)
+               (expr ae lz e)
+               acc)
+          gs
+          fail
     in
     let rec nest bs vs =
       match bs, vs with
@@ -480,32 +628,57 @@ and case_cascade (ae : int IM.t) (lz : SS.t) (scruts : A.atom list) (alts : A.al
   in
   Printf.sprintf "(%s%s)" lets (build alts)
 
+(* Collect every bound name (see [bound_names]). *)
+
 (** Emit a whole ANF program as a self-contained OCaml source string. A *pure* entry is
     printed in `Value.to_string` form; an *Effect* entry (`Unit -> a`, ADR-0023) is
     forced — applied to unit (the `VInt 0` convention, ADR-0032) — performing its
     effects, with the (`Unit`) result suppressed (as `purvm run` does for the bytecode
     image). So an Effect program's stdout is exactly its observable effects. *)
-(* Collect every bound name (see [bound_names]). *)
 let collect_bound (e : A.expr) : SS.t =
   let acc = ref SS.empty in
   let add x = acc := SS.add x !acc in
   let rec ex = function
     | A.Ret c -> cx c
-    | A.Let (x, c, b) -> add x; cx c; ex b
-    | A.LetRec (g, b) -> List.iter (fun (x, r) -> add x; ex r) g; ex b
+    | A.Let (x, c, b) ->
+      add x;
+      cx c;
+      ex b
+    | A.LetRec (g, b) ->
+      List.iter
+        (fun (x, r) ->
+           add x;
+           ex r)
+        g;
+      ex b
   and cx = function
-    | A.CLam (ps, b) -> List.iter add ps; ex b
-    | A.CIf (_, t, e) -> ex t; ex e
+    | A.CLam (ps, b) ->
+      List.iter add ps;
+      ex b
+    | A.CIf (_, t, e) ->
+      ex t;
+      ex e
     | A.CCase (_, alts) ->
       List.iter
         (fun (a : A.alt) ->
-          List.iter (fun bd -> List.iter add (binder_vars bd)) a.binders;
-          match a.result with
-          | A.Uncond e -> ex e
-          | A.Guarded gs -> List.iter (fun (g, e) -> ex g; ex e) gs)
+           List.iter (fun bd -> List.iter add (binder_vars bd)) a.binders;
+           match a.result with
+           | A.Uncond e -> ex e
+           | A.Guarded gs ->
+             List.iter
+               (fun (g, e) ->
+                  ex g;
+                  ex e)
+               gs)
         alts
-    | A.CAtom _ | A.CApp _ | A.CPrim _ | A.CCtor _ | A.CArray _ | A.CRecord _ | A.CAccessor _ | A.CUpdate _ ->
-      ()
+    | A.CAtom _
+    | A.CApp _
+    | A.CPrim _
+    | A.CCtor _
+    | A.CArray _
+    | A.CRecord _
+    | A.CAccessor _
+    | A.CUpdate _ -> ()
   in
   ex e;
   !acc
@@ -513,7 +686,12 @@ let collect_bound (e : A.expr) : SS.t =
 let program ?(is_effect = false) (e : A.expr) : string =
   bound_names := collect_bound e;
   let runner =
-    if is_effect then "ignore (app result (VInt 0))"
+    if is_effect
+    then "ignore (app result (VInt 0))"
     else "print_string (to_string result)"
   in
-  Printf.sprintf "[@@@warning \"-a\"]\n%s\nlet result = %s\nlet () = %s\n" rt (expr IM.empty SS.empty e) runner
+  Printf.sprintf
+    "[@@@warning \"-a\"]\n%s\nlet result = %s\nlet () = %s\n"
+    rt
+    (expr IM.empty SS.empty e)
+    runner

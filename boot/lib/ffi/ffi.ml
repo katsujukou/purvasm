@@ -298,12 +298,72 @@ let ref_modify : C.term =
            , C.Prim (SetArray, [ v "ref"; int_lit 0; C.Accessor (v "t", "state") ])
            , C.Accessor (v "t", "value") ) ))
 
+(* --- Control.Monad.ST.Internal: the same thunk model as Effect (ADR-0023) -- *)
+
+(* An `ST r a` is the same nullary thunk `Unit -> a` as `Effect a`, and `STRef` the
+   same one-cell mutable array as `Ref`; ST mutation stays local to its region, so
+   forcing the thunk (via [run]) escapes to a pure value. Most ops are shared with the
+   Effect terms (`pure_`/`bind_`/`while`/`for`/`foreach`/`new`/`read`/`modifyImpl`);
+   only these three differ. *)
+
+(* map_ f a = \_ -> f (a unit). *)
+let st_map : C.term = lams [ "f"; "a"; "$u" ] (C.App (v "f", run_eff (v "a")))
+
+(* run f = f unit — force the ST thunk, escaping its local mutation to a pure result. *)
+let st_run : C.term = lams [ "f" ] (run_eff (v "f"))
+
+(* write val ref = \_ -> (ref[0] := val; val). Unlike `Effect.Ref.write` this returns
+   the written value (the JS assignment-expression result), not unit. *)
+let st_write : C.term =
+  lams
+    [ "val"; "ref"; "$u" ]
+    (C.Let ("$_", C.Prim (SetArray, [ v "ref"; int_lit 0; v "val" ]), v "val"))
+
+(* --- Control.Monad.ST.Uncurried: curried <-> uncurried ST adapters (ADR-0039) -
+   In the all-curried runtime an `STFnN` is just a curried function whose saturated
+   application runs the `ST`. `mkSTFnN f = \x0..xN -> run (f x0 .. xN)` forces that
+   thunk after applying; `runSTFnN g x0..xN = \_ -> g x0 .. xN` rebuilds it. The
+   `STFnN` *types* are phantom (`foreign import data`), so only these values resolve. *)
+let st_uncurried : (string * C.term) list =
+  let arg i = Printf.sprintf "x%d" i in
+  List.concat_map
+    (fun n ->
+       let xs = List.init n arg in
+       let app_args f = List.fold_left (fun acc x -> C.App (acc, v x)) f xs in
+       [ ( Printf.sprintf "Control.Monad.ST.Uncurried.mkSTFn%d" n
+         , lams ("f" :: xs) (run_eff (app_args (v "f"))) )
+       ; ( Printf.sprintf "Control.Monad.ST.Uncurried.runSTFn%d" n
+         , lams (("g" :: xs) @ [ "$u" ]) (app_args (v "g")) )
+       ])
+    [ 1; 2; 3; 4; 5; 6; 7; 8; 9; 10 ]
+
+(* --- Data.Function.Uncurried: curried <-> uncurried *pure* function adapters ----
+   The pure analogue of `ST.Uncurried` (ADR-0039): boot is all-curried, so an `FnN`
+   (N>=2) just *is* a curried function — `mkFnN = identity`, `runFnN = saturated apply`.
+   There is no `Fn1`; `Fn0 a` is the `Unit -> a` thunk (`mkFn0`/`runFn0` introduce and
+   force it). The `FnN` *types* are phantom, so only these values resolve. *)
+let fn_uncurried : (string * C.term) list =
+  let arg i = Printf.sprintf "x%d" i in
+  let nary n =
+    let xs = List.init n arg in
+    let app_args f = List.fold_left (fun acc x -> C.App (acc, v x)) f xs in
+    [ Printf.sprintf "Data.Function.Uncurried.mkFn%d" n, lams [ "f" ] (v "f")
+    ; ( Printf.sprintf "Data.Function.Uncurried.runFn%d" n
+      , lams ("f" :: xs) (app_args (v "f")) )
+    ]
+  in
+  [ "Data.Function.Uncurried.mkFn0", lams [ "fn"; "$u" ] (C.App (v "fn", int_lit 0))
+  ; "Data.Function.Uncurried.runFn0", lams [ "f" ] (C.App (v "f", int_lit 0))
+  ]
+  @ List.concat_map nary [ 2; 3; 4; 5; 6; 7; 8; 9; 10 ]
+
 (** Structural foreigns, as guest terms over the first-order primitives:
     higher-order ones (`arrayMap`, `eqArrayImpl`) whose callback is an ordinary
-    `App`, composite first-order ones (the scalar `Ord` comparisons), and the
-    `Effect` monad / `Effect.Ref` thunks (ADR-0023). Hand-written `Cesk.Ast` for
-    now; a PureScript surface comes with the optimiser (ADR-0020). `Char` is `Int`
-    (ADR-0006), so `ordCharImpl` reuses the int term. *)
+    `App`, composite first-order ones (the scalar `Ord` comparisons), the
+    `Effect` monad / `Effect.Ref` thunks (ADR-0023), and the `ST` monad / `STRef`
+    (same model). Hand-written `Cesk.Ast` for now; a PureScript surface comes with
+    the optimiser (ADR-0020). `Char` is `Int` (ADR-0006), so `ordCharImpl` reuses the
+    int term. *)
 let structural : (string * C.term) list =
   [ "Data.Functor.arrayMap", array_map
   ; "Data.Eq.eqArrayImpl", eq_array
@@ -322,7 +382,26 @@ let structural : (string * C.term) list =
   ; "Effect.Ref.read", ref_read
   ; "Effect.Ref.write", ref_write
   ; "Effect.Ref.modifyImpl", ref_modify
+    (* `_unsafePartial f = f unit` (matching the prelude JS `f()`): discharge the
+       phantom `Partial` constraint by applying the partial computation to a dummy
+       dictionary. `Partial` has no methods, so the dict (the immediate [0]) is
+       never inspected. *)
+  ; "Partial.Unsafe._unsafePartial", lams [ "f" ] (C.App (v "f", int_lit 0))
+    (* `Control.Monad.ST.Internal`: same thunk/cell model as Effect (ADR-0023). *)
+  ; "Control.Monad.ST.Internal.map_", st_map
+  ; "Control.Monad.ST.Internal.pure_", eff_pure
+  ; "Control.Monad.ST.Internal.bind_", eff_bind
+  ; "Control.Monad.ST.Internal.run", st_run
+  ; "Control.Monad.ST.Internal.while", eff_while
+  ; "Control.Monad.ST.Internal.for", eff_for
+  ; "Control.Monad.ST.Internal.foreach", eff_foreach
+  ; "Control.Monad.ST.Internal.new", ref_new
+  ; "Control.Monad.ST.Internal.read", ref_read
+  ; "Control.Monad.ST.Internal.write", st_write
+  ; "Control.Monad.ST.Internal.modifyImpl", ref_modify
   ]
+  @ st_uncurried
+  @ fn_uncurried
 
 let structural_provider : provider = fun key -> List.assoc_opt key structural
 
@@ -487,6 +566,15 @@ let host : Cesk.Machine.host =
                      V.VInt 0)
                }
            | _ -> Cesk.Errors.stuck "log: not a String"))
+    (* `_crashWith msg :: a` is a *pure* partial crash (not an `Effect`): forcing it
+       halts with the message, mirroring the prelude JS `throw new Error(msg)`. So it
+       crashes when the leaf is saturated, like the pure `Data.Show` leaves — not via a
+       deferred `Effect` thunk. *)
+    | "Partial._crashWith" ->
+      Some
+        (unary (function
+           | V.VString msg -> Cesk.Errors.stuck ("Partial.crashWith: " ^ msg)
+           | _ -> Cesk.Errors.stuck "crashWith: not a String"))
     | _ -> None
 
 (** Whether applying a native leaf yields an *effectful* value — one whose force (its
@@ -504,7 +592,9 @@ let effectful (key : string) : bool = String.equal key "Effect.Console.log"
     fully applied, so assuming arity 1 would mis-place the effect. Unknown keys default
     to 1 (a truly unbound foreign is handled conservatively in the analysis). *)
 let foreign_arity (key : string) : int =
-  match host key with Some (ar, _) -> ar | None -> 1
+  match host key with
+  | Some (ar, _) -> ar
+  | None -> 1
 
 (** The native rung: a name is bound to an opaque [Foreign] reference exactly when
     the host registry implements it, so the two never drift apart. *)

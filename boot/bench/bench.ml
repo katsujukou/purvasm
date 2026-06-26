@@ -38,7 +38,9 @@ let vm_variants : (string * (C.term -> Middle_end.Anf.expr)) list =
   [ ("anf", fun t -> T.transl t)
   ; ("dictelim", fun t -> Middle_end.Passes.Dict_elim.run (T.transl t))
   ; ( "opt"
-    , fun t -> dbe (Middle_end.Passes.Simplify.run (Middle_end.Passes.Dict_elim.run (T.transl t)))
+    , fun t ->
+        dbe
+          (Middle_end.Passes.Simplify.run (Middle_end.Passes.Dict_elim.run (T.transl t)))
     )
   ]
 
@@ -48,7 +50,7 @@ let vm_measure (program : Middle_end.Anf.expr) : Vm.Value.t * int * float =
   let t0 = Unix.gettimeofday () in
   let v, instrs = Vm.eval_anf_counted program in
   let ms = (Unix.gettimeofday () -. t0) *. 1000.0 in
-  (v, instrs, ms)
+  v, instrs, ms
 
 (* ADR-0030 requires the VM to agree with the oracle on every benchmark, not just
    the e2e fixtures. Tracked here and reported at the end of the sweep. *)
@@ -102,7 +104,8 @@ let gnuplot_script () : string =
     add (Printf.sprintf "set output '%s.png'\n" metric);
     add
       (Printf.sprintf
-         "set multiplot layout 2,3 title 'purvasm benchmark — %s vs input size (ADR-0026/0030)'\n"
+         "set multiplot layout 2,3 title 'purvasm benchmark — %s vs input size \
+          (ADR-0026/0030)'\n"
          metric);
     List.iter
       (fun (label, _, _, _) ->
@@ -141,7 +144,10 @@ let () =
    | Unix.Unix_error (Unix.EEXIST, _, _) -> ());
   Printf.printf "purvasm benchmark sweep (ADR-0026) — deterministic oracle cost\n";
   Printf.printf "fixtures: %s   output: %s\n\n" fixtures outdir;
-  let comparisons = ref [] (* (label, (opt tree instrs, opt naive instrs)) at max size *) in
+  let comparisons =
+    ref []
+    (* (label, (opt tree instrs, opt naive instrs)) at max size *)
+  in
   List.iter
     (fun (label, entry_module, entry, sizes) ->
        (* The entry is an `Int -> Int`; link it once and apply each swept size. *)
@@ -166,7 +172,10 @@ let () =
        in
        Buffer.add_string buf (header ^ "\n");
        let last = ref (0, 0) in
-       let last_cmp = ref (0, 0) (* (opt tree instrs, opt naive instrs) at last size *) in
+       let last_cmp =
+         ref (0, 0)
+         (* (opt tree instrs, opt naive instrs) at last size *)
+       in
        List.iter
          (fun n ->
             let term = C.App (base, C.Lit (C.LInt n)) in
@@ -199,7 +208,9 @@ let () =
             (* ADR-0031 measurement: recompile the opt pipeline with the naive
                explicit matcher and re-run, to quantify the decision tree's win. *)
             let opt_anf =
-              dbe (Middle_end.Passes.Simplify.run (Middle_end.Passes.Dict_elim.run (T.transl term)))
+              dbe
+                (Middle_end.Passes.Simplify.run
+                   (Middle_end.Passes.Dict_elim.run (T.transl term)))
             in
             let nv, opt_naive = Vm.eval_anf_counted ~naive:true opt_anf in
             if not (String.equal (Vm.Value.to_string nv) oracle)
@@ -211,7 +222,7 @@ let () =
                 n
                 (Vm.Value.to_string nv)
                 oracle);
-            last_cmp := (!opt_tree, opt_naive);
+            last_cmp := !opt_tree, opt_naive;
             Buffer.add_string buf (Printf.sprintf "  %d" opt_naive);
             Buffer.add_char buf '\n')
          sizes;
@@ -246,10 +257,7 @@ let () =
          (if naive = 0 then 1.0 else float_of_int tree /. float_of_int naive))
     (List.rev !comparisons);
   if rc = 0
-  then
-    Printf.printf
-      "wrote %s/{steps,allocs,vm_instrs,vm_ms}.png\n"
-      outdir
+  then Printf.printf "wrote %s/{steps,allocs,vm_instrs,vm_ms}.png\n" outdir
   else
     Printf.printf
       "\n\

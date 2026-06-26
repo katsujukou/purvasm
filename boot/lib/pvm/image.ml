@@ -26,16 +26,36 @@ let err msg = raise (Bad_image msg)
 (* --- primitive operations (bijective tag table) --------------------------- *)
 
 let prim_tags : (C.primop * string) list =
-  [ C.AddInt, "AddInt"; C.SubInt, "SubInt"; C.MulInt, "MulInt"; C.DivInt, "DivInt"
+  [ C.AddInt, "AddInt"
+  ; C.SubInt, "SubInt"
+  ; C.MulInt, "MulInt"
+  ; C.DivInt, "DivInt"
   ; C.ModInt, "ModInt"
-  ; C.AndInt, "AndInt"; C.OrInt, "OrInt"; C.XorInt, "XorInt"; C.ShlInt, "ShlInt"
-  ; C.ShrInt, "ShrInt"; C.ZshrInt, "ZshrInt"; C.ComplementInt, "ComplementInt"
-  ; C.AddNumber, "AddNumber"; C.SubNumber, "SubNumber"
-  ; C.MulNumber, "MulNumber"; C.DivNumber, "DivNumber"; C.EqInt, "EqInt"
-  ; C.EqString, "EqString"; C.EqNumber, "EqNumber"; C.EqBool, "EqBool"; C.LtInt, "LtInt"
-  ; C.LtString, "LtString"; C.LtNumber, "LtNumber"; C.AndBool, "AndBool"
-  ; C.OrBool, "OrBool"; C.NotBool, "NotBool"; C.Append, "Append"
-  ; C.IndexArray, "IndexArray"; C.LengthArray, "LengthArray"; C.NewArray, "NewArray"
+  ; C.AndInt, "AndInt"
+  ; C.OrInt, "OrInt"
+  ; C.XorInt, "XorInt"
+  ; C.ShlInt, "ShlInt"
+  ; C.ShrInt, "ShrInt"
+  ; C.ZshrInt, "ZshrInt"
+  ; C.ComplementInt, "ComplementInt"
+  ; C.AddNumber, "AddNumber"
+  ; C.SubNumber, "SubNumber"
+  ; C.MulNumber, "MulNumber"
+  ; C.DivNumber, "DivNumber"
+  ; C.EqInt, "EqInt"
+  ; C.EqString, "EqString"
+  ; C.EqNumber, "EqNumber"
+  ; C.EqBool, "EqBool"
+  ; C.LtInt, "LtInt"
+  ; C.LtString, "LtString"
+  ; C.LtNumber, "LtNumber"
+  ; C.AndBool, "AndBool"
+  ; C.OrBool, "OrBool"
+  ; C.NotBool, "NotBool"
+  ; C.Append, "Append"
+  ; C.IndexArray, "IndexArray"
+  ; C.LengthArray, "LengthArray"
+  ; C.NewArray, "NewArray"
   ; C.SetArray, "SetArray"
   ]
 
@@ -80,11 +100,20 @@ let strs ss = `List (List.map (fun s -> `String s) ss)
 
 let strs_of = function
   | `List xs ->
-    List.map (function `String s -> s | _ -> err "expected string") xs
+    List.map
+      (function
+        | `String s -> s
+        | _ -> err "expected string")
+      xs
   | _ -> err "expected string list"
 
-let int_of = function `Int n -> n | _ -> err "expected int"
-let str_of = function `String s -> s | _ -> err "expected string"
+let int_of = function
+  | `Int n -> n
+  | _ -> err "expected int"
+
+let str_of = function
+  | `String s -> s
+  | _ -> err "expected string"
 
 (* --- instructions --------------------------------------------------------- *)
 
@@ -139,7 +168,7 @@ let rec instr_of_json : J.t -> B.instr = function
        B.Make_rec
          (List.map
             (function
-              | `List [ `String n; c ] -> (n, chunk_of_json c)
+              | `List [ `String n; c ] -> n, chunk_of_json c
               | _ -> err "malformed Make_rec member")
             ms)
      | "ct", [ tag; arity; n ] -> B.Ctor (str_of tag, int_of arity, int_of n)
@@ -165,19 +194,27 @@ let rec instr_of_json : J.t -> B.instr = function
 and ctor_cases_of = function
   | `List xs ->
     List.map
-      (function `List [ `String tag; r ] -> (tag, int_of r) | _ -> err "bad ctor case")
+      (function
+        | `List [ `String tag; r ] -> tag, int_of r
+        | _ -> err "bad ctor case")
       xs
   | _ -> err "expected ctor cases"
 
 and int_cases_of = function
   | `List xs ->
-    List.map (function `List [ k; r ] -> (int_of k, int_of r) | _ -> err "bad case") xs
+    List.map
+      (function
+        | `List [ k; r ] -> int_of k, int_of r
+        | _ -> err "bad case")
+      xs
   | _ -> err "expected int cases"
 
 and lit_cases_of = function
   | `List xs ->
     List.map
-      (function `List [ l; r ] -> (lit_of_json l, int_of r) | _ -> err "bad lit case")
+      (function
+        | `List [ l; r ] -> lit_of_json l, int_of r
+        | _ -> err "bad lit case")
       xs
   | _ -> err "expected lit cases"
 
@@ -213,8 +250,7 @@ let to_json (img : t) : J.t =
   `Assoc
     [ "version", `Int format_version
     ; ( "gdefs"
-      , `List
-          (List.map (fun (n, g) -> `List [ `String n; gdef_to_json g ]) img.gdefs) )
+      , `List (List.map (fun (n, g) -> `List [ `String n; gdef_to_json g ]) img.gdefs) )
     ; "main", chunk_to_json img.main
     ; "effect", `Bool img.is_effect
     ]
@@ -222,23 +258,30 @@ let to_json (img : t) : J.t =
 let of_json : J.t -> t = function
   | `Assoc fields ->
     let get k =
-      match List.assoc_opt k fields with Some v -> v | None -> err ("missing field: " ^ k)
+      match List.assoc_opt k fields with
+      | Some v -> v
+      | None -> err ("missing field: " ^ k)
     in
     (match get "version" with
      | `Int v when v = format_version -> ()
-     | `Int v -> err (Printf.sprintf "image format version %d, expected %d" v format_version)
+     | `Int v ->
+       err (Printf.sprintf "image format version %d, expected %d" v format_version)
      | _ -> err "version: expected int");
     let gdefs =
       match get "gdefs" with
       | `List xs ->
         List.map
           (function
-            | `List [ `String n; g ] -> (n, gdef_of_json g)
+            | `List [ `String n; g ] -> n, gdef_of_json g
             | _ -> err "malformed gdef entry")
           xs
       | _ -> err "gdefs: expected array"
     in
-    let is_effect = match List.assoc_opt "effect" fields with Some (`Bool b) -> b | _ -> false in
+    let is_effect =
+      match List.assoc_opt "effect" fields with
+      | Some (`Bool b) -> b
+      | _ -> false
+    in
     { gdefs; main = chunk_of_json (get "main"); is_effect }
   | _ -> err "image: expected object"
 

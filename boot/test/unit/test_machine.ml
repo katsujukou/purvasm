@@ -340,10 +340,17 @@ let test_number_lt_nan () =
 
 (* Bitwise (Data.Int.Bits over the signed 32-bit Int) ----------------------- *)
 
-let test_bit_and () = Alcotest.(check int) "12 & 10" 8 (eval_int (and_int (num 12) (num 10)))
-let test_bit_or () = Alcotest.(check int) "12 | 10" 14 (eval_int (or_int (num 12) (num 10)))
-let test_bit_xor () = Alcotest.(check int) "12 ^ 10" 6 (eval_int (xor_int (num 12) (num 10)))
-let test_bit_shl () = Alcotest.(check int) "1 << 4" 16 (eval_int (shl_int (num 1) (num 4)))
+let test_bit_and () =
+  Alcotest.(check int) "12 & 10" 8 (eval_int (and_int (num 12) (num 10)))
+
+let test_bit_or () =
+  Alcotest.(check int) "12 | 10" 14 (eval_int (or_int (num 12) (num 10)))
+
+let test_bit_xor () =
+  Alcotest.(check int) "12 ^ 10" 6 (eval_int (xor_int (num 12) (num 10)))
+
+let test_bit_shl () =
+  Alcotest.(check int) "1 << 4" 16 (eval_int (shl_int (num 1) (num 4)))
 
 (* A shift into the sign bit wraps to the minimum 32-bit int. *)
 let test_bit_shl_sign () =

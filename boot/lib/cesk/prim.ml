@@ -10,7 +10,14 @@ let w32 (n : int) : int = Int32.to_int (Int32.of_int n)
 
 (* Euclidean division / remainder — `Prelude`'s `EuclideanRing Int` (4.x+): a non-negative
    remainder `0 <= r < |b|`; `0` on a zero divisor. (Truncating is `quot`/`rem`.) *)
-let emod a b = if b = 0 then 0 else (let m = abs b in let r = a mod m in if r < 0 then r + m else r)
+let emod a b =
+  if b = 0
+  then 0
+  else (
+    let m = abs b in
+    let r = a mod m in
+    if r < 0 then r + m else r)
+
 let ediv a b = if b = 0 then 0 else (a - emod a b) / b
 
 let eval (op : primop) (args : Value.t list) : Value.t =
@@ -31,7 +38,8 @@ let eval (op : primop) (args : Value.t list) : Value.t =
   | XorInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (w32 (a lxor b))
   | ShlInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (w32 (a lsl (b land 31)))
   | ShrInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (a asr (b land 31))
-  | ZshrInt, [ Value.VInt a; Value.VInt b ] -> Value.VInt (w32 ((a land 0xFFFFFFFF) lsr (b land 31)))
+  | ZshrInt, [ Value.VInt a; Value.VInt b ] ->
+    Value.VInt (w32 ((a land 0xFFFFFFFF) lsr (b land 31)))
   | ComplementInt, [ Value.VInt a ] -> Value.VInt (w32 (lnot a))
   | AddNumber, [ Value.VNumber a; Value.VNumber b ] -> Value.VNumber (a +. b)
   | SubNumber, [ Value.VNumber a; Value.VNumber b ] -> Value.VNumber (a -. b)

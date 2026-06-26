@@ -56,17 +56,17 @@ let rec to_string : t -> string = function
   | Vnumber f -> Stdlib.string_of_float f
   | Vbool b -> string_of_bool b
   | Vstring s -> "\"" ^ s ^ "\""
-  | Varray a ->
-    "[" ^ String.concat ", " (List.map to_string (Array.to_list a)) ^ "]"
+  | Varray a -> "[" ^ String.concat ", " (List.map to_string (Array.to_list a)) ^ "]"
   | Vrecord m ->
     "{"
-    ^ String.concat ", " (List.map (fun (k, v) -> k ^ ": " ^ to_string v) (SMap.bindings m))
+    ^ String.concat
+        ", "
+        (List.map (fun (k, v) -> k ^ ": " ^ to_string v) (SMap.bindings m))
     ^ "}"
   | Vdata (tag, fields) ->
     if Array.length fields = 0
     then tag
-    else
-      tag ^ "(" ^ String.concat ", " (List.map to_string (Array.to_list fields)) ^ ")"
+    else tag ^ "(" ^ String.concat ", " (List.map to_string (Array.to_list fields)) ^ ")"
   | Vctor (tag, arity, _) -> "<ctor " ^ tag ^ "/" ^ string_of_int arity ^ ">"
   | Vclosure _ | Vpap _ -> "<closure>"
   | Vforeign (name, arity, _, _) -> "<foreign " ^ name ^ "/" ^ string_of_int arity ^ ">"

@@ -63,7 +63,15 @@ type frame =
 (* --- Primitives: the same operations as the oracle's [Cesk.Prim], over VM values. *)
 (* PureScript `Int` is signed 32-bit with wrapping; div/mod are Euclidean (see [Cesk.Prim]). *)
 let w32 (n : int) : int = Int32.to_int (Int32.of_int n)
-let emod a b = if b = 0 then 0 else (let m = abs b in let r = a mod m in if r < 0 then r + m else r)
+
+let emod a b =
+  if b = 0
+  then 0
+  else (
+    let m = abs b in
+    let r = a mod m in
+    if r < 0 then r + m else r)
+
 let ediv a b = if b = 0 then 0 else (a - emod a b) / b
 
 let eval_prim (op : C.primop) (args : V.t list) : V.t =
@@ -80,7 +88,8 @@ let eval_prim (op : C.primop) (args : V.t list) : V.t =
   | C.XorInt, [ V.Vint a; V.Vint b ] -> V.Vint (w32 (a lxor b))
   | C.ShlInt, [ V.Vint a; V.Vint b ] -> V.Vint (w32 (a lsl (b land 31)))
   | C.ShrInt, [ V.Vint a; V.Vint b ] -> V.Vint (a asr (b land 31))
-  | C.ZshrInt, [ V.Vint a; V.Vint b ] -> V.Vint (w32 ((a land 0xFFFFFFFF) lsr (b land 31)))
+  | C.ZshrInt, [ V.Vint a; V.Vint b ] ->
+    V.Vint (w32 ((a land 0xFFFFFFFF) lsr (b land 31)))
   | C.ComplementInt, [ V.Vint a ] -> V.Vint (w32 (lnot a))
   | C.AddNumber, [ V.Vnumber a; V.Vnumber b ] -> V.Vnumber (a +. b)
   | C.SubNumber, [ V.Vnumber a; V.Vnumber b ] -> V.Vnumber (a -. b)
@@ -114,14 +123,19 @@ let eval_prim (op : C.primop) (args : V.t list) : V.t =
     else stuck ("array set out of bounds: " ^ string_of_int i)
   | _ -> stuck ("primop " ^ C.primop_to_string op ^ ": ill-typed arguments")
 
-
 (** Take/drop helpers for the eval/apply over-application split. *)
 let rec take n = function
   | _ when n = 0 -> []
   | x :: xs -> x :: take (n - 1) xs
   | [] -> []
 
-let rec drop n l = if n = 0 then l else match l with _ :: xs -> drop (n - 1) xs | [] -> []
+let rec drop n l =
+  if n = 0
+  then l
+  else (
+    match l with
+    | _ :: xs -> drop (n - 1) xs
+    | [] -> [])
 
 (* Scalar-literal comparison for [Switch_lit] (ADR-0031): [lit_eq] is value-level
    equality (same kind and value) used to select a case; [lit_kind_eq] tells "wrong
@@ -198,7 +212,8 @@ let rec run
     if tail then frames := fr :: List.tl !frames else frames := fr :: !frames
   in
   let rec apply_closure ~tail (c : V.closure) args =
-    let np = List.length c.V.params and na = List.length args in
+    let np = List.length c.V.params
+    and na = List.length args in
     if na = np
     then enter ~tail c args
     else if na < np
@@ -207,13 +222,15 @@ let rec run
       (* Over-application: saturate with the first [np] args (entering a frame), then
          apply the rest to the result via an [Apply_more] continuation. In tail
          position the current frame is abandoned first (TCE). *)
-      let first = take np args and rest = drop np args in
+      let first = take np args
+      and rest = drop np args in
       if tail then frames := List.tl !frames;
       frames := Apply_more rest :: !frames;
       let base =
         List.fold_left2 (fun e p a -> SMap.add p a e) !(c.V.env) c.V.params first
       in
-      frames := Code { chunk = c.V.body; ip = 0; env = ref base; share = false } :: !frames)
+      frames
+      := Code { chunk = c.V.body; ip = 0; env = ref base; share = false } :: !frames)
   and do_call ~tail (f : V.t) args =
     match force f with
     | V.Vclosure c -> apply_closure ~tail c args
@@ -238,8 +255,14 @@ let rec run
            call is synchronous, so no return frame is needed. *)
         let v = call (take arity all) in
         do_call ~tail v (drop arity all))
-    | V.Vint _ | V.Vnumber _ | V.Vbool _ | V.Vstring _ | V.Varray _ | V.Vrecord _
-    | V.Vdata _ | V.Vindirect _ -> stuck "application of a non-function"
+    | V.Vint _
+    | V.Vnumber _
+    | V.Vbool _
+    | V.Vstring _
+    | V.Varray _
+    | V.Vrecord _
+    | V.Vdata _
+    | V.Vindirect _ -> stuck "application of a non-function"
   in
   let make_rec (fr : code_frame) (members : (string * B.chunk) list) =
     (* Knot-tying (ADR-0030): build each member in a [share] frame over one ref [r]
@@ -250,7 +273,7 @@ let rec run
     let values =
       List.map
         (fun (name, chunk) ->
-          (name, run globals ~foreigns [ Code { chunk; ip = 0; env = r; share = true } ]))
+           name, run globals ~foreigns [ Code { chunk; ip = 0; env = r; share = true } ])
         members
     in
     let grp = List.fold_left (fun e (n, v) -> SMap.add n v e) !r values in
@@ -378,10 +401,11 @@ let rec run
           (match force (pop ()) with
            | V.Vdata (tag, _) ->
              fr.ip
-             <- fr.ip
-                + (match List.assoc_opt tag cases with
-                   | Some rel -> rel
-                   | None -> default)
+             <- (fr.ip
+                 +
+                 match List.assoc_opt tag cases with
+                 | Some rel -> rel
+                 | None -> default)
            | _ -> stuck "switch on a non-data value");
           loop ()
         | B.Switch_lit (cases, default) ->
@@ -391,18 +415,22 @@ let rec run
              stuck "literal switch on a wrong-kind value"
            | _ ->
              fr.ip
-             <- fr.ip
-                + (match List.find_opt (fun (l, _) -> lit_eq l v) cases with
-                   | Some (_, rel) -> rel
-                   | None -> default));
+             <- (fr.ip
+                 +
+                 match List.find_opt (fun (l, _) -> lit_eq l v) cases with
+                 | Some (_, rel) -> rel
+                 | None -> default));
           loop ()
         | B.Switch_len (cases, default) ->
           (match force (pop ()) with
            | V.Varray a ->
              let n = Array.length a in
              fr.ip
-             <- fr.ip
-                + (match List.assoc_opt n cases with Some rel -> rel | None -> default)
+             <- (fr.ip
+                 +
+                 match List.assoc_opt n cases with
+                 | Some rel -> rel
+                 | None -> default)
            | _ -> stuck "array-length switch on a non-array value");
           loop ()
         | B.Fail msg -> stuck msg)

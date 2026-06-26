@@ -74,7 +74,10 @@ let join a b =
    an inner binder of the same name is still counted, which can only *keep* a binding,
    never drop a live one (sound). *)
 let occurs (x : string) (e : expr) : bool =
-  let in_atom = function AVar y -> String.equal x y | _ -> false in
+  let in_atom = function
+    | AVar y -> String.equal x y
+    | _ -> false
+  in
   let any = List.exists in_atom in
   let rec ex = function
     | Ret c -> cx c
@@ -119,7 +122,7 @@ type t =
   { analyze : expr -> vsum M.t
   ; eperf : expr -> bool
   ; dbe : expr -> expr
-        (* Dead-binding elimination (ADR-0034's partial-correctness DBE): drop a
+    (* Dead-binding elimination (ADR-0034's partial-correctness DBE): drop a
            [let x = c in body] when [c] cannot perform and [x] is unused in [body]. *)
   }
 
@@ -137,7 +140,10 @@ let create ~(effectful_leaf : string -> bool) ~(foreign_arity : string -> int) :
     { arity = foreign_arity k; vsat = false; ret_vsat = effectful_leaf k }
   in
   let atom_sum env = function
-    | AVar x -> (match M.find_opt x env with Some s -> s | None -> unknown)
+    | AVar x ->
+      (match M.find_opt x env with
+       | Some s -> s
+       | None -> unknown)
     | AForeign k -> foreign_sum k
     | ALit _ -> pure_value
   in
@@ -161,7 +167,8 @@ let create ~(effectful_leaf : string -> bool) ~(foreign_arity : string -> int) :
       if n < sf.arity
       then { arity = sf.arity - n; vsat = sf.vsat; ret_vsat = sf.ret_vsat } (* PAP *)
       else if n = sf.arity
-      then { arity = 0; vsat = sf.ret_vsat; ret_vsat = sf.ret_vsat }
+      then
+        { arity = 0; vsat = sf.ret_vsat; ret_vsat = sf.ret_vsat }
         (* saturated result: one level of [ret] info; [arity 0] forces any later
            application of it onto the over-application path (conservatively safe) *)
       else unknown (* over-application result is an opaque value (see [eperf_c]) *)
@@ -178,22 +185,26 @@ let create ~(effectful_leaf : string -> bool) ~(foreign_arity : string -> int) :
   and eperf_expr env (e : expr) : bool =
     match e with
     | Ret c -> eperf_c env c
-    | Let (x, c, rest) ->
-      eperf_c env c || eperf_expr (M.add x (vsum_c env c) env) rest
-    | LetRec (g, rest) -> eperf_expr (fix_group env g) rest (* building closures is pure *)
+    | Let (x, c, rest) -> eperf_c env c || eperf_expr (M.add x (vsum_c env c) env) rest
+    | LetRec (g, rest) ->
+      eperf_expr (fix_group env g) rest (* building closures is pure *)
   and eperf_c env (c : cexpr) : bool =
     match c with
     | CAtom _ | CLam _ | CCtor _ | CArray _ | CRecord _ | CAccessor _ | CUpdate _ ->
       false (* construction / projection is pure (I1) *)
     | CPrim (op, _) ->
-      (match op with Cesk.Ast.NewArray | Cesk.Ast.SetArray -> true | _ -> false)
+      (match op with
+       | Cesk.Ast.NewArray | Cesk.Ast.SetArray -> true
+       | _ -> false)
     | CApp (f, args) ->
       let sf = atom_sum env f in
       let n = List.length args in
       if n < sf.arity
       then false (* partial application: builds a PAP, body not run *)
       else if n = sf.arity
-      then sf.vsat (* exact saturation: runs only this callee; deeper levels of a
+      then
+        sf.vsat
+        (* exact saturation: runs only this callee; deeper levels of a
                       returned closure fire at their own application sites *)
       else true
       (* over-application (e.g. [(log s) u] flattened to one node, or applying a
@@ -212,8 +223,10 @@ let create ~(effectful_leaf : string -> bool) ~(foreign_arity : string -> int) :
   and fix_group env (binds : (string * expr) list) : vsum M.t =
     let init =
       List.fold_left
-        (fun e (x, rhs) -> M.add x { arity = rhs_arity rhs; vsat = false; ret_vsat = false } e)
-        env binds
+        (fun e (x, rhs) ->
+           M.add x { arity = rhs_arity rhs; vsat = false; ret_vsat = false } e)
+        env
+        binds
     in
     let step env_g =
       List.fold_left (fun e (x, rhs) -> M.add x (vsum_expr env_g rhs) e) env_g binds
@@ -221,20 +234,21 @@ let create ~(effectful_leaf : string -> bool) ~(foreign_arity : string -> int) :
     let changed env_a env_b =
       List.exists
         (fun (x, _) ->
-          let a = M.find x env_a and b = M.find x env_b in
-          (* [arity] too: a point-free member's real arity is recovered over several
+           let a = M.find x env_a
+           and b = M.find x env_b in
+           (* [arity] too: a point-free member's real arity is recovered over several
              hops (it propagates from the lambda it bottoms out at), and it is
              monotone-increasing and bounded, so iterating until it settles converges
              and makes recursive point-free bindings precise, not just sound-low. *)
-          a.arity <> b.arity || a.vsat <> b.vsat || a.ret_vsat <> b.ret_vsat)
+           a.arity <> b.arity || a.vsat <> b.vsat || a.ret_vsat <> b.ret_vsat)
         binds
     in
     let rec loop env_g n =
       if n = 0
       then env_g
-      else
+      else (
         let env' = step env_g in
-        if changed env_g env' then loop env' (n - 1) else env'
+        if changed env_g env' then loop env' (n - 1) else env')
     in
     loop init (List.length binds + 2)
   in
@@ -258,10 +272,11 @@ let create ~(effectful_leaf : string -> bool) ~(foreign_arity : string -> int) :
     | LetRec (g, body) ->
       let env' = fix_group env g in
       let body' = dbe env' body in
-      if List.for_all (fun (n, _) -> not (occurs n body')) g
-         && not (List.exists (fun (_, rhs) -> eperf_expr env' rhs) g)
+      if
+        List.for_all (fun (n, _) -> not (occurs n body')) g
+        && not (List.exists (fun (_, rhs) -> eperf_expr env' rhs) g)
       then body' (* whole group unused and pure to build: drop it *)
-      else LetRec (List.map (fun (n, rhs) -> (n, dbe env' rhs)) g, body')
+      else LetRec (List.map (fun (n, rhs) -> n, dbe env' rhs) g, body')
   and dbe_c env (c : cexpr) : cexpr =
     match c with
     | CLam (ps, body) ->
@@ -273,15 +288,22 @@ let create ~(effectful_leaf : string -> bool) ~(foreign_arity : string -> int) :
         ( ats
         , List.map
             (fun (al : alt) ->
-              { al with
-                result =
-                  (match al.result with
-                   | Uncond e -> Uncond (dbe env e)
-                   | Guarded gs -> Guarded (List.map (fun (g, e) -> dbe env g, dbe env e) gs))
-              })
+               { al with
+                 result =
+                   (match al.result with
+                    | Uncond e -> Uncond (dbe env e)
+                    | Guarded gs ->
+                      Guarded (List.map (fun (g, e) -> dbe env g, dbe env e) gs))
+               })
             alts )
-    | CAtom _ | CApp _ | CPrim _ | CCtor _ | CArray _ | CRecord _ | CAccessor _ | CUpdate _ ->
-      c
+    | CAtom _
+    | CApp _
+    | CPrim _
+    | CCtor _
+    | CArray _
+    | CRecord _
+    | CAccessor _
+    | CUpdate _ -> c
   in
   { analyze = (fun program -> collect M.empty program)
   ; eperf = (fun program -> eperf_expr M.empty program)

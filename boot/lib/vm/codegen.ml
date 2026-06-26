@@ -44,7 +44,7 @@ let rec gen_expr (tail : bool) (e : A.expr) : B.instr list =
   | A.Ret c -> gen_cexpr tail c
   | A.Let (x, c, rest) -> gen_cexpr false c @ (B.Bind x :: gen_expr tail rest)
   | A.LetRec (binds, rest) ->
-    B.Make_rec (List.map (fun (name, def) -> (name, fn_chunk def)) binds)
+    B.Make_rec (List.map (fun (name, def) -> name, fn_chunk def) binds)
     :: gen_expr tail rest
 
 and fn_chunk (body : A.expr) : B.chunk = Array.of_list (gen_expr true body)
@@ -55,7 +55,8 @@ and gen_cexpr (tail : bool) (c : A.cexpr) : B.instr list =
     (gen_atom h :: gen_atoms args)
     @ [ (if tail then B.Tail_call (len args) else B.Call (len args)) ]
   | A.CIf (a, t, e) ->
-    let tc = gen_expr tail t and ec = gen_expr tail e in
+    let tc = gen_expr tail t
+    and ec = gen_expr tail e in
     if tail
     then (* each branch ends with Return/Tail_call; skip [then] when false *)
       gen_atom a :: B.Jump_unless (len tc) :: (tc @ ec)
@@ -63,8 +64,14 @@ and gen_cexpr (tail : bool) (c : A.cexpr) : B.instr list =
       (* each branch leaves a value; [then] jumps over [else] to the join point *)
       gen_atom a :: B.Jump_unless (len tc + 1) :: (tc @ (B.Jump (len ec) :: ec))
   | A.CCase (scruts, alts) -> gen_case tail scruts alts
-  | (A.CAtom _ | A.CPrim _ | A.CCtor _ | A.CArray _ | A.CRecord _ | A.CAccessor _
-    | A.CUpdate _ | A.CLam _) as v -> gen_value v @ if tail then [ B.Return ] else []
+  | ( A.CAtom _
+    | A.CPrim _
+    | A.CCtor _
+    | A.CArray _
+    | A.CRecord _
+    | A.CAccessor _
+    | A.CUpdate _
+    | A.CLam _ ) as v -> gen_value v @ if tail then [ B.Return ] else []
 
 (* The non-control computations: each leaves exactly one value on the stack. *)
 and gen_value (c : A.cexpr) : B.instr list =
@@ -106,9 +113,9 @@ let program (e : A.expr) : (string * gdef) list * B.chunk =
       walk ((k, gdef_of_expr ~recursive:false (A.Ret c)) :: acc) rest
     | A.LetRec (binds, rest) ->
       let defs =
-        List.map (fun (name, def) -> (name, gdef_of_expr ~recursive:true def)) binds
+        List.map (fun (name, def) -> name, gdef_of_expr ~recursive:true def) binds
       in
       walk (List.rev_append defs acc) rest
-    | main -> (List.rev acc, Array.of_list (gen_expr true main))
+    | main -> List.rev acc, Array.of_list (gen_expr true main)
   in
   walk [] e

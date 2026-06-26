@@ -23,7 +23,9 @@ let topo (arts : A.module_artifact list) : A.module_artifact list =
       Hashtbl.replace visited a.name ();
       List.iter
         (fun imp ->
-          match Hashtbl.find_opt by_name imp with Some d -> visit d | None -> ())
+           match Hashtbl.find_opt by_name imp with
+           | Some d -> visit d
+           | None -> ())
         a.imports;
       order := a :: !order)
   in
@@ -44,9 +46,13 @@ let link
   (* A foreign that resolves to a guest term becomes a runtime definition; a native
      leaf ([C.Foreign]) is host-resolved at run, so it contributes no definition. *)
   let structural k =
-    match resolver k with Some (C.Foreign _) | None -> None | Some t -> Some t
+    match resolver k with
+    | Some (C.Foreign _) | None -> None
+    | Some t -> Some t
   in
-  let module_groups = List.concat_map (fun (a : A.module_artifact) -> a.groups) (topo artifacts) in
+  let module_groups =
+    List.concat_map (fun (a : A.module_artifact) -> a.groups) (topo artifacts)
+  in
   let defs : (string, A.group) Hashtbl.t = Hashtbl.create 256 in
   List.iter
     (fun (g : A.group) -> List.iter (fun k -> Hashtbl.replace defs k g) g.keys)
@@ -68,17 +74,17 @@ let link
            | None ->
              Option.map
                (fun t ->
-                 let gd =
-                   Vm.Codegen.gdef_of_expr ~recursive:false (Middle_end.Transl.transl t)
-                 in
-                 let g =
-                   { A.keys = [ k ]
-                   ; deps = SSet.elements (Link.free_vars t)
-                   ; members = [ (k, gd) ]
-                   }
-                 in
-                 Hashtbl.replace runtime k g;
-                 g)
+                  let gd =
+                    Vm.Codegen.gdef_of_expr ~recursive:false (Middle_end.Transl.transl t)
+                  in
+                  let g =
+                    { A.keys = [ k ]
+                    ; deps = SSet.elements (Link.free_vars t)
+                    ; members = [ k, gd ]
+                    }
+                  in
+                  Hashtbl.replace runtime k g;
+                  g)
                (structural k))
       in
       match g_opt with
@@ -100,7 +106,9 @@ let link
     |> List.concat_map (fun (g : A.group) -> g.members)
   in
   let module_members =
-    List.filter (fun (g : A.group) -> Hashtbl.mem reached_gid (List.hd g.keys)) module_groups
+    List.filter
+      (fun (g : A.group) -> Hashtbl.mem reached_gid (List.hd g.keys))
+      module_groups
     |> List.concat_map (fun (g : A.group) -> g.members)
   in
   let main_img = I.of_term main_term in

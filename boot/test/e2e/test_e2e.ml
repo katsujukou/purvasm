@@ -561,7 +561,9 @@ let test_de_effect_ref () =
    (ADR-0034) runs last, consuming the effect analysis fed by [Ffi]'s leaf bits. *)
 let opt (t : C.term) : C.term =
   Middle_end.Transl.rev_transl
-    (Middle_end.Passes.Dbe.run ~effectful_leaf:Ffi.effectful ~foreign_arity:Ffi.foreign_arity
+    (Middle_end.Passes.Dbe.run
+       ~effectful_leaf:Ffi.effectful
+       ~foreign_arity:Ffi.foreign_arity
        (Middle_end.Passes.Simplify.run
           (Middle_end.Passes.Dict_elim.run (Middle_end.Transl.transl t))))
 
@@ -620,7 +622,10 @@ let test_opt_effect_ref () =
    apps). *)
 let node_counts (e : Middle_end.Anf.expr) : int * int * int * int =
   let open Middle_end.Anf in
-  let l = ref 0 and acc = ref 0 and pr = ref 0 and ap = ref 0 in
+  let l = ref 0
+  and acc = ref 0
+  and pr = ref 0
+  and ap = ref 0 in
   let rec ex = function
     | Ret c -> cx c
     | Let (_, c, b) ->
@@ -630,8 +635,8 @@ let node_counts (e : Middle_end.Anf.expr) : int * int * int * int =
     | LetRec (g, b) ->
       List.iter
         (fun (_, r) ->
-          incr l;
-          ex r)
+           incr l;
+           ex r)
         g;
       ex b
   and cx = function
@@ -645,35 +650,48 @@ let node_counts (e : Middle_end.Anf.expr) : int * int * int * int =
     | CCase (_, alts) ->
       List.iter
         (fun (al : alt) ->
-          match al.result with
-          | Uncond e -> ex e
-          | Guarded gs ->
-            List.iter
-              (fun (g, e) ->
-                ex g;
-                ex e)
-              gs)
+           match al.result with
+           | Uncond e -> ex e
+           | Guarded gs ->
+             List.iter
+               (fun (g, e) ->
+                  ex g;
+                  ex e)
+               gs)
         alts
     | _ -> ()
   in
   ex e;
-  (!l, !acc, !pr, !ap)
+  !l, !acc, !pr, !ap
 
-let n_lets e = let l, _, _, _ = node_counts e in l
-let n_apps e = let _, _, _, a = node_counts e in a
+let n_lets e =
+  let l, _, _, _ = node_counts e in
+  l
+
+let n_apps e =
+  let _, _, _, a = node_counts e in
+  a
+
 let transl = Middle_end.Transl.transl
 let dictelim t = Middle_end.Passes.Dict_elim.run (transl t)
 let simplify t = Middle_end.Passes.Simplify.run (dictelim t)
-
 let opt_pre (t : C.term) = simplify t
 
 let opt_post (t : C.term) =
-  Middle_end.Passes.Dbe.run ~effectful_leaf:Ffi.effectful ~foreign_arity:Ffi.foreign_arity (opt_pre t)
+  Middle_end.Passes.Dbe.run
+    ~effectful_leaf:Ffi.effectful
+    ~foreign_arity:Ffi.foreign_arity
+    (opt_pre t)
 
 (* The fib program (Ord + Semiring dictionaries) — a rich witness for every pass. *)
 let fib10 () =
   C.App
-    ( Link.link_program ~resolver:Ffi.resolver ~outdir:"../fixtures/fib" ~entry_module:[ "FibAnd" ] ~entry:"fib" ()
+    ( Link.link_program
+        ~resolver:Ffi.resolver
+        ~outdir:"../fixtures/fib"
+        ~entry_module:[ "FibAnd" ]
+        ~entry:"fib"
+        ()
     , int 10 )
 
 (* DictElim (ADR-0027) collapses statically-known dictionary dispatch, removing the
@@ -681,24 +699,38 @@ let fib10 () =
    Simplify's job below, so the two metrics attribute cleanly). *)
 let test_dictelim_fires () =
   let t = fib10 () in
-  let before = n_apps (transl t) and after = n_apps (dictelim t) in
-  Alcotest.(check bool) (Printf.sprintf "DictElim removes dispatch apps (%d -> %d)" before after) true (after < before)
+  let before = n_apps (transl t)
+  and after = n_apps (dictelim t) in
+  Alcotest.(check bool)
+    (Printf.sprintf "DictElim removes dispatch apps (%d -> %d)" before after)
+    true
+    (after < before)
 
 (* Simplify (ADR-0028) copy-propagates, dropping the alias [let]s DictElim leaves; the
    let-count strictly drops (DictElim did not move it). *)
 let test_simplify_fires () =
   let t = fib10 () in
-  let before = n_lets (dictelim t) and after = n_lets (simplify t) in
-  Alcotest.(check bool) (Printf.sprintf "Simplify drops alias lets (%d -> %d)" before after) true (after < before)
+  let before = n_lets (dictelim t)
+  and after = n_lets (simplify t) in
+  Alcotest.(check bool)
+    (Printf.sprintf "Simplify drops alias lets (%d -> %d)" before after)
+    true
+    (after < before)
 
 (* DBE (ADR-0034) drops dead pure bindings. The whole-module lowering keeps a module's
    private bindings (no cross-module reachability DCE here, as in per-module compile),
    so an entry like `classify` leaves dead pure helpers DBE must remove. *)
 let dbe_fires (label : string) (t : C.term) =
-  let pre = n_lets (opt_pre t) and post = n_lets (opt_post t) in
-  Alcotest.(check bool) (Printf.sprintf "%s: DBE drops dead lets (%d -> %d)" label pre post) true (post < pre)
+  let pre = n_lets (opt_pre t)
+  and post = n_lets (opt_post t) in
+  Alcotest.(check bool)
+    (Printf.sprintf "%s: DBE drops dead lets (%d -> %d)" label pre post)
+    true
+    (post < pre)
 
-let test_dbe_fires_classify () = dbe_fires "classify" (Lower.module_ fixture ~entry:"classify")
+let test_dbe_fires_classify () =
+  dbe_fires "classify" (Lower.module_ fixture ~entry:"classify")
+
 let test_dbe_fires_anint () = dbe_fires "anInt" (Lower.module_ fixture ~entry:"anInt")
 
 (* --- OCaml native backend (ADR-0036) differential equivalence ------------- *)
@@ -708,28 +740,41 @@ let test_dbe_fires_anint () = dbe_fires "anInt" (Lower.module_ fixture ~entry:"a
    full native path — a purs-compiled `corefn.json` fixture, lowered and codegen'd to
    native, must print what the CESK oracle computes. *)
 let ocaml_run ?(is_effect = false) (t : C.term) : string =
-  let dir = Filename.concat (Filename.get_temp_dir_name ()) (Printf.sprintf "purvasm_ml_%x" (Hashtbl.hash t)) in
-  (try Sys.mkdir dir 0o755 with Sys_error _ -> ());
+  let dir =
+    Filename.concat
+      (Filename.get_temp_dir_name ())
+      (Printf.sprintf "purvasm_ml_%x" (Hashtbl.hash t))
+  in
+  (try Sys.mkdir dir 0o755 with
+   | Sys_error _ -> ());
   let src = Ocaml_backend.Codegen_ml.program ~is_effect (Middle_end.Transl.transl t) in
   let oc = open_out (Filename.concat dir "gen.ml") in
   output_string oc src;
   close_out oc;
-  if Sys.command (Printf.sprintf "cd %s && ocamlfind ocamlopt gen.ml -o gen 2>err" dir) <> 0
+  if
+    Sys.command (Printf.sprintf "cd %s && ocamlfind ocamlopt gen.ml -o gen 2>err" dir)
+    <> 0
   then Alcotest.failf "ocamlopt failed; see %s/err and %s/gen.ml" dir dir;
-  if Sys.command (Printf.sprintf "%s/gen > %s/out" dir dir) <> 0 then Alcotest.fail "generated program crashed";
+  if Sys.command (Printf.sprintf "%s/gen > %s/out" dir dir) <> 0
+  then Alcotest.fail "generated program crashed";
   let ic = open_in (Filename.concat dir "out") in
   let s = In_channel.input_all ic in
   close_in ic;
   s
 
 let same_on_ocaml (label : string) (t : C.term) =
-  Alcotest.(check string) label (V.to_string (Cesk.Machine.eval ~host:Ffi.host t)) (ocaml_run t)
+  Alcotest.(check string)
+    label
+    (V.to_string (Cesk.Machine.eval ~host:Ffi.host t))
+    (ocaml_run t)
 
 (* An Effect entry's observable is its effects (stdout); the native runner performs them
    and suppresses the (`Unit`) result, matching `purvm run`. So compare the generated
    program's stdout to the oracle's captured `run_effect` stdout. *)
 let same_on_ocaml_effect (label : string) (t : C.term) =
-  let out = with_captured_stdout (fun () -> ignore (Cesk.Machine.run_effect ~host:Ffi.host t)) in
+  let out =
+    with_captured_stdout (fun () -> ignore (Cesk.Machine.run_effect ~host:Ffi.host t))
+  in
   Alcotest.(check string) label out (ocaml_run ~is_effect:true t)
 
 (* Slice 1 (ADR-0036): the pure first-order subset, uniform calling convention. A real
@@ -737,21 +782,36 @@ let same_on_ocaml_effect (label : string) (t : C.term) =
    kind. (Value-recursive `let rec` → `lazy`, record binders, foreigns, and Effect are
    later slices — see the ADR's named follow-ups.) *)
 let test_ml_prelude_answer () = same_on_ocaml "answer" (prelude_term "answer")
-let test_ml_arith () = same_on_ocaml "(1+2)*3" (C.Prim (C.MulInt, [ C.Prim (C.AddInt, [ int 1; int 2 ]); int 3 ]))
-let test_ml_app () = same_on_ocaml "app" (C.App (C.Lam ("x", C.Prim (C.AddInt, [ C.Var "x"; int 1 ])), int 41))
-let test_ml_if () = same_on_ocaml "if" (C.If (C.Prim (C.LtInt, [ int 1; int 2 ]), int 10, int 20))
+
+let test_ml_arith () =
+  same_on_ocaml
+    "(1+2)*3"
+    (C.Prim (C.MulInt, [ C.Prim (C.AddInt, [ int 1; int 2 ]); int 3 ]))
+
+let test_ml_app () =
+  same_on_ocaml
+    "app"
+    (C.App (C.Lam ("x", C.Prim (C.AddInt, [ C.Var "x"; int 1 ])), int 41))
+
+let test_ml_if () =
+  same_on_ocaml "if" (C.If (C.Prim (C.LtInt, [ int 1; int 2 ]), int 10, int 20))
+
 let test_ml_ctor () = same_on_ocaml "ctor" (C.App (C.Ctor ("Just", 1), int 7))
 
 let classify_term scrut =
   C.Case
     ( [ scrut ]
     , [ { C.binders = [ C.BCtor ("Just", [ C.BVar "x" ]) ]
-        ; result = C.Unconditional (C.Prim (C.AddInt, [ C.Var "x"; int 1 ])) }
+        ; result = C.Unconditional (C.Prim (C.AddInt, [ C.Var "x"; int 1 ]))
+        }
       ; { C.binders = [ C.BCtor ("Nothing", []) ]; result = C.Unconditional (int 0) }
       ] )
 
-let test_ml_case_just () = same_on_ocaml "case Just 5" (classify_term (C.App (C.Ctor ("Just", 1), int 5)))
-let test_ml_case_nothing () = same_on_ocaml "case Nothing" (classify_term (C.Ctor ("Nothing", 0)))
+let test_ml_case_just () =
+  same_on_ocaml "case Just 5" (classify_term (C.App (C.Ctor ("Just", 1), int 5)))
+
+let test_ml_case_nothing () =
+  same_on_ocaml "case Nothing" (classify_term (C.Ctor ("Nothing", 0)))
 
 let test_ml_recursion () =
   let fact =
@@ -760,24 +820,47 @@ let test_ml_recursion () =
       , C.If
           ( C.Prim (C.LtInt, [ C.Var "n"; int 1 ])
           , int 1
-          , C.Prim (C.MulInt, [ C.Var "n"; C.App (C.Var "fact", C.Prim (C.SubInt, [ C.Var "n"; int 1 ])) ]) ) )
+          , C.Prim
+              ( C.MulInt
+              , [ C.Var "n"
+                ; C.App (C.Var "fact", C.Prim (C.SubInt, [ C.Var "n"; int 1 ]))
+                ] ) ) )
   in
   same_on_ocaml "fact 5" (C.Letrec ([ "fact", fact ], C.App (C.Var "fact", int 5)))
 
-let test_ml_record () = same_on_ocaml "record.x" (C.Accessor (C.Record [ "x", int 5; "y", int 9 ], "x"))
+let test_ml_record () =
+  same_on_ocaml "record.x" (C.Accessor (C.Record [ "x", int 5; "y", int 9 ], "x"))
+
 let test_ml_array () = same_on_ocaml "array" (C.Array [ int 10; int 20; int 30 ])
 
 (* Whole-module fixtures (no DCE) — the spine now includes record binders (`viaRecord`)
    and guards (`pick`), which the CPS cascade matcher handles. *)
 let test_ml_anint () = same_on_ocaml "anInt" (Lower.module_ fixture ~entry:"anInt")
-let test_ml_classify () = same_on_ocaml "classify (Just 0)" (C.App (Lower.module_ fixture ~entry:"classify", just (int 0)))
-let test_ml_firstof () = same_on_ocaml "firstOf [10,20]" (C.App (Lower.module_ fixture ~entry:"firstOf", C.Array [ int 10; int 20 ]))
-let test_ml_via_record () = same_on_ocaml "viaRecord {x:5}" (C.App (Lower.module_ fixture ~entry:"viaRecord", C.Record [ "x", int 5 ]))
-let test_ml_pick () = same_on_ocaml "pick true" (C.App (Lower.module_ fixture ~entry:"pick", C.Lit (C.LBool true)))
+
+let test_ml_classify () =
+  same_on_ocaml
+    "classify (Just 0)"
+    (C.App (Lower.module_ fixture ~entry:"classify", just (int 0)))
+
+let test_ml_firstof () =
+  same_on_ocaml
+    "firstOf [10,20]"
+    (C.App (Lower.module_ fixture ~entry:"firstOf", C.Array [ int 10; int 20 ]))
+
+let test_ml_via_record () =
+  same_on_ocaml
+    "viaRecord {x:5}"
+    (C.App (Lower.module_ fixture ~entry:"viaRecord", C.Record [ "x", int 5 ]))
+
+let test_ml_pick () =
+  same_on_ocaml
+    "pick true"
+    (C.App (Lower.module_ fixture ~entry:"pick", C.Lit (C.LBool true)))
 
 (* number-literal binder (OCaml float patterns are disallowed; the cascade uses `=`) *)
 let test_ml_number_binder () =
-  same_on_ocaml "case 3.5"
+  same_on_ocaml
+    "case 3.5"
     (C.Case
        ( [ C.Lit (C.LNumber 3.5) ]
        , [ { C.binders = [ C.BLit (C.LNumber 3.5) ]; result = C.Unconditional (int 1) }
@@ -787,9 +870,15 @@ let test_ml_number_binder () =
 (* A recursive *value* binding (ADR-0024): `FibAnd.fibAnd` is the recursive `Fib` data
    value, so its `let rec` member lowers to OCaml `lazy` and uses force. *)
 let test_ml_fib () =
-  same_on_ocaml "fib 10"
+  same_on_ocaml
+    "fib 10"
     (C.App
-       ( Link.link_program ~resolver:Ffi.resolver ~outdir:"../fixtures/fib" ~entry_module:[ "FibAnd" ] ~entry:"fib" ()
+       ( Link.link_program
+           ~resolver:Ffi.resolver
+           ~outdir:"../fixtures/fib"
+           ~entry_module:[ "FibAnd" ]
+           ~entry:"fib"
+           ()
        , int 10 ))
 
 (* Foreign boundary (ADR-0036): the native leaf `Data.Show.showIntImpl` (pure) and
@@ -798,12 +887,24 @@ let test_ml_show () = same_on_ocaml "shownStr" (prelude_term "shownStr")
 let test_ml_doubled () = same_on_ocaml "doubled" (prelude_term "doubled")
 
 let test_ml_effect_console () =
-  same_on_ocaml_effect "console"
-    (Link.link_program ~resolver:Ffi.resolver ~outdir:"../fixtures/effect_console" ~entry_module:[ "ConsoleMain" ] ~entry:"main" ())
+  same_on_ocaml_effect
+    "console"
+    (Link.link_program
+       ~resolver:Ffi.resolver
+       ~outdir:"../fixtures/effect_console"
+       ~entry_module:[ "ConsoleMain" ]
+       ~entry:"main"
+       ())
 
 let test_ml_effect_ref () =
-  same_on_ocaml_effect "effect_ref"
-    (Link.link_program ~resolver:Ffi.resolver ~outdir:"../fixtures/effect_ref" ~entry_module:[ "RefMain" ] ~entry:"main" ())
+  same_on_ocaml_effect
+    "effect_ref"
+    (Link.link_program
+       ~resolver:Ffi.resolver
+       ~outdir:"../fixtures/effect_ref"
+       ~entry_module:[ "RefMain" ]
+       ~entry:"main"
+       ())
 
 (* --- I4: loop combinator × effect body (ADR-0034) ------------------------- *)
 
@@ -814,23 +915,35 @@ let test_ml_effect_ref () =
    backend, and the OCaml backend applies the body as a `VClos` value (the hybrid path),
    so this checks all three agree. *)
 let foreign_ref k = Option.get (Ffi.resolver k)
+
 let log_show_body var =
-  C.Lam (var, C.App (C.Foreign "Effect.Console.log", C.App (C.Foreign "Data.Show.showIntImpl", C.Var var)))
+  C.Lam
+    ( var
+    , C.App
+        ( C.Foreign "Effect.Console.log"
+        , C.App (C.Foreign "Data.Show.showIntImpl", C.Var var) ) )
 
 let i4_effect (label : string) (t : C.term) =
-  let oracle = with_captured_stdout (fun () -> ignore (Cesk.Machine.run_effect ~host:Ffi.host t)) in
+  let oracle =
+    with_captured_stdout (fun () -> ignore (Cesk.Machine.run_effect ~host:Ffi.host t))
+  in
   let vm = with_captured_stdout (fun () -> ignore (Vm.run_effect ~host:Ffi.host t)) in
   Alcotest.(check string) (label ^ ": oracle/vm") oracle vm;
   Alcotest.(check string) (label ^ ": oracle/ocaml") oracle (ocaml_run ~is_effect:true t)
 
 (* forE lo hi (\i -> log (show i)) — the index-arg body, applied then forced each step. *)
 let test_i4_fore () =
-  i4_effect "forE" (C.App (C.App (C.App (foreign_ref "Effect.forE", int 0), int 4), log_show_body "i"))
+  i4_effect
+    "forE"
+    (C.App (C.App (C.App (foreign_ref "Effect.forE", int 0), int 4), log_show_body "i"))
 
 (* foreachE [..] (\x -> log (show x)) — the element-arg body. *)
 let test_i4_foreach () =
-  i4_effect "foreachE"
-    (C.App (C.App (foreign_ref "Effect.foreachE", C.Array [ int 10; int 20; int 30 ]), log_show_body "x"))
+  i4_effect
+    "foreachE"
+    (C.App
+       ( C.App (foreign_ref "Effect.foreachE", C.Array [ int 10; int 20; int 30 ])
+       , log_show_body "x" ))
 
 (* whileE/untilE terminate via a Ref condition (mutable state), so these exercise the
    loop combinators *together with* Ref + bindE sequencing across all backends. *)
@@ -839,30 +952,64 @@ let pureE x = C.App (foreign_ref "Effect.pureE", x)
 let new_ref v = C.App (foreign_ref "Effect.Ref._new", v)
 let read_ref r = C.App (foreign_ref "Effect.Ref.read", r)
 let write_ref v r = C.App (C.App (foreign_ref "Effect.Ref.write", v), r)
-let log_show n = C.App (C.Foreign "Effect.Console.log", C.App (C.Foreign "Data.Show.showIntImpl", n))
+
+let log_show n =
+  C.App (C.Foreign "Effect.Console.log", C.App (C.Foreign "Data.Show.showIntImpl", n))
 
 (* count 0..4, printing each, while the Ref is < 5. *)
 let test_i4_while () =
   let prog =
-    bindE (new_ref (int 0)) (C.Lam ("ref",
-      C.App
-        ( C.App
-            ( foreign_ref "Effect.whileE"
-            , bindE (read_ref (C.Var "ref")) (C.Lam ("v", pureE (C.Prim (C.LtInt, [ C.Var "v"; int 5 ])))) )
-        , bindE (read_ref (C.Var "ref")) (C.Lam ("v",
-            bindE (log_show (C.Var "v")) (C.Lam ("_", write_ref (C.Prim (C.AddInt, [ C.Var "v"; int 1 ])) (C.Var "ref"))))) )))
+    bindE
+      (new_ref (int 0))
+      (C.Lam
+         ( "ref"
+         , C.App
+             ( C.App
+                 ( foreign_ref "Effect.whileE"
+                 , bindE
+                     (read_ref (C.Var "ref"))
+                     (C.Lam ("v", pureE (C.Prim (C.LtInt, [ C.Var "v"; int 5 ])))) )
+             , bindE
+                 (read_ref (C.Var "ref"))
+                 (C.Lam
+                    ( "v"
+                    , bindE
+                        (log_show (C.Var "v"))
+                        (C.Lam
+                           ( "_"
+                           , write_ref
+                               (C.Prim (C.AddInt, [ C.Var "v"; int 1 ]))
+                               (C.Var "ref") )) )) ) ))
   in
   i4_effect "whileE" prog
 
 (* run the body until the Ref reaches 3, printing 0,1,2. *)
 let test_i4_until () =
   let body =
-    bindE (read_ref (C.Var "ref")) (C.Lam ("v",
-      bindE (log_show (C.Var "v")) (C.Lam ("_",
-        bindE (write_ref (C.Prim (C.AddInt, [ C.Var "v"; int 1 ])) (C.Var "ref"))
-          (C.Lam ("_", pureE (C.Prim (C.NotBool, [ C.Prim (C.LtInt, [ C.Prim (C.AddInt, [ C.Var "v"; int 1 ]); int 3 ]) ]))))))))
+    bindE
+      (read_ref (C.Var "ref"))
+      (C.Lam
+         ( "v"
+         , bindE
+             (log_show (C.Var "v"))
+             (C.Lam
+                ( "_"
+                , bindE
+                    (write_ref (C.Prim (C.AddInt, [ C.Var "v"; int 1 ])) (C.Var "ref"))
+                    (C.Lam
+                       ( "_"
+                       , pureE
+                           (C.Prim
+                              ( C.NotBool
+                              , [ C.Prim
+                                    ( C.LtInt
+                                    , [ C.Prim (C.AddInt, [ C.Var "v"; int 1 ]); int 3 ]
+                                    )
+                                ] )) )) )) ))
   in
-  let prog = bindE (new_ref (int 0)) (C.Lam ("ref", C.App (foreign_ref "Effect.untilE", body))) in
+  let prog =
+    bindE (new_ref (int 0)) (C.Lam ("ref", C.App (foreign_ref "Effect.untilE", body)))
+  in
   i4_effect "untilE" prog
 
 (* --- PURVASM bytecode VM (ADR-0030) differential equivalence -------------- *)
@@ -876,8 +1023,7 @@ let same_on_vm (label : string) (t : C.term) =
   let vm = Vm.eval ~host:Ffi.host t in
   Alcotest.(check string) label (V.to_string oracle) (Vm.Value.to_string vm)
 
-let test_vm_fixture () =
-  same_on_vm "fixture.anInt" (Lower.module_ fixture ~entry:"anInt")
+let test_vm_fixture () = same_on_vm "fixture.anInt" (Lower.module_ fixture ~entry:"anInt")
 
 (* Module-fixture entries applied to an argument, run on the VM vs the oracle. These
    reach the in-module `case`s directly: `classify`/`pick` are guarded (ADR-0013),
@@ -885,12 +1031,16 @@ let test_vm_fixture () =
 let same_on_vm_app (label : string) (entry : string) (arg : C.term) =
   same_on_vm label (C.App (Lower.module_ fixture ~entry, arg))
 
-let test_vm_classify_just () = same_on_vm_app "classify (Just 0)" "classify" (just (int 0))
+let test_vm_classify_just () =
+  same_on_vm_app "classify (Just 0)" "classify" (just (int 0))
+
 let test_vm_classify_nothing () = same_on_vm_app "classify Nothing" "classify" nothing
 let test_vm_pick_true () = same_on_vm_app "pick true" "pick" (C.Lit (C.LBool true))
 let test_vm_pick_false () = same_on_vm_app "pick false" "pick" (C.Lit (C.LBool false))
+
 let test_vm_first_of () =
   same_on_vm_app "firstOf [10,20]" "firstOf" (C.Array [ int 10; int 20 ])
+
 let test_vm_via_record () =
   same_on_vm_app "viaRecord {x:5}" "viaRecord" (C.Record [ "x", int 5 ])
 
@@ -957,7 +1107,9 @@ let test_vm_dt_array () =
     case
       [ C.Array xs ]
       [ alt [ C.BArray [ C.BVar "a" ] ] (C.Var "a")
-      ; alt [ C.BArray [ C.BVar "a"; C.BVar "b" ] ] (C.Prim (C.AddInt, [ C.Var "a"; C.Var "b" ]))
+      ; alt
+          [ C.BArray [ C.BVar "a"; C.BVar "b" ] ]
+          (C.Prim (C.AddInt, [ C.Var "a"; C.Var "b" ]))
       ; alt [ C.BNull ] (int 0)
       ]
   in
@@ -975,7 +1127,7 @@ let test_vm_dt_guard_chain () =
   let prog n =
     case
       [ int n ]
-      [ altg [ C.BVar "x" ] [ (gt 10 "x", int 1); (gt 5 "x", int 2) ]
+      [ altg [ C.BVar "x" ] [ gt 10 "x", int 1; gt 5 "x", int 2 ]
       ; alt [ C.BNull ] (int 3)
       ]
   in
@@ -989,7 +1141,7 @@ let test_vm_dt_guard_ctor () =
   let prog s =
     case
       [ s ]
-      [ altg [ C.BCtor ("Just", [ C.BVar "x" ]) ] [ (gt 0 "x", C.Var "x") ]
+      [ altg [ C.BCtor ("Just", [ C.BVar "x" ]) ] [ gt 0 "x", C.Var "x" ]
       ; alt [ C.BCtor ("Just", [ C.BNull ]) ] (int (-1))
       ; alt [ C.BCtor ("Nothing", []) ] (int (-2))
       ]
@@ -1006,9 +1158,7 @@ let same_on_vm_naive (label : string) (t : C.term) =
 
 let test_vm_naive_guard () =
   let prog n =
-    case
-      [ int n ]
-      [ altg [ C.BVar "x" ] [ (gt 10 "x", int 1) ]; alt [ C.BNull ] (int 0) ]
+    case [ int n ] [ altg [ C.BVar "x" ] [ gt 10 "x", int 1 ]; alt [ C.BNull ] (int 0) ]
   in
   same_on_vm_naive "naive guard 20" (prog 20);
   same_on_vm_naive "naive guard 5" (prog 5)
@@ -1040,9 +1190,7 @@ let test_vm_effect_console () =
   let oracle_out =
     with_captured_stdout (fun () -> ignore (Cesk.Machine.run_effect ~host:Ffi.host t))
   in
-  let vm_out =
-    with_captured_stdout (fun () -> ignore (Vm.run_effect ~host:Ffi.host t))
-  in
+  let vm_out = with_captured_stdout (fun () -> ignore (Vm.run_effect ~host:Ffi.host t)) in
   Alcotest.(check string) "console stdout (order)" oracle_out vm_out
 
 (* --- separate-compilation image (ADR-0033): serialize -> deserialize -> run --- *)
@@ -1061,7 +1209,9 @@ let same_on_image (label : string) (t : C.term) =
    checked exactly rather than via the cross-printer string form. *)
 let test_image_float_bits () =
   let f = 1.0 /. 3.0 in
-  let img = Pvm.Image.of_string (Pvm.Image.to_string (Pvm.Image.of_term (C.Lit (C.LNumber f)))) in
+  let img =
+    Pvm.Image.of_string (Pvm.Image.to_string (Pvm.Image.of_term (C.Lit (C.LNumber f))))
+  in
   match Pvm.Image.run ~host:Ffi.host img with
   | Vm.Value.Vnumber g ->
     Alcotest.(check bool)
@@ -1100,7 +1250,9 @@ let test_image_effect_console () =
   let oracle_out =
     with_captured_stdout (fun () -> ignore (Cesk.Machine.run_effect ~host:Ffi.host t))
   in
-  let img_out = with_captured_stdout (fun () -> ignore (Pvm.Image.run ~host:Ffi.host img)) in
+  let img_out =
+    with_captured_stdout (fun () -> ignore (Pvm.Image.run ~host:Ffi.host img))
+  in
   Alcotest.(check string) "image console stdout (order)" oracle_out img_out
 
 (* --- separate compilation (ADR-0033): per-module artifacts -> link -> run ----- *)
@@ -1113,20 +1265,24 @@ let sepcomp_image ~outdir ~entry_module ~entry ?arg () : Pvm.Image.t =
   let artifacts =
     Link.load ~outdir ~entry_module ()
     |> List.map (fun m ->
-         Pvm.Artifact.module_of_string
-           (Pvm.Artifact.module_to_string (Pvm.Compile.compile_module m)))
+      Pvm.Artifact.module_of_string
+        (Pvm.Artifact.module_to_string (Pvm.Compile.compile_module m)))
   in
   let entry_key = Lower.qualified_key entry_module entry in
   let main_term =
-    match arg with None -> C.Var entry_key | Some a -> C.App (C.Var entry_key, a)
+    match arg with
+    | None -> C.Var entry_key
+    | Some a -> C.App (C.Var entry_key, a)
   in
   Pvm.Plink.link artifacts ~resolver:Ffi.resolver ~main_term
 
 let oracle_value ~outdir ~entry_module ~entry ?arg () : V.t =
-  let base =
-    Link.link_program ~resolver:Ffi.resolver ~outdir ~entry_module ~entry ()
+  let base = Link.link_program ~resolver:Ffi.resolver ~outdir ~entry_module ~entry () in
+  let t =
+    match arg with
+    | None -> base
+    | Some a -> C.App (base, a)
   in
-  let t = match arg with None -> base | Some a -> C.App (base, a) in
   Cesk.Machine.eval ~host:Ffi.host t
 
 let same_on_sepcomp label ~outdir ~entry_module ~entry ?arg () =
@@ -1137,59 +1293,96 @@ let same_on_sepcomp label ~outdir ~entry_module ~entry ?arg () =
        (Pvm.Image.run ~host:Ffi.host (sepcomp_image ~outdir ~entry_module ~entry ?arg ())))
 
 let test_sc_answer () =
-  same_on_sepcomp "sc.answer" ~outdir:"../fixtures/prelude" ~entry_module:[ "Main" ]
-    ~entry:"answer" ()
+  same_on_sepcomp
+    "sc.answer"
+    ~outdir:"../fixtures/prelude"
+    ~entry_module:[ "Main" ]
+    ~entry:"answer"
+    ()
 
 let test_sc_doubled () =
-  same_on_sepcomp "sc.doubled" ~outdir:"../fixtures/prelude" ~entry_module:[ "Main" ]
-    ~entry:"doubled" ()
+  same_on_sepcomp
+    "sc.doubled"
+    ~outdir:"../fixtures/prelude"
+    ~entry_module:[ "Main" ]
+    ~entry:"doubled"
+    ()
 
 let test_sc_show () =
-  same_on_sepcomp "sc.shownStr" ~outdir:"../fixtures/prelude" ~entry_module:[ "Main" ]
-    ~entry:"shownStr" ()
+  same_on_sepcomp
+    "sc.shownStr"
+    ~outdir:"../fixtures/prelude"
+    ~entry_module:[ "Main" ]
+    ~entry:"shownStr"
+    ()
 
 let test_sc_fib () =
-  same_on_sepcomp "sc.fib 10" ~outdir:"../fixtures/fib" ~entry_module:[ "FibAnd" ]
-    ~entry:"fib" ~arg:(int 10) ()
+  same_on_sepcomp
+    "sc.fib 10"
+    ~outdir:"../fixtures/fib"
+    ~entry_module:[ "FibAnd" ]
+    ~entry:"fib"
+    ~arg:(int 10)
+    ()
 
 (* Cross-module linking: the entry's value is defined in terms of other modules'
    exports, so the image must merge several `.pvmo`s. *)
 let test_sc_transitive () =
-  same_on_sepcomp "sc.trans.a" ~outdir:"../fixtures/trans" ~entry_module:[ "TransA" ]
-    ~entry:"a" ()
+  same_on_sepcomp
+    "sc.trans.a"
+    ~outdir:"../fixtures/trans"
+    ~entry_module:[ "TransA" ]
+    ~entry:"a"
+    ()
 
 let test_sc_diamond () =
-  same_on_sepcomp "sc.diamond.both" ~outdir:"../fixtures/diamond" ~entry_module:[ "DiaA" ]
-    ~entry:"both" ()
+  same_on_sepcomp
+    "sc.diamond.both"
+    ~outdir:"../fixtures/diamond"
+    ~entry_module:[ "DiaA" ]
+    ~entry:"both"
+    ()
 
 (* The `.pvmi` interface carries each public export's kind/arity and a hash over that
    surface, and survives serialization (ADR-0033). *)
 let test_sc_interface () =
   let modules = Link.load ~outdir:"../fixtures/fib" ~entry_module:[ "FibAnd" ] () in
   let m =
-    List.find (fun (mm : Corefn.Module.t) -> String.equal (Link.name_key mm.name) "FibAnd") modules
+    List.find
+      (fun (mm : Corefn.Module.t) -> String.equal (Link.name_key mm.name) "FibAnd")
+      modules
   in
   let i = Pvm.Artifact.interface_of (Pvm.Compile.compile_module m) in
   let i2 = Pvm.Artifact.interface_of_string (Pvm.Artifact.interface_to_string i) in
-  Alcotest.(check string) "interface hash stable through serde" i.Pvm.Artifact.hash i2.Pvm.Artifact.hash;
+  Alcotest.(check string)
+    "interface hash stable through serde"
+    i.Pvm.Artifact.hash
+    i2.Pvm.Artifact.hash;
   match List.assoc_opt "FibAnd.fib" i.Pvm.Artifact.exports with
   | Some (Pvm.Artifact.Efn 1) -> ()
   | _ -> Alcotest.fail "FibAnd.fib should be exported as a fn/1"
 
 let test_sc_effect_console () =
-  let t = effect_term ~outdir:"../fixtures/effect_console" ~entry_module:[ "ConsoleMain" ] in
+  let t =
+    effect_term ~outdir:"../fixtures/effect_console" ~entry_module:[ "ConsoleMain" ]
+  in
   let img =
-    sepcomp_image ~outdir:"../fixtures/effect_console" ~entry_module:[ "ConsoleMain" ]
-      ~entry:"main" ~arg:(int 0) ()
+    sepcomp_image
+      ~outdir:"../fixtures/effect_console"
+      ~entry_module:[ "ConsoleMain" ]
+      ~entry:"main"
+      ~arg:(int 0)
+      ()
   in
   let oracle_out =
     with_captured_stdout (fun () -> ignore (Cesk.Machine.run_effect ~host:Ffi.host t))
   in
-  let img_out = with_captured_stdout (fun () -> ignore (Pvm.Image.run ~host:Ffi.host img)) in
+  let img_out =
+    with_captured_stdout (fun () -> ignore (Pvm.Image.run ~host:Ffi.host img))
+  in
   Alcotest.(check string) "sc console stdout (order)" oracle_out img_out
 
 let test_vm_app () = same_on_vm "app.result" (program "result")
-
 let test_vm_prelude_answer () = same_on_vm "prelude.answer" (prelude_term "answer")
 let test_vm_prelude_div () = same_on_vm "prelude.quotient" (prelude_term "quotient")
 let test_vm_prelude_eq () = same_on_vm "prelude.isEq" (prelude_term "isEq")
@@ -1232,7 +1425,11 @@ let test_vm_lazy_fix () =
 let test_vm_transitive () =
   same_on_vm
     "trans.a"
-    (Link.link_program ~outdir:"../fixtures/trans" ~entry_module:[ "TransA" ] ~entry:"a" ())
+    (Link.link_program
+       ~outdir:"../fixtures/trans"
+       ~entry_module:[ "TransA" ]
+       ~entry:"a"
+       ())
 
 let test_vm_diamond () =
   same_on_vm

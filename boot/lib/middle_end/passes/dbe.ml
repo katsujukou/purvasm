@@ -10,6 +10,10 @@
 
     [effectful_leaf]/[foreign_arity] are the native-leaf classification ([Ffi]). *)
 
-let run ~(effectful_leaf : string -> bool) ~(foreign_arity : string -> int) (program : Anf.expr)
-  : Anf.expr =
+let run
+      ~(effectful_leaf : string -> bool)
+      ~(foreign_arity : string -> int)
+      (program : Anf.expr)
+  : Anf.expr
+  =
   (Effect_analysis.create ~effectful_leaf ~foreign_arity).dbe program
