@@ -18,6 +18,21 @@
 open Anf
 module M = Map.Make (String)
 
+(* Drop [names] from the known-environment: a name being re-bound in an inner scope must not
+   resolve to a (now-shadowed) outer alias/fun. Omitting this lets an inner binder that reuses a
+   source name (e.g. a record field `step`) wrongly resolve to an outer entry — a scope bug that
+   only surfaces once name reuse appears (large closures). *)
+let remove_all (names : string list) (env : 'a M.t) : 'a M.t =
+  List.fold_left (fun e n -> M.remove n e) env names
+
+(* The variables an ANF/Cesk binder introduces. *)
+let rec binder_vars : Cesk.Ast.binder -> string list = function
+  | Cesk.Ast.BNull | Cesk.Ast.BLit _ -> []
+  | Cesk.Ast.BVar x -> [ x ]
+  | Cesk.Ast.BNamed (x, b) -> x :: binder_vars b
+  | Cesk.Ast.BCtor (_, bs) | Cesk.Ast.BArray bs -> List.concat_map binder_vars bs
+  | Cesk.Ast.BRecord fs -> List.concat_map (fun (_, b) -> binder_vars b) fs
+
 (* A binder-free computation: small and with no nested scope. *)
 let is_flat : cexpr -> bool = function
   | CLam _ | CIf _ | CCase _ -> false
@@ -96,9 +111,13 @@ let run (program : expr) : expr =
          rw_expr (M.add x (Alias (resolve_atom env a)) env) body
        | CLam (params, Ret cf) when inlinable params cf ->
          Let (x, c', rw_expr (M.add x (Fun (params, cf)) env) body)
-       | _ -> Let (x, c', rw_expr env body))
+       | _ ->
+         (* [x] is re-bound to a non-inlinable computation: it must shadow any outer entry. *)
+         Let (x, c', rw_expr (M.remove x env) body))
     | LetRec (binds, body) ->
-      (* Conservatively do not register recursive members as inlinable. *)
+      (* Conservatively do not register recursive members as inlinable; the bound names shadow
+         any outer entries in both the members and the body. *)
+      let env = remove_all (List.map fst binds) env in
       LetRec (List.map (fun (x, d) -> x, rw_expr env d) binds, rw_expr env body)
   and rw_cexpr env (c : cexpr) : cexpr =
     match c with
@@ -121,11 +140,13 @@ let run (program : expr) : expr =
     | CAccessor (a, l) -> CAccessor (resolve_atom env a, l)
     | CUpdate (a, ups) ->
       CUpdate (resolve_atom env a, List.map (fun (l, a) -> l, resolve_atom env a) ups)
-    | CLam (ps, body) -> CLam (ps, rw_expr env body)
+    | CLam (ps, body) -> CLam (ps, rw_expr (remove_all ps env) body)
     | CIf (a, t, e) -> CIf (resolve_atom env a, rw_expr env t, rw_expr env e)
     | CCase (ats, alts) ->
       CCase (List.map (resolve_atom env) ats, List.map (rw_alt env) alts)
   and rw_alt env (a : alt) : alt =
+    (* The alternative's binders shadow any outer entries in the result/guards. *)
+    let env = remove_all (List.concat_map binder_vars a.binders) env in
     { a with
       result =
         (match a.result with
