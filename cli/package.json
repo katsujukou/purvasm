@@ -17,6 +17,6 @@
     "test": "npm run test:unit",
     "format": "purs-tidy format-in-place src test",
     "check": "purs-tidy check src test",
-    "version": "echo 'export const version = \"v'$npm_package_version'\";' > ./src/Purvasm/CLI/Version.js && git add ."
+    "version": "node scripts/gen-version.mjs && git add ."
   }
 }
