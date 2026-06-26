@@ -34,6 +34,11 @@ data PrimOp
   | LengthArray
   | NewArray
   | SetArray
+  -- Dynamic record field access by a runtime label (ADR-0010 record-as-field-map; Record.Unsafe).
+  | RecordGet
+  | RecordSet
+  | RecordHas
+  | RecordDelete
 
 
 derive instance Eq PrimOp

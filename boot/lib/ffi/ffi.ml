@@ -103,6 +103,22 @@ let intrinsics : (string * C.term) list =
     (* `Char` is `Int` (ADR-0006), so the char-code conversions are the identity. *)
   ; "Purvasm.Char.toCodePoint", C.Lam ("$0", C.Var "$0")
   ; "Purvasm.Char.fromCodePoint", C.Lam ("$0", C.Var "$0")
+    (* `Record.Unsafe` dynamic record access by runtime label (ADR-0010 record-as-field-map):
+       eta-expanded record primops (the label-as-value form of `Accessor`/`Update`). *)
+  ; p "Record.Unsafe.unsafeGet" C.RecordGet 2
+  ; p "Record.Unsafe.unsafeSet" C.RecordSet 3
+  ; p "Record.Unsafe.unsafeHas" C.RecordHas 2
+  ; p "Record.Unsafe.unsafeDelete" C.RecordDelete 2
+    (* `Record.Builder` over the same record primops: `copyRecord` is the identity (records are
+       persistent — no defensive copy needed); insert/delete reuse the record primops.
+       `unsafeModify`/`unsafeRename` are structural guest terms (below). *)
+  ; "Record.Builder.copyRecord", C.Lam ("$0", C.Var "$0")
+  ; p "Record.Builder.unsafeInsert" C.RecordSet 3
+  ; p "Record.Builder.unsafeDelete" C.RecordDelete 2
+    (* `Data.Number` IEEE constants (ADR-0042): pure compile-time `Number` literals, so they
+       resolve at the intrinsic rung (like `Data.Unit.unit`), not as host leaves. *)
+  ; "Data.Number.nan", C.Lit (C.LNumber Stdlib.nan)
+  ; "Data.Number.infinity", C.Lit (C.LNumber Stdlib.infinity)
     (* `unsafeCoerce` is a representation-preserving cast — at runtime the identity,
        exactly like an erased newtype constructor (ADR-0018). The optimizer
        beta-reduces the resulting [(\x -> x) e] away (ADR-0028). *)
@@ -361,6 +377,9 @@ let fn_uncurried : (string * C.term) list =
   ]
   @ List.concat_map nary [ 2; 3; 4; 5; 6; 7; 8; 9; 10 ]
 
+(* `Record.Builder.unsafeModify l f r = RecordSet l (f (RecordGet l r)) r` — higher-order
+   (the modifier `f` is an ordinary `App`, ADR-0020), so a guest term, not a primop. *)
+
 (** Structural foreigns, as guest terms over the first-order primitives:
     higher-order ones (`arrayMap`, `eqArrayImpl`) whose callback is an ordinary
     `App`, composite first-order ones (the scalar `Ord` comparisons), the
@@ -368,8 +387,27 @@ let fn_uncurried : (string * C.term) list =
     (same model). Hand-written `Cesk.Ast` for now; a PureScript surface comes with
     the optimiser (ADR-0020). `Char` is `Int` (ADR-0006), so `ordCharImpl` reuses the
     int term. *)
+let record_modify : C.term =
+  lams
+    [ "l"; "f"; "r" ]
+    (C.Prim
+       (RecordSet, [ v "l"; C.App (v "f", C.Prim (RecordGet, [ v "l"; v "r" ])); v "r" ]))
+
+(* `Record.Builder.unsafeRename old new r = RecordSet new (RecordGet old r) (RecordDelete old r)`. *)
+let record_rename : C.term =
+  lams
+    [ "o"; "n"; "r" ]
+    (C.Prim
+       ( RecordSet
+       , [ v "n"
+         ; C.Prim (RecordGet, [ v "o"; v "r" ])
+         ; C.Prim (RecordDelete, [ v "o"; v "r" ])
+         ] ))
+
 let structural : (string * C.term) list =
   [ "Data.Functor.arrayMap", array_map
+  ; "Record.Builder.unsafeModify", record_modify
+  ; "Record.Builder.unsafeRename", record_rename
   ; "Data.Eq.eqArrayImpl", eq_array
   ; "Data.Ord.ordIntImpl", ord_cmp LtInt EqInt
   ; "Data.Ord.ordNumberImpl", ord_cmp LtNumber EqNumber
@@ -532,6 +570,23 @@ let js_round (f : float) : float =
     let r = Stdlib.Float.floor (f +. 0.5) in
     if r = 0.0 && Stdlib.Float.sign_bit f then -0.0 else r)
 
+(* Native IO for the purvasm-native CLI interpreter (ADR-0045). Stdlib file ops; the effect
+   happens when the returned `Effect` thunk is forced (ADR-0023), as for `Console.log`. *)
+let read_file (path : string) : string =
+  In_channel.with_open_bin path In_channel.input_all
+
+let write_file (path : string) (contents : string) : unit =
+  Out_channel.with_open_bin path (fun oc -> Out_channel.output_string oc contents)
+
+(* mkdir -p: create [d] and any missing parents (idempotent). *)
+let rec mkdir_p (d : string) : unit =
+  if d = "" || d = "." || d = "/" || Sys.file_exists d
+  then ()
+  else (
+    mkdir_p (Filename.dirname d);
+    try Sys.mkdir d 0o755 with
+    | _ -> ())
+
 let host : Cesk.Machine.host =
   let unary (f : V.t -> V.t) =
     ( 1
@@ -539,6 +594,10 @@ let host : Cesk.Machine.host =
         match args with
         | [ a ] -> f a
         | _ -> Cesk.Errors.stuck "native foreign: wrong arity" )
+  in
+  (* An effectful leaf returns this `Effect` thunk; forcing it (applying unit) runs [f] (ADR-0023). *)
+  let perform name f =
+    V.VForeign { name; arity = 1; args = []; call = (fun _ -> f ()) }
   in
   fun key ->
     match key with
@@ -619,6 +678,92 @@ let host : Cesk.Machine.host =
         (unary (function
            | V.VNumber f -> V.VNumber (Stdlib.Float.sin f)
            | _ -> Cesk.Errors.stuck "sin: not a Number"))
+    | "Data.Number.isFinite" ->
+      Some
+        (unary (function
+           | V.VNumber f -> V.VBool (Stdlib.Float.is_finite f)
+           | _ -> Cesk.Errors.stuck "isFinite: not a Number"))
+    | "Data.Number.isNaN" ->
+      Some
+        (unary (function
+           | V.VNumber f -> V.VBool (Stdlib.Float.is_nan f)
+           | _ -> Cesk.Errors.stuck "isNaN: not a Number"))
+    (* `purvasm-base` `Purvasm.String` byte primitives (ADR-0038): pure UTF-8 byte ops. In the
+       native backend these also live in the `Rt` prelude (a codegen fallback for unbound refs);
+       the VM / oracle need them in the host registry to resolve them through the foreign rung. *)
+    | "Purvasm.String.byteLength" ->
+      Some
+        (unary (function
+           | V.VString s -> V.VInt (String.length s)
+           | _ -> Cesk.Errors.stuck "byteLength: not a String"))
+    | "Purvasm.String.byteAt" ->
+      Some
+        ( 2
+        , fun args ->
+            match args with
+            | [ V.VString s; V.VInt i ] -> V.VInt (Char.code (String.get s i))
+            | _ -> Cesk.Errors.stuck "byteAt: ill-typed arguments" )
+    | "Purvasm.String.unsafeNew" ->
+      Some
+        (unary (function
+           | V.VInt n -> V.VString (String.make n '\000')
+           | _ -> Cesk.Errors.stuck "unsafeNew: not an Int"))
+    | "Purvasm.String.unsafeSetByte" ->
+      Some
+        ( 3
+        , fun args ->
+            match args with
+            | [ V.VString s; V.VInt i; V.VInt b ] ->
+              let bs = Bytes.of_string s in
+              Bytes.set bs i (Char.chr (b land 0xff));
+              V.VString (Bytes.to_string bs)
+            | _ -> Cesk.Errors.stuck "unsafeSetByte: ill-typed arguments" )
+    (* Native IO leaves for the purvasm-native CLI interpreter (ADR-0045): each returns an
+       `Effect` thunk that performs the IO when forced (the `Console.log` shape). *)
+    | "Purvasm.CLI.Native.readTextImpl" ->
+      Some
+        (unary (function
+           | V.VString path ->
+             perform "readTextImpl#perform" (fun () -> V.VString (read_file path))
+           | _ -> Cesk.Errors.stuck "readTextImpl: not a String"))
+    | "Purvasm.CLI.Native.existsImpl" ->
+      Some
+        (unary (function
+           | V.VString path ->
+             perform "existsImpl#perform" (fun () -> V.VBool (Sys.file_exists path))
+           | _ -> Cesk.Errors.stuck "existsImpl: not a String"))
+    | "Purvasm.CLI.Native.writeTextImpl" ->
+      Some
+        ( 2
+        , fun args ->
+            match args with
+            | [ V.VString path; V.VString contents ] ->
+              perform "writeTextImpl#perform" (fun () ->
+                write_file path contents;
+                V.VInt 0)
+            | _ -> Cesk.Errors.stuck "writeTextImpl: ill-typed arguments" )
+    | "Purvasm.CLI.Native.mkdirRecImpl" ->
+      Some
+        (unary (function
+           | V.VString path ->
+             perform "mkdirRecImpl#perform" (fun () ->
+               mkdir_p path;
+               V.VInt 0)
+           | _ -> Cesk.Errors.stuck "mkdirRecImpl: not a String"))
+    | "Purvasm.CLI.Native.argvImpl" ->
+      (* `argvImpl :: Effect (Array String)` is itself the thunk: forcing it (applying unit)
+         reads `Sys.argv` (element 0 is the executable, as on the native target). *)
+      Some (1, fun _ -> V.VArray (Array.map (fun s -> V.VString s) Sys.argv))
+    | "Effect.Console.error" ->
+      Some
+        (unary (function
+           | V.VString s ->
+             perform "Effect.Console.error#perform" (fun () ->
+               prerr_string s;
+               prerr_newline ();
+               flush stderr;
+               V.VInt 0)
+           | _ -> Cesk.Errors.stuck "error: not a String"))
     | _ -> None
 
 (** Whether applying a native leaf yields an *effectful* value — one whose force (its
@@ -627,7 +772,17 @@ let host : Cesk.Machine.host =
     This is the source of truth the effect analysis ([Middle_end.Effect_analysis])
     consumes for foreign leaves; structural mutation (`Ref` → `NewArray`/`SetArray`)
     is recognised by the analysis from the primops themselves. *)
-let effectful (key : string) : bool = String.equal key "Effect.Console.log"
+let effectful (key : string) : bool =
+  List.mem
+    key
+    [ "Effect.Console.log"
+    ; "Effect.Console.error"
+    ; "Purvasm.CLI.Native.readTextImpl"
+    ; "Purvasm.CLI.Native.existsImpl"
+    ; "Purvasm.CLI.Native.writeTextImpl"
+    ; "Purvasm.CLI.Native.mkdirRecImpl"
+    ; "Purvasm.CLI.Native.argvImpl"
+    ]
 
 (** A native leaf's declared arity (the [host] entry's). The effect analysis needs the
     real arity, not an assumed 1, to tell a partial application (a pure build) from a

@@ -48,6 +48,13 @@ type primop =
   | LengthArray
   | NewArray
   | SetArray
+  (* Dynamic record field access by a runtime `String` label (ADR-0010's record-as-field-map,
+     completing `Record.Unsafe`): get / functional-set / membership / delete. The static-label
+     form is `Accessor`/`Update`; these take the label as a value. *)
+  | RecordGet
+  | RecordSet
+  | RecordHas
+  | RecordDelete
 
 (* A pattern, matched structurally against an already-evaluated value (ADR-0011,
    ADR-0012). Covers all of CoreFn's binders: wildcard, variable, scalar literal,
@@ -152,6 +159,10 @@ let primop_to_string : primop -> string = function
   | LengthArray -> "#"
   | NewArray -> "new[]"
   | SetArray -> "set[]"
+  | RecordGet -> "rec.get"
+  | RecordSet -> "rec.set"
+  | RecordHas -> "rec.has"
+  | RecordDelete -> "rec.del"
 
 let lit_to_string : lit -> string = function
   | LInt n -> Int.to_string n

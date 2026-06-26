@@ -100,6 +100,12 @@ let p_new_array n = let n = as_int n in
     if n < 0 then stuck "newArray: negative length" else VArray (Array.make n (VInt 0))
 let p_set_array a i v = (match a with VArray ar -> let i = as_int i in
     if i >= 0 && i < Array.length ar then (ar.(i) <- v; a) else stuck "set out of bounds" | _ -> stuck "set")
+(* Dynamic record access by a runtime label (ADR-0010); mirrors Cesk.Prim / the VM. *)
+let p_record_get l r = (match r with VRecord m ->
+    (match SMap.find_opt (as_str l) m with Some v -> v | None -> stuck "record field absent") | _ -> stuck "recordGet")
+let p_record_set l v r = (match r with VRecord m -> VRecord (SMap.add (as_str l) v m) | _ -> stuck "recordSet")
+let p_record_has l r = (match r with VRecord m -> VBool (SMap.mem (as_str l) m) | _ -> stuck "recordHas")
+let p_record_delete l r = (match r with VRecord m -> VRecord (SMap.remove (as_str l) m) | _ -> stuck "recordDelete")
 
 (* Native foreign leaves, re-implemented over [value]. The generated program is a
    standalone executable and cannot link Cesk's host registry, so the leaves live here;
@@ -151,6 +157,13 @@ let js_round f =
   if not (Float.is_finite f) then f
   else (let r = Float.floor (f +. 0.5) in if r = 0.0 && Float.sign_bit f then -0.0 else r)
 
+(* Native IO for the purvasm-native CLI interpreter (ADR-0045); mirrors `Ffi.host`. *)
+let read_file p = In_channel.with_open_bin p In_channel.input_all
+let write_file p c = Out_channel.with_open_bin p (fun oc -> Out_channel.output_string oc c)
+let rec mkdir_p d =
+  if d = "" || d = "." || d = "/" || Sys.file_exists d then ()
+  else (mkdir_p (Filename.dirname d); (try Sys.mkdir d 0o755 with _ -> ()))
+
 let foreign = function
   | "Data.Show.showIntImpl" -> VClos (fun v -> VString (string_of_int (as_int v)))
   | "Data.Show.showStringImpl" -> VClos (fun v -> VString (show_string_impl (as_str v)))
@@ -176,6 +189,18 @@ let foreign = function
   | "Data.Number.ceil" -> VClos (fun v -> VNumber (Float.ceil (as_num v)))
   | "Data.Number.round" -> VClos (fun v -> VNumber (js_round (as_num v)))
   | "Data.Number.sin" -> VClos (fun v -> VNumber (Float.sin (as_num v)))
+  | "Data.Number.isFinite" -> VClos (fun v -> VBool (Float.is_finite (as_num v)))
+  | "Data.Number.isNaN" -> VClos (fun v -> VBool (Float.is_nan (as_num v)))
+  (* Native IO leaves for the purvasm-native CLI interpreter (ADR-0045); mirror `Ffi.host`.
+     Each returns an `Effect` thunk that performs the IO when forced. *)
+  | "Purvasm.CLI.Native.readTextImpl" -> VClos (fun p -> VClos (fun _ -> VString (read_file (as_str p))))
+  | "Purvasm.CLI.Native.existsImpl" -> VClos (fun p -> VClos (fun _ -> VBool (Sys.file_exists (as_str p))))
+  | "Purvasm.CLI.Native.writeTextImpl" ->
+    VClos (fun p -> VClos (fun c -> VClos (fun _ -> write_file (as_str p) (as_str c); VInt 0)))
+  | "Purvasm.CLI.Native.mkdirRecImpl" -> VClos (fun p -> VClos (fun _ -> mkdir_p (as_str p); VInt 0))
+  | "Purvasm.CLI.Native.argvImpl" -> VClos (fun _ -> VArray (Array.map (fun s -> VString s) Sys.argv))
+  | "Effect.Console.error" ->
+    VClos (fun s -> VClos (fun _ -> prerr_string (as_str s); prerr_newline (); flush stderr; VInt 0))
   | k -> stuck ("unbound foreign: " ^ k)
 
 let accessor v l = match v with VRecord m -> SMap.find l m | _ -> stuck "accessor: not a record"
@@ -297,6 +322,10 @@ let prim_fn : C.primop -> string = function
   | C.LengthArray -> "p_length"
   | C.NewArray -> "p_new_array"
   | C.SetArray -> "p_set_array"
+  | C.RecordGet -> "p_record_get"
+  | C.RecordSet -> "p_record_set"
+  | C.RecordHas -> "p_record_has"
+  | C.RecordDelete -> "p_record_delete"
 
 let prim (lz : SS.t) (op : C.primop) (args : A.atom list) : string =
   Printf.sprintf

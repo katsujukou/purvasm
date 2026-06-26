@@ -105,6 +105,10 @@ primTag = case _ of
   LengthArray -> "LengthArray"
   NewArray -> "NewArray"
   SetArray -> "SetArray"
+  RecordGet -> "RecordGet"
+  RecordSet -> "RecordSet"
+  RecordHas -> "RecordHas"
+  RecordDelete -> "RecordDelete"
 
 -- --- instructions / chunks / gdefs --------------------------------------------------
 

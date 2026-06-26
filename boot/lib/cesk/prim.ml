@@ -100,4 +100,16 @@ let eval (op : primop) (args : Value.t list) : Value.t =
       a.(i) <- v;
       Value.VArray a)
     else Errors.stuck ("array set out of bounds: " ^ string_of_int i)
+  (* Dynamic record access by a runtime label (ADR-0010 record-as-field-map). The record is a
+     `Base.Map` (`Value.record`); set/delete are functional (persistent), matching immutability. *)
+  | RecordGet, [ Value.VString label; Value.VRecord m ] ->
+    (match Base.Map.find m label with
+     | Some v -> v
+     | None -> Errors.stuck ("record field absent: " ^ label))
+  | RecordSet, [ Value.VString label; v; Value.VRecord m ] ->
+    Value.VRecord (Base.Map.set m ~key:label ~data:v)
+  | RecordHas, [ Value.VString label; Value.VRecord m ] ->
+    Value.VBool (Base.Map.mem m label)
+  | RecordDelete, [ Value.VString label; Value.VRecord m ] ->
+    Value.VRecord (Base.Map.remove m label)
   | _ -> Errors.stuck ("primop " ^ primop_to_string op ^ ": ill-typed arguments")

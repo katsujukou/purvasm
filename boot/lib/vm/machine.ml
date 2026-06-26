@@ -130,6 +130,14 @@ let eval_prim (op : C.primop) (args : V.t list) : V.t =
       a.(i) <- v;
       V.Varray a)
     else stuck ("array set out of bounds: " ^ string_of_int i)
+  (* Dynamic record access by a runtime label (ADR-0010), mirroring [Cesk.Prim]. *)
+  | C.RecordGet, [ V.Vstring label; V.Vrecord m ] ->
+    (match SMap.find_opt label m with
+     | Some v -> v
+     | None -> stuck ("record field absent: " ^ label))
+  | C.RecordSet, [ V.Vstring label; v; V.Vrecord m ] -> V.Vrecord (SMap.add label v m)
+  | C.RecordHas, [ V.Vstring label; V.Vrecord m ] -> V.Vbool (SMap.mem label m)
+  | C.RecordDelete, [ V.Vstring label; V.Vrecord m ] -> V.Vrecord (SMap.remove label m)
   | _ -> stuck ("primop " ^ C.primop_to_string op ^ ": ill-typed arguments")
 
 (** Take/drop helpers for the eval/apply over-application split. *)

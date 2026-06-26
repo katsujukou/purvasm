@@ -59,6 +59,10 @@ let prim_tags : (C.primop * string) list =
   ; C.LengthArray, "LengthArray"
   ; C.NewArray, "NewArray"
   ; C.SetArray, "SetArray"
+  ; C.RecordGet, "RecordGet"
+  ; C.RecordSet, "RecordSet"
+  ; C.RecordHas, "RecordHas"
+  ; C.RecordDelete, "RecordDelete"
   ]
 
 let prim_to_json (op : C.primop) : J.t = `String (List.assoc op prim_tags)
