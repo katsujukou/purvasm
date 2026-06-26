@@ -86,5 +86,10 @@ language and are kept out of version control.)
 | [0037](0037-self-hosting-purescript.md) | Self-hosting: reimplement purvasm in PureScript on the boot native backend | Accepted |
 | [0038](0038-base-package-and-ulib-patches.md) | A minimal native base (`Purvasm.*`) and a `ulib` of registry-package patches | Accepted |
 | [0039](0039-ulib-st-array-and-st-uncurried.md) | `ulib` `Data.Array.ST` over the fixed-length primitive; `ST.Uncurried` structural | Accepted |
+| [0040](0040-ulib-testing-strategy.md) | `ulib` testing: upstream suites by representation-seam fidelity; `purs`-side interface verify | Accepted |
+| [0041](0041-int-number-conversion-primops.md) | `Int`↔`Number` conversion: a cross-representation primop pair in the `Purvasm.*` ABI | Accepted |
+| [0042](0042-data-number-math-native-leaves.md) | `Data.Number` math family as JS-faithful native leaves (not primops, not `ulib`) | Accepted |
+| [0043](0043-ulib-tools-build-verify-test.md) | `ulib-tools`: a PureScript CLI to build, interface-verify, and test the `ulib` patches | Proposed |
+| [0044](0044-foreign-object-over-data-map.md) | `Foreign.Object a` as a `ulib` newtype over `Data.Map String a` | Accepted |
 
 ## Scope
