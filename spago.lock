@@ -84,6 +84,9 @@
           "dependencies": [
             "arrays",
             "either",
+            "enums",
+            "foldable-traversable",
+            "lists",
             "maybe",
             "numbers",
             "prelude",
@@ -92,7 +95,11 @@
           ]
         },
         "test": {
-          "dependencies": []
+          "dependencies": [
+            "effect",
+            "spec",
+            "spec-node"
+          ]
         }
       },
       "sample": {
@@ -127,7 +134,8 @@
             "ordered-collections",
             "prelude",
             "run",
-            "strings"
+            "strings",
+            "tuples"
           ]
         },
         "test": {

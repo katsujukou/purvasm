@@ -5,6 +5,7 @@ _build
 /.spago
 /output
 /output-pvm
+/output-purvm
 /dist
 purvasm_lib
 .psc-ide-port
