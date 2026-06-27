@@ -1,15 +1,19 @@
 module Purvasm.CLI.Node
   ( runNode
+  , nodeEnvHandler
+  , nodeFsHandler
+  , nodeProcHandler
   , defaultLoggerConfig
   ) where
 
 import Prelude
 
 import Data.ArrayBuffer.Types (Uint8Array)
-import Data.Either (Either, hush)
+import Data.Either (Either(..), hush)
 import Data.Maybe (isNothing)
 import Effect (Effect)
 import Effect.Exception (try)
+import Effect.Exception as Exn
 import Node.Encoding (Encoding(..))
 import Node.FS.Perms (permsAll)
 import Node.FS.Sync as Sync
@@ -21,6 +25,7 @@ import Purvasm.CLI.Effect.Filesystem (FS, FilesystemF(..))
 import Purvasm.CLI.Effect.Filesystem as FS
 import Purvasm.CLI.Effect.Log (LOG, LogLevel(..), LoggerConfig)
 import Purvasm.CLI.Effect.Log as Log
+import Purvasm.CLI.Effect.Process (ProcF(..))
 import Run (EFFECT, Run, liftEffect, runBaseEffect)
 import Run.Except (EXCEPT)
 import Run.Except as Except
@@ -60,6 +65,27 @@ nodeFsHandler = case _ of
   Unlink path next -> liftEffect (Sync.unlink path) $> next
   JoinPath segments k -> pure (k (Path.concat segments))
   ResolvePath segments last k -> k <$> liftEffect (Path.resolve segments last)
+  Dirname path k -> pure $ k (Path.dirname path)
+
+-- | Discharge the `Process` effect against `node:child_process`. The foreigns throw on non-zero
+-- | exit; we catch and surface the message as `Left` so callers route failures through `EXCEPT`.
+nodeProcHandler :: forall r. ProcF ~> Run (EFFECT + r)
+nodeProcHandler = case _ of
+  Exec cmd args k -> k <$> liftEffect do
+    res <- try (execFileImpl cmd args)
+    pure case res of
+      Left e -> Left (Exn.message e)
+      Right _ -> Right unit
+  ExecCapture cmd args k -> k <$> liftEffect do
+    res <- try (execFileCaptureImpl cmd args)
+    pure case res of
+      Left e -> Left (Exn.message e)
+      Right out -> Right out
+  ExecInput cmd args input k -> k <$> liftEffect do
+    res <- try (execFileInputImpl cmd args input)
+    pure case res of
+      Left e -> Left (Exn.message e)
+      Right _ -> Right unit
 
 -- | Run an external tool synchronously (`execFileSync`, stdio inherited; throws on non-zero exit).
 foreign import execFileImpl :: String -> Array String -> Effect Unit

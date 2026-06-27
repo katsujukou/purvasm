@@ -24,6 +24,7 @@ data FilesystemF a
   -- Path ops are effects too — not for side effects, but for *portability*: 
   -- the path separator and resolution are environment-specific, so the interpreter owns them.
   | JoinPath (Array FilePath) (FilePath -> a)
+  | Dirname FilePath (FilePath -> a)
   | ResolvePath (Array FilePath) FilePath (FilePath -> a)
 
 derive instance functorFilesystemF :: Functor FilesystemF
@@ -75,3 +76,6 @@ joinPath segments = Run.lift _fs (JoinPath segments identity)
 -- | Resolve path segments to an absolute, normalised path (mirrors `path.resolve(...segs, last)`).
 resolvePath :: forall r. Array FilePath -> FilePath -> Run (FS + r) FilePath
 resolvePath segments last = Run.lift _fs (ResolvePath segments last identity)
+
+dirname :: forall r. FilePath -> Run (FS + r) FilePath
+dirname path = Run.lift _fs (Dirname path identity) 

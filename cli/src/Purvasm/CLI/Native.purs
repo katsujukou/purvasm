@@ -19,6 +19,8 @@ import Data.Array as Array
 import Data.Either (Either(..))
 import Data.Foldable (intercalate)
 import Data.Maybe (Maybe(..))
+import Data.String (Pattern(..))
+import Data.String as String
 import Effect (Effect)
 import Effect.Console as Console
 import Fmt as Fmt
@@ -79,7 +81,11 @@ nativeFsHandler = case _ of
   WriteText path contents next -> liftEffect (writeTextImpl path contents) $> next
   MkdirP path next -> liftEffect (mkdirRecImpl path) $> next
   Exists path k -> k <$> liftEffect (existsImpl path)
+  -- POSIX-only path ops: a pure `/` separator, correct on the boot/posix target this interpreter
+  -- runs on. Windows fidelity (a platform-aware host path leaf) is deferred to release (ADR-0045);
+  -- the Node interpreter (`runNode`) is already platform-correct via `node:path`.
   JoinPath segments k -> pure (k (intercalate "/" segments))
+  Dirname path k -> pure (k (intercalate "/" (Array.dropEnd 1 (String.split (Pattern "/") path))))
   ReadBinary _ _ -> unsafeCrashWith notYet
   WriteBinary _ _ _ -> unsafeCrashWith notYet
   ReadDir _ _ -> unsafeCrashWith notYet
