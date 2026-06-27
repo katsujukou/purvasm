@@ -17,6 +17,7 @@ package:
     - prelude
     - run
     - strings
+    - tuples
   test:
     main: Test.Unit.Purvasm.UlibTools
     dependencies:

@@ -50,6 +50,7 @@ type Options =
   { package :: Maybe String
   , ulibDir :: FilePath
   , baseDir :: FilePath
+  , packagesDir :: FilePath
   , purs :: String
   , spagoPkgs :: FilePath
   }
@@ -68,6 +69,10 @@ options = fromRecord
       ArgParser.argument [ "--base" ]
         "purvasm-base src dir. Defaults to 'packages/purvasm-base/src'."
         # ArgParser.default "packages/purvasm-base/src"
+  , packagesDir:
+      ArgParser.argument [ "--packages-dir" ]
+        "In-repo packages dir for resolving declared deps. Defaults to 'packages'."
+        # ArgParser.default "packages"
   , purs:
       ArgParser.argument [ "--purs" ]
         "purs executable. Defaults to 'purs'."
@@ -103,6 +108,8 @@ cmd opts = do
   when (Array.null patches) do
     throw "ulib-tools verify: no patches found (check --ulib / --package)."
 
+  Stage.validate { ulibDir: opts.ulibDir, packagesDir: opts.packagesDir, spagoPkgs: opts.spagoPkgs } allPatches
+
   Log.info "verify: compiling registry baseline…"
   baseline <- stage false
   Log.info "verify: compiling patched tree…"
@@ -124,6 +131,7 @@ cmd opts = do
     Stage.stageRegistry opts.spagoPkgs opts.baseDir srcDir
     when overlay do
       all <- Stage.collectPatches opts.ulibDir
+      Stage.stageDeclaredDeps { ulibDir: opts.ulibDir, packagesDir: opts.packagesDir } all srcDir
       Stage.overlayPatches opts.ulibDir srcDir all
     Stage.compileCorefn opts.purs srcDir output
     pure { work, output }

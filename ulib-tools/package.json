@@ -1,0 +1,21 @@
+{
+  "name": "purvasm-ulib-tools",
+  "version": "0.1.0",
+  "description": "Build, verify, and test the ulib registry-package patches (ADR-0043)",
+  "keywords": [
+    "purescript",
+    "purvasm",
+    "ulib"
+  ],
+  "license": "MIT",
+  "author": "Katsujukou Kineya",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "compile": "spago build -p ulib-tools",
+    "test:unit": "spago test -p ulib-tools",
+    "test": "npm run test:unit",
+    "format": "purs-tidy format-in-place src test",
+    "check": "purs-tidy check src test"
+  }
+}

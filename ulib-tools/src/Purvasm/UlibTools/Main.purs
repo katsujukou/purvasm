@@ -22,6 +22,7 @@ import Purvasm.UlibTools.Build as Build
 import Purvasm.UlibTools.Options as Options
 import Purvasm.UlibTools.Test as Test
 import Purvasm.UlibTools.Verify as Verify
+import Purvasm.UlibTools.VerifyDeps as VerifyDeps
 import Run (EFFECT, Run, runBaseEffect)
 import Run.Except (EXCEPT)
 import Run.Except as Except
@@ -35,6 +36,7 @@ main = do
     Right cmd -> run case cmd of
       Options.Build opts -> Build.cmd opts
       Options.Verify opts -> Verify.cmd opts
+      Options.VerifyDeps opts -> VerifyDeps.cmd opts
       Options.Test opts -> Test.cmd opts
   where
   run program = do

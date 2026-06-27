@@ -32,9 +32,10 @@ import Type.Row (type (+))
 
 type Options =
   { out :: Maybe FilePath
-  , install :: Boolean
+  , prepareRelease :: Boolean
   , ulibDir :: FilePath
   , baseDir :: FilePath
+  , packagesDir :: FilePath
   , purs :: String
   , spagoPkgs :: FilePath
   }
@@ -43,11 +44,14 @@ options :: ArgParser Options
 options = fromRecord
   { out:
       ArgParser.argument [ "--out" ]
-        "Output dir for the extracted corefn (<dir>/<Module>/corefn.json)."
+        "Destination directory for the compiled corefn (writes <DIR>/<Module>/corefn.json per\n\
+        \patched module). Use this for an ad-hoc build to a chosen path; to stage it for\n\
+        \distribution use --prepare-release instead. One of --out / --prepare-release is required."
         # ArgParser.optional
-  , install:
-      ArgParser.flag [ "--install" ]
-        "Write to the default install location ($PURVASM_ULIB, else 'dist/ulib')."
+  , prepareRelease:
+      ArgParser.flag [ "--prepare-release" ]
+        "Write the corefn to the default lib location for distribution with purvasm\n\
+        \($PURVASM_LIB, else 'dist/ulib') — the path purvm reads by default. Alternative to --out."
         # ArgParser.boolean
   , ulibDir:
       ArgParser.argument [ "--ulib" ]
@@ -57,6 +61,10 @@ options = fromRecord
       ArgParser.argument [ "--base" ]
         "purvasm-base src dir. Defaults to 'packages/purvasm-base/src'."
         # ArgParser.default "packages/purvasm-base/src"
+  , packagesDir:
+      ArgParser.argument [ "--packages-dir" ]
+        "In-repo packages dir for resolving declared deps. Defaults to 'packages'."
+        # ArgParser.default "packages"
   , purs:
       ArgParser.argument [ "--purs" ]
         "purs executable. Defaults to 'purs'."
@@ -70,13 +78,16 @@ options = fromRecord
 cmd :: forall r. Options -> Run (PROC + ENV + FS + LOG + EXCEPT String + EFFECT + r) Unit
 cmd opts = do
   out <- resolveOut opts
+  patches <- Stage.collectPatches opts.ulibDir
+  Stage.validate { ulibDir: opts.ulibDir, packagesDir: opts.packagesDir, spagoPkgs: opts.spagoPkgs } patches
+
   work <- Stage.mkTemp
   srcDir <- FS.joinPath [ work, "src" ]
   outputDir <- FS.joinPath [ work, "output" ]
   FS.mkdirP srcDir
 
   Stage.stageRegistry opts.spagoPkgs opts.baseDir srcDir
-  patches <- Stage.collectPatches opts.ulibDir
+  Stage.stageDeclaredDeps { ulibDir: opts.ulibDir, packagesDir: opts.packagesDir } patches srcDir
   Stage.overlayPatches opts.ulibDir srcDir patches
   Stage.compileCorefn opts.purs srcDir outputDir
 
@@ -86,14 +97,14 @@ cmd opts = do
   _ <- Proc.exec "rm" [ "-rf", work ]
   Log.info $ Fmt.fmt @"ulib: wrote patched corefn to {out}" { out }
 
--- | `--out` wins; otherwise `--install` resolves the default location ($PURVASM_ULIB, else
+-- | `--out` wins; otherwise `--prepare-release` resolves the default location ($PURVASM_LIB, else
 -- | 'dist/ulib'); with neither, fail loudly.
 resolveOut :: forall r. Options -> Run (ENV + EXCEPT String + r) FilePath
 resolveOut opts = case opts.out of
   Just o -> pure o
   Nothing
-    | opts.install -> fromMaybe "dist/ulib" <$> Env.lookupEnv "PURVASM_ULIB"
-    | otherwise -> throw "ulib-tools build: one of --out or --install is required."
+    | opts.prepareRelease -> fromMaybe "dist/ulib" <$> Env.lookupEnv "PURVASM_LIB"
+    | otherwise -> throw "ulib-tools build: one of --out or --prepare-release is required."
 
 -- | Copy one patched module's compiled corefn into the flat output layout.
 extractCorefn :: forall r. FilePath -> FilePath -> Patch -> Run (FS + LOG + EXCEPT String + r) Unit
