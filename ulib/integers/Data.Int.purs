@@ -5,9 +5,13 @@
 -- | `fromNumberImpl` is a range/integrality test. On this backend the two are distinct
 -- | representations (ADR-0008), so they are reimplemented in PureScript over the
 -- | `Purvasm.Int` conversion intrinsics (`toNumber`/`fromNumber` = `ToInt32`, ADR-0041) — no
--- | native leaf. Everything else is the upstream module verbatim, so the public interface is
--- | unchanged. The remaining foreigns (`quot`/`rem`/`pow`/`fromStringAsImpl`/`toStringAs`)
--- | are kept as-is — separate ulib targets; unreached ones are dropped by link-time DCE.
+-- | native leaf. The other foreigns are likewise reimplemented in PureScript over the
+-- | `Purvasm.*` primitive base — `quot`/`rem` as truncating division via `ToInt32`, `pow` by
+-- | repeated squaring, and `toStringAs`/`fromStringAsImpl` as base-`b` digit conversions over the
+-- | `Purvasm.String` byte primitives (digits are ASCII). Depending on the primitive base rather
+-- | than `Data.String.*` keeps `Data.Int` low in the layering and avoids the module cycle that
+-- | `Data.String.CodePoints` (which imports `Data.Int.toStringAs`) would otherwise create. No
+-- | `Data.Int` foreign remains; the public interface is unchanged.
 module Data.Int
   ( fromNumber
   , ceil
@@ -42,6 +46,7 @@ import Data.Number (isFinite)
 import Data.Number as Number
 import Purvasm.Int as PI
 import Purvasm.Number as PN
+import Purvasm.String as PS
 
 -- | Creates an `Int` from a `Number` value. The number must already be an
 -- | integer and fall within the valid range of values for the `Int` type
@@ -243,7 +248,11 @@ fromStringAs = fromStringAsImpl Just Nothing
 -- | div 2 (-3) == 0
 -- | quot 2 (-3) == 0
 -- | ```
-foreign import quot :: Int -> Int -> Int
+-- ulib shadow (was a foreign): truncating division, exactly JS `x / y | 0` — a `Number` divide
+-- then `ToInt32` (`Purvasm.Int.fromNumber`), which truncates toward zero and yields `0` when
+-- `y == 0` (the quotient is non-finite). (`EuclideanRing`'s `div` differs for negative dividends.)
+quot :: Int -> Int -> Int
+quot x y = PI.fromNumber (PN.div (PI.toNumber x) (PI.toNumber y))
 
 -- | The `rem` function provides the remainder after _truncating_ integer
 -- | division (see the documentation for the `EuclideanRing` class). It is
@@ -261,16 +270,84 @@ foreign import quot :: Int -> Int -> Int
 -- | mod 2 (-3) == 2
 -- | rem 2 (-3) == 2
 -- | ```
-foreign import rem :: Int -> Int -> Int
+-- ulib shadow (was a foreign): the matching truncating remainder, `x - (x `quot` y) * y`
+-- (JS `x % y`, whose result takes the sign of the dividend).
+rem :: Int -> Int -> Int
+rem x y = x - quot x y * y
 
 -- | Raise an Int to the power of another Int.
-foreign import pow :: Int -> Int -> Int
+-- ulib shadow (was a foreign): `Math.pow(x, y) | 0`. For `y >= 0`, exponentiation by squaring
+-- with the `Int` multiply (which wraps at 32 bits, matching the final `| 0`). For `y < 0` the
+-- result is a fraction truncated to `0`, except for the bases `1` and `-1`.
+pow :: Int -> Int -> Int
+pow x y
+  | y < 0 =
+      if x == 1 then 1
+      else if x == -1 then (if even y then 1 else -1)
+      else 0
+  | otherwise = go 1 x y
+  where
+  go acc b e =
+    if e == 0 then acc
+    else go (if odd e then acc * b else acc) (b * b) (e / 2)
 
-foreign import fromStringAsImpl
+-- ulib shadow (was a foreign): parse an optional sign and base-`b` digits, accumulating in
+-- `Number` (so an out-of-`Int32`-range value is rejected by `fromNumber`, matching the
+-- registry's `(i | 0) === i` check rather than silently wrapping). Any non-digit, an
+-- out-of-range digit, or no digits at all fails.
+fromStringAsImpl
   :: (forall a. a -> Maybe a)
   -> (forall a. Maybe a)
   -> Radix
   -> String
   -> Maybe Int
+fromStringAsImpl just nothing (Radix b) s =
+  if start >= n then nothing
+  else case go start 0.0 of
+    Just mag -> case fromNumber (PN.mul sign mag) of
+      Just i -> just i
+      Nothing -> nothing
+    Nothing -> nothing
+  where
+  n = PS.byteLength s
+  firstByte = if n > 0 then PS.byteAt s 0 else 0
+  -- skip an optional leading '+' (0x2B) / '-' (0x2D); `start` is the first digit index
+  sign = if firstByte == 0x2D then -1.0 else 1.0
+  start = if firstByte == 0x2B || firstByte == 0x2D then 1 else 0
+  bNum = PI.toNumber b
 
-foreign import toStringAs :: Radix -> Int -> String
+  -- Accumulate base-`b` digits in `Number` (self-tail recursive over the bytes).
+  go i acc =
+    if i >= n then Just acc
+    else case digitValue (PS.byteAt s i) of
+      Just d | d < b -> go (i + 1) (PN.add (PN.mul acc bNum) (PI.toNumber d))
+      _ -> Nothing
+
+-- ulib shadow (was a foreign): `i.toString(radix)` — the base-`b` digits of `|i|`, with a
+-- leading '-' for negatives. As in JS the radix is trusted to be 2..36.
+toStringAs :: Radix -> Int -> String
+toStringAs (Radix b) i =
+  if i == 0 then "0"
+  else if i < 0 then "-" <> digitsOf (negate i)
+  else digitsOf i
+  where
+  digitsOf n = go n ""
+  go n acc =
+    if n == 0 then acc
+    else go (n / b) (digitChar (n `mod` b) <> acc)
+
+-- The character for a digit value `0 <= d < 36`, as a one-byte ASCII `String` (`0-9`, then `a-z`).
+digitChar :: Int -> String
+digitChar d = byteString (if d < 10 then 0x30 + d else 0x61 + d - 10)
+
+-- A one-byte `String` holding byte `b` (0-255). Safe: index 0 is in range of the length-1 buffer.
+byteString :: Int -> String
+byteString b = PS.unsafeSetByte (PS.unsafeNew 1) 0 b
+
+-- The value of an ASCII digit byte (`0-9`, `a-z`, `A-Z` case-insensitive), or `Nothing`.
+digitValue :: Int -> Maybe Int
+digitValue c =
+  if c >= 0x30 && c <= 0x39 then Just (c - 0x30)
+  else if c >= 0x61 && c <= 0x7A then Just (c - 0x61 + 10)
+  else if c >= 0x41 && c <= 0x5A then Just (c - 0x41 + 10)
+  else Nothing

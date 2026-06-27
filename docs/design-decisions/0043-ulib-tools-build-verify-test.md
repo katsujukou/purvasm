@@ -62,6 +62,10 @@ package" option), rather than duplicated. Module names are preserved across the 
   pinned `purs`, and extract the patched modules into the flat lib layout. Adds `--install`
   (write to the default location, §3) and keeps an explicit `--out` for ad-hoc builds.
   `install.sh` is retired once `build` reaches parity.
+
+  > **Progress (2026-06-28):** `install.sh` removed. `ulib-tools build` reached byte-parity with it
+  > and now exceeds it — `install.sh` could not stage a patch's declared dependencies (ADR-0047), so
+  > it failed on `argonaut-core`'s `purvasm-json` dependency, whereas `build` resolves it.
 - **`ulib-tools verify`** — build-time patch-faithfulness (0040 §5): run `purs docs --format
   json` for the upstream module and the patched module and diff the public surface (exports +
   signatures). Independent of boot; catches `STArray(..)`-style surface drift mechanically.
@@ -107,6 +111,11 @@ override for development. The on-disk layout is unchanged (flat `<Module>/corefn
 loader (boot/lib/link/link.ml) is untouched; only flag resolution in boot/bin/main.ml changes.
 (Scope: applied to the `native` command, which is the self-host build path; the bytecode `build`
 command may adopt the same resolution later.)
+
+> **Correction (2026-06-28):** the env var is **`PURVASM_LIB`** (renamed from `PURVASM_ULIB` above),
+> and the build flag is **`--prepare-release`** (renamed from `--install`, which read as OS-install).
+> `ulib-tools build --prepare-release` resolves `$PURVASM_LIB`, else `dist/ulib`; `purvm`'s matching
+> default resolution is still pending (boot change).
 
 ### 4. Behaviour tests: upstream suite from git, routed by fidelity
 

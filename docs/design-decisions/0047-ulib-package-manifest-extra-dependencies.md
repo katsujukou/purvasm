@@ -66,7 +66,10 @@ always-staged base ABI.
 
 ### 3. Validation, before staging — hard errors
 
-`build`/`verify` run a validation pass first (also available on its own as `ulib-tools validate`)
+> **Correction (2026-06-28):** the standalone command is **`ulib-tools verify-deps`** (renamed from
+> `validate`).
+
+`build`/`verify` run a validation pass first (also available on its own as `ulib-tools verify-deps`)
 that aborts on:
 
 - **Unresolvable dependency** — a declared name that is **neither** an in-repo package
