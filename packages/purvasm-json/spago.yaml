@@ -1,0 +1,10 @@
+package:
+  name: purvasm-json
+  dependencies:
+    - prelude
+    - either
+    - maybe
+    - tuples
+    - arrays
+    - strings
+    - numbers
