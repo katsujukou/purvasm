@@ -57,6 +57,17 @@ let intrinsics : (string * C.term) list =
   ; p "Data.HeytingAlgebra.boolDisj" C.OrBool 2
   ; p "Data.HeytingAlgebra.boolNot" C.NotBool 1
   ; p "Data.Semigroup.concatString" C.Append 2
+    (* `Data.Int.Bits` 32-bit bitwise ops (the `integers` package foreigns): each a single
+       `Int` primop, like the `Data.Semiring`/`Data.Ring` scalar leaves above and mirroring
+       purs-wasm's `Data.Int.Bits` intrinsics. The registry module is kept verbatim; its
+       foreigns resolve here, reusing the same primops the `Purvasm.Int.*` base uses. *)
+  ; p "Data.Int.Bits.and" C.AndInt 2
+  ; p "Data.Int.Bits.or" C.OrInt 2
+  ; p "Data.Int.Bits.xor" C.XorInt 2
+  ; p "Data.Int.Bits.shl" C.ShlInt 2
+  ; p "Data.Int.Bits.shr" C.ShrInt 2
+  ; p "Data.Int.Bits.zshr" C.ZshrInt 2
+  ; p "Data.Int.Bits.complement" C.ComplementInt 1
     (* A foreign *constant*, not a function. `Unit` is opaque (no constructors,
        no fields, never inspected), so purvasm is free to represent `unit` as it
        likes; we pick the immediate [0] — the cheapest representation and aligned
@@ -715,6 +726,15 @@ let host : Cesk.Machine.host =
                (try Stdlib.float_of_string s with
                 | _ -> Stdlib.Float.nan)
            | _ -> Cesk.Errors.stuck "parseFloatImpl: not a String"))
+    (* `Purvasm.Compiler.Bytecode.Image.floatBitsDecimalImpl :: Number -> String` (ADR-0038 §4):
+       a `Number`'s IEEE-754 bits read back as a signed 64-bit integer, as decimal — byte-identical
+       to `Pvm.Image`'s `Int64.to_string (Int64.bits_of_float f)`, so a `Number` literal serialises
+       identically in the self-host. A genuinely-native leaf (there is no float-bits primop). *)
+    | "Purvasm.Compiler.Bytecode.Image.floatBitsDecimalImpl" ->
+      Some
+        (unary (function
+           | V.VNumber f -> V.VString (Int64.to_string (Int64.bits_of_float f))
+           | _ -> Cesk.Errors.stuck "floatBitsDecimalImpl: not a Number"))
     (* `purvasm-base` `Purvasm.String` byte primitives (ADR-0038): pure UTF-8 byte ops. In the
        native backend these also live in the `Rt` prelude (a codegen fallback for unbound refs);
        the VM / oracle need them in the host registry to resolve them through the foreign rung. *)
