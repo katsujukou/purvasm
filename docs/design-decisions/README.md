@@ -89,7 +89,7 @@ language and are kept out of version control.)
 | [0040](0040-ulib-testing-strategy.md) | `ulib` testing: upstream suites by representation-seam fidelity; `purs`-side interface verify | Accepted |
 | [0041](0041-int-number-conversion-primops.md) | `Int`↔`Number` conversion: a cross-representation primop pair in the `Purvasm.*` ABI | Accepted |
 | [0042](0042-data-number-math-native-leaves.md) | `Data.Number` math family as JS-faithful native leaves (not primops, not `ulib`) | Accepted |
-| [0043](0043-ulib-tools-build-verify-test.md) | `ulib-tools`: a PureScript CLI to build, interface-verify, and test the `ulib` patches | Proposed |
+| [0043](0043-ulib-tools-build-verify-test.md) | `ulib-tools`: a PureScript CLI to build, interface-verify, and test the `ulib` patches | Accepted |
 | [0044](0044-foreign-object-over-data-map.md) | `Foreign.Object a` as a `ulib` newtype over `Data.Map String a` | Accepted |
 | [0045](0045-native-cli-run-interpreter-io-leaves.md) | A purvasm-native CLI entry: swap the `Run` interpreter to native IO leaves; never shadow `node-*` | Accepted |
 

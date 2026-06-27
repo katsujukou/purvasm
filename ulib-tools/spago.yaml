@@ -1,0 +1,21 @@
+package:
+  name: ulib-tools
+  dependencies:
+    - argparse-basic
+    - arrays
+    - cli-lib
+    - console
+    - effect
+    - either
+    - fmt
+    - foldable-traversable
+    - maybe
+    - node-process
+    - prelude
+    - run
+    - strings
+  test:
+    main: Test.Unit.Purvasm.UlibTools
+    dependencies:
+      - spec
+      - spec-node

@@ -8,6 +8,7 @@
             "ansi",
             "argonaut",
             "argparse-basic",
+            "cli-lib",
             "compiler",
             "console",
             "dodo-printer",
@@ -16,6 +17,29 @@
             "fmt",
             "node-buffer",
             "node-fs",
+            "node-process",
+            "prelude",
+            "run"
+          ]
+        },
+        "test": {
+          "dependencies": []
+        }
+      },
+      "cli-lib": {
+        "path": "cli-lib",
+        "core": {
+          "dependencies": [
+            "ansi",
+            "arraybuffer-types",
+            "console",
+            "dodo-printer",
+            "effect",
+            "either",
+            "maybe",
+            "node-buffer",
+            "node-fs",
+            "node-path",
             "node-process",
             "prelude",
             "run"
@@ -65,6 +89,32 @@
         },
         "test": {
           "dependencies": []
+        }
+      },
+      "ulib-tools": {
+        "path": "ulib-tools",
+        "core": {
+          "dependencies": [
+            "argparse-basic",
+            "arrays",
+            "cli-lib",
+            "console",
+            "effect",
+            "either",
+            "fmt",
+            "foldable-traversable",
+            "maybe",
+            "node-process",
+            "prelude",
+            "run",
+            "strings"
+          ]
+        },
+        "test": {
+          "dependencies": [
+            "spec",
+            "spec-node"
+          ]
         }
       }
     },

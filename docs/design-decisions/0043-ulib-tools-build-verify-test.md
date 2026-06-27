@@ -1,6 +1,6 @@
 # 0043. `ulib-tools`: a PureScript CLI to build, interface-verify, and test the `ulib` patches
 
-- Status: Proposed
+- Status: ~~Proposed~~ **Accepted** _(2026-06-27: promoted — maintainer authorised implementation; §1 amended to extract shared node-effect helpers into a `cli-lib` package)_
 - Date: 2026-06-26
 
 ## Context
@@ -45,6 +45,17 @@ Mirroring `cli/` (argparse-basic + node-fs/process + `run`, tested with `spec`/`
 so the orchestration logic — manifest parsing, fidelity routing, xfail handling, the docs diff
 — is typed and itself unit-testable, rather than growing `sh` + `jq`. The CLI shells out to the
 external toolchain (`purs`, `spago`, `git`, `node`, `purvm`) via the Node child-process FFI.
+
+`ulib-tools` is an **independent `spago` package**, not source co-located under `cli/src`: it
+must *not* inherit `cli`'s `compiler` dependency (it orchestrates external tools, never links the
+compiler library), and it carries its own `spec` test suite (a `spago` package has a single test
+main). The node-effect helpers `cli` already owns — `Purvasm.CLI.Effect.{Env,Filesystem,Log}`
+and the synchronous Node interpreter/child-process FFI `Purvasm.CLI.Node` — are the genuine reuse
+surface, and they are `compiler`-independent. They are therefore **extracted into a shared
+`cli-lib` package** that both `cli` and `ulib-tools` depend on (the "extract a shared local
+package" option), rather than duplicated. Module names are preserved across the move
+(`Purvasm.CLI.*`) to keep `cli`'s imports unchanged; `cli`'s `compiler`-dependent entry modules
+(`Main`, `Native`, `Build`, `Compile`, `Options`, `Version`) stay in `cli`.
 
 - **`ulib-tools build`** — supersedes `install.sh`: overlay each `ulib/<package>/<Module>.purs`
   over the resolved registry sources plus `purvasm-base`, compile the lot to corefn with the

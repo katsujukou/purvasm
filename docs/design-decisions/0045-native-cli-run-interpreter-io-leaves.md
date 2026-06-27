@@ -52,6 +52,15 @@ for the **dual-target** stock-`purs`/Node build (dev/test); only the entry and i
 `ENV` is dropped from the native row (unused); `joinPath` is pure PureScript in the interpreter
 (the separator is `/`), not a leaf.
 
+> **Progress (2026-06-27):** the native interpreter's `dirname` (added when `Filesystem` promoted
+> path handling, ADR-0043) follows the same pure `/`-separator convention as `joinPath`. This makes
+> the native path ops **POSIX-only**: correct on the boot/posix target they run on today, and
+> tolerated by Windows file APIs for paths we build ourselves, but not Windows-faithful (a
+> `\`-separated argument would mis-split; `dirname` semantics differ). The Node interpreter
+> (`runNode`, used by `cli`'s Node entry and `ulib-tools`) is already platform-correct via
+> `node:path`. Windows fidelity for the native interpreter — delegating these ops to a
+> platform-aware host path leaf — is **deferred to release**, not the bootstrap.
+
 ### 3. The first increment of the native IO leaf set, dual-target
 
 The native IO leaf surface is grown **incrementally**; this record adds the subset for the

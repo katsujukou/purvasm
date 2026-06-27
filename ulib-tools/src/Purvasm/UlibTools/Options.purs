@@ -1,0 +1,36 @@
+module Purvasm.UlibTools.Options where
+
+import Prelude
+
+import ArgParse.Basic (ArgParser)
+import ArgParse.Basic as ArgParser
+import Data.Either (Either)
+import Purvasm.UlibTools.Build as Build
+import Purvasm.UlibTools.Test as Test
+import Purvasm.UlibTools.Verify as Verify
+
+data Command
+  = Build Build.Options
+  | Verify Verify.Options
+  | Test Test.Options
+
+command :: ArgParser Command
+command =
+  ArgParser.choose "COMMAND"
+    [ ArgParser.command [ "build" ]
+        "Compile the ulib patches to corefn (supersedes install.sh)."
+        ((Build <$> Build.options) <* ArgParser.flagHelp)
+    , ArgParser.command [ "verify" ]
+        "Check ulib patch interface-faithfulness against the registry module."
+        ((Verify <$> Verify.options) <* ArgParser.flagHelp)
+    , ArgParser.command [ "test" ]
+        "Run ulib behaviour tests by representation-seam fidelity."
+        ((Test <$> Test.options) <* ArgParser.flagHelp)
+    ]
+    <* ArgParser.flagHelp
+
+parse :: Array String -> Either ArgParser.ArgError Command
+parse =
+  ArgParser.parseArgs "ulib-tools"
+    "Build, verify, and test the ulib registry-package patches (ADR-0043)."
+    command
