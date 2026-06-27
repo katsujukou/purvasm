@@ -191,6 +191,8 @@ let foreign = function
   | "Data.Number.sin" -> VClos (fun v -> VNumber (Float.sin (as_num v)))
   | "Data.Number.isFinite" -> VClos (fun v -> VBool (Float.is_finite (as_num v)))
   | "Data.Number.isNaN" -> VClos (fun v -> VBool (Float.is_nan (as_num v)))
+  | "Data.Number.parseFloatImpl" ->
+    VClos (fun v -> VNumber (try float_of_string (as_str v) with _ -> Float.nan))
   (* Native IO leaves for the purvasm-native CLI interpreter (ADR-0045); mirror `Ffi.host`.
      Each returns an `Effect` thunk that performs the IO when forced. *)
   | "Purvasm.CLI.Native.readTextImpl" -> VClos (fun p -> VClos (fun _ -> VString (read_file (as_str p))))

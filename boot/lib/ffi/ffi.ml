@@ -404,8 +404,24 @@ let record_rename : C.term =
          ; C.Prim (RecordDelete, [ v "o"; v "r" ])
          ] ))
 
+(* `Data.Number.fromStringImpl` is the higher-order `Fn4 String (Number -> Boolean)
+   (forall a. a -> Maybe a) (forall a. Maybe a) (Maybe Number)` foreign behind
+   `Data.Number.fromString` (ADR-0046). Like the `Fn*`/`ST` adapters it is a structural guest
+   term, not a native leaf (native leaves are first-order, ADR-0022): it parses via the
+   first-order `parseFloatImpl` leaf, then applies the caller's `isFinite`/`Just`/`Nothing` —
+   so a `NaN`/non-finite parse becomes `Nothing`, exactly as the prelude's
+   `runFn4 _ str isFinite Just Nothing`. *)
+let number_from_string_impl : C.term =
+  lams
+    [ "str"; "isFin"; "just"; "nothing" ]
+    (C.Let
+       ( "n"
+       , C.App (C.Foreign "Data.Number.parseFloatImpl", v "str")
+       , C.If (C.App (v "isFin", v "n"), C.App (v "just", v "n"), v "nothing") ))
+
 let structural : (string * C.term) list =
   [ "Data.Functor.arrayMap", array_map
+  ; "Data.Number.fromStringImpl", number_from_string_impl
   ; "Record.Builder.unsafeModify", record_modify
   ; "Record.Builder.unsafeRename", record_rename
   ; "Data.Eq.eqArrayImpl", eq_array
@@ -688,6 +704,17 @@ let host : Cesk.Machine.host =
         (unary (function
            | V.VNumber f -> V.VBool (Stdlib.Float.is_nan f)
            | _ -> Cesk.Errors.stuck "isNaN: not a Number"))
+    (* `Data.Number.parseFloatImpl :: String -> Number` (ADR-0046): the first-order parse engine
+       behind the structural `fromStringImpl`. A parse failure yields `NaN`; the guest term turns
+       that into `Nothing` via `isFinite`, so this leaf never needs to build a `Maybe`. *)
+    | "Data.Number.parseFloatImpl" ->
+      Some
+        (unary (function
+           | V.VString s ->
+             V.VNumber
+               (try Stdlib.float_of_string s with
+                | _ -> Stdlib.Float.nan)
+           | _ -> Cesk.Errors.stuck "parseFloatImpl: not a String"))
     (* `purvasm-base` `Purvasm.String` byte primitives (ADR-0038): pure UTF-8 byte ops. In the
        native backend these also live in the `Rt` prelude (a codegen fallback for unbound refs);
        the VM / oracle need them in the host registry to resolve them through the foreign rung. *)
