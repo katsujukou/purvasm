@@ -334,6 +334,9 @@ parse builder s = do
         if isLowSurrogate lo then strBody (cur + 10) (combineSurrogate u lo : acc)
         else Left ("invalid low surrogate at index " <> show (cur + 6))
       else Left ("expected low surrogate at index " <> show cur)
+    -- A lone low surrogate is not a scalar value; reject it rather than let `toEnum` drop it
+    -- silently when the string is built (keeps the high/low surrogate handling consistent).
+    else if isLowSurrogate u then Left ("unexpected lone low surrogate at index " <> show cur)
     else strBody (cur + 4) (u : acc)
 
   isHighSurrogate :: Int -> Boolean

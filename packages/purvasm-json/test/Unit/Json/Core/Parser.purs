@@ -56,6 +56,7 @@ spec = describe "Json.Core.Parser" do
       p "\"ab" `shouldSatisfy` isLeft -- unterminated
       p "\"\\q\"" `shouldSatisfy` isLeft -- invalid escape
       p "\"\\uD83D\"" `shouldSatisfy` isLeft -- lone high surrogate
+      p "\"\\uDC00\"" `shouldSatisfy` isLeft -- lone low surrogate
       p "\"\\u00G0\"" `shouldSatisfy` isLeft -- non-hex digit
 
   describe "arrays" do
