@@ -70,9 +70,26 @@
         }
       },
       "purvasm-base": {
-        "path": "purvasm-base",
+        "path": "packages/purvasm-base",
         "core": {
           "dependencies": []
+        },
+        "test": {
+          "dependencies": []
+        }
+      },
+      "purvasm-json": {
+        "path": "packages/purvasm-json",
+        "core": {
+          "dependencies": [
+            "arrays",
+            "either",
+            "maybe",
+            "numbers",
+            "prelude",
+            "strings",
+            "tuples"
+          ]
         },
         "test": {
           "dependencies": []
@@ -95,6 +112,7 @@
         "path": "ulib-tools",
         "core": {
           "dependencies": [
+            "argonaut-core",
             "argparse-basic",
             "arrays",
             "cli-lib",
@@ -103,8 +121,10 @@
             "either",
             "fmt",
             "foldable-traversable",
+            "foreign-object",
             "maybe",
             "node-process",
+            "ordered-collections",
             "prelude",
             "run",
             "strings"
