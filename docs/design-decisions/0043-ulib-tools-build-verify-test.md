@@ -65,6 +65,17 @@ package" option), rather than duplicated. Module names are preserved across the 
 - **`ulib-tools verify`** — build-time patch-faithfulness (0040 §5): run `purs docs --format
   json` for the upstream module and the patched module and diff the public surface (exports +
   signatures). Independent of boot; catches `STArray(..)`-style surface drift mechanically.
+
+  > **Progress (2026-06-27):** the pinned `purs` (0.15.16) has **no `docs --format json`** (only
+  > `markdown | html | etags | ctags`), so `verify` instead compiles both a **registry baseline**
+  > and the **patched tree** to corefn and diffs each patched module's **export-name set**
+  > (corefn `exports` + flattened `reExports`). This catches the `STArray(..)`-style *export*
+  > drift (a patch narrowing the registry surface) but **not type-signature** drift — corefn
+  > carries names, not signatures. Signature-level faithfulness needs externs / `purs publish` and
+  > is deferred. A ulib module with no registry counterpart (e.g. `Foreign.Object.Internal`,
+  > `Data.String.Internal.Utf8` — helper modules of a reimplemented package, ADR-0044) has nothing
+  > upstream to narrow and is reported as a *new module*, not a failure. Implemented in
+  > `Purvasm.UlibTools.{Verify,Stage}`.
 - **`ulib-tools test`** — run each module's behaviour test at the fidelity its manifest entry
   declares (§4–§5), honouring the xfail list, and report per-module pass/xfail/fail.
 
