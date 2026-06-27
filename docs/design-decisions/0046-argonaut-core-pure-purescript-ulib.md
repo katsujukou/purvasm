@@ -99,10 +99,12 @@ Overlay `Data.Argonaut.Core` and `Data.Argonaut.Parser`, foreign-free, as a thin
 
 - `Json` becomes a pure-PS ADT, abstract (constructors not exported), so the public surface is
   unchanged:
+
   ```purescript
   data Json = JNull | JBoolean Boolean | JNumber Number | JString String
             | JArray (Array Json) | JObject (Object Json)   -- the [0044] Foreign.Object
   ```
+
 - The whole exported surface (`caseJson`/`is*`/`to*`/`from*`/`json*` defaults/`Eq`/`Ord`) is
   ordinary guest code over the ADT — `caseJson` pattern-matches instead of `runFn7 _caseJson`,
   `Eq`/`Ord` become structural (faithful to upstream's tag-then-value order). `stringify`
