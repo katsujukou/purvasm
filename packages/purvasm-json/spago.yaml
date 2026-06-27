@@ -2,9 +2,18 @@ package:
   name: purvasm-json
   dependencies:
     - prelude
-    - either
-    - maybe
-    - tuples
     - arrays
-    - strings
+    - either
+    - enums
+    - foldable-traversable
+    - lists
+    - maybe
     - numbers
+    - strings
+    - tuples
+  test:
+    main: Test.Unit.Json.Core
+    dependencies:
+      - effect
+      - spec
+      - spec-node
