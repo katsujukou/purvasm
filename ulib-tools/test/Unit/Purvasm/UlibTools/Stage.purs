@@ -1,14 +1,14 @@
-module Test.Unit.Purvasm.UlibTools.Build (spec) where
+module Test.Unit.Purvasm.UlibTools.Stage (spec) where
 
 import Prelude
 
-import Purvasm.UlibTools.Build (modulePath)
+import Purvasm.UlibTools.Stage (modulePath)
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
 
 spec :: Spec Unit
 spec = do
-  describe "Purvasm.UlibTools.Build" do
+  describe "Purvasm.UlibTools.Stage" do
     describe "modulePath" do
       it "maps a dotted module name to its slash path" do
         modulePath "Data.Array" `shouldEqual` "Data/Array"

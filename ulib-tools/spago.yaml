@@ -1,6 +1,7 @@
 package:
   name: ulib-tools
   dependencies:
+    - argonaut-core
     - argparse-basic
     - arrays
     - cli-lib
@@ -9,8 +10,10 @@ package:
     - either
     - fmt
     - foldable-traversable
+    - foreign-object
     - maybe
     - node-process
+    - ordered-collections
     - prelude
     - run
     - strings

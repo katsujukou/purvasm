@@ -11,7 +11,7 @@ set -eu
 
 OUT="$1"
 ULIB="${2:-ulib}"
-BASE="${3:-purvasm-base/src}"
+BASE="${3:-packages/purvasm-base/src}"
 PURS="${4:-purs}"
 SPAGO="${5:-.spago/p}"
 
