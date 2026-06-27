@@ -1,6 +1,6 @@
 # 0046. JSON in pure PureScript: a backend-agnostic shared parse/print core, with `argonaut-core` as a `ulib` adapter over it
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-06-27
 
 ## Context
