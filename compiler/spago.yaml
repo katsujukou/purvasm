@@ -7,6 +7,7 @@ package:
     - filterable
     - fmt
     - foreign-object
+    - lists
     - prelude
   test:
     main: Test.Unit.Purvasm.Compiler

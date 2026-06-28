@@ -179,10 +179,14 @@ let foreign = function
     VClos (fun s -> VClos (fun i -> VInt (Char.code (String.get (as_str s) (as_int i)))))
   | "Purvasm.String.unsafeNew" -> VClos (fun n -> VString (String.make (as_int n) '\000'))
   | "Purvasm.String.unsafeSetByte" ->
+    (* In-place byte write, O(1) (ADR-0052): the old `Bytes.of_string … to_string` copied the whole
+       string per byte, making `joinWith`/`blit` O(T²). Sound under the linear unsafe-build protocol
+       — the buffer comes from `unsafeNew` and is threaded linearly (no alias, never a shared/literal
+       string), exactly as native `SetArray` mutates in place (ADR-0009/0019). Output is unchanged. *)
     VClos (fun s -> VClos (fun i -> VClos (fun b ->
-      let bs = Bytes.of_string (as_str s) in
-      Bytes.set bs (as_int i) (Char.chr (as_int b land 0xff));
-      VString (Bytes.to_string bs))))
+      let str = as_str s in
+      Bytes.unsafe_set (Bytes.unsafe_of_string str) (as_int i) (Char.chr (as_int b land 0xff));
+      VString str)))
   (* `Data.Number` math family as native leaves (ADR-0042); mirror `Ffi.host`. *)
   | "Data.Number.abs" -> VClos (fun v -> VNumber (Float.abs (as_num v)))
   | "Data.Number.floor" -> VClos (fun v -> VNumber (Float.floor (as_num v)))

@@ -6,6 +6,7 @@ _build
 /output
 /output-pvm
 /output-purvm
+/output-lv3
 /dist
 purvasm_lib
 .psc-ide-port

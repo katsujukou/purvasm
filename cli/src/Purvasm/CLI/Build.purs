@@ -7,6 +7,8 @@ import ArgParse.Basic as ArgParser
 import Data.Array as Array
 import Data.Either (Either(..))
 import Data.Foldable (foldM, foldl, for_)
+import Data.List (List(..), (:))
+import Data.List as List
 import Data.Map (Map)
 import Data.Map as Map
 import Data.Maybe (Maybe(..))
@@ -77,10 +79,11 @@ loadClosure corefnDir = go Map.empty
 
 -- | Dependency order (imports before importers): a DFS post-order over the loaded closure.
 depOrder :: Map String Module -> Array Module
-depOrder mods = snd (foldl visit (Set.empty /\ []) names)
+depOrder mods = Array.fromFoldable (List.reverse (snd (foldl visit (Set.empty /\ Nil) names)))
   where
   names = map fst (Map.toUnfoldable mods :: Array (String /\ Module))
 
+  -- post-order accumulated in reverse (cons is O(1), ADR-0049), reversed once above.
   visit acc@(seen /\ done) name
     | Set.member name seen = acc
     | otherwise = case Map.lookup name mods of
@@ -89,7 +92,7 @@ depOrder mods = snd (foldl visit (Set.empty /\ []) names)
           let
             seen1 /\ done1 = foldl visit (Set.insert name seen /\ done) (localDeps m)
           in
-            seen1 /\ Array.snoc done1 m
+            seen1 /\ (m : done1)
 
   localDeps m = Array.filter (\n -> Map.member n mods) (importNames m)
 

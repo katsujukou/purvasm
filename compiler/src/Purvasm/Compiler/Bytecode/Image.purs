@@ -6,12 +6,17 @@ module Purvasm.Compiler.Bytecode.Image where
 
 import Prelude
 
+import Data.Array (fromFoldable) as Array
 import Data.Char (toCharCode)
+import Data.Foldable (foldl)
 import Data.Int (hexadecimal, toStringAs)
+import Data.List (List(..), (:))
+import Data.List as List
 import Data.String (length) as Str
 import Data.String.CodeUnits (singleton, toCharArray)
 import Data.Monoid (power)
 import Data.String.Common (joinWith)
+import Data.Tuple (Tuple(..))
 import Data.Tuple.Nested (type (/\), (/\))
 import Purvasm.Compiler.Bytecode.Codegen (Gdef(..))
 import Purvasm.Compiler.Bytecode.Instruction (CodeBlock, Instruction(..))
@@ -32,13 +37,35 @@ data Json
   | JArr (Array Json)
   | JObj (Array (String /\ Json))
 
+-- | Serialise a `Json` tree (byte-identical output). The naive recursive form
+-- | (`"[" <> joinWith "," (map stringify xs) <> "]"`) re-concatenates each node's whole subtree
+-- | string at every level; on a backend where `<>` is an O(n) byte copy (not a rope) this is
+-- | ~O(output × depth) and dominates native build time. Instead, flatten the tree to a token
+-- | list (each leaf string allocated once, prepended O(1)) and `joinWith ""` exactly once at the
+-- | end, so every byte is copied a constant number of times.
 stringify :: Json -> String
-stringify = case _ of
-  JBool b -> if b then "true" else "false"
-  JInt n -> show n
-  JStr s -> jstr s
-  JArr xs -> "[" <> joinWith "," (map stringify xs) <> "]"
-  JObj kvs -> "{" <> joinWith "," (map (\(k /\ v) -> jstr k <> ":" <> stringify v) kvs) <> "}"
+stringify j = joinWith "" (Array.fromFoldable (List.reverse (go j Nil)))
+  where
+  go :: Json -> List String -> List String
+  go val acc = case val of
+    JBool b -> (if b then "true" else "false") : acc
+    JInt n -> show n : acc
+    JStr s -> jstr s : acc
+    JArr xs -> "]" : goElems xs true ("[" : acc)
+    JObj kvs -> "}" : goMembers kvs true ("{" : acc)
+
+  goElems :: Array Json -> Boolean -> List String -> List String
+  goElems xs first acc = foldl step (Tuple first acc) xs # snd'
+    where
+    step (Tuple isFirst a) x = Tuple false (go x (if isFirst then a else "," : a))
+    snd' (Tuple _ a) = a
+
+  goMembers :: Array (String /\ Json) -> Boolean -> List String -> List String
+  goMembers kvs first acc = foldl step (Tuple first acc) kvs # snd'
+    where
+    step (Tuple isFirst a) (k /\ v) =
+      Tuple false (go v (":" : jstr k : (if isFirst then a else "," : a)))
+    snd' (Tuple _ a) = a
 
 jstr :: String -> String
 jstr s = "\"" <> (joinWith "" (map esc (toCharArray s))) <> "\""

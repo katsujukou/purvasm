@@ -24,6 +24,8 @@ import Prelude
 
 import Control.Monad.State (State, execState, get, modify_)
 import Data.Array as Array
+import Data.List (List(..), (:))
+import Data.List as List
 import Data.Foldable (all, any, for_)
 import Data.FoldableWithIndex (forWithIndex_)
 import Data.Map as Map
@@ -58,11 +60,14 @@ data Pseudo
   | PswitchLen (Array (Int /\ Int)) Int
   | Plabel Int
 
-type AsmState = { lbl :: Int, occ :: Int, buf :: Array Pseudo }
+-- | `buf` accumulates emitted pseudo-instructions in *reverse* order (cons is O(1); ADR-0049)
+-- | and is reversed once at `resolve`'s entry. (Forward end-append, no mid-stream length read —
+-- | so reverse-cons is the right discipline here, unlike `Lower`'s offset-reading worker.)
+type AsmState = { lbl :: Int, occ :: Int, buf :: List Pseudo }
 type Asm = State AsmState
 
 emit :: Pseudo -> Asm Unit
-emit p = modify_ \s -> s { buf = Array.snoc s.buf p }
+emit p = modify_ \s -> s { buf = p : s.buf }
 
 freshLbl :: Asm Int
 freshLbl = do
@@ -107,11 +112,11 @@ emitRhs lw tail endLbl rhs onFail = case rhs of
 -- | Two passes: record each label's instruction index, then emit the final array with
 -- | every jump/switch target turned into an offset relative to the *next* instruction
 -- | (matching the VM's `ip := ip + rel` after it has stepped past the instruction).
-resolve :: Array Pseudo -> CodeBlock
-resolve pseudos = (Array.foldl step { self: 0, out: [] } pseudos).out
+resolve :: List Pseudo -> CodeBlock
+resolve pseudos = Array.fromFoldable (List.reverse (List.foldl step { self: 0, out: Nil } pseudos).out)
   where
   labelpos :: Map.Map Int Int
-  labelpos = (Array.foldl mark { pos: 0, m: Map.empty } pseudos).m
+  labelpos = (List.foldl mark { pos: 0, m: Map.empty } pseudos).m
     where
     mark acc = case _ of
       Plabel l -> acc { m = Map.insert l acc.pos acc.m }
@@ -122,7 +127,7 @@ resolve pseudos = (Array.foldl step { self: 0, out: [] } pseudos).out
 
   step acc = case _ of
     Plabel _ -> acc
-    p -> acc { self = acc.self + 1, out = Array.snoc acc.out (toInstr acc.self p) }
+    p -> acc { self = acc.self + 1, out = toInstr acc.self p : acc.out }
 
   toInstr self = case _ of
     Pinstr i -> i
@@ -217,7 +222,7 @@ testBinder o failLbl = case _ of
     testBinder so failLbl sub
 
 compileNaive :: Lowerers -> Boolean -> Array Atom -> Array Alt -> CodeBlock
-compileNaive lw tail scruts alts = resolve (execState build { lbl: 0, occ: 0, buf: [] }).buf
+compileNaive lw tail scruts alts = resolve (List.reverse (execState build { lbl: 0, occ: 0, buf: Nil }).buf)
   where
   build :: Asm Unit
   build = do
@@ -238,7 +243,7 @@ compileNaive lw tail scruts alts = resolve (execState build { lbl: 0, occ: 0, bu
 -- --- decision-tree matcher (Maranget, ADR-0031) -------------------------------------
 
 compileTree :: Lowerers -> Boolean -> Array Atom -> Array Alt -> CodeBlock
-compileTree lw tail scruts alts = resolve (execState build { lbl: 0, occ: 0, buf: [] }).buf
+compileTree lw tail scruts alts = resolve (List.reverse (execState build { lbl: 0, occ: 0, buf: Nil }).buf)
   where
   build :: Asm Unit
   build = do
@@ -271,12 +276,13 @@ compileTree lw tail scruts alts = resolve (execState build { lbl: 0, occ: 0, buf
           let
             c = firstRefutable cores0
             occ_c = idx occs c
-          in case idx cores0 c of
-            Cctor _ _ -> compileCtor endLbl occs rows c occ_c
-            Clit _ -> compileLit endLbl occs rows c occ_c
-            Carr _ -> compileArr endLbl occs rows c occ_c
-            Crec _ -> compileRec endLbl occs rows c occ_c
-            Cwild -> unsafeCrashWith "compile: refutable column is wild"
+          in
+            case idx cores0 c of
+              Cctor _ _ -> compileCtor endLbl occs rows c occ_c
+              Clit _ -> compileLit endLbl occs rows c occ_c
+              Carr _ -> compileArr endLbl occs rows c occ_c
+              Crec _ -> compileRec endLbl occs rows c occ_c
+              Cwild -> unsafeCrashWith "compile: refutable column is wild"
 
   -- switch on a constructor tag; each head specialises the matrix with its fields
   compileCtor :: Int -> Array String -> Array DtRow -> Int -> String -> Asm Unit
@@ -306,10 +312,11 @@ compileTree lw tail scruts alts = resolve (execState build { lbl: 0, occ: 0, buf
               let
                 p = peel (idx row.pats c)
                 binds' = row.binds <> bindsOf p.names occ_c
-              in case p.core of
-                Cctor t subs | t == h.tag -> Just { pats: replaceCol row.pats c subs, binds: binds', rhs: row.rhs }
-                Cwild -> Just { pats: replaceCol row.pats c (Array.replicate h.arity BNull), binds: binds', rhs: row.rhs }
-                _ -> Nothing
+              in
+                case p.core of
+                  Cctor t subs | t == h.tag -> Just { pats: replaceCol row.pats c subs, binds: binds', rhs: row.rhs }
+                  Cwild -> Just { pats: replaceCol row.pats c (Array.replicate h.arity BNull), binds: binds', rhs: row.rhs }
+                  _ -> Nothing
           )
           rows
       compile endLbl (replaceCol occs c subOccs) rows'
@@ -377,10 +384,11 @@ compileTree lw tail scruts alts = resolve (execState build { lbl: 0, occ: 0, buf
               let
                 p = peel (idx row.pats c)
                 binds' = row.binds <> bindsOf p.names occ_c
-              in case p.core of
-                Carr subs | Array.length subs == arity -> Just { pats: replaceCol row.pats c subs, binds: binds', rhs: row.rhs }
-                Cwild -> Just { pats: replaceCol row.pats c (Array.replicate arity BNull), binds: binds', rhs: row.rhs }
-                _ -> Nothing
+              in
+                case p.core of
+                  Carr subs | Array.length subs == arity -> Just { pats: replaceCol row.pats c subs, binds: binds', rhs: row.rhs }
+                  Cwild -> Just { pats: replaceCol row.pats c (Array.replicate arity BNull), binds: binds', rhs: row.rhs }
+                  _ -> Nothing
           )
           rows
       compile endLbl (replaceCol occs c subOccs) rows'
@@ -418,8 +426,9 @@ compileTree lw tail scruts alts = resolve (execState build { lbl: 0, occ: 0, buf
     ( \row ->
         let
           p = peel (idx row.pats c)
-        in case p.core of
-          Cwild -> Just { pats: removeCol row.pats c, binds: row.binds <> bindsOf p.names occ_c, rhs: row.rhs }
-          _ -> Nothing
+        in
+          case p.core of
+            Cwild -> Just { pats: removeCol row.pats c, binds: row.binds <> bindsOf p.names occ_c, rhs: row.rhs }
+            _ -> Nothing
     )
     rows

@@ -9,7 +9,10 @@ module Purvasm.Compiler.Bytecode.Codegen where
 import Prelude
 
 import Data.Array as Array
+import Data.Foldable (foldl)
 import Data.Generic.Rep (class Generic)
+import Data.List (List(..), (:))
+import Data.List as List
 import Data.Show.Generic (genericShow)
 import Data.Tuple.Nested (type (/\), (/\))
 import Purvasm.Compiler.Bytecode.Instruction (CodeBlock)
@@ -37,9 +40,12 @@ gdefOfExpr recursive = case _ of
 -- | definitions and the `main` chunk (the first non-binding expression). Ported from
 -- | boot's `Vm.Codegen.program`.
 program :: Expr -> { gdefs :: Array (String /\ Gdef), main :: CodeBlock }
-program = go []
+program = go Nil
   where
+  -- `acc` holds the gdefs in *reverse* spine order (cons is O(1), ADR-0049), reversed once
+  -- at the end; the `LetRec` arm conses its group in order so the final reverse restores it.
+  go :: List (String /\ Gdef) -> Expr -> { gdefs :: Array (String /\ Gdef), main :: CodeBlock }
   go acc = case _ of
-    Let k c rest -> go (Array.snoc acc (k /\ gdefOfExpr false (Ret c))) rest
-    LetRec binds rest -> go (acc <> map (\b -> b.var /\ gdefOfExpr true b.rhs) binds) rest
-    e -> { gdefs: acc, main: lowerExpr true e }
+    Let k c rest -> go ((k /\ gdefOfExpr false (Ret c)) : acc) rest
+    LetRec binds rest -> go (foldl (\a b -> (b.var /\ gdefOfExpr true b.rhs) : a) acc binds) rest
+    e -> { gdefs: Array.fromFoldable (List.reverse acc), main: lowerExpr true e }

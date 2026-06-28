@@ -756,14 +756,17 @@ let host : Cesk.Machine.host =
            | V.VInt n -> V.VString (String.make n '\000')
            | _ -> Cesk.Errors.stuck "unsafeNew: not an Int"))
     | "Purvasm.String.unsafeSetByte" ->
+      (* In-place byte write, O(1) (ADR-0052): the old `Bytes.of_string … to_string` copied the whole
+         string per byte, making `joinWith`/`blit` O(T²). Sound under the linear unsafe-build protocol
+         — the buffer comes from `unsafeNew` and is threaded linearly (no alias, never a shared/literal
+         string), as native `SetArray` mutates in place (ADR-0009/0019). Output is unchanged. *)
       Some
         ( 3
         , fun args ->
             match args with
             | [ V.VString s; V.VInt i; V.VInt b ] ->
-              let bs = Bytes.of_string s in
-              Bytes.set bs i (Char.chr (b land 0xff));
-              V.VString (Bytes.to_string bs)
+              Bytes.unsafe_set (Bytes.unsafe_of_string s) i (Char.chr (b land 0xff));
+              V.VString s
             | _ -> Cesk.Errors.stuck "unsafeSetByte: ill-typed arguments" )
     (* Native IO leaves for the purvasm-native CLI interpreter (ADR-0045): each returns an
        `Effect` thunk that performs the IO when forced (the `Console.log` shape). *)

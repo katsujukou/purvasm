@@ -15,8 +15,10 @@ module Purvasm.Compiler.Link
 import Prelude
 
 import Control.Monad.State (State, execState, get, gets, modify_)
-import Data.Array (concatMap, filter, head, snoc)
+import Data.Array (concatMap, filter, fromFoldable, head)
 import Data.Foldable (foldl, for_)
+import Data.List (List(..), (:))
+import Data.List as List
 import Data.Map (Map)
 import Data.Map as Map
 import Data.Maybe (Maybe(..), fromMaybe)
@@ -39,10 +41,11 @@ headKey g = fromMaybe "" (head g.keys)
 -- | Order artifacts so a dependency precedes its dependents (DFS over imports), then a
 -- | module's own decls keep their order — a valid build order for strict CAFs.
 topo :: Array ModuleArtifact -> Array ModuleArtifact
-topo arts = snd (foldl go (Set.empty /\ []) arts)
+topo arts = fromFoldable (List.reverse (snd (foldl go (Set.empty /\ Nil) arts)))
   where
   byName = Map.fromFoldable (map (\a -> a.name /\ a) arts)
 
+  -- post-order accumulated in reverse (cons is O(1), ADR-0049), reversed once above.
   go acc@(seen /\ ord) a
     | Set.member a.name seen = acc
     | otherwise =
@@ -52,7 +55,7 @@ topo arts = snd (foldl go (Set.empty /\ []) arts)
             Nothing -> acc2
           seen1 /\ ord1 = foldl step (Set.insert a.name seen /\ ord) a.imports
         in
-          seen1 /\ snoc ord1 a
+          seen1 /\ (a : ord1)
 
 type LinkState =
   { seen :: Set String

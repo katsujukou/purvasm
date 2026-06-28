@@ -28,8 +28,23 @@ foreign import byteAt :: String -> Int -> Int
 -- | backend: a zeroed byte-array allocation primitive.
 foreign import unsafeNew :: Int -> String
 
--- | Write byte `b` (0-255) at index `i`, **mutating the string in place**, and return that same
--- | string, so a builder loop threads it — keeping the write live (not dead-code-eliminated) and
--- | ordered by the data dependency, without needing an effect. Unchecked (out of range traps). On
--- | the purvasm backend: a byte-array set primitive that then yields the string.
+-- | Write byte `b` (0-255) at index `i`, **mutating the string in place** (O(1) on the native
+-- | backend, ADR-0052), and return that same string, so a builder loop threads it — keeping the
+-- | write live (not dead-code-eliminated) and ordered by the data dependency, without needing an
+-- | effect. Unchecked (out of range traps).
+-- |
+-- | Contract (the *linear unsafe-build protocol* — the caller MUST uphold these; the native
+-- | implementation mutates in place and relies on them, like `Purvasm.Array.unsafeSet`,
+-- | ADR-0009/0019):
+-- |
+-- |   * the buffer MUST be a fresh allocation from `unsafeNew` (never a shared or literal `String`);
+-- |   * it MUST be threaded **linearly** — pass the *returned* string to the next write; never reuse
+-- |     a reference to the buffer taken before a write, and do not retain it after it is published as
+-- |     an immutable `String`;
+-- |   * when copying bytes between two strings, source and destination MUST be distinct (no `src = dst`
+-- |     overlapping copy).
+-- |
+-- | Violating any of these mutates a value other callers observe (silent corruption). All current
+-- | `ulib` builders honour it (`Data.String.Common.blit`, `Data.String.Internal.Utf8` `putCp`/copy,
+-- | `Data.Semigroup` `append`, `Data.Int.byteString`, `Data.Show` `put1`..`put4`).
 foreign import unsafeSetByte :: String -> Int -> Int -> String
