@@ -1,0 +1,13 @@
+{
+  "test": {
+    "repo": "https://github.com/purescript/purescript-enums",
+    "ref": "v6.0.1",
+    "testMain": "Test.Main",
+    "testDeps": [
+      "assert",
+      "console"
+    ],
+    "fidelity": "js",
+    "xfail": []
+  }
+}
