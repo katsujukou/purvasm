@@ -102,12 +102,14 @@ translBinds key binds body = foldr
       case b of
         CF.NonRec _ id e -> TmLet (key id) (translExpr e) acc
         CF.Rec rbs ->
-            TmLetrec (rbs <#> \{ident,expr} -> (key ident /\ translExpr expr)) acc
+          TmLetrec (rbs <#> \{ ident, expr } -> (key ident /\ translExpr expr)) acc
   )
   body
   binds
 
 translModule :: CF.Ident -> CF.Module -> Cesk.Term
-translModule entry m = 
-  let key id = qualifiedKey m.name id in 
-  translBinds key m.decls (TmVar (key entry))
+translModule entry m =
+  let
+    key id = qualifiedKey m.name id
+  in
+    translBinds key m.decls (TmVar (key entry))

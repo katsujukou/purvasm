@@ -20,25 +20,33 @@ import Test.Spec.Assertions (shouldEqual)
 -- boot's diamond fixture, as compiled artifacts (matches each module's `.pmo`).
 diaD :: ModuleArtifact
 diaD =
-  { name: "DiaD", imports: [ "Prim" ], exports: [ "DiaD.d" ]
+  { name: "DiaD"
+  , imports: [ "Prim" ]
+  , exports: [ "DiaD.d" ]
   , groups: [ { keys: [ "DiaD.d" ], deps: [], members: [ "DiaD.d" /\ Gcaf [ PushInt 7, Return ] ] } ]
   }
 
 diaB :: ModuleArtifact
 diaB =
-  { name: "DiaB", imports: [ "DiaB", "DiaD", "Prim" ], exports: [ "DiaB.b" ]
+  { name: "DiaB"
+  , imports: [ "DiaB", "DiaD", "Prim" ]
+  , exports: [ "DiaB.b" ]
   , groups: [ { keys: [ "DiaB.b" ], deps: [ "DiaD.d" ], members: [ "DiaB.b" /\ Gcaf [ Load "DiaD.d", Return ] ] } ]
   }
 
 diaC :: ModuleArtifact
 diaC =
-  { name: "DiaC", imports: [ "DiaC", "DiaD", "Prim" ], exports: [ "DiaC.c" ]
+  { name: "DiaC"
+  , imports: [ "DiaC", "DiaD", "Prim" ]
+  , exports: [ "DiaC.c" ]
   , groups: [ { keys: [ "DiaC.c" ], deps: [ "DiaD.d" ], members: [ "DiaC.c" /\ Gcaf [ Load "DiaD.d", Return ] ] } ]
   }
 
 diaA :: ModuleArtifact
 diaA =
-  { name: "DiaA", imports: [ "DiaA", "DiaB", "DiaC", "Prim" ], exports: [ "DiaA.Two", "DiaA.both" ]
+  { name: "DiaA"
+  , imports: [ "DiaA", "DiaB", "DiaC", "Prim" ]
+  , exports: [ "DiaA.Two", "DiaA.both" ]
   , groups:
       [ { keys: [ "DiaA.Two" ], deps: [], members: [ "DiaA.Two" /\ Gcaf [ Ctor "Two" 2 0, Return ] ] }
       , { keys: [ "DiaA.both" ]

@@ -14,13 +14,13 @@ data Binder
   = BNull
   | BVar String
   | BLit Literal
-  | BCtor String (Array Binder) 
-  | BArray (Array Binder) 
+  | BCtor String (Array Binder)
+  | BArray (Array Binder)
   | BRecord (Array { prop :: String, binder :: Binder })
   | BNamed String Binder
 
-derive instance Eq Binder 
-derive instance Generic Binder _ 
+derive instance Eq Binder
+derive instance Generic Binder _
 instance Show Binder where
-  show it = genericShow it 
+  show it = genericShow it
 

@@ -59,7 +59,6 @@ data Instruction
   -- No alternative matched (or every guard fell through): a stuck program.
   | Fail String
 
-
 type CodeBlock = Array Instruction
 
 derive instance Eq Instruction

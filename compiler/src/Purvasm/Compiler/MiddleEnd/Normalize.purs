@@ -53,14 +53,18 @@ normalize term = evalState (anfTail term) 0
     TmForeign s -> k (CAtom (AtomForeign s))
     TmCtor tag arity -> k (CCtor tag arity [])
     TmLam _ _ ->
-      let { params, body } = collectLam t
-      in anfTail body >>= \b -> k (CLam params b)
+      let
+        { params, body } = collectLam t
+      in
+        anfTail body >>= \b -> k (CLam params b)
     TmApp _ _ ->
-      let { head, args } = collectApp t
-      in normAtoms args \argAtoms -> case head of
-           -- a saturated/partial constructor application stays a constructor node
-           TmCtor tag arity -> k (CCtor tag arity argAtoms)
-           _ -> normAtom head \h -> k (CApp h argAtoms)
+      let
+        { head, args } = collectApp t
+      in
+        normAtoms args \argAtoms -> case head of
+          -- a saturated/partial constructor application stays a constructor node
+          TmCtor tag arity -> k (CCtor tag arity argAtoms)
+          _ -> normAtom head \h -> k (CApp h argAtoms)
     TmPrim op args -> normAtoms args \atoms -> k (CPrim op atoms)
     TmArray es -> normAtoms es \atoms -> k (CArray atoms)
     TmRecord fields ->
@@ -115,9 +119,10 @@ normalize term = evalState (anfTail term) 0
       -- allocates the rhs's fresh names before the guard's. Match that for byte-identity.
       Cesk.Guarded gs ->
         Guarded <$> traverse
-          (\g -> do
-            rhs <- anfTail g.rhs
-            guard <- anfTail g.guard
-            pure { guard, rhs })
+          ( \g -> do
+              rhs <- anfTail g.rhs
+              guard <- anfTail g.guard
+              pure { guard, rhs }
+          )
           gs
     pure { binders: a.binders, result }

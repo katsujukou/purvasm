@@ -17,10 +17,10 @@ import Data.String.CodeUnits (charAt)
 import Data.Traversable (traverse)
 import Data.Tuple (Tuple(..))
 import Foreign.Object (Object)
-import PureScript.CoreFn.Ann as Ann 
+import PureScript.CoreFn.Ann as Ann
 import PureScript.CoreFn.Expr as Expr
-import PureScript.CoreFn.Literal as Lit 
-import PureScript.CoreFn.Module as Mod 
+import PureScript.CoreFn.Literal as Lit
+import PureScript.CoreFn.Module as Mod
 import PureScript.CoreFn.Names as N
 
 -- | Decode a full CoreFn module.

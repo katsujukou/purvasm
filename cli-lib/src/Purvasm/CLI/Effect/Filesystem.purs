@@ -78,4 +78,4 @@ resolvePath :: forall r. Array FilePath -> FilePath -> Run (FS + r) FilePath
 resolvePath segments last = Run.lift _fs (ResolvePath segments last identity)
 
 dirname :: forall r. FilePath -> Run (FS + r) FilePath
-dirname path = Run.lift _fs (Dirname path identity) 
+dirname path = Run.lift _fs (Dirname path identity)

@@ -4,7 +4,7 @@ import Prelude
 
 import Data.Generic.Rep (class Generic)
 import Data.Show.Generic (genericShow)
-  
+
 data PrimOp
   = AddInt
   | SubInt
@@ -39,7 +39,6 @@ data PrimOp
   | RecordSet
   | RecordHas
   | RecordDelete
-
 
 derive instance Eq PrimOp
 derive instance Generic PrimOp _

@@ -35,8 +35,10 @@ lams params body = foldr TmLam body params
 -- | Eta-expand an arity-`n` primop into `\$0 -> … -> \$(n-1) -> Prim(op, [$0; …])`.
 eta :: PrimOp -> Int -> Term
 eta op arity =
-  let names = map (\i -> "$" <> show i) (0 .. (arity - 1))
-  in foldr TmLam (TmPrim op (map v names)) names
+  let
+    names = map (\i -> "$" <> show i) (0 .. (arity - 1))
+  in
+    foldr TmLam (TmPrim op (map v names)) names
 
 -- intrinsics (eta-expanded primops) ----------------------------------------------------
 

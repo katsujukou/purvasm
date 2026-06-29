@@ -13,7 +13,7 @@ import Purvasm.Compiler.Binder (Binder)
 import Purvasm.Compiler.Literal (Literal)
 import Purvasm.Compiler.Primitive (PrimOp)
 
-data Atom 
+data Atom
   = AtomVar String
   | AtomLit Literal
   | AtomForeign String
@@ -25,16 +25,16 @@ instance Show Atom where
 
 -- | A computation - a single step that produces a value
 -- | Its operants are atoms; its sub-*expressions* (`CIf`/`CCase` branches, `CLam` body) are full `Expr`s.
-data CExpr 
-  = CAtom Atom 
-  | CLam (Array String) Expr 
+data CExpr
+  = CAtom Atom
+  | CLam (Array String) Expr
   | CApp Atom (Array Atom)
   | CPrim PrimOp (Array Atom)
   | CCtor String Int (Array Atom) -- name of constructor, arity, args 
   | CArray (Array Atom)
   | CRecord (Array { prop :: String, val :: Atom })
   | CAccessor Atom String
-  | CUpdate Atom (Array { prop :: String, val :: Atom})
+  | CUpdate Atom (Array { prop :: String, val :: Atom })
   | CIf Atom Expr Expr
   | CCase (Array Atom) (Array Alt)
 
@@ -42,15 +42,15 @@ data CExpr
 -- | `Let` binds a (non-recursive) computation;
 -- | `LetRec` a recursive group (each rhs a full `Expr`,
 -- | since its internal bindings may reference the group and cannot bt hoisted
-data Expr 
+data Expr
   = Ret CExpr
-  | Let String CExpr Expr 
-  | LetRec (Array { var :: String, rhs :: Expr }) Expr 
-  
+  | Let String CExpr Expr
+  | LetRec (Array { var :: String, rhs :: Expr }) Expr
+
 type Alt =
   { binders :: Array Binder
   , result :: Rhs
-  } 
+  }
 
 data Rhs
   = Uncond Expr

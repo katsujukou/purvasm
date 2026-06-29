@@ -57,9 +57,10 @@ freeVarsSet = fv Set.empty Set.empty
           ( \a alt ->
               let
                 bound' = foldl (flip Set.insert) bound (concatMap binderVars alt.binders)
-              in case alt.result of
-                Unconditional e -> fv bound' a e
-                Guarded gs -> foldl (\aa g -> fv bound' (fv bound' aa g.guard) g.rhs) a gs
+              in
+                case alt.result of
+                  Unconditional e -> fv bound' a e
+                  Guarded gs -> foldl (\aa g -> fv bound' (fv bound' aa g.guard) g.rhs) a gs
           )
           acc'
           alts

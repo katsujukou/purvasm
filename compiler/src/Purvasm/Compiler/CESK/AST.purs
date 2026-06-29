@@ -9,26 +9,26 @@ import Purvasm.Compiler.Binder (Binder)
 import Purvasm.Compiler.Literal (Literal)
 import Purvasm.Compiler.Primitive (PrimOp)
 
-data Term 
+data Term
   = TmLit Literal
   | TmVar String
-  | TmLam String Term 
-  | TmApp Term Term 
-  | TmLet String Term Term 
-  | TmLetrec (Array (String /\ Term)) Term 
-  | TmIf Term Term Term 
+  | TmLam String Term
+  | TmApp Term Term
+  | TmLet String Term Term
+  | TmLetrec (Array (String /\ Term)) Term
+  | TmIf Term Term Term
   | TmPrim PrimOp (Array Term)
   | TmArray (Array Term)
   | TmRecord (Array { prop :: String, term :: Term })
   | TmAccessor Term String
   | TmUpdate Term (Array { prop :: String, term :: Term })
-  | TmCtor String Int 
+  | TmCtor String Int
   | TmForeign String
   | TmCase (Array Term) (Array Alternative)
 
 type Alternative =
   { binders :: Array Binder
-  , result :: Rhs 
+  , result :: Rhs
   }
 
 data Rhs

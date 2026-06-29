@@ -8,7 +8,6 @@ import PureScript.CoreFn.Ann (Ann)
 import PureScript.CoreFn.Expr (Bind)
 import PureScript.CoreFn.Names (ModuleName, Ident)
 
-
 -- | An imported module reference.
 type Import = { ann :: Ann, moduleName :: ModuleName }
 

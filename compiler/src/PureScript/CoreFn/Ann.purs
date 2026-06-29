@@ -7,8 +7,6 @@ import Data.Maybe (Maybe)
 import Data.Show.Generic (genericShow)
 import PureScript.CoreFn.Names (Ident)
 
-
-
 -- | A 1-based source position `{ line, column }`.
 type SourcePos = { line :: Int, column :: Int }
 
