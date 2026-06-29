@@ -7,7 +7,7 @@ import Data.Map as Map
 import Data.Maybe (Maybe(..))
 import Data.Set as Set
 import Data.Tuple (Tuple(..))
-import Purvasm.UlibTools.Manifest (Resolution(..), classifyDep, findCycle, inRepoClosure, parseDependencies, parsePackageSet, parseSpagoDependencies, stripVersion)
+import Purvasm.UlibTools.Manifest (Fidelity(..), Resolution(..), classifyDep, findCycle, inRepoClosure, parseBowerDependencies, parseDependencies, parsePackageSet, parseRegistryVersion, parseSpagoDependencies, parseTest, repoSlug, stripVersion)
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
 
@@ -24,6 +24,54 @@ spec = do
         isLeft (parseDependencies """{"dependencies":5}""") `shouldEqual` true
       it "fails on a non-object top level" do
         isLeft (parseDependencies "[]") `shouldEqual` true
+
+    describe "parseTest" do
+      it "treats a missing test block as not-yet-tested" do
+        parseTest """{"dependencies":["purvasm-json"]}""" `shouldEqual` Right Nothing
+      it "reads a full test block" do
+        parseTest fullTest `shouldEqual` Right
+          ( Just
+              { repo: "https://github.com/purescript/purescript-arrays"
+              , ref: "v7.3.0"
+              , testMain: "Test.Main"
+              , testDeps: [ "assert", "console" ]
+              , fidelity: JsFidelity
+              , xfail: []
+              }
+          )
+      it "defaults testMain to Test.Main and optional arrays to empty" do
+        parseTest """{"test":{"repo":"r","ref":"x","fidelity":"native"}}""" `shouldEqual` Right
+          ( Just
+              { repo: "r", ref: "x", testMain: "Test.Main", testDeps: [], fidelity: NativeFidelity, xfail: [] }
+          )
+      it "parses the bespoke fidelity" do
+        map (map _.fidelity) (parseTest """{"test":{"repo":"r","ref":"x","fidelity":"bespoke"}}""")
+          `shouldEqual` Right (Just BespokeFidelity)
+      it "fails on an unknown fidelity" do
+        isLeft (parseTest """{"test":{"repo":"r","ref":"x","fidelity":"wasm"}}""") `shouldEqual` true
+      it "fails when a required string is missing" do
+        isLeft (parseTest """{"test":{"ref":"x","fidelity":"js"}}""") `shouldEqual` true
+
+    describe "parseBowerDependencies" do
+      it "reads dependency keys and strips the purescript- prefix" do
+        parseBowerDependencies """{"dependencies":{"purescript-prelude":"^6.0.0","purescript-arrays":"^7.0.0"}}"""
+          `shouldEqual` Right [ "prelude", "arrays" ]
+      it "treats a missing field as no deps" do
+        parseBowerDependencies "{}" `shouldEqual` Right []
+      it "fails on a non-object dependencies field" do
+        isLeft (parseBowerDependencies """{"dependencies":[]}""") `shouldEqual` true
+
+    describe "parseRegistryVersion" do
+      it "extracts the registry version from a workspace spago.yaml" do
+        parseRegistryVersion "workspace:\n  packageSet:\n    registry: 77.8.0\n  extraPackages: {}\n"
+          `shouldEqual` Just "77.8.0"
+      it "is Nothing when no registry line is present" do
+        parseRegistryVersion "workspace:\n  extraPackages: {}\n" `shouldEqual` Nothing
+
+    describe "repoSlug" do
+      it "takes the last path segment without a trailing .git" do
+        repoSlug "https://github.com/purescript/purescript-arrays" `shouldEqual` "purescript-arrays"
+        repoSlug "https://github.com/purescript/purescript-arrays.git" `shouldEqual` "purescript-arrays"
 
     describe "parseSpagoDependencies" do
       it "reads the first (package) dependencies block, not test deps" do
@@ -64,6 +112,19 @@ spec = do
           `shouldEqual` [ "a", "b", "c" ]
   where
   t k v = Tuple k v
+
+fullTest :: String
+fullTest =
+  """{
+  "test": {
+    "repo": "https://github.com/purescript/purescript-arrays",
+    "ref": "v7.3.0",
+    "testMain": "Test.Main",
+    "testDeps": ["assert", "console"],
+    "fidelity": "js",
+    "xfail": []
+  }
+}"""
 
 pkgYaml :: String
 pkgYaml =

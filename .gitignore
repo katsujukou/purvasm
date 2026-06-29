@@ -8,6 +8,7 @@ _build
 /output-purvm
 /output-lv3
 /dist
+/.ulib-test-cache
 /cli/bin
 purvasm_lib
 .psc-ide-port

@@ -4,7 +4,13 @@
 -- | cycles. Kept free of effects so the resolution/validation logic is unit-testable.
 module Purvasm.UlibTools.Manifest
   ( Resolution(..)
+  , Fidelity(..)
+  , TestSpec
   , parseDependencies
+  , parseTest
+  , parseBowerDependencies
+  , parseRegistryVersion
+  , repoSlug
   , parseSpagoDependencies
   , parsePackageSet
   , stripVersion
@@ -41,6 +47,93 @@ instance showResolution :: Show Resolution where
     Resolved -> "Resolved"
     UnresolvedRegistry -> "UnresolvedRegistry"
     Unknown -> "Unknown"
+
+-- | How faithfully a `ulib` package's behaviour must match its registry original, by representation
+-- | seam (ADR-0040/0048). `JsFidelity` packages are representation-equivalent and run on node;
+-- | `NativeFidelity`/`BespokeFidelity` need `purvm` and are deferred (ADR-0048 Phase 2).
+data Fidelity = JsFidelity | NativeFidelity | BespokeFidelity
+
+derive instance eqFidelity :: Eq Fidelity
+instance showFidelity :: Show Fidelity where
+  show = case _ of
+    JsFidelity -> "js"
+    NativeFidelity -> "native"
+    BespokeFidelity -> "bespoke"
+
+-- | A `ulib` package's upstream test suite, from the `test` object of its `ulib.json` (ADR-0048 §1).
+-- | `repo`/`ref` pin the upstream source; `testMain` defaults to `Test.Main`; `testDeps` are the
+-- | suite's extra dependencies; `fidelity` selects the run path; `xfail` documents intended
+-- | divergences (Phase 2).
+type TestSpec =
+  { repo :: String
+  , ref :: String
+  , testMain :: String
+  , testDeps :: Array String
+  , fidelity :: Fidelity
+  , xfail :: Array String
+  }
+
+-- | The `test` object of a `ulib.json` (`Nothing` if absent — the package is not yet tested).
+parseTest :: String -> Either String (Maybe TestSpec)
+parseTest src = do
+  json <- jsonParser src
+  obj <- note "ulib.json: top level is not an object" (toObject json)
+  case Object.lookup "test" obj of
+    Nothing -> Right Nothing
+    Just t -> do
+      to <- note "ulib.json: 'test' must be an object" (toObject t)
+      repo <- reqStr to "repo"
+      ref <- reqStr to "ref"
+      fidStr <- reqStr to "fidelity"
+      fidelity <- parseFidelity fidStr
+      testDeps <- optStrArray to "testDeps"
+      xfail <- optStrArray to "xfail"
+      let testMain = fromMaybe "Test.Main" (Object.lookup "testMain" to >>= toString)
+      pure (Just { repo, ref, testMain, testDeps, fidelity, xfail })
+  where
+  reqStr o k = note ("ulib.json: 'test." <> k <> "' must be a string") (Object.lookup k o >>= toString)
+  optStrArray o k = case Object.lookup k o of
+    Nothing -> Right []
+    Just v -> do
+      arr <- note ("ulib.json: 'test." <> k <> "' must be an array") (toArray v)
+      traverse (note ("ulib.json: 'test." <> k <> "' must contain only strings") <<< toString) arr
+  parseFidelity = case _ of
+    "js" -> Right JsFidelity
+    "native" -> Right NativeFidelity
+    "bespoke" -> Right BespokeFidelity
+    other -> Left ("ulib.json: 'test.fidelity' must be js|native|bespoke, got '" <> other <> "'")
+
+-- | The dependency names of a `bower.json` (the build config the upstream `purescript-*` repos ship),
+-- | with the conventional `purescript-` prefix stripped to the registry/package-set name
+-- | (`purescript-foldable-traversable` -> `foldable-traversable`). Absent field ⇒ none.
+parseBowerDependencies :: String -> Either String (Array String)
+parseBowerDependencies src = do
+  json <- jsonParser src
+  obj <- note "bower.json: top level is not an object" (toObject json)
+  case Object.lookup "dependencies" obj of
+    Nothing -> Right []
+    Just d -> do
+      deps <- note "bower.json: 'dependencies' must be an object" (toObject d)
+      Right (map stripPurescript (Object.keys deps))
+  where
+  stripPurescript name = fromMaybe name (String.stripPrefix (Pattern "purescript-") name)
+
+-- | The package-set registry version from a workspace `spago.yaml` (`registry: 77.8.0`).
+parseRegistryVersion :: String -> Maybe String
+parseRegistryVersion src =
+  Array.findMap registryOn (String.split (Pattern "\n") src)
+  where
+  registryOn line = String.trim <$> String.stripPrefix (Pattern "registry:") (String.trim line)
+
+-- | The repository slug of a git URL — its last path segment without a trailing `.git`
+-- | (`https://github.com/purescript/purescript-arrays` -> `purescript-arrays`). Used as a cache key.
+repoSlug :: String -> String
+repoSlug url =
+  let
+    segs = String.split (Pattern "/") url
+    last = fromMaybe url (Array.last segs)
+  in
+    fromMaybe last (String.stripSuffix (Pattern ".git") last)
 
 -- | The `dependencies` array of a `ulib.json` (absent field ⇒ no extra deps).
 parseDependencies :: String -> Either String (Array String)
