@@ -1,29 +1,34 @@
 # purvasm
 
-Purvasm is an experimental abstract machine and bytecode designed for interpreting/executing PureScript.
+Purvasm is an experimental abstract machine and bytecode format designed for interpreting and executing PureScript programs.
 
-The name purvasm comes from dual origin:
+The name *purvasm* has two origins:
 
-- *PureScript VM Assembler* -- so it's an bytecode **assembler** running on VM
-- *PureScript Viratual Asynchronous Stack Machine* -- so it's a **runtime** which executes PureScript with genuine parallel execution model
+* **PureScript VM Assembler** — referring to the bytecode assembler and compilation infrastructure.
+* **PureScript Virtual Asynchronous Stack Machine** — referring to the runtime architecture designed to execute PureScript with a truly parallel execution model.
 
-purvasm は virtual machine の名を冠しているが、これは歴史的な背景によるもので、現在のところ我々はネイティブをターゲットにしている。
+Although *purvasm* carries the name *virtual machine*, this is mostly for historical reasons. At present, our implementation targets native code generation.
 
 ## Roadmap
 
-- [x] Level 1:
-  - Implement Purvasm bytecode compiler in OCaml
-  - Implement native codegen in OCaml
-- [x] Level 2:
-  - Implement Purvasm bytecode compiler in PureScript
-- [x] Level 3:
-  - Compile Lv2 compiler with Lv1 booted compiler
-- [ ] Level4: 
-  - Compile Lv2 compiler with Lv3 compiler
+* [x] Level 1
 
-Currently, the second-half of Level 3 is working: **we successfully compiled the purvasm compiler codebase written in PureScript** into the bytecode object files with the Lv1-native purvasm compiler.
+  * Implement the Purvasm bytecode compiler in OCaml
+  * Implement native code generation in OCaml
+* [x] Level 2
 
-The Lv2, PureScript version codebase, has no optimization pass, so the Lv3 compiler is horribly slow - it takes over ten minutes to compile 227 modules. So clealy our next goal is optimization.
+  * Implement the Purvasm bytecode compiler in PureScript
+* [x] Level 3
 
-While the Lv1 compiler is able to emit native binary, it completely relies on ocamlopt. So the runtime including GC and the concurrent execution model -- which is our central goal -- is not achieved by our own hand.
-So after Lv2 optimization is done, out next goal is to implement the runtime system from scratch.
+  * Compile the Level 2 compiler using the bootstrapped Level 1 compiler
+* [ ] Level 4
+
+  * Compile the Level 2 compiler using the Level 3 compiler
+
+Currently, the latter half of Level 3 has been achieved: **we successfully compiled the Purvasm compiler codebase written in PureScript into bytecode object files using the Level 1 native Purvasm compiler.**
+
+The Level 2 compiler, which is implemented in PureScript, currently has no optimization passes. As a result, the Level 3 compiler is extremely slow — compiling 227 modules takes more than ten minutes. Therefore, our next goal is to improve optimization.
+
+Although the Level 1 compiler is capable of generating native binaries, it currently relies entirely on `ocamlopt` for code generation and runtime support. As a result, core components such as the runtime system, garbage collector, and concurrent execution model — which are central goals of this project — are not yet implemented by Purvasm itself.
+
+After completing optimization of the Level 2 compiler, our next objective is to implement the runtime system from scratch.

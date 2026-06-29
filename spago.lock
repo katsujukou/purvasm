@@ -92,6 +92,7 @@
             "maybe",
             "numbers",
             "prelude",
+            "purvasm-base",
             "strings",
             "tuples"
           ]

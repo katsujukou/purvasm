@@ -7,12 +7,25 @@ import Data.Either (Either(..), isLeft)
 import Data.String.Common (joinWith)
 import Data.Tuple (Tuple(..))
 import Json.Core.Parser (parse)
+import Purvasm.String as PS
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual, shouldSatisfy)
 import Test.Unit.Json.Core.Rep (TJ(..), builder)
 
 p :: String -> Either String TJ
 p = parse builder
+
+-- The parser yields a `String` of UTF-8 bytes (ADR-0006/0054). A non-ASCII PureScript string literal
+-- is a *different* byte sequence on the JS test backend (UTF-16) than on native (UTF-8), so a literal
+-- like `"é"` cannot be the expected value on both. Assert the canonical UTF-8 **bytes** instead —
+-- representation-faithful on either backend (ADR-0040).
+bytesOf :: String -> Array Int
+bytesOf s = let n = PS.byteLength s in if n <= 0 then [] else map (PS.byteAt s) (range 0 (n - 1))
+
+asBytes :: Either String TJ -> Either String (Array Int)
+asBytes = map case _ of
+  TStr s -> bytesOf s
+  _ -> [ -1 ]
 
 spec :: Spec Unit
 spec = describe "Json.Core.Parser" do
@@ -48,10 +61,12 @@ spec = describe "Json.Core.Parser" do
     it "parses simple escapes" do
       p "\"a\\nb\"" `shouldEqual` Right (TStr "a\nb")
       p "\"\\\"\\\\\\/\\b\\f\\r\\t\"" `shouldEqual` Right (TStr "\"\\/\x08\x0C\r\t")
-    it "parses BMP \\u escapes" do
-      p "\"\\u0041\\u00e9\"" `shouldEqual` Right (TStr "Aé")
-    it "combines a surrogate pair into one code point" do
-      p "\"\\uD83D\\uDE00\"" `shouldEqual` Right (TStr "\x1F600")
+    it "parses BMP \\u escapes to canonical UTF-8 bytes" do
+      asBytes (p "\"\\u0041\\u00e9\"") `shouldEqual` Right [ 0x41, 0xC3, 0xA9 ] -- A, é (U+00E9)
+    it "combines a surrogate pair into one supplementary code point (UTF-8 bytes)" do
+      asBytes (p "\"\\uD83D\\uDE00\"") `shouldEqual` Right [ 0xF0, 0x9F, 0x98, 0x80 ] -- U+1F600 😀
+    it "decodes an escaped object key" do
+      p "{\"a\\nb\":1}" `shouldEqual` Right (TObj [ Tuple "a\nb" (TNum 1.0) ])
     it "rejects bad strings" do
       p "\"ab" `shouldSatisfy` isLeft -- unterminated
       p "\"\\q\"" `shouldSatisfy` isLeft -- invalid escape

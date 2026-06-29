@@ -9,6 +9,7 @@ package:
     - lists
     - maybe
     - numbers
+    - purvasm-base
     - strings
     - tuples
   test:
