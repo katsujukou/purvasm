@@ -1,7 +1,17 @@
 # 0053. Association-array JSON objects on the CoreFn decode path — remove the `Foreign.Object`/`Data.Map` build that dominates `loadClosure`
 
-- Status: Accepted
+- Status: ~~Accepted~~ **Rejected** *(2026-06-29)*
 - Date: 2026-06-29
+
+> **Rejected (2026-06-29).** This record's own staged gate (step 0) refuted its premise *before* the
+> bespoke-decoder implementation: with only `jobject` changed to keep the association array, native
+> parse time did **not** move (argonaut/`Data.Map` ≈ assoc-array ≈ no-tree builders all parse in the
+> same time), so neither the assoc-array object representation nor parse-straight-to-CoreFn is on the
+> critical path. The real cost is the parser's code-point-array scanning floor; that is fixed by a
+> byte-oriented parser instead. Superseded in substance by **ADR-0054** (byte-oriented
+> `Json.Core.Parser`, accepted + implemented); evidence in
+> [sidenotes/0007](sidenotes/0007-loadclosure-parse-profiling.md). Rejected — not implemented — same
+> as ADR-0029. The original text is kept below as history.
 
 ## Context
 
