@@ -1,0 +1,110 @@
+name: PureScript-CI
+
+# Parallel to ocaml-ci.yaml (ADR-0057): same gate topology, applied to the `spago` workspace.
+# The workflow always triggers (no top-level `paths-ignore`) so that the required `ps-ci-gate`
+# status check is *always* produced — otherwise a PR touching only the OCaml/docs side would skip
+# the workflow, never report `ps-ci-gate`, and branch protection would leave the PR unmergeable.
+# The expensive Nix build is gated on whether the PureScript surface actually changed, so a
+# change elsewhere still skips the heavy build but the gate goes green.
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+# Cancel a superseded run when new commits land on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Decide whether the heavy build needs to run: true iff something on the PureScript surface
+  # changed. `ulib/**` is excluded — those are loose `.purs` patches compiled by `ulib-tools`,
+  # not part of the `spago` build (their build/verify/test path is ADR-0043/0048, not PR CI).
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'compiler/**'
+              - 'cli/**'
+              - 'cli-lib/**'
+              - 'packages/**'
+              - 'ulib/**'
+              - 'ulib-tools/**'
+              - 'spago.yaml'
+              - 'spago.lock'
+              - 'flake.nix'
+              - 'flake.lock'
+              - '.github/workflows/purescript-ci.yaml'
+
+  ci:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      # Setup Nix environment — identical to ocaml-ci.yaml so the toolchain (purs, spago,
+      # purs-tidy, node) comes from flake.nix + flake.lock as the single source of truth.
+      - uses: actions/checkout@v5
+      # v30 ships Nix >= 2.18, required by the pinned nixos-25.11 nixpkgs.
+      - uses: cachix/install-nix-action@v30
+        with:
+          # No nixpkgs channel pin here: the toolchain comes from `nix develop`,
+          # so flake.nix + flake.lock are the single source of truth.
+          extra_nix_config: experimental-features = nix-command flakes
+      - uses: cachix/cachix-action@v17
+        with:
+          name: katsujukou-github
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+      # Loads the `nix develop` environment (purs, spago, purs-tidy, node, …) into PATH for
+      # every `run:` step below.
+      - uses: nicknovitski/nix-develop@v1
+
+      # Build the whole spago workspace from the repo root (the workspace root).
+      - name: Build
+        run: spago build
+
+      # Each test-bearing package runs its single declared test main as a named step so a
+      # failure points at the suite. New `test:`-bearing packages are added here.
+      - name: Test (purvasm-json unit)
+        run: spago test -p purvasm-json -m Test.Unit.Json.Core
+
+      - name: Test (ulib-tools unit)
+        run: spago test -p ulib-tools -m Test.Unit.Purvasm.UlibTools
+
+      - name: Test (compiler unit)
+        run: spago test -p compiler -m Test.Unit.Purvasm.Compiler
+
+      # The byte-identity oracle: in-process and fixture-based, no boot shell-out.
+      - name: Test (compiler E2E)
+        run: spago test -p compiler -m Test.E2E.Purvasm.Compiler
+
+      # Fails if any tracked .purs is not purs-tidy-clean (profile pinned to purs-tidy-0.10.0 in
+      # flake.nix). `ulib/**` is excluded — those patches are formatted/verified by ulib-tools.
+      # The OCaml `dune build @fmt` equivalent. Enumerating tracked files avoids passing a
+      # non-existent `test/` path for the build-only packages.
+      - name: Format check
+        run: git ls-files '*.purs' | grep -v '^ulib/' | xargs purs-tidy check
+
+  # The single required status check. Always runs; green when `ci` passed OR was skipped
+  # (PureScript surface untouched), red when `ci` failed or was cancelled. Point branch
+  # protection at THIS job (`ps-ci-gate`), alongside OCaml-CI's `ci-gate`.
+  ps-ci-gate:
+    needs: [ci]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate on the ci result
+        run: |
+          result='${{ needs.ci.result }}'
+          if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+            echo "::error::PureScript CI did not pass (result: $result)"
+            exit 1
+          fi
+          echo "PureScript CI gate green (ci result: $result)"
