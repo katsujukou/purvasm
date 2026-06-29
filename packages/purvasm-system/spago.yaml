@@ -1,0 +1,6 @@
+package:
+  name: purvasm-system
+  dependencies:
+    - effect
+    - maybe
+    - prelude

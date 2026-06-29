@@ -1,0 +1,6 @@
+package:
+  name: purvasm-fs
+  dependencies:
+    - effect
+    - maybe
+    - prelude
