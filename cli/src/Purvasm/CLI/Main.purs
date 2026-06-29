@@ -18,7 +18,7 @@ main :: Effect Unit
 main = do
   cliArgs <- Array.drop 2 <$> Process.argv
   case Options.parse cliArgs of
-    Left err -> Console.error (ArgParser.printArgError err)
+    Left err -> Console.error (ArgParser.printArgError err) *> Process.exit' 1
     Right cmd -> runNode case cmd of
       Options.Compile opts -> Compile.cmd opts
       Options.Build opts -> Build.cmd opts
@@ -28,4 +28,4 @@ main = do
     res <- Node.runNode program
     case res of
       Right a -> pure a
-      Left err -> Console.error $ Fmt.fmt @"purvasm: {err}" { err }
+      Left err -> Console.error (Fmt.fmt @"purvasm: {err}" { err }) *> Process.exit' 1

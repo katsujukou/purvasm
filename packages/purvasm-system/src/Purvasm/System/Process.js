@@ -4,3 +4,5 @@
 import process from "node:process";
 
 export const argvImpl = () => process.argv.slice(1);
+
+export const exitImpl = (code) => () => process.exit(code);

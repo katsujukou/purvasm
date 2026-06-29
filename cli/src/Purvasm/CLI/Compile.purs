@@ -11,10 +11,12 @@ import Data.Maybe (maybe)
 import Fmt as Fmt
 import PureScript.CoreFn.Decode (decodeModule)
 import PureScript.CoreFn.Module (Module)
+import Purvasm.CLI.Effect.Env (ENV)
 import Purvasm.CLI.Effect.Filesystem (FS, FilePath)
 import Purvasm.CLI.Effect.Filesystem as FS
 import Purvasm.CLI.Effect.Log (LOG)
 import Purvasm.CLI.Effect.Log as Log
+import Purvasm.CLI.Ulib (corefnPathFor, requireUlibDir)
 import Purvasm.Compiler.Bytecode.Artifact (interfaceOf, interfaceToString, moduleToString)
 import Purvasm.Compiler.Compile (compileModule)
 import Run (Run, EFFECT)
@@ -52,10 +54,13 @@ options = ArgParser.fromRecord
 -- | Compile a single module to its `.pmo`/`.pmi` objects (boot's `purvm compile`):
 -- | read `<corefnDir>/<entryModule>/corefn.json`, decode it, run `compileModule`, and
 -- | write the artifacts (byte-identical to boot) under `<outDir>/_build`.
-cmd :: forall r. Options -> Run (LOG + FS + EXCEPT String + EFFECT + r) Unit
+cmd :: forall r. Options -> Run (ENV + LOG + FS + EXCEPT String + EFFECT + r) Unit
 cmd opts = do
   info $ Fmt.fmt @"Compiling {modname}" { modname: opts.targetModule }
-  let corefnPath = opts.corefnDir <> "/" <> opts.targetModule <> "/corefn.json"
+  -- Resolve the module through the `ulib` overlay first (the patched module wins, ADR-0055),
+  -- falling back to `--corefn-dir`. A missing overlay is a hard error (ADR-0055 correction).
+  ulibDir <- requireUlibDir
+  corefnPath <- corefnPathFor ulibDir opts.corefnDir opts.targetModule
   src <- FS.readText corefnPath >>= maybe
     (throw $ Fmt.fmt @"Failed to read corefn.json at {corefnPath}" { corefnPath })
     pure

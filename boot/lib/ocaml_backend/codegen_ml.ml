@@ -208,6 +208,7 @@ let foreign = function
     VClos (fun p -> VClos (fun c -> VClos (fun _ -> write_file (as_str p) (as_str c); VInt 0)))
   | "Purvasm.FS.mkdirRecImpl" -> VClos (fun p -> VClos (fun _ -> mkdir_p (as_str p); VInt 0))
   | "Purvasm.System.Process.argvImpl" -> VClos (fun _ -> VArray (Array.map (fun s -> VString s) Sys.argv))
+  | "Purvasm.System.Process.exitImpl" -> VClos (fun code -> VClos (fun _ -> exit (as_int code)))
   (* `getenvImpl :: String -> Effect String` (ADR-0055/0056): unset yields "", folded to `Nothing`
      by the `lookupEnv` wrapper. Lets the native binary read `PURVASM_LIB` to overlay the ulib. *)
   | "Purvasm.System.Env.getenvImpl" ->

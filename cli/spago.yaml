@@ -16,4 +16,6 @@ package:
     - node-fs
     - node-process
     - prelude
+    - purvasm-fs
+    - purvasm-system
     - run

@@ -18,10 +18,12 @@ import Data.Tuple.Nested (type (/\), (/\))
 import Fmt as Fmt
 import PureScript.CoreFn.Module (Module)
 import Purvasm.CLI.Compile (parseModule)
+import Purvasm.CLI.Effect.Env (ENV)
 import Purvasm.CLI.Effect.Filesystem (FS, FilePath)
 import Purvasm.CLI.Effect.Filesystem as FS
 import Purvasm.CLI.Effect.Log (LOG)
 import Purvasm.CLI.Effect.Log as Log
+import Purvasm.CLI.Ulib (corefnPathFor, requireUlibDir)
 import Purvasm.Compiler.Bytecode.Artifact (interfaceOf, interfaceToString, moduleToString)
 import Purvasm.Compiler.Bytecode.Image (imageToString)
 import Purvasm.Compiler.CESK.AST (Term(..))
@@ -63,14 +65,16 @@ importNames :: Module -> Array String
 importNames m = map (nameKey <<< _.moduleName) m.imports
 
 -- | Load the entry module and the transitive closure of its imports (boot's `Link.load`):
--- | a module whose `corefn.json` is absent (e.g. `Prim`) is simply skipped.
-loadClosure :: forall r. FilePath -> String -> Run (FS + EXCEPT String + r) (Map String Module)
-loadClosure corefnDir = go Map.empty
+-- | a module whose `corefn.json` is absent (e.g. `Prim`) is simply skipped. Each module is
+-- | resolved through the `ulib` overlay first (the patched module wins, ADR-0055), falling back
+-- | to `corefnDir`.
+loadClosure :: forall r. FilePath -> FilePath -> String -> Run (FS + EXCEPT String + r) (Map String Module)
+loadClosure ulibDir corefnDir = go Map.empty
   where
   go visited name
     | Map.member name visited = pure visited
     | otherwise = do
-        path <- FS.joinPath [ corefnDir, name, "corefn.json" ]
+        path <- corefnPathFor ulibDir corefnDir name
         FS.readText path >>= case _ of
           Nothing -> pure visited
           Just src -> case parseModule src of
@@ -98,10 +102,12 @@ depOrder mods = Array.fromFoldable (List.reverse (snd (foldl visit (Set.empty /\
 
 -- | Compile every module reachable from the entry to its `.pmo`/`.pmi`, in dependency
 -- | order. (Linking the closure into a single `app.pvm` is a later step.)
-cmd :: forall r. Options -> Run (LOG + FS + EXCEPT String + EFFECT + r) Unit
+cmd :: forall r. Options -> Run (ENV + LOG + FS + EXCEPT String + EFFECT + r) Unit
 cmd opts = do
   Log.info $ Fmt.fmt @"Building from entry {entry}" { entry: opts.entryModule }
-  mods <- loadClosure opts.corefnDir opts.entryModule
+  ulibDir <- requireUlibDir
+  Log.debug $ Fmt.fmt @"Overlaying patched ulib from {dir}" { dir: ulibDir }
+  mods <- loadClosure ulibDir opts.corefnDir opts.entryModule
   let artifacts = map compileModule (depOrder mods)
   buildDir <- FS.joinPath [ opts.outDir, "_build" ]
   FS.mkdirP buildDir

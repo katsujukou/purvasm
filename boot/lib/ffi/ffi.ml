@@ -805,6 +805,13 @@ let host : Cesk.Machine.host =
       (* `argvImpl :: Effect (Array String)` is itself the thunk: forcing it (applying unit)
          reads `Sys.argv` (element 0 is the executable, as on the native target). *)
       Some (1, fun _ -> V.VArray (Array.map (fun s -> V.VString s) Sys.argv))
+    | "Purvasm.System.Process.exitImpl" ->
+      (* `exitImpl :: Int -> Effect Unit`: forcing the thunk terminates the process. Does not
+         return — the `V.VInt 0` is unreachable, present only to satisfy the value type. *)
+      Some
+        (unary (function
+           | V.VInt code -> perform "exitImpl#perform" (fun () -> exit code)
+           | _ -> Cesk.Errors.stuck "exitImpl: not an Int"))
     | "Purvasm.System.Env.getenvImpl" ->
       (* `getenvImpl :: String -> Effect String` (ADR-0055/0056): the environment read used to find
          `PURVASM_LIB`. An unset variable yields "" — the `lookupEnv` wrapper folds "" to `Nothing`. *)
@@ -842,6 +849,7 @@ let effectful (key : string) : bool =
     ; "Purvasm.FS.writeTextImpl"
     ; "Purvasm.FS.mkdirRecImpl"
     ; "Purvasm.System.Process.argvImpl"
+    ; "Purvasm.System.Process.exitImpl"
     ; "Purvasm.System.Env.getenvImpl"
     ]
 

@@ -45,9 +45,43 @@ intDegree =
   TmLam "$0"
     (TmIf (TmPrim LtInt [ v "$0", intLit 0 ]) (TmPrim SubInt [ intLit 0, v "$0" ]) (v "$0"))
 
+-- | `Char` is `Int` (ADR-0006), so the char-code conversions are the identity.
+charId :: Term
+charId = TmLam "$0" (v "$0")
+
 intrinsics :: Map String Term
 intrinsics = Map.fromFoldable
-  [ "Data.Semiring.intAdd" /\ eta AddInt 2
+  -- The `purvasm-base` primitive layer (ADR-0038): `Purvasm.*` foreigns the backend recognises as
+  -- intrinsics — the seam the `ulib` reimplementations build on. Mirrors boot's `Ffi`; without
+  -- these the overlaid (patched-`ulib`) build's `Purvasm.Int.eq` etc. link to an unbound name.
+  -- NOTE: the `Int` bitwise family (`Purvasm.Int.{and,or,xor,shl,shr,zshr,complement}` and the
+  -- `Data.Int.Bits.*` foreigns) is deferred — it needs `PrimOp` constructors this compiler does not
+  -- yet have (boot's `AndInt`/`OrInt`/… ). Closures that use them are not yet faithfully linkable.
+  [ "Purvasm.Int.add" /\ eta AddInt 2
+  , "Purvasm.Int.sub" /\ eta SubInt 2
+  , "Purvasm.Int.mul" /\ eta MulInt 2
+  , "Purvasm.Int.eq" /\ eta EqInt 2
+  , "Purvasm.Int.lt" /\ eta LtInt 2
+  , "Purvasm.Int.div" /\ eta DivInt 2
+  , "Purvasm.Int.mod" /\ eta ModInt 2
+  -- Cross-representation conversions (ADR-0041): `Int`<->`Number` casts. `fromNumber` is `ToInt32`.
+  , "Purvasm.Int.toNumber" /\ eta IntToNumber 1
+  , "Purvasm.Int.fromNumber" /\ eta NumberToInt 1
+  , "Purvasm.Number.add" /\ eta AddNumber 2
+  , "Purvasm.Number.sub" /\ eta SubNumber 2
+  , "Purvasm.Number.mul" /\ eta MulNumber 2
+  , "Purvasm.Number.div" /\ eta DivNumber 2
+  , "Purvasm.Number.eq" /\ eta EqNumber 2
+  , "Purvasm.Number.lt" /\ eta LtNumber 2
+  , "Purvasm.Array.length" /\ eta LengthArray 1
+  , "Purvasm.Array.unsafeIndex" /\ eta IndexArray 2
+  , "Purvasm.Array.unsafeNew" /\ eta NewArray 1
+  , "Purvasm.Array.unsafeSet" /\ eta SetArray 3
+  , "Purvasm.Boolean.not" /\ eta NotBool 1
+  , "Purvasm.Char.toCodePoint" /\ charId
+  , "Purvasm.Char.fromCodePoint" /\ charId
+  -- stock-registry scalar leaves (used when building against stock, no-overlay corefn) --------
+  , "Data.Semiring.intAdd" /\ eta AddInt 2
   , "Data.Semiring.intMul" /\ eta MulInt 2
   , "Data.Semiring.numAdd" /\ eta AddNumber 2
   , "Data.Semiring.numMul" /\ eta MulNumber 2

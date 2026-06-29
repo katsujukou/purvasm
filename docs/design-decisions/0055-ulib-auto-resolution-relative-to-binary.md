@@ -43,9 +43,18 @@ The **launcher resolves `ulib` and passes it to purvasm through the subprocess e
   do it portably, independent of the (bootstrap) native runtime.
 - **purvasm reads `PURVASM_LIB`; it never self-locates.** The CLI's `ulib` directory is:
   `PURVASM_LIB` if set (the launcher sets it for npm; a developer sets it for a direct run), else a
-  **cwd-relative dev default** (`purvasm_lib`, else `dist/ulib`), else **none** — in which case the
+  **cwd-relative dev default** (`purvasm_lib`, else `dist/ulib`), else ~~**none** — in which case the
   build proceeds with no overlay and `log`s that it is un-overlaid (a bare-checkout dev run still
-  works). No `Sys.executable_name`, no new path-resolution leaf.
+  works)~~ **a hard build error** (see correction). No `Sys.executable_name`, no new path-resolution
+  leaf.
+
+  > **Correction (2026-06-29):** the no-overlay case is now a **build-time error**, not a silent
+  > un-overlaid build. Every intended invocation resolves `ulib` (the launcher sets `PURVASM_LIB`; a
+  > dev run finds `purvasm_lib`/`dist/ulib`), and a stock-corefn build links JS-only foreigns (e.g.
+  > `Data.Argonaut.Parser._jsonParser`) that are unbound at run — so failing fast at build time with
+  > `PURVASM_LIB is not set …` is far more actionable than a deep runtime "unbound" crash. No
+  > escape-hatch flag (YAGNI; boot's `purvm build` without `--ulib`, or pointing `PURVASM_LIB` at a
+  > stock dir, covers a deliberate un-overlaid build).
 - **A minimal environment read.** This re-introduces one environment capability the native
   interpreter dropped as unused (ADR-0045): a `getenv`-style leaf (`Sys.getenv_opt` in the bootstrap;
   `getenv` is a universal libc syscall, trivially provided by any future native backend — unlike
@@ -67,8 +76,10 @@ The **launcher resolves `ulib` and passes it to purvasm through the subprocess e
   **byte-identical to `purvm build --ulib …`** for the same closure (the patched argonaut is used; no
   `format_version` bump), and the produced `app.pvm` **runs** (no `_jsonParser`-stuck) — closing the
   gap this record opens.
-- **Degrade, don't crash.** With `PURVASM_LIB` unset and no dev default present, the build runs
-  un-overlaid with a clear log rather than failing.
+- ~~**Degrade, don't crash.** With `PURVASM_LIB` unset and no dev default present, the build runs
+  un-overlaid with a clear log rather than failing.~~ **Fail fast (correction 2026-06-29):** with
+  `PURVASM_LIB` unset and no dev default present, the build **errors** at build time
+  (`PURVASM_LIB is not set …`) rather than emitting an almost-certainly-broken un-overlaid artifact.
 - **No runtime-backend coupling.** Nothing in purvasm resolves its own path; the only environment
   dependency is `getenv`, which any native backend provides.
 - **No regression.** Existing `compile`/`build` and the Node entry stay green (unit/E2E).
