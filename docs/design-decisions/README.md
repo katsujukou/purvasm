@@ -94,7 +94,7 @@ language and are kept out of version control.)
 | [0045](0045-native-cli-run-interpreter-io-leaves.md) | A purvasm-native CLI entry: swap the `Run` interpreter to native IO leaves; never shadow `node-*` | Accepted |
 | [0046](0046-argonaut-core-pure-purescript-ulib.md) | JSON in pure PureScript: a backend-agnostic shared parse/print core, with `argonaut-core` as a `ulib` adapter over it | Accepted |
 | [0047](0047-ulib-package-manifest-extra-dependencies.md) | `ulib` package manifest: per-patch extra dependencies (in-repo or registry), with validation | Accepted |
-| [0048](0048-ulib-tools-test-upstream-suite-execution.md) | `ulib-tools test`: per-package upstream-suite execution, JS-fidelity first; native/bespoke deferred | Proposed |
+| [0048](0048-ulib-tools-test-upstream-suite-execution.md) | `ulib-tools test`: per-package upstream-suite execution, JS-fidelity first; native/bespoke deferred | Accepted |
 | [0049](0049-eliminate-superlinear-bytecode-construction.md) | Eliminate super-linear construction in bytecode lowering, match compilation, and link ordering | Accepted |
 | [0050](0050-build-streaming-incremental-reuse.md) | Level-2 `build`: per-module streaming orchestration and incremental artifact reuse | Proposed |
 | [0051](0051-flatten-json-serialization.md) | Flatten JSON serialization to a single join (the native serialize bottleneck) | Accepted |
@@ -102,5 +102,6 @@ language and are kept out of version control.)
 | [0053](0053-cheap-json-objects-corefn-decode.md) | Association-array JSON objects on the CoreFn decode path — remove the `Foreign.Object`/`Data.Map` build that dominates `loadClosure` | Rejected |
 | [0054](0054-byte-oriented-json-parser.md) | Byte-oriented `Json.Core.Parser`: scan UTF-8 bytes directly, eliminating the code-point-array parse floor | Accepted |
 | [0055](0055-ulib-auto-resolution-relative-to-binary.md) | Resolve `ulib` from `PURVASM_LIB` in the environment (set by the launcher) — no user flag, no binary self-location | Accepted |
+| [0056](0056-purvasm-system-host-leaves.md) | Two host-capability packages — `purvasm-system` (env, process) and `purvasm-fs` (file IO) — to retire the `Purvasm.CLI.Native.*` leaf names | Accepted |
 
 ## Scope
