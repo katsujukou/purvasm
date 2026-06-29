@@ -199,14 +199,19 @@ let foreign = function
     VClos (fun v -> VNumber (try float_of_string (as_str v) with _ -> Float.nan))
   | "Purvasm.Compiler.Bytecode.Image.floatBitsDecimalImpl" ->
     VClos (fun v -> VString (Int64.to_string (Int64.bits_of_float (as_num v))))
-  (* Native IO leaves for the purvasm-native CLI interpreter (ADR-0045); mirror `Ffi.host`.
-     Each returns an `Effect` thunk that performs the IO when forced. *)
-  | "Purvasm.CLI.Native.readTextImpl" -> VClos (fun p -> VClos (fun _ -> VString (read_file (as_str p))))
-  | "Purvasm.CLI.Native.existsImpl" -> VClos (fun p -> VClos (fun _ -> VBool (Sys.file_exists (as_str p))))
-  | "Purvasm.CLI.Native.writeTextImpl" ->
+  (* Host-system leaves (ADR-0022/0056); mirror `Ffi.host`. File IO (`purvasm-fs`, `Purvasm.FS.*`)
+     and process/environment (`purvasm-system`, `Purvasm.System.*`). Each returns an `Effect` thunk
+     that performs the IO when forced. *)
+  | "Purvasm.FS.readTextImpl" -> VClos (fun p -> VClos (fun _ -> VString (read_file (as_str p))))
+  | "Purvasm.FS.existsImpl" -> VClos (fun p -> VClos (fun _ -> VBool (Sys.file_exists (as_str p))))
+  | "Purvasm.FS.writeTextImpl" ->
     VClos (fun p -> VClos (fun c -> VClos (fun _ -> write_file (as_str p) (as_str c); VInt 0)))
-  | "Purvasm.CLI.Native.mkdirRecImpl" -> VClos (fun p -> VClos (fun _ -> mkdir_p (as_str p); VInt 0))
-  | "Purvasm.CLI.Native.argvImpl" -> VClos (fun _ -> VArray (Array.map (fun s -> VString s) Sys.argv))
+  | "Purvasm.FS.mkdirRecImpl" -> VClos (fun p -> VClos (fun _ -> mkdir_p (as_str p); VInt 0))
+  | "Purvasm.System.Process.argvImpl" -> VClos (fun _ -> VArray (Array.map (fun s -> VString s) Sys.argv))
+  (* `getenvImpl :: String -> Effect String` (ADR-0055/0056): unset yields "", folded to `Nothing`
+     by the `lookupEnv` wrapper. Lets the native binary read `PURVASM_LIB` to overlay the ulib. *)
+  | "Purvasm.System.Env.getenvImpl" ->
+    VClos (fun p -> VClos (fun _ -> VString (Option.value ~default:"" (Sys.getenv_opt (as_str p)))))
   | "Effect.Console.error" ->
     VClos (fun s -> VClos (fun _ -> prerr_string (as_str s); prerr_newline (); flush stderr; VInt 0))
   | k -> stuck ("unbound foreign: " ^ k)

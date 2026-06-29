@@ -768,21 +768,22 @@ let host : Cesk.Machine.host =
               Bytes.unsafe_set (Bytes.unsafe_of_string s) i (Char.chr (b land 0xff));
               V.VString s
             | _ -> Cesk.Errors.stuck "unsafeSetByte: ill-typed arguments" )
-    (* Native IO leaves for the purvasm-native CLI interpreter (ADR-0045): each returns an
-       `Effect` thunk that performs the IO when forced (the `Console.log` shape). *)
-    | "Purvasm.CLI.Native.readTextImpl" ->
+    (* Host-system leaves (ADR-0022/0056): file IO (`purvasm-fs`, `Purvasm.FS.*`) and
+       process/environment (`purvasm-system`, `Purvasm.System.*`). Each returns an `Effect`
+       thunk that performs the IO when forced (the `Console.log` shape). *)
+    | "Purvasm.FS.readTextImpl" ->
       Some
         (unary (function
            | V.VString path ->
              perform "readTextImpl#perform" (fun () -> V.VString (read_file path))
            | _ -> Cesk.Errors.stuck "readTextImpl: not a String"))
-    | "Purvasm.CLI.Native.existsImpl" ->
+    | "Purvasm.FS.existsImpl" ->
       Some
         (unary (function
            | V.VString path ->
              perform "existsImpl#perform" (fun () -> V.VBool (Sys.file_exists path))
            | _ -> Cesk.Errors.stuck "existsImpl: not a String"))
-    | "Purvasm.CLI.Native.writeTextImpl" ->
+    | "Purvasm.FS.writeTextImpl" ->
       Some
         ( 2
         , fun args ->
@@ -792,7 +793,7 @@ let host : Cesk.Machine.host =
                 write_file path contents;
                 V.VInt 0)
             | _ -> Cesk.Errors.stuck "writeTextImpl: ill-typed arguments" )
-    | "Purvasm.CLI.Native.mkdirRecImpl" ->
+    | "Purvasm.FS.mkdirRecImpl" ->
       Some
         (unary (function
            | V.VString path ->
@@ -800,10 +801,19 @@ let host : Cesk.Machine.host =
                mkdir_p path;
                V.VInt 0)
            | _ -> Cesk.Errors.stuck "mkdirRecImpl: not a String"))
-    | "Purvasm.CLI.Native.argvImpl" ->
+    | "Purvasm.System.Process.argvImpl" ->
       (* `argvImpl :: Effect (Array String)` is itself the thunk: forcing it (applying unit)
          reads `Sys.argv` (element 0 is the executable, as on the native target). *)
       Some (1, fun _ -> V.VArray (Array.map (fun s -> V.VString s) Sys.argv))
+    | "Purvasm.System.Env.getenvImpl" ->
+      (* `getenvImpl :: String -> Effect String` (ADR-0055/0056): the environment read used to find
+         `PURVASM_LIB`. An unset variable yields "" — the `lookupEnv` wrapper folds "" to `Nothing`. *)
+      Some
+        (unary (function
+           | V.VString name ->
+             perform "getenvImpl#perform" (fun () ->
+               V.VString (Option.value ~default:"" (Sys.getenv_opt name)))
+           | _ -> Cesk.Errors.stuck "getenvImpl: not a String"))
     | "Effect.Console.error" ->
       Some
         (unary (function
@@ -827,11 +837,12 @@ let effectful (key : string) : bool =
     key
     [ "Effect.Console.log"
     ; "Effect.Console.error"
-    ; "Purvasm.CLI.Native.readTextImpl"
-    ; "Purvasm.CLI.Native.existsImpl"
-    ; "Purvasm.CLI.Native.writeTextImpl"
-    ; "Purvasm.CLI.Native.mkdirRecImpl"
-    ; "Purvasm.CLI.Native.argvImpl"
+    ; "Purvasm.FS.readTextImpl"
+    ; "Purvasm.FS.existsImpl"
+    ; "Purvasm.FS.writeTextImpl"
+    ; "Purvasm.FS.mkdirRecImpl"
+    ; "Purvasm.System.Process.argvImpl"
+    ; "Purvasm.System.Env.getenvImpl"
     ]
 
 (** A native leaf's declared arity (the [host] entry's). The effect analysis needs the
