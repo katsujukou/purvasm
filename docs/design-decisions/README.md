@@ -103,5 +103,6 @@ language and are kept out of version control.)
 | [0054](0054-byte-oriented-json-parser.md) | Byte-oriented `Json.Core.Parser`: scan UTF-8 bytes directly, eliminating the code-point-array parse floor | Accepted |
 | [0055](0055-ulib-auto-resolution-relative-to-binary.md) | Resolve `ulib` from `PURVASM_LIB` in the environment (set by the launcher) — no user flag, no binary self-location | Accepted |
 | [0056](0056-purvasm-system-host-leaves.md) | Two host-capability packages — `purvasm-system` (env, process) and `purvasm-fs` (file IO) — to retire the `Purvasm.CLI.Native.*` leaf names | Accepted |
+| [0057](0057-purescript-ci.md) | PureScript-CI: a standalone `spago` build/test + `purs-tidy` gate parallel to OCaml-CI, under `nix develop`, with its own `ps-ci-gate` | Accepted |
 
 ## Scope
