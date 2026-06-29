@@ -20,6 +20,8 @@
             "node-fs",
             "node-process",
             "prelude",
+            "purvasm-fs",
+            "purvasm-system",
             "run"
           ]
         },
@@ -80,6 +82,19 @@
           "dependencies": []
         }
       },
+      "purvasm-fs": {
+        "path": "packages/purvasm-fs",
+        "core": {
+          "dependencies": [
+            "effect",
+            "maybe",
+            "prelude"
+          ]
+        },
+        "test": {
+          "dependencies": []
+        }
+      },
       "purvasm-json": {
         "path": "packages/purvasm-json",
         "core": {
@@ -103,6 +118,19 @@
             "spec",
             "spec-node"
           ]
+        }
+      },
+      "purvasm-system": {
+        "path": "packages/purvasm-system",
+        "core": {
+          "dependencies": [
+            "effect",
+            "maybe",
+            "prelude"
+          ]
+        },
+        "test": {
+          "dependencies": []
         }
       },
       "sample": {
