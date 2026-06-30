@@ -3,6 +3,10 @@
 - Status: Accepted
 - Date: 2026-06-30
 
+> **Progress (2026-06-30):** implemented — `ulib/arrays/Data.Array.ST.Partial.purs` (the two-line
+> shadow) plus the `arrays` `test` block. `verify` reports all four `arrays` modules interface-faithful
+> (`Data.Array.ST.Partial: ok`), and `ulib-tools test` now shows `arrays` and `enums` both PASS.
+
 ## Context
 
 [0039](0039-ulib-st-array-and-st-uncurried.md) reified the `ulib` `Data.Array.ST`'s `STArray` as an

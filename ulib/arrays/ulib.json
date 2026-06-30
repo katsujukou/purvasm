@@ -1,0 +1,14 @@
+{
+  "test": {
+    "repo": "https://github.com/purescript/purescript-arrays",
+    "ref": "v7.3.0",
+    "testMain": "Test.Main",
+    "testDeps": [
+      "assert",
+      "console",
+      "const"
+    ],
+    "fidelity": "js",
+    "xfail": []
+  }
+}
