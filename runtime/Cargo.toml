@@ -1,0 +1,14 @@
+[package]
+name = "purvasm-rt"
+version = "0.0.0"
+edition = "2021"
+description = "purvasm v1 native runtime (ADR-0063/0064): the owned allocator, GC, and value ABI"
+publish = false
+
+[lib]
+# v1: a plain lib for bring-up + unit tests. It becomes a `staticlib` to link with the
+# LLVM-codegen output once the codegen lands (ADR-0060/0064).
+
+[profile.release]
+# The runtime is unsafe-heavy; keep overflow checks on until the differential is trusted.
+overflow-checks = true
