@@ -1,0 +1,8 @@
+{
+  "dependencies": ["purvasm-stdio"],
+  "test": {
+    "repo": "https://github.com/purescript/purescript-console",
+    "ref": "v6.1.0",
+    "fidelity": "js"
+  }
+}
