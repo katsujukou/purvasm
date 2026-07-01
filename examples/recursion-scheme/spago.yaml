@@ -1,0 +1,7 @@
+package:
+  name: ex-recursion-scheme
+  dependencies:
+    - console
+    - effect
+    - fmt
+    - prelude

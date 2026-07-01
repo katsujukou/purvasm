@@ -73,6 +73,46 @@
           ]
         }
       },
+      "ex-fib": {
+        "path": "examples/fib",
+        "core": {
+          "dependencies": [
+            "console",
+            "effect",
+            "prelude"
+          ]
+        },
+        "test": {
+          "dependencies": []
+        }
+      },
+      "ex-helloworld": {
+        "path": "examples/helloworld",
+        "core": {
+          "dependencies": [
+            "console",
+            "effect",
+            "prelude"
+          ]
+        },
+        "test": {
+          "dependencies": []
+        }
+      },
+      "ex-recursion-scheme": {
+        "path": "examples/recursion-scheme",
+        "core": {
+          "dependencies": [
+            "console",
+            "effect",
+            "fmt",
+            "prelude"
+          ]
+        },
+        "test": {
+          "dependencies": []
+        }
+      },
       "purvasm-base": {
         "path": "packages/purvasm-base",
         "core": {
@@ -126,19 +166,6 @@
           "dependencies": [
             "effect",
             "maybe",
-            "prelude"
-          ]
-        },
-        "test": {
-          "dependencies": []
-        }
-      },
-      "sample": {
-        "path": "sample",
-        "core": {
-          "dependencies": [
-            "console",
-            "effect",
             "prelude"
           ]
         },

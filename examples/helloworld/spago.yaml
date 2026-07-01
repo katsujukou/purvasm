@@ -1,0 +1,6 @@
+package:
+  name: ex-helloworld
+  dependencies:
+    - console
+    - effect
+    - prelude

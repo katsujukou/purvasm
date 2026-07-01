@@ -1,0 +1,6 @@
+package:
+  name: ex-fib
+  dependencies:
+    - console
+    - effect
+    - prelude
