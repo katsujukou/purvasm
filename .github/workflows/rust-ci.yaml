@@ -1,0 +1,99 @@
+name: Rust-CI
+
+# Parallel to ocaml-ci.yaml / purescript-ci.yaml (ADR-0057 gate topology), applied to the Rust
+# runtime crate under `runtime/` (ADR-0063/0064). The workflow always triggers (no top-level
+# `paths-ignore`) so that the required `rust-ci-gate` status check is *always* produced — otherwise a
+# PR touching only the OCaml/PureScript/docs side would skip the workflow, never report
+# `rust-ci-gate`, and branch protection would leave the PR unmergeable. The expensive Nix build is
+# gated on whether the Rust surface actually changed, so a change elsewhere still skips the heavy
+# build but the gate goes green.
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+# Cancel a superseded run when new commits land on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Decide whether the heavy build needs to run: true iff something on the Rust surface changed.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'runtime/**'
+              - 'flake.nix'
+              - 'flake.lock'
+              - '.github/workflows/rust-ci.yaml'
+
+  ci:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      # Setup Nix environment — identical to ocaml-ci.yaml / purescript-ci.yaml so the toolchain
+      # (rustc, cargo, rustfmt, clippy) comes from flake.nix + flake.lock as the single source of
+      # truth.
+      - uses: actions/checkout@v5
+      # v30 ships Nix >= 2.18, required by the pinned nixos-25.11 nixpkgs.
+      - uses: cachix/install-nix-action@v30
+        with:
+          # No nixpkgs channel pin here: the toolchain comes from `nix develop`,
+          # so flake.nix + flake.lock are the single source of truth.
+          extra_nix_config: experimental-features = nix-command flakes
+      - uses: cachix/cachix-action@v17
+        with:
+          name: katsujukou-github
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+      # Loads the `nix develop` environment (rustc, cargo, rustfmt, clippy, …) into PATH for every
+      # `run:` step below.
+      - uses: nicknovitski/nix-develop@v1
+
+      # Build, test, format-check, and lint the runtime crate under runtime/.
+      - name: Build
+        run: cargo build
+        working-directory: runtime
+
+      # `cargo test` runs in debug, so the `#[cfg(debug_assertions)]` invariant tests (size-0 header,
+      # invalid code point, 63-bit overflow) are exercised.
+      - name: Test
+        run: cargo test
+        working-directory: runtime
+
+      # Fails if any file is not rustfmt-clean. The OCaml `dune build @fmt` / PureScript `purs-tidy
+      # check` equivalent.
+      - name: Format check
+        run: cargo fmt --all -- --check
+        working-directory: runtime
+
+      # Deny all clippy warnings — the unsafe-heavy runtime is held to a clean lint bar from the start.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+        working-directory: runtime
+
+  # The single required status check. Always runs; green when `ci` passed OR was skipped (Rust
+  # surface untouched), red when `ci` failed or was cancelled. Point branch protection at THIS job
+  # (`rust-ci-gate`), alongside OCaml-CI's `ci-gate` and PureScript-CI's `ps-ci-gate`.
+  rust-ci-gate:
+    needs: [ci]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate on the ci result
+        run: |
+          result='${{ needs.ci.result }}'
+          if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+            echo "::error::Rust CI did not pass (result: $result)"
+            exit 1
+          fi
+          echo "Rust CI gate green (ci result: $result)"
