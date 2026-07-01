@@ -35,6 +35,10 @@ use core::ptr::NonNull;
 /// - [`Array`](Kind::Array): `[slot: value; n]` — a value-slot array (`size == n`). PureScript
 ///   `Array`, a closure's shared env block, and a record's value array all use this kind. (The
 ///   empty-array singleton is deferred.)
+/// - [`RawIds`](Kind::RawIds): `[count: raw] [id: raw; count]` — a `Record`'s sorted FNV-1a-64 label
+///   ids (ADR-0069). **All-raw** (no value slots): the collector moves the object but never
+///   interprets its words. The `count` word lets it carry its length; an empty record stores no
+///   `RawIds` (an immediate sentinel in the `Record` slots instead).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum Kind {
@@ -47,6 +51,7 @@ pub enum Kind {
     Ref = 6,
     ByNeed = 7,
     Array = 8,
+    RawIds = 9,
 }
 
 impl Kind {
@@ -63,6 +68,7 @@ impl Kind {
             6 => Some(Kind::Ref),
             7 => Some(Kind::ByNeed),
             8 => Some(Kind::Array),
+            9 => Some(Kind::RawIds),
             _ => None,
         }
     }
@@ -268,7 +274,8 @@ mod tests {
         assert_eq!(Kind::from_u8(0), Some(Kind::Adt));
         assert_eq!(Kind::from_u8(7), Some(Kind::ByNeed));
         assert_eq!(Kind::from_u8(8), Some(Kind::Array));
-        assert_eq!(Kind::from_u8(9), None);
+        assert_eq!(Kind::from_u8(9), Some(Kind::RawIds));
+        assert_eq!(Kind::from_u8(10), None);
         assert_eq!(Kind::from_u8(255), None);
     }
 }

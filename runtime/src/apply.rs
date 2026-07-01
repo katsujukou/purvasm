@@ -65,6 +65,20 @@ impl Heap {
             // (and avoids re-walking the object-start check on every field — see the tier note in
             // `gc`). The `header_unchecked` read is what `checked_ptr` licensed.
             match self.header_unchecked(p).kind() {
+                // A by-need callee (a projected dictionary member used as a function) is forced, then
+                // re-dispatched on the forced value (ADR-0070 §3). `force` is a safepoint, so the
+                // in-flight `args` are rooted across it and reloaded (`f` is replaced by the result).
+                Kind::ByNeed => {
+                    let frame = self.frame();
+                    let mut arg_roots: Vec<Root> = Vec::with_capacity(args.len());
+                    for a in &args {
+                        arg_roots.push(self.root(*a));
+                    }
+                    let forced = self.force(f);
+                    args = arg_roots.iter().map(|r| self.get(*r)).collect();
+                    self.pop_frame(frame);
+                    f = forced;
+                }
                 // A PAP flattens to its underlying function applied to (captured ++ args); re-dispatch
                 // that as a closure. `remaining_arity` (payload word 1) is redundant here — the
                 // closure's own arity drives the split — so it is not read.

@@ -26,6 +26,11 @@ use core::ptr::NonNull;
 /// Bytes per heap word.
 const WORD: usize = core::mem::size_of::<u64>();
 
+/// `ByNeed` cell `state` word (ADR-0070 §1). `pub(crate)`: shared with the `force` operation.
+pub(crate) const BYNEED_UNFORCED: u64 = 0;
+pub(crate) const BYNEED_BUILDING: u64 = 1;
+pub(crate) const BYNEED_FORCED: u64 = 2;
+
 /// A single-capability local heap with two equal semi-spaces (ADR-0064 §5).
 ///
 /// Each semi-space is a raw allocation reached through a **single stable base pointer** whose
@@ -87,6 +92,15 @@ pub(crate) struct Root {
 #[derive(Clone, Copy)]
 pub(crate) struct RootFrame {
     len: usize,
+}
+
+/// A validated view of a `Record` (ADR-0069 §3): its field count and, when non-empty, the `RawIds`
+/// and value-`Array` pointers. Valid only until the next allocation — the pointers are not rooted, so
+/// a caller reads what it needs *before* allocating.
+pub(crate) struct RecordView {
+    pub count: usize,
+    pub ids: Option<HeapPtr>,
+    pub vals: Option<HeapPtr>,
 }
 
 impl Heap {
@@ -425,6 +439,172 @@ impl Heap {
         let bytes =
             unsafe { core::slice::from_raw_parts((s.as_ptr() as *const u8).add(2 * WORD), len) };
         String::from_utf8(bytes.to_vec()).expect("Str invariant: valid UTF-8")
+    }
+
+    // --- records (ADR-0069) -------------------------------------------------
+
+    /// A `RawIds` object of the sorted label `ids` — `[count][id; count]` (ADR-0069 §1). Non-empty
+    /// here (`count >= 1`; the empty record stores no `RawIds`). No `Value` input (ids are raw
+    /// `u64`s), so nothing to root across the allocation.
+    fn new_rawids(&mut self, ids: &[u64]) -> HeapPtr {
+        let p = self.alloc(Kind::RawIds, 1 + ids.len() as u64, Color::White);
+        self.write_raw_unchecked(p, 0, ids.len() as u64);
+        for (i, id) in ids.iter().enumerate() {
+            self.write_raw_unchecked(p, 1 + i as u64, *id);
+        }
+        p
+    }
+
+    /// The `i`-th label id of a **validated** `RawIds` (`i < count`). `pub(crate)`; the caller
+    /// validated the `RawIds` (e.g. via [`checked_record`](Heap::checked_record)).
+    #[inline]
+    pub(crate) fn rawids_id(&self, p: HeapPtr, i: usize) -> u64 {
+        self.read_raw_unchecked(p, 1 + i as u64)
+    }
+
+    /// A `Record` from parallel sorted `ids` and `values` (ADR-0069 §1). `ids` must be **strictly
+    /// ascending** and equal in length to `values`. The **empty** record stores the `unit` sentinel
+    /// in both slots (no zero-length object). Self-rooting (ADR-0066 §3).
+    pub fn new_record(&mut self, ids: &[u64], values: &[TaggedWord]) -> HeapPtr {
+        assert_eq!(
+            ids.len(),
+            values.len(),
+            "new_record: ids/values length mismatch"
+        );
+        assert!(
+            ids.windows(2).all(|w| w[0] < w[1]),
+            "new_record: ids must be strictly ascending"
+        );
+        if ids.is_empty() {
+            let p = self.alloc(Kind::Record, 2, Color::White);
+            self.write_field_unchecked(p, 0, TaggedWord::unit());
+            self.write_field_unchecked(p, 1, TaggedWord::unit());
+            return p;
+        }
+        let frame = self.frame();
+        let varr = self.new_array(values); // self-roots `values` across its own allocation
+        let vr = self.root(varr.as_word());
+        let rawids = self.new_rawids(ids); // `varr` is rooted, so it survives a collection here
+        let ir = self.root(rawids.as_word());
+        let p = self.alloc(Kind::Record, 2, Color::White);
+        let ids_w = self.get(ir);
+        let vals_w = self.get(vr);
+        self.write_field_unchecked(p, 0, ids_w);
+        self.write_field_unchecked(p, 1, vals_w);
+        self.pop_frame(frame);
+        p
+    }
+
+    /// Release-validate a `Record`'s shape and return a [`RecordView`] (ADR-0069 §3, the `str_read`
+    /// safety pattern). Rejects a non-`Record`, a mixed empty/non-empty slot pair, a wrong `RawIds`
+    /// or value kind, a `count`/length mismatch, and non-strictly-ascending ids — so a record
+    /// corrupted through the public `write_*` API faults here, never driving an out-of-bounds read.
+    pub(crate) fn checked_record(&self, rec: TaggedWord) -> RecordView {
+        let rp = self.checked_ptr(rec);
+        assert_eq!(
+            self.header_unchecked(rp).kind(),
+            Kind::Record,
+            "checked_record: not a Record"
+        );
+        let ids_slot = self.read_field_unchecked(rp, 0);
+        let vals_slot = self.read_field_unchecked(rp, 1);
+        if ids_slot.is_immediate() {
+            // Empty record: both slots must be *exactly* the `unit` sentinel (ADR-0069 §1), not any
+            // immediate — so a record corrupted via the public `write_field` (a non-`unit` immediate,
+            // or a mixed sentinel/pointer pair) faults rather than being read as empty.
+            assert!(
+                ids_slot == TaggedWord::unit() && vals_slot == TaggedWord::unit(),
+                "corrupt Record: empty-record slots must both be the unit sentinel"
+            );
+            return RecordView {
+                count: 0,
+                ids: None,
+                vals: None,
+            };
+        }
+        let ip = self.checked_ptr(ids_slot);
+        assert_eq!(
+            self.header_unchecked(ip).kind(),
+            Kind::RawIds,
+            "corrupt Record: label_ids is not RawIds"
+        );
+        let vp = self.checked_ptr(vals_slot);
+        assert_eq!(
+            self.header_unchecked(vp).kind(),
+            Kind::Array,
+            "corrupt Record: values is not an Array"
+        );
+        let count = self.read_raw_unchecked(ip, 0) as usize;
+        assert_eq!(
+            count,
+            self.header_unchecked(ip).size_words() as usize - 1,
+            "corrupt RawIds: count word disagrees with size"
+        );
+        assert_eq!(
+            self.header_unchecked(vp).size_words() as usize,
+            count,
+            "corrupt Record: values length != id count"
+        );
+        assert!(
+            count >= 1,
+            "corrupt Record: non-sentinel record with count 0"
+        );
+        for i in 1..count {
+            assert!(
+                self.rawids_id(ip, i) > self.rawids_id(ip, i - 1),
+                "corrupt Record: ids not strictly ascending"
+            );
+        }
+        RecordView {
+            count,
+            ids: Some(ip),
+            vals: Some(vp),
+        }
+    }
+
+    // --- by-need cells (ADR-0070) -------------------------------------------
+
+    /// A by-need cell `[state][result]` holding `suspension` (a nullary thunk closure) in the
+    /// `Unforced` state (ADR-0070 §1). The **public** entry: the cell is born with its real
+    /// suspension. Self-rooting (ADR-0066 §3).
+    pub fn new_byneed(&mut self, suspension: TaggedWord) -> HeapPtr {
+        let frame = self.frame();
+        let sr = self.root(suspension);
+        let p = self.alloc(Kind::ByNeed, 2, Color::White);
+        self.write_raw_unchecked(p, 0, BYNEED_UNFORCED);
+        let s = self.get(sr);
+        self.write_field_unchecked(p, 1, s);
+        self.pop_frame(frame);
+        p
+    }
+
+    /// A **placeholder** by-need cell (`Unforced`, `result` = `unit`) for the `Grec` builder
+    /// (ADR-0070 §4). Its real suspension — which must capture the group's `env`, which holds the
+    /// cells — is backpatched by [`byneed_set_suspension`](Heap::byneed_set_suspension) once `env` is
+    /// complete. `pub(crate)`: builder-internal, kept off the public API so `new_byneed`'s
+    /// born-with-its-suspension invariant stays clean. No `Value` input.
+    ///
+    /// `#[allow(dead_code)]`: the `Grec` builder that calls this is emitted by codegen (not yet
+    /// present); v1 exercises it only from the by-need recursive-group tests.
+    #[allow(dead_code)]
+    pub(crate) fn new_byneed_placeholder(&mut self) -> HeapPtr {
+        let p = self.alloc(Kind::ByNeed, 2, Color::White);
+        self.write_raw_unchecked(p, 0, BYNEED_UNFORCED);
+        self.write_field_unchecked(p, 1, TaggedWord::unit());
+        p
+    }
+
+    /// Backpatch a placeholder cell's suspension (`Grec` builder only; the cell must still be
+    /// `Unforced`). A plain value-slot store — it does **not** force the suspension (ADR-0070 §4).
+    /// `#[allow(dead_code)]` for the same reason as [`new_byneed_placeholder`](Heap::new_byneed_placeholder).
+    #[allow(dead_code)]
+    pub(crate) fn byneed_set_suspension(&mut self, cell: HeapPtr, suspension: TaggedWord) {
+        debug_assert_eq!(
+            self.read_raw_unchecked(cell, 0),
+            BYNEED_UNFORCED,
+            "byneed_set_suspension: cell is not Unforced"
+        );
+        self.write_field_unchecked(cell, 1, suspension);
     }
 
     // --- field access -------------------------------------------------------
@@ -806,9 +986,9 @@ fn value_slot_ranges(kind: Kind, size: u64) -> [(u64, u64); 2] {
     match kind {
         // [tag: raw] ++ [field: value; ..]
         Kind::Adt => [(1, size), (0, 0)],
-        // [label_ids: value ptr → raw-id array] [values: value ptr → value array] — both fields are
-        // pointers the collector traces (the pointed-to arrays are separate objects; `new_record`
-        // and the raw-id-array kind are deferred).
+        // [label_ids: value → RawIds | unit sentinel] [values: value → Array | unit sentinel] — both
+        // slots are traced (a pointer to a separate object, or an immediate sentinel for the empty
+        // record; ADR-0064 §2 / ADR-0069).
         Kind::Record => [(0, 2), (0, 0)],
         // [code: raw] [arity: raw] [env: value ptr → shared env block] — env is ONE value slot (the
         // pointer); captures live in the separate env `Array`, scanned there (ADR-0059 §1).
@@ -825,6 +1005,8 @@ fn value_slot_ranges(kind: Kind, size: u64) -> [(u64, u64); 2] {
         Kind::ByNeed => [(1, 2), (0, 0)],
         // [slot: value; n] — every slot is a value slot.
         Kind::Array => [(0, size), (0, 0)],
+        // [count: raw] [id: raw; count] — a Record's sorted label ids (ADR-0069); all raw.
+        Kind::RawIds => [(0, 0), (0, 0)],
     }
 }
 
@@ -1163,6 +1345,45 @@ mod tests {
     fn new_str_rejects_invalid_utf8() {
         let mut h = Heap::new(16);
         let _ = h.new_str(&[0xff, 0xfe]); // not valid UTF-8
+    }
+
+    #[test]
+    fn new_record_with_boxed_values_survives_collection() {
+        // A `Record` traces `[label_ids → RawIds (raw, skipped)][values → Array]`; the boxed `Number`
+        // values must relocate intact while the `RawIds` bytes are moved but never interpreted.
+        let mut h = Heap::new(64);
+        let a = h.new_number(1.5);
+        let b = h.new_number(2.5);
+        let r = h.new_record(&[10, 20], &[a.as_word(), b.as_word()]);
+        let mut roots = [r.as_word()];
+        h.collect(&mut roots);
+        let r2 = unsafe { HeapPtr::from_word(roots[0]) }.as_word();
+        assert_eq!(h.checked_record(r2).count, 2);
+        let v10 = unsafe { HeapPtr::from_word(h.record_get(r2, 10)) };
+        assert_eq!(f64::from_bits(h.read_raw(v10, 0)), 1.5);
+        let v20 = unsafe { HeapPtr::from_word(h.record_get(r2, 20)) };
+        assert_eq!(f64::from_bits(h.read_raw(v20, 0)), 2.5);
+    }
+
+    #[test]
+    fn new_record_empty_uses_sentinels() {
+        let mut h = Heap::new(16);
+        let e = h.new_record(&[], &[]);
+        assert_eq!(h.header(e).kind(), Kind::Record);
+        assert!(h.read_field(e, 0).is_immediate()); // label_ids sentinel
+        assert!(h.read_field(e, 1).is_immediate()); // values sentinel
+        assert_eq!(h.checked_record(e.as_word()).count, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "unit sentinel")]
+    fn checked_record_rejects_non_unit_empty_slot() {
+        // A record corrupted via the public `write_field` to hold a non-`unit` immediate must not be
+        // read as empty (ADR-0069 §1: the empty record is *exactly* the `unit` sentinel in both slots).
+        let mut h = Heap::new(16);
+        let e = h.new_record(&[], &[]);
+        h.write_field(e, 0, TaggedWord::int(1)); // corrupt the label_ids slot
+        let _ = h.checked_record(e.as_word());
     }
 
     #[test]

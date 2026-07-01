@@ -19,16 +19,21 @@
 //! (ADR-0066): a `Heap`-owned shadow stack ([`Heap::root`]/[`Heap::get`]/[`Heap::frame`]) with
 //! self-rooting constructors, so `alloc` **collects on overflow and retries** (GC-on-alloc), and
 //! **`Effect` execution** ([`Heap::run_effect`], the `Ref` leaves, `Str` + a generic stdio write-line
-//! leaf, ADR-0067). The C-ABI / native FFI boundary, the direct known-arity fast path, and the by-need
-//! recursive-CAF (`ByNeed`) force needed by full compiled programs land in following increments.
+//! leaf, ADR-0067), **dynamic Records** ([`Heap::new_record`] + [`record`], ADR-0069:
+//! `get`/`insert`/`set`/`delete`/`modify` on the hash-id layout), and **by-need recursive CAFs**
+//! ([`Heap::force`] + [`byneed`], ADR-0070: the `ByNeed` 3-state memoising suspension that unblocks the
+//! recursive `Monad Effect` dictionary). The C-ABI / native FFI boundary and the direct known-arity
+//! fast path land in following increments.
 //!
 //! Scope reminder (ADR-0064 §0): v1 is **single-capability, sequential, 64-bit, boot-parity**; the
 //! whole cross-capability side is v2.
 
 pub mod apply;
+pub mod byneed;
 pub mod effect;
 pub mod gc;
 pub mod heap;
+pub mod record;
 pub mod word;
 
 pub use apply::CodeFn;
