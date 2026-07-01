@@ -9,6 +9,7 @@ _build
 /output-purvm
 /output-lv3
 /dist
+/target
 /.ulib-test-cache
 /cli/bin
 purvasm_lib

@@ -81,19 +81,50 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
         working-directory: runtime
 
-  # The single required status check. Always runs; green when `ci` passed OR was skipped (Rust
-  # surface untouched), red when `ci` failed or was cancelled. Point branch protection at THIS job
-  # (`rust-ci-gate`), alongside OCaml-CI's `ci-gate` and PureScript-CI's `ps-ci-gate`.
+  # Miri interprets the unsafe GC island for Undefined Behaviour (ADR-0063 §4) — out-of-bounds,
+  # use-after-free, invalid transmutes, aliasing (Stacked Borrows). A separate job from `ci` because
+  # it needs the nightly `.#miri` devShell (nixpkgs stable `rustc` ships no `miri`), and runs in
+  # parallel with build/test/clippy so it does not serialise behind them.
+  miri:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
+      # Caches the nightly toolchain derivations (oxalica/rust-overlay) so only the first run builds
+      # them; the `cargo miri setup` checked-sysroot compile still runs each time (a cargo artifact,
+      # not a nix store path).
+      - uses: cachix/cachix-action@v17
+        with:
+          name: katsujukou-github
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+      # Runs in the `.#miri` shell (nightly + miri), NOT the default stable shell, so it is invoked
+      # directly rather than via nicknovitski/nix-develop. `nix develop` resolves the flake at the
+      # repo root, so `cd runtime` happens inside the command. Default (permissive/exposed) provenance
+      # is intentional: the tagged-word ABI does int↔pointer casts, which `-Zmiri-strict-provenance`
+      # would flag as false failures; default Miri still catches genuine UB.
+      - name: Miri (unsafe GC island — ADR-0063 §4)
+        run: nix develop .#miri --command sh -c 'cd runtime && cargo miri test'
+
+  # The single required status check. Always runs; green when `ci` + `miri` passed OR were skipped
+  # (Rust surface untouched), red when either failed or was cancelled. Point branch protection at THIS
+  # job (`rust-ci-gate`), alongside OCaml-CI's `ci-gate` and PureScript-CI's `ps-ci-gate`.
   rust-ci-gate:
-    needs: [ci]
+    needs: [ci, miri]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Gate on the ci result
+      - name: Gate on the ci + miri results
         run: |
-          result='${{ needs.ci.result }}'
-          if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
-            echo "::error::Rust CI did not pass (result: $result)"
-            exit 1
-          fi
-          echo "Rust CI gate green (ci result: $result)"
+          ci='${{ needs.ci.result }}'
+          miri='${{ needs.miri.result }}'
+          for r in "$ci" "$miri"; do
+            if [ "$r" = "failure" ] || [ "$r" = "cancelled" ]; then
+              echo "::error::Rust CI did not pass (ci=$ci miri=$miri)"
+              exit 1
+            fi
+          done
+          echo "Rust CI gate green (ci=$ci miri=$miri)"

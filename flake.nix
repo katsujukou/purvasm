@@ -6,17 +6,33 @@
       url = "github:thomashoneyman/purescript-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # Nightly Rust with the `miri` component for the ADR-0063 §4 island check — stable nixpkgs
+    # `rustc` provides neither nightly nor `miri`. Only the `miri` devShell uses it; the default
+    # shell stays on stable nixpkgs `rustc`.
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
  };
 
-  outputs = { self, nixpkgs, flake-utils, purescript-overlay }:
+  outputs = { self, nixpkgs, flake-utils, purescript-overlay, rust-overlay }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
           inherit system;
           overlays = [
             purescript-overlay.overlays.default
+            rust-overlay.overlays.default
           ];
         };
+
+        # A nightly toolchain carrying `miri` + `rust-src` (the latter lets `cargo miri setup`
+        # build a checked std). `selectLatestNightlyWith` picks the newest nightly on which every
+        # requested component actually exists, so it never lands on a day `miri` was missing.
+        rustNightlyMiri = pkgs.rust-bin.selectLatestNightlyWith
+          (toolchain: toolchain.default.override {
+            extensions = [ "miri" "rust-src" ];
+          });
 
         # Override the OCaml packages to set `dontStrip = true` for `wasm_of_ocaml-compiler`.
         ocamlPackages = pkgs.ocaml-ng.ocamlPackages_5_3.overrideScope
@@ -78,6 +94,23 @@
               clang
               lld
             ]);
+          };
+
+          # Miri-only shell for the ADR-0063 §4 unsafe-island check (nightly + `miri`). Kept separate
+          # from `default` so the everyday stable toolchain is untouched. Usage:
+          #   nix develop .#miri -c sh -c 'cd runtime && cargo miri test'
+          #
+          # Provenance mode: run under Miri's DEFAULT (exposed/permissive) provenance — do NOT set
+          # `-Zmiri-strict-provenance`. The tagged-word ABI (ADR-0064 §1) round-trips heap pointers
+          # through integers on purpose, so strict provenance would report the int↔pointer tagging as
+          # false failures. "Miri clean" here = no real UB (out-of-bounds, use-after-free, bad
+          # transmutes, Stacked-Borrows aliasing); one expected "integer-to-pointer cast" WARNING
+          # remains and is fine. See ADR-0063 §4.
+          devShells.miri = pkgs.mkShellNoCC {
+            buildInputs = [ rustNightlyMiri ];
+            shellHook = ''
+              echo "nightly + miri ready — run: (cd runtime && cargo miri test)"
+            '';
           };
         }
     );
