@@ -153,6 +153,14 @@ heap fields as tagged words, **the GC scans by checking each field's tag bit; no
 (the reason OCaml's collector is simple). An ADT's constructor index lives in the header (or is
 pointer-tagged, below).
 
+> **Correction (2026-07-01):** "all heterogeneous heap fields are tagged words … no layout bitmap is
+> needed" was an over-claim. Objects also hold **raw (non-value) words** — a closure's code pointer, a
+> string's bytes, a `$Num`'s `f64`, a record's label-id array — which are *not* tagged words and must not
+> be scanned by the tag-bit rule. The scan is therefore **kind-directed**: the header `kind` is a *layout
+> descriptor* that tells the collector which words are *value slots* (scanned by the LSB tag rule) and
+> which are raw (skipped). Pure tag-bit scanning holds only *within* the value slots. See
+> [0064](0064-v1-single-capability-native-abi-codegen-contract.md) §2 for the concrete v1 contract.
+
 Nullary constructors are already `i31` immediates (§1), so they carry no header and a match on them never
 dereferences. The remaining optional optimisation is, for **field-carrying** constructors, to
 **pointer-tag the constructor index into the spare bits of the block pointer** (GHC-style), so a match
