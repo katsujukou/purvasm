@@ -6,7 +6,9 @@
 -- | `Purvasm.Int`) — so the mapped closure specializes (ADR-0027) instead of going through the
 -- | opaque foreign, and no foreign remains.
 module Data.FunctorWithIndex
-  ( class FunctorWithIndex, mapWithIndex, mapDefault
+  ( class FunctorWithIndex
+  , mapWithIndex
+  , mapDefault
   ) where
 
 import Prelude

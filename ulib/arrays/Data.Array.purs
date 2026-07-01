@@ -422,9 +422,11 @@ uncons = runFn3 unconsImpl (const Nothing) \x xs -> Just { head: x, tail: xs }
 -- ulib shadow: split head/tail over `Purvasm.Array`; the tail is a fresh sub-array (was a foreign).
 unconsImpl :: forall a b. Fn3 (Unit -> b) (a -> Array a -> b) (Array a) b
 unconsImpl = mkFn3 \empty next xs ->
-  let n = PA.length xs in
-  if n == 0 then empty unit
-  else next (PA.unsafeIndex xs 0) (subArray xs 1 (n - 1))
+  let
+    n = PA.length xs
+  in
+    if n == 0 then empty unit
+    else next (PA.unsafeIndex xs 0) (subArray xs 1 (n - 1))
 
 -- | Break an array into its last element and all preceding elements.
 -- |
@@ -743,9 +745,11 @@ filter f xs = go 0 0 (PA.unsafeNew (count 0 0))
   go i j out =
     if i == n then out
     else
-      let x = PA.unsafeIndex xs i in
-      if f x then go (i + 1) (j + 1) (PA.unsafeSet out j x)
-      else go (i + 1) j out
+      let
+        x = PA.unsafeIndex xs i
+      in
+        if f x then go (i + 1) (j + 1) (PA.unsafeSet out j x)
+        else go (i + 1) j out
 
 -- | Partition an array using a predicate function, creating a set of
 -- | new arrays. One for the values satisfying the predicate function
@@ -927,8 +931,10 @@ scanl f z xs = go 0 z (PA.unsafeNew n)
   go i acc out =
     if i == n then out
     else
-      let acc' = f acc (PA.unsafeIndex xs i) in
-      go (i + 1) acc' (PA.unsafeSet out i acc')
+      let
+        acc' = f acc (PA.unsafeIndex xs i)
+      in
+        go (i + 1) acc' (PA.unsafeSet out i acc')
 
 -- | Fold a data structure from the right, keeping all intermediate results
 -- | instead of only the final result. Note that the initial value does not
@@ -945,8 +951,10 @@ scanr f z xs = go (n - 1) z (PA.unsafeNew n)
   go i acc out =
     if i < 0 then out
     else
-      let acc' = f (PA.unsafeIndex xs i) acc in
-      go (i - 1) acc' (PA.unsafeSet out i acc')
+      let
+        acc' = f (PA.unsafeIndex xs i) acc
+      in
+        go (i - 1) acc' (PA.unsafeSet out i acc')
 
 --------------------------------------------------------------------------------
 -- Sorting ---------------------------------------------------------------------
@@ -1023,7 +1031,6 @@ sortBy comp xs0 =
 -- |
 sortWith :: forall a b. Ord b => (a -> b) -> Array a -> Array a
 sortWith f = sortBy (comparing f)
-
 
 --------------------------------------------------------------------------------
 -- Subarrays -------------------------------------------------------------------

@@ -7,7 +7,8 @@
 -- | `Data.Unfoldable1` shadow, but testing the `Maybe` first so an empty result is produced when
 -- | the seed yields `Nothing` immediately.
 module Data.Unfoldable
-  ( class Unfoldable, unfoldr
+  ( class Unfoldable
+  , unfoldr
   , replicate
   , replicateA
   , none
@@ -100,10 +101,10 @@ blit src dst n = go 0 dst
 replicate :: forall f a. Unfoldable f => Int -> a -> f a
 replicate n v = unfoldr step n
   where
-    step :: Int -> Maybe (Tuple a Int)
-    step i =
-      if i <= 0 then Nothing
-      else Just (Tuple v (i - 1))
+  step :: Int -> Maybe (Tuple a Int)
+  step i =
+    if i <= 0 then Nothing
+    else Just (Tuple v (i - 1))
 
 -- | Perform an Applicative action `n` times, and accumulate all the results.
 -- |

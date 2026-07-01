@@ -6,8 +6,13 @@
 -- | Everything else — the `Enum`/`BoundedEnum` classes, their instances, and the combinators — is the
 -- | upstream module verbatim, so the public interface is unchanged.
 module Data.Enum
-  ( class Enum, succ, pred
-  , class BoundedEnum, cardinality, toEnum, fromEnum
+  ( class Enum
+  , succ
+  , pred
+  , class BoundedEnum
+  , cardinality
+  , toEnum
+  , fromEnum
   , toEnumWithDefaults
   , Cardinality(..)
   , enumFromTo
@@ -63,7 +68,7 @@ instance enumBoolean :: Enum Boolean where
   succ false = Just true
   succ _ = Nothing
   pred true = Just false
-  pred _= Nothing
+  pred _ = Nothing
 
 instance enumInt :: Enum Int where
   succ n = if n < top then Just (n + 1) else Nothing
@@ -197,7 +202,7 @@ enumFromTo = case _, _ of
     | from < to -> unfoldr1 (go succ (<=) to) from
     | otherwise -> unfoldr1 (go pred (>=) to) from
   where
-    go step op to a = Tuple a (step a >>= \a' -> guard (a' `op` to) $> a')
+  go step op to a = Tuple a (step a >>= \a' -> guard (a' `op` to) $> a')
 
 -- | Returns a sequence of elements from the first value, taking steps
 -- | according to the difference between the first and second value, up to
@@ -222,9 +227,9 @@ enumFromThenTo = unsafePartial \a b c ->
   in
     (toEnum >>> fromJust) <$> unfoldr (go (b' - a') c') a'
   where
-    go step to e
-      | e <= to = Just (Tuple e (e + step))
-      | otherwise = Nothing
+  go step to e
+    | e <= to = Just (Tuple e (e + step))
+    | otherwise = Nothing
 
 -- | Produces all successors of an `Enum` value, excluding the start value.
 upFrom :: forall a u. Enum a => Unfoldable u => a -> u a
@@ -279,7 +284,8 @@ defaultPred toEnum' fromEnum' a = toEnum' (fromEnum' a - 1)
 -- |
 -- | Runs in `O(n)` where `n` is `fromEnum top`
 defaultCardinality :: forall a. Bounded a => Enum a => Cardinality a
-defaultCardinality = Cardinality $ go 1 (bottom :: a) where
+defaultCardinality = Cardinality $ go 1 (bottom :: a)
+  where
   go i x =
     case succ x of
       Just x' -> go (i + 1) x'
@@ -293,17 +299,15 @@ defaultCardinality = Cardinality $ go 1 (bottom :: a) where
 -- | Runs in `O(n)` where `n` is `fromEnum a`.
 defaultToEnum :: forall a. Bounded a => Enum a => Int -> Maybe a
 defaultToEnum i' =
-  if i' < 0
-    then Nothing
-    else go i' bottom
+  if i' < 0 then Nothing
+  else go i' bottom
   where
   go i x =
-    if i == 0
-      then Just x
-      -- We avoid using >>= here because it foils tail-call optimization
-      else case succ x of
-              Just x' -> go (i - 1) x'
-              Nothing -> Nothing
+    if i == 0 then Just x
+    -- We avoid using >>= here because it foils tail-call optimization
+    else case succ x of
+      Just x' -> go (i - 1) x'
+      Nothing -> Nothing
 
 -- | Provides a default implementation for `fromEnum`.
 -- |
@@ -312,7 +316,8 @@ defaultToEnum i' =
 -- |
 -- | Runs in `O(n)` where `n` is `fromEnum a`.
 defaultFromEnum :: forall a. Enum a => a -> Int
-defaultFromEnum = go 0 where
+defaultFromEnum = go 0
+  where
   go i x =
     case pred x of
       Just x' -> go (i + 1) x'

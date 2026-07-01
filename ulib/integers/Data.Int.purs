@@ -63,8 +63,10 @@ fromNumberImpl
   -> Number
   -> Maybe Int
 fromNumberImpl just nothing n =
-  let i = PI.fromNumber n
-  in if PN.eq (PI.toNumber i) n then just i else nothing
+  let
+    i = PI.fromNumber n
+  in
+    if PN.eq (PI.toNumber i) n then just i else nothing
 
 -- | Convert a `Number` to an `Int`, by taking the closest integer equal to or
 -- | less than the argument. Values outside the `Int` range are clamped, `NaN`
@@ -220,8 +222,9 @@ base36 = Radix 36
 
 -- | Create a `Radix` from a number between 2 and 36.
 radix :: Int -> Maybe Radix
-radix n | n >= 2 && n <= 36 = Just (Radix n)
-        | otherwise         = Nothing
+radix n
+  | n >= 2 && n <= 36 = Just (Radix n)
+  | otherwise = Nothing
 
 -- | Like `fromString`, but the integer can be specified in a different base.
 -- |
@@ -286,10 +289,10 @@ pow x y
       else if x == -1 then (if even y then 1 else -1)
       else 0
   | otherwise = go 1 x y
-  where
-  go acc b e =
-    if e == 0 then acc
-    else go (if odd e then acc * b else acc) (b * b) (e / 2)
+      where
+      go acc b e =
+        if e == 0 then acc
+        else go (if odd e then acc * b else acc) (b * b) (e / 2)
 
 -- ulib shadow (was a foreign): parse an optional sign and base-`b` digits, accumulating in
 -- `Number` (so an out-of-`Int32`-range value is rejected by `fromNumber`, matching the

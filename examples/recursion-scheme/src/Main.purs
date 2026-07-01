@@ -11,7 +11,7 @@ data ExprF a
   = Lit Int
   | Add a a
   | Mul a a
-  | Neg a 
+  | Neg a
 
 derive instance functorExprF :: Functor ExprF
 
@@ -33,7 +33,7 @@ print :: Expr -> String
 print = cata alg
   where
   alg :: ExprF String -> String
-  alg = case _ of 
+  alg = case _ of
     Lit n -> show n
     Add x y -> "(" <> x <> " + " <> y <> ")"
     Mul x y -> "(" <> x <> " * " <> y <> ")"
@@ -53,7 +53,7 @@ main :: Effect Unit
 main = do
   let expr1 = add (lit 1) (mul (lit 2) (lit 3))
   log $ Fmt.fmt @"{exp} = {val}" { exp: print expr1, val: eval expr1 }
-  
+
   let expr2 = mul (add (lit 3) (neg (mul (lit 4) (lit 5)))) (add (lit 1) (lit 2))
   log $ Fmt.fmt @"{exp} = {val}" { exp: print expr2, val: eval expr2 }
 
