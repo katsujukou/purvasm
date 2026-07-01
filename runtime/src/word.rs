@@ -47,7 +47,11 @@ impl TaggedWord {
     /// `LSB = 0` holds by construction).
     #[inline]
     pub fn from_addr(addr: usize) -> Self {
-        debug_assert_eq!(addr & (TAG_BIT as usize), 0, "heap pointer must be 2-aligned");
+        debug_assert_eq!(
+            addr & (TAG_BIT as usize),
+            0,
+            "heap pointer must be 2-aligned"
+        );
         TaggedWord(addr as u64)
     }
 
@@ -179,7 +183,17 @@ mod tests {
 
     #[test]
     fn int_round_trips_including_bounds_and_negatives() {
-        for v in [0i32, 1, -1, 42, -42, i32::MIN, i32::MAX, i32::MIN + 1, i32::MAX - 1] {
+        for v in [
+            0i32,
+            1,
+            -1,
+            42,
+            -42,
+            i32::MIN,
+            i32::MAX,
+            i32::MIN + 1,
+            i32::MAX - 1,
+        ] {
             let w = TaggedWord::int(v);
             assert!(w.is_immediate());
             assert_eq!(w.as_int(), v, "int round-trip failed for {v}");
