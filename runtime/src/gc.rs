@@ -61,6 +61,13 @@ pub struct Heap {
     /// would be a provenance-free (UB) call. The native ABI stores a real code address here instead
     /// (ADR-0064 §3 Correction). Never relocated by GC.
     code_table: Vec<CodeFn>,
+    /// The **output sink** for the native stdio write-line leaf (ADR-0067 §5): captured lines, one per
+    /// write. A *labelled layering bleed* — safe-shell IO state co-located on the `Heap` in v1 because
+    /// the `Heap` already is the universal `CodeFn` runtime context; it moves to a dedicated driver
+    /// with the scheduler (the ADR-0063 safe shell). Production drains it to real `stdout`; tests read
+    /// [`output`](Heap::output). (`Effect.Console.log` is a `ulib` shadow over the leaf, not a runtime
+    /// concern.)
+    output: Vec<String>,
 }
 
 /// A handle to a value rooted on the shadow stack (ADR-0066 §2). `Copy`, borrows nothing, and is only
@@ -97,7 +104,21 @@ impl Heap {
             #[cfg(debug_assertions)]
             next_gen: 0,
             code_table: Vec::new(),
+            output: Vec::new(),
         }
+    }
+
+    /// The captured stdio write-line output (ADR-0067 §5), in program order — the test/differential
+    /// view of the output sink.
+    #[inline]
+    pub fn output(&self) -> &[String] {
+        &self.output
+    }
+
+    /// Append a line to the output sink (the stdio write-line leaf's write). `pub(crate)`.
+    #[inline]
+    pub(crate) fn push_output(&mut self, line: String) {
+        self.output.push(line);
     }
 
     /// Words currently allocated in the active space.
@@ -343,6 +364,67 @@ impl Heap {
         }
         self.pop_frame(frame);
         p
+    }
+
+    /// A `Str` from UTF-8 `bytes` (ADR-0067 §5). Layout: `[len: raw][utf8 bytes: raw…]` — `len` is the
+    /// byte length (payload word 0); the bytes occupy the following words **in ascending memory order**
+    /// (byte `i` at payload byte offset `i`), the trailing partial word **zero-filled**, so
+    /// `size_words = 1 + ceil(len / 8)`. The **empty string** is valid (`len = 0`, `size_words = 1`).
+    /// `new_str` **owns the UTF-8 invariant** — it asserts validity so every reader may assume it. No
+    /// `Value` input, so nothing to root across the allocation.
+    pub fn new_str(&mut self, bytes: &[u8]) -> HeapPtr {
+        assert!(
+            core::str::from_utf8(bytes).is_ok(),
+            "new_str: bytes are not valid UTF-8 (the Str invariant, ADR-0067 §5)"
+        );
+        let len = bytes.len();
+        let byte_words = len.div_ceil(WORD); // ceil(len / 8); 0 for the empty string
+        let p = self.alloc(Kind::Str, 1 + byte_words as u64, Color::White);
+        self.write_raw_unchecked(p, 0, len as u64);
+        // Zero the byte words first (so the trailing partial word's padding is zero), then copy the
+        // bytes over the front in memory order.
+        for i in 0..byte_words {
+            self.write_raw_unchecked(p, 1 + i as u64, 0);
+        }
+        // SAFETY: the byte region is payload word 1.. — `WORD` (header) + `WORD` (len) bytes into the
+        // object; `byte_words` words (>= ceil(len/8)) were just allocated and zeroed, covering `len`
+        // bytes. `bytes` is a disjoint host slice.
+        unsafe {
+            let dst = (p.as_ptr() as *mut u8).add(2 * WORD);
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, len);
+        }
+        p
+    }
+
+    /// The byte length of a `Str`. **Release-checked** (this is reachable from the safe public API, so
+    /// the checks are not `debug`-only): asserts the object is a `Str` and that its stored `len` fits
+    /// the allocated byte words, so a non-`Str` object or a `len` word corrupted via the public
+    /// `write_raw` cannot drive [`str_read`](Self::str_read) into an out-of-bounds slice (UB).
+    #[inline]
+    pub fn str_len(&self, s: HeapPtr) -> usize {
+        let hdr = self.header(s); // checked: validates `s` is a live object header
+        assert_eq!(hdr.kind(), Kind::Str, "str_len on a non-Str object");
+        let len = self.read_raw(s, 0) as usize;
+        // The bytes occupy `size_words - 1` payload words after the `len` word; `len` must fit them.
+        let byte_capacity = (hdr.size_words() as usize - 1) * WORD;
+        assert!(
+            len <= byte_capacity,
+            "Str length {len} exceeds its allocated byte capacity {byte_capacity} (corrupt Str)"
+        );
+        len
+    }
+
+    /// Copy a `Str`'s bytes out to an owned `String`. Copies (never borrows into the moving heap,
+    /// ADR-0063 §2); valid UTF-8 by the `new_str` invariant.
+    pub fn str_read(&self, s: HeapPtr) -> String {
+        // Release-checked: `str_len` asserts `s` is a `Str` and `len <= byte_capacity`, so the slice
+        // below is within the object's allocation.
+        let len = self.str_len(s);
+        // SAFETY: `len` bytes live at payload word 1 (`2 * WORD` bytes into the object) and, by the
+        // `str_len` bound, stay within the object's allocated byte words; `s` is a validated header.
+        let bytes =
+            unsafe { core::slice::from_raw_parts((s.as_ptr() as *const u8).add(2 * WORD), len) };
+        String::from_utf8(bytes.to_vec()).expect("Str invariant: valid UTF-8")
     }
 
     // --- field access -------------------------------------------------------
@@ -1048,6 +1130,60 @@ mod tests {
         let keep2 = unsafe { HeapPtr::from_word(h.get(kr)) };
         assert_eq!(f64::from_bits(h.read_raw(keep2, 0)), 3.5);
         h.pop_frame(frame);
+    }
+
+    #[test]
+    fn new_str_round_trips_including_empty_and_padding() {
+        let mut h = Heap::new(64);
+        for text in ["", "a", "hello", "日本語", "12345678", "123456789"] {
+            let s = h.new_str(text.as_bytes());
+            assert_eq!(h.header(s).kind(), Kind::Str);
+            assert_eq!(h.str_len(s), text.len());
+            assert_eq!(h.str_read(s), text);
+            // size_words = 1 (len word) + ceil(byte_len / 8); the empty string is size 1.
+            let expect_words = 1 + text.len().div_ceil(WORD) as u64;
+            assert_eq!(h.header(s).size_words(), expect_words);
+        }
+    }
+
+    #[test]
+    fn new_str_survives_collection() {
+        // A `Str`'s packed bytes must relocate intact (they are raw words the collector skips, but the
+        // object still moves as a unit).
+        let mut h = Heap::new(64);
+        let s = h.new_str(b"purvasm");
+        let mut roots = [s.as_word()];
+        h.collect(&mut roots);
+        let s2 = unsafe { HeapPtr::from_word(roots[0]) };
+        assert_eq!(h.str_read(s2), "purvasm");
+    }
+
+    #[test]
+    #[should_panic(expected = "valid UTF-8")]
+    fn new_str_rejects_invalid_utf8() {
+        let mut h = Heap::new(16);
+        let _ = h.new_str(&[0xff, 0xfe]); // not valid UTF-8
+    }
+
+    #[test]
+    #[should_panic(expected = "non-Str")]
+    fn str_read_rejects_non_str_object() {
+        // Release-on: `str_read` on a non-`Str` (here a `NumberBox`) must reject the kind, not trust
+        // payload word 0 as a length and build an out-of-bounds slice.
+        let mut h = Heap::new(16);
+        let n = h.new_number(1.0);
+        let _ = h.str_read(n);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds its allocated byte capacity")]
+    fn str_read_rejects_corrupt_length() {
+        // The public `write_raw` can overwrite a `Str`'s `len` word; `str_read` must bound the length
+        // against the allocated byte words rather than read out of bounds (UB).
+        let mut h = Heap::new(16);
+        let s = h.new_str(b"hi"); // byte capacity = 8
+        h.write_raw(s, 0, 9999); // corrupt the len word
+        let _ = h.str_read(s);
     }
 
     #[test]

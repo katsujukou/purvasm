@@ -95,6 +95,19 @@ program trips the safepoint rule**, so its rooting is fixed here, not left to th
 
 ### 5. `Console.log` — `String` construction + an injectable output sink
 
+> **Correction (2026-07-02):** the runtime should **not** own a `Console.log` primitive. `Console.log`
+> is a JS-derived name and shape; a native-backend core runtime knowing it directly is a layering
+> smell. Revised realisation: the runtime provides **one generic IO leaf, `stdio_write_line`** (the
+> eventual `extern "C"` `purvasm_stdio_write_line`), framed as a **boot-parity / smoke-test scaffold
+> for the FFI-absent period — not a permanent first-class runtime feature**. `Effect.Console.log` is
+> instead a **`ulib` shadow** over a `Purvasm.Stdio.writeLine`-style API that calls this leaf. When
+> user-defined (C) native **FFI** lands, stdio drops to an ordinary **library** leaf and the runtime
+> keeps only the FFI-call mechanism + value conversion + effect-thunk forcing — it forgets individual
+> leaf names. `Effect.Ref` (§4) remains the *core* runtime bring-up vehicle; the write-line leaf is
+> merely the FFI-absence foothold. The `Str` ABI and the output sink below are unaffected (they stay in
+> the runtime); only the leaf's **name and status** change — read "`Console.log`" below as the generic
+> `stdio_write_line` leaf, with `Effect.Console.log` as its `ulib` shadow.
+
 The canonical demo needs a `String` and an output boundary:
 
 - **`String` construction and `Str` ABI**: add `new_str(bytes)` building a `Str` object and a reader —
