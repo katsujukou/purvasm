@@ -76,12 +76,23 @@ VM value model:
   ctors are ADT objects).
 - **Record** — a label-id array (raw 64-bit FNV-1a ids, [0059](0059-native-abi-value-representation.md)) +
   a parallel value-slot array. Type-class dictionaries use this kind.
-- **Closure** — **`{ code fn ptr (raw), arity (raw), env (value-slot array) }`**. Arity is carried inline
-  so `apply` can dispatch (§3).
-- **PAP** — **`{ function (value slot), remaining_arity (raw), captured_args (value-slot array) }`**.
+- **Closure** — **`{ code fn ptr (raw), arity (raw), env (one *pointer* value slot → a shared
+  value-slot block, the `Array` kind) }`**. Arity is carried inline so `apply` can dispatch (§3).
+  _(Clarified 2026-07-01: env is a **pointer to a separate block, not inline** — the shared-env
+  knot-tying of [0059](0059-native-abi-value-representation.md) §1 requires **one** block shared by a
+  mutually-recursive group, which an inline array cannot express; a no-capture closure's env is an
+  **immediate sentinel** (so the empty-array singleton stays deferred). The asymmetry with **PAP** —
+  whose `captured_args` are inline below, since a PAP's captures are not shared — is intentional,
+  despite both being "value-slot array" data.)_
+- **PAP** — **`{ function (value slot), remaining_arity (raw), captured_args (inline value-slot
+  array) }`** — captured args are *inline* (not shared, so no separate block; contrast Closure's env).
 - **String** — length (raw) + packed UTF-8 bytes (raw).
 - **NumberBox** — one raw `f64`. **Ref** — one mutable value slot. **ByNeedCell** — its state + a value
   slot.
+- **Array** — a value-slot array `[slot; n]`: PureScript `Array`, a closure's shared env block, and a
+  record's value array all use this kind. _(Added 2026-07-01 with the runtime — the kind discriminant is
+  ABI, so it is listed here.)_ The **raw-id array** a `Record`'s `label_ids` points to is a separate
+  raw-array kind, deferred with `Record` construction (the empty-`Array` singleton is likewise deferred).
 
 **Forwarding (Cheney):** an object being evacuated is fully copied to to-space *first*, then its from-space
 **header word** is marked **forwarded** (a GC-colour state) and its **first payload word** holds the

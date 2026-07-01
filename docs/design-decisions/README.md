@@ -111,5 +111,6 @@ language and are kept out of version control.)
 | [0062](0062-mn-work-stealing-scheduler-fibers.md) | M:N work-stealing scheduler; heap-continuation fibers bound to a Capability (balance at fork); reduction-count preemption (= GC safepoints); io_uring/Waker async I/O; `Ref`/`AVar` | Accepted |
 | [0063](0063-runtime-implementation-language-rust.md) | Runtime in Rust: a small `unsafe` GC island (`Value`/`TaggedWord`/`HeapPtr`, explicit field APIs — no `Gc<T>`→`&T`) under a safe scheduler/driver shell; Miri for the island only | Accepted |
 | [0064](0064-v1-single-capability-native-abi-codegen-contract.md) | v1 first cut: single-capability native runtime — concrete ABI (63-bit low-tagged immediates → unboxed Int/Char/Bool), `apply`-N + shadow-stack codegen contract, Cheney local GC, boot-parity oracle; all cross-capability deferred to v2 | Accepted |
+| [0065](0065-ulib-one-directory-per-registry-package.md) | `ulib` directory = one registry package: split `foldable-traversable`, testing `unfoldable` on its own | Proposed |
 
 ## Scope

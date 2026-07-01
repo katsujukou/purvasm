@@ -16,8 +16,10 @@ use core::ptr::NonNull;
 ///
 /// Value-slot vs raw layout per kind (payload words after the header):
 /// - [`Adt`](Kind::Adt): `[ctor_tag: raw] ++ [field: value; n]`.
-/// - [`Record`](Kind::Record): `[label_ids: raw ptr] [values: value ptr]` (two parallel arrays;
-///   dictionaries use this kind).
+/// - [`Record`](Kind::Record): `[label_ids: value ptr → raw-id array] [values: value ptr → value
+///   array]` — *both fields are pointers* (value slots the collector traces); the label-id array they
+///   point to is all-raw. Dictionaries use this kind. (The raw-id-array kind and `new_record` land
+///   with records; the value array uses [`Array`](Kind::Array).)
 /// - [`Closure`](Kind::Closure): `[code: raw fn ptr] [arity: raw] [env: value → shared env block]`.
 ///   The env is a **pointer to a separate value-slot block**, *not* inline: a mutually-recursive
 ///   group shares **one** env block, knot-tied by back-patching each member into it (function
@@ -30,6 +32,9 @@ use core::ptr::NonNull;
 /// - [`NumberBox`](Kind::NumberBox): `[f64: raw]`.
 /// - [`Ref`](Kind::Ref): `[cell: value (mutable)]`.
 /// - [`ByNeed`](Kind::ByNeed): `[state: raw] [result: value]`.
+/// - [`Array`](Kind::Array): `[slot: value; n]` — a value-slot array (`size == n`). PureScript
+///   `Array`, a closure's shared env block, and a record's value array all use this kind. (The
+///   empty-array singleton is deferred.)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum Kind {
@@ -41,6 +46,7 @@ pub enum Kind {
     NumberBox = 5,
     Ref = 6,
     ByNeed = 7,
+    Array = 8,
 }
 
 impl Kind {
@@ -56,6 +62,7 @@ impl Kind {
             5 => Some(Kind::NumberBox),
             6 => Some(Kind::Ref),
             7 => Some(Kind::ByNeed),
+            8 => Some(Kind::Array),
             _ => None,
         }
     }
@@ -96,11 +103,14 @@ impl Header {
     /// A live object header. `size_words` is the payload length (words after this header).
     #[inline]
     pub const fn new(kind: Kind, size_words: u64, colour: Color) -> Header {
-        debug_assert!(
+        // Release-on: a size-0 object would corrupt the *next* object when forwarded (the forwarding
+        // address goes in the first payload word), and an over-53-bit size would overflow the field.
+        // These are memory-safety invariants the collector relies on, so `assert!`, not `debug_assert!`.
+        assert!(
             size_words >= 1,
             "every heap object needs >= 1 payload word (forwarding stores the address there)"
         );
-        debug_assert!(size_words < (1 << 53), "size_words must fit in 53 bits");
+        assert!(size_words < (1 << 53), "size_words must fit in 53 bits");
         Header((kind as u64) | ((colour as u64) << COLOR_SHIFT) | (size_words << SIZE_SHIFT))
     }
 
@@ -138,10 +148,16 @@ impl Header {
         Header(self.0 | FWD_BIT)
     }
 
-    /// Raw bits (for tests / debugging).
+    /// Raw bits (for storing the header word / debugging).
     #[inline]
     pub const fn to_bits(self) -> u64 {
         self.0
+    }
+
+    /// Reconstruct a header from its stored word.
+    #[inline]
+    pub const fn from_bits(bits: u64) -> Header {
+        Header(bits)
     }
 }
 
@@ -176,6 +192,16 @@ impl HeapPtr {
         HeapPtr(ptr)
     }
 
+    /// Reconstruct the [`HeapPtr`] a *pointer* value word denotes (ADR-0064 §1).
+    ///
+    /// # Safety
+    /// `w` must be a pointer word (`w.is_pointer()`) to a live, header-prefixed object.
+    #[inline]
+    pub unsafe fn from_word(w: crate::TaggedWord) -> HeapPtr {
+        debug_assert!(w.is_pointer(), "from_word: not a pointer word");
+        HeapPtr::from_raw(NonNull::new_unchecked(w.addr() as *mut Header))
+    }
+
     /// The raw header pointer.
     #[inline]
     pub const fn as_ptr(self) -> *mut Header {
@@ -204,6 +230,7 @@ mod tests {
             Kind::NumberBox,
             Kind::Ref,
             Kind::ByNeed,
+            Kind::Array,
         ] {
             for size in [1u64, 2, 42, 1 << 20, (1 << 53) - 1] {
                 for colour in [Color::White, Color::Grey, Color::Black] {
@@ -231,8 +258,8 @@ mod tests {
 
     #[test]
     #[should_panic]
-    #[cfg(debug_assertions)]
     fn header_rejects_size_zero() {
+        // `Header::new` now `assert!`s (release-on), so this holds regardless of build profile.
         let _ = Header::new(Kind::Adt, 0, Color::White);
     }
 
@@ -240,7 +267,8 @@ mod tests {
     fn kind_from_u8_rejects_unknown() {
         assert_eq!(Kind::from_u8(0), Some(Kind::Adt));
         assert_eq!(Kind::from_u8(7), Some(Kind::ByNeed));
-        assert_eq!(Kind::from_u8(8), None);
+        assert_eq!(Kind::from_u8(8), Some(Kind::Array));
+        assert_eq!(Kind::from_u8(9), None);
         assert_eq!(Kind::from_u8(255), None);
     }
 }

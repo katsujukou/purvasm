@@ -5,17 +5,20 @@
 //! treated as a Rust object: there is no `Gc<T>` that derefs to `&T`; the guest heap is reached
 //! only through [`TaggedWord`] / [`HeapPtr`] and explicit field accessors (ADR-0063 §2).
 //!
-//! This crate currently implements the **value representation and object-header layout** of the v1
-//! ABI (ADR-0064 §1–§2). The Cheney collector, allocator, `apply`, and the C-ABI boundary land in
-//! following increments.
+//! This crate currently implements the v1 **value representation** and **object-header layout**
+//! (ADR-0064 §1–§2) and the **local Cheney copying collector + allocator** ([`gc::Heap`], ADR-0064
+//! §5). `apply` (the calling convention), the shadow-stack root API + GC-on-alloc, and the C-ABI
+//! boundary land in following increments.
 //!
 //! Scope reminder (ADR-0064 §0): v1 is **single-capability, sequential, 64-bit, boot-parity**; the
 //! whole cross-capability side is v2.
 
+pub mod gc;
 pub mod heap;
 pub mod word;
 
-pub use heap::{Header, HeapPtr, Kind};
+pub use gc::Heap;
+pub use heap::{Color, Header, HeapPtr, Kind};
 pub use word::TaggedWord;
 
 /// A guest value: a [`TaggedWord`] that the machine treats as a PureScript value. The word carries
