@@ -104,5 +104,12 @@ language and are kept out of version control.)
 | [0055](0055-ulib-auto-resolution-relative-to-binary.md) | Resolve `ulib` from `PURVASM_LIB` in the environment (set by the launcher) — no user flag, no binary self-location | Accepted |
 | [0056](0056-purvasm-system-host-leaves.md) | Two host-capability packages — `purvasm-system` (env, process) and `purvasm-fs` (file IO) — to retire the `Purvasm.CLI.Native.*` leaf names | Accepted |
 | [0057](0057-purescript-ci.md) | PureScript-CI: a standalone `spago` build/test + `purs-tidy` gate parallel to OCaml-CI, under `nix develop`, with its own `ps-ci-gate` | Accepted |
+| [0058](0058-ulib-data-array-st-partial-shadow.md) | `ulib` `Data.Array.ST.Partial` shadow over the reified `STArray` (turns the `arrays` suite green) | Accepted |
+| [0059](0059-native-abi-value-representation.md) | Native ABI: uniform tagged-word value representation, inline-tagged header, eval/apply two-entry calling convention, and the GC seam (collector policy deferred to wall 2) | Accepted |
+| [0060](0060-native-codegen-llvm-owned-runtime.md) | Native codegen via LLVM, with an owned runtime (GC/scheduler/fibers); roots via `gc.statepoint`, `musttail` TCE, heap-continuation fibers, per-module ANF→LLVM | Accepted |
+| [0061](0061-capability-local-shared-immutable-gc.md) | Capability-local copying heaps + a shared-immutable heap (no global STW); partition invariant via copy-on-send, shadow-stack roots first, concurrent black-hole for shared CAFs | Accepted |
+| [0062](0062-mn-work-stealing-scheduler-fibers.md) | M:N work-stealing scheduler; heap-continuation fibers bound to a Capability (balance at fork); reduction-count preemption (= GC safepoints); io_uring/Waker async I/O; `Ref`/`AVar` | Accepted |
+| [0063](0063-runtime-implementation-language-rust.md) | Runtime in Rust: a small `unsafe` GC island (`Value`/`TaggedWord`/`HeapPtr`, explicit field APIs — no `Gc<T>`→`&T`) under a safe scheduler/driver shell; Miri for the island only | Accepted |
+| [0064](0064-v1-single-capability-native-abi-codegen-contract.md) | v1 first cut: single-capability native runtime — concrete ABI (63-bit low-tagged immediates → unboxed Int/Char/Bool), `apply`-N + shadow-stack codegen contract, Cheney local GC, boot-parity oracle; all cross-capability deferred to v2 | Accepted |
 
 ## Scope
