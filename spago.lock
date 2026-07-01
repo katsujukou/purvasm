@@ -113,6 +113,19 @@
           "dependencies": []
         }
       },
+      "ex-recursive-value": {
+        "path": "examples/recursive-value",
+        "core": {
+          "dependencies": [
+            "console",
+            "effect",
+            "prelude"
+          ]
+        },
+        "test": {
+          "dependencies": []
+        }
+      },
       "purvasm-base": {
         "path": "packages/purvasm-base",
         "core": {

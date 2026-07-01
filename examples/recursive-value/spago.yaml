@@ -1,0 +1,6 @@
+package:
+  name: ex-recursive-value
+  dependencies:
+    - effect
+    - console 
+    - prelude
