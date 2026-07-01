@@ -1,6 +1,6 @@
 package:
   name: ex-helloworld
   dependencies:
-    - console
+    - purvasm-stdio
     - effect
     - prelude

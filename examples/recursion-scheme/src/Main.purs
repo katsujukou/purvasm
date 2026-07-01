@@ -3,7 +3,7 @@ module Example.RecursionScheme.Main where
 import Prelude hiding (add, mul)
 
 import Effect (Effect)
-import Effect.Console (log)
+import Purvasm.Stdio (writeLine)
 import Example.RecursionScheme.Cata (Fix(..), cata)
 import Fmt as Fmt
 
@@ -52,8 +52,8 @@ eval = cata alg
 main :: Effect Unit
 main = do
   let expr1 = add (lit 1) (mul (lit 2) (lit 3))
-  log $ Fmt.fmt @"{exp} = {val}" { exp: print expr1, val: eval expr1 }
+  writeLine $ Fmt.fmt @"{exp} = {val}" { exp: print expr1, val: eval expr1 }
 
   let expr2 = mul (add (lit 3) (neg (mul (lit 4) (lit 5)))) (add (lit 1) (lit 2))
-  log $ Fmt.fmt @"{exp} = {val}" { exp: print expr2, val: eval expr2 }
+  writeLine $ Fmt.fmt @"{exp} = {val}" { exp: print expr2, val: eval expr2 }
 

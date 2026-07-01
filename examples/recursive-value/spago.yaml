@@ -2,5 +2,5 @@ package:
   name: ex-recursive-value
   dependencies:
     - effect
-    - console 
+    - purvasm-stdio
     - prelude

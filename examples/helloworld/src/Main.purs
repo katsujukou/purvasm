@@ -3,8 +3,8 @@ module Example.HelloWorld.Main where
 import Prelude
 
 import Effect (Effect)
-import Effect.Console (log)
+import Purvasm.Stdio (writeLine)
 
 main :: Effect Unit
 main = do
-  log "Hello from Purvasm Native!"
+  writeLine "Hello from Purvasm Native!"
