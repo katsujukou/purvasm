@@ -1,0 +1,7 @@
+package:
+  name: ex-effect-ref
+  dependencies:
+    - effect
+    - prelude
+    - purvasm-stdio
+    - refs
