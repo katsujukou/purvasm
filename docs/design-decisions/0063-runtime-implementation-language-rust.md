@@ -68,6 +68,17 @@ separate — the [0062](0062-mn-work-stealing-scheduler-fibers.md) validation no
 deterministic mode, `AVar`/cancellation linearizability property tests, deterministic replay) — and Miri
 does not replace it.
 
+**Provenance mode — "Miri clean" means *exposed/permissive*, not *strict*.** The tagged-word ABI
+([0064](0064-v1-single-capability-native-abi-codegen-contract.md) §1) deliberately round-trips a heap
+pointer through an integer (`TaggedWord`) and rebuilds it (`HeapPtr::from_word`: `usize → *mut Header`).
+That is an integer-to-pointer cast, which is legitimate under the **exposed-provenance** model (each such
+recovery angelically re-acquires a previously exposed allocation) but forbidden under **strict**
+provenance. So the runtime is run under Miri's *default* (permissive/exposed) provenance and emits one
+expected **warning** ("integer-to-pointer cast") — not an error. `-Zmiri-strict-provenance` is **not**
+used: it would report the ABI's intentional int↔pointer tagging as false failures. What Miri does enforce
+here — and what "clean" asserts — is the substantive UB: out-of-bounds, use-after-free, invalid
+transmutes, and aliasing (Stacked Borrows). CI runs exactly this default-provenance `cargo miri test`.
+
 ## Consequences
 
 - The **non-GC runtime** (the flagship risk surface) gets Rust's data-race safety and ownership; the

@@ -113,6 +113,14 @@ leaves. **Boundary values are tagged words (`Value`) / opaque handles — never 
 heap nor an `addrspace(1)` pointer** ([0063](0063-runtime-implementation-language-rust.md) §2); the
 generated code and the runtime agree on the tagged-word ABI.
 
+> **Correction (2026-07-01):** in the v1 Rust runtime a closure's `code` word is an **index into a
+> per-heap code table** of `CodeFn` pointers, not a raw code address. Rebuilding a function pointer
+> from a bare integer (`transmute::<usize, CodeFn>`) and calling it is Undefined Behaviour in Rust's
+> model — the pointer has no provenance — and Miri ([0063](0063-runtime-implementation-language-rust.md)
+> §4) rejects it. `apply` therefore recovers the real `CodeFn` by a bounds-checked table lookup (a bad
+> index panics, not UB). This is a v1-only realisation of "closure = (code, …)"; under the native ABI
+> the `code` word is a real code address the generated code calls directly, as described above.
+
 ### 4. Codegen — ANF → LLVM IR; safepoints, shadow stack, tail calls
 
 Per-module **ANF → LLVM IR → object**, linked with the Rust runtime. Each ANF construct lowers to IR

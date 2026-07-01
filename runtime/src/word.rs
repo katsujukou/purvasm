@@ -45,8 +45,13 @@ impl TaggedWord {
 
     /// A heap pointer to a 2-aligned address (every heap object is at least word-aligned, so
     /// `LSB = 0` holds by construction).
+    ///
+    /// **Crate-internal.** The only public way to mint a *pointer* word is
+    /// [`HeapPtr::as_word`](crate::HeapPtr::as_word) from a real allocated object, so safe callers
+    /// cannot forge a pointer to an arbitrary address (which `apply` / `collect` would then deref as
+    /// a header — UB). This is the "a pointer word is heap-owned" invariant.
     #[inline]
-    pub fn from_addr(addr: usize) -> Self {
+    pub(crate) fn from_addr(addr: usize) -> Self {
         debug_assert_eq!(
             addr & (TAG_BIT as usize),
             0,
@@ -87,9 +92,12 @@ impl TaggedWord {
         self.0
     }
 
-    /// Reconstruct from a raw bit pattern received across the ABI boundary.
+    /// Reconstruct from a raw bit pattern. **Crate-internal** for the same reason as
+    /// [`from_addr`](Self::from_addr): an arbitrary `bits` with `LSB = 0` is a forged pointer word.
+    /// The inbound codegen / C-ABI boundary will re-expose a dedicated `unsafe` entry when it lands;
+    /// until then only the runtime reconstructs already-stored words (e.g. `read_field`).
     #[inline]
-    pub const fn from_bits(bits: u64) -> Self {
+    pub(crate) const fn from_bits(bits: u64) -> Self {
         TaggedWord(bits)
     }
 
