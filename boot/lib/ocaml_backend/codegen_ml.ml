@@ -168,7 +168,8 @@ let foreign = function
   | "Data.Show.showIntImpl" -> VClos (fun v -> VString (string_of_int (as_int v)))
   | "Data.Show.showStringImpl" -> VClos (fun v -> VString (show_string_impl (as_str v)))
   | "Data.Show.showNumberImpl" -> VClos (fun v -> VString (show_number_impl (as_num v)))
-  | "Effect.Console.log" ->
+  (* Generic stdout line leaf (ADR-0068); `Effect.Console.log`/`info`/`debug` shadow over it. *)
+  | "Purvasm.Stdio.writeLineImpl" ->
     VClos (fun s -> VClos (fun _u -> print_string (as_str s); print_newline (); flush stdout; VInt 0))
   (* `_crashWith msg :: a` — a pure partial crash; forcing it halts with the message
      (mirrors `Ffi.host` and the prelude JS `throw new Error(msg)`). *)
@@ -213,7 +214,8 @@ let foreign = function
      by the `lookupEnv` wrapper. Lets the native binary read `PURVASM_LIB` to overlay the ulib. *)
   | "Purvasm.System.Env.getenvImpl" ->
     VClos (fun p -> VClos (fun _ -> VString (Option.value ~default:"" (Sys.getenv_opt (as_str p)))))
-  | "Effect.Console.error" ->
+  (* Generic stderr line leaf (ADR-0068); `Effect.Console.error`/`warn` shadow over it. *)
+  | "Purvasm.Stdio.writeErrLineImpl" ->
     VClos (fun s -> VClos (fun _ -> prerr_string (as_str s); prerr_newline (); flush stderr; VInt 0))
   | k -> stuck ("unbound foreign: " ^ k)
 

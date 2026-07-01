@@ -586,10 +586,12 @@ let show_number (f : float) : string =
 
 (** The host registry (ADR-0022): the native foreign leaves, each an arity and a
     first-order host implementation over evaluated values. The pure leaves
-    (`Data.Show`) are faithful to the `prelude` JS FFI; the one effectful leaf
-    (`Effect.Console.log`, ADR-0023) performs real IO when its `Effect` thunk is
-    forced. This is the single source of truth for which names are native —
-    [native_provider] derives from it. *)
+    (`Data.Show`) are faithful to the `prelude` JS FFI; the effectful leaves
+    (`Purvasm.Stdio.*`, `Purvasm.FS.*`, `Purvasm.System.*`) perform real IO when their
+    `Effect` thunk is forced (ADR-0023/0068). The resolver knows only generic host names,
+    never a JS-derived `Console.log` (that is a `ulib` shadow over `Purvasm.Stdio`). This
+    is the single source of truth for which names are native — [native_provider] derives
+    from it. *)
 let js_round (f : float) : float =
   if not (Stdlib.Float.is_finite f)
   then f
@@ -648,26 +650,22 @@ let host : Cesk.Machine.host =
         (unary (function
            | V.VString s -> V.VString (show_string s)
            | _ -> Cesk.Errors.stuck "showStringImpl: not a String"))
-    (* The one genuinely effectful leaf (ADR-0023): `log s :: Effect Unit` is the
-       thunk `\_ -> console.log s`. Applying [log] to the string returns that
-       thunk; forcing it (running the effect) performs the real stdout write — so
-       the side effect happens at the `Perform`, not at construction. *)
-    | "Effect.Console.log" ->
+    (* The generic stdout line leaf (ADR-0068): `writeLine s :: Effect Unit` is the
+       thunk `\_ -> stdout.write (s ^ "\n")`. Applying [writeLine] to the string returns
+       that thunk; forcing it (running the effect) performs the real stdout write — so
+       the side effect happens at the `Perform`, not at construction (ADR-0023). The
+       resolver knows this generic leaf, not a JS-derived `Console.log` name;
+       `Effect.Console.log` is a `ulib` shadow over `Purvasm.Stdio.writeLine`. *)
+    | "Purvasm.Stdio.writeLineImpl" ->
       Some
         (unary (function
            | V.VString s ->
-             V.VForeign
-               { name = "Effect.Console.log#perform"
-               ; arity = 1
-               ; args = []
-               ; call =
-                   (fun _ ->
-                     print_string s;
-                     print_newline ();
-                     flush stdout;
-                     V.VInt 0)
-               }
-           | _ -> Cesk.Errors.stuck "log: not a String"))
+             perform "Purvasm.Stdio.writeLineImpl#perform" (fun () ->
+               print_string s;
+               print_newline ();
+               flush stdout;
+               V.VInt 0)
+           | _ -> Cesk.Errors.stuck "writeLineImpl: not a String"))
     (* `_crashWith msg :: a` is a *pure* partial crash (not an `Effect`): forcing it
        halts with the message, mirroring the prelude JS `throw new Error(msg)`. So it
        crashes when the leaf is saturated, like the pure `Data.Show` leaves — not via a
@@ -821,29 +819,30 @@ let host : Cesk.Machine.host =
              perform "getenvImpl#perform" (fun () ->
                V.VString (Option.value ~default:"" (Sys.getenv_opt name)))
            | _ -> Cesk.Errors.stuck "getenvImpl: not a String"))
-    | "Effect.Console.error" ->
+    | "Purvasm.Stdio.writeErrLineImpl" ->
+      (* The generic stderr line leaf (ADR-0068); `Effect.Console.error`/`warn` shadow over it. *)
       Some
         (unary (function
            | V.VString s ->
-             perform "Effect.Console.error#perform" (fun () ->
+             perform "Purvasm.Stdio.writeErrLineImpl#perform" (fun () ->
                prerr_string s;
                prerr_newline ();
                flush stderr;
                V.VInt 0)
-           | _ -> Cesk.Errors.stuck "error: not a String"))
+           | _ -> Cesk.Errors.stuck "writeErrLineImpl: not a String"))
     | _ -> None
 
 (** Whether applying a native leaf yields an *effectful* value — one whose force (its
     `Effect` thunk run to saturation) performs an observable effect (ADR-0034's leaf
-    bits). Only `Effect.Console.log` does real IO; the `Data.Show` leaves are pure.
-    This is the source of truth the effect analysis ([Middle_end.Effect_analysis])
-    consumes for foreign leaves; structural mutation (`Ref` → `NewArray`/`SetArray`)
-    is recognised by the analysis from the primops themselves. *)
+    bits). The `Purvasm.Stdio.*` / `Purvasm.FS.*` / `Purvasm.System.*` leaves do real IO;
+    the `Data.Show` leaves are pure. This is the source of truth the effect analysis
+    ([Middle_end.Effect_analysis]) consumes for foreign leaves; structural mutation
+    (`Ref` → `NewArray`/`SetArray`) is recognised by the analysis from the primops themselves. *)
 let effectful (key : string) : bool =
   List.mem
     key
-    [ "Effect.Console.log"
-    ; "Effect.Console.error"
+    [ "Purvasm.Stdio.writeLineImpl"
+    ; "Purvasm.Stdio.writeErrLineImpl"
     ; "Purvasm.FS.readTextImpl"
     ; "Purvasm.FS.existsImpl"
     ; "Purvasm.FS.writeTextImpl"

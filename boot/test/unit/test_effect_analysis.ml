@@ -10,7 +10,7 @@ module E = Middle_end.Passes.Effect_analysis
 
 (* The production leaf classification (only [Effect.Console.log] performs). *)
 let ea = E.create ~effectful_leaf:Ffi.effectful ~foreign_arity:Ffi.foreign_arity
-let log_app s = A.CApp (A.AForeign "Effect.Console.log", [ A.ALit (LString s) ])
+let log_app s = A.CApp (A.AForeign "Purvasm.Stdio.writeLineImpl", [ A.ALit (LString s) ])
 let check_eperf msg expected e = Alcotest.(check bool) msg expected (ea.eperf e)
 
 (* I1: applying [log] to its string only *builds* the `#perform` thunk — pure. *)
@@ -41,7 +41,9 @@ let test_log_over_application () =
     "(log \"x\") () as one node"
     true
     (A.Ret
-       (A.CApp (A.AForeign "Effect.Console.log", [ A.ALit (LString "x"); A.ALit (LInt 0) ])))
+       (A.CApp
+          ( A.AForeign "Purvasm.Stdio.writeLineImpl"
+          , [ A.ALit (LString "x"); A.ALit (LInt 0) ] )))
 
 (* The mutation primops are may-perform at evaluation (NewArray allocates observable
    identity; SetArray mutates). Reads/arithmetic are pure. *)
@@ -144,8 +146,9 @@ let test_deep_returned_closure_chain () =
     A.CLam
       ( [ "c" ]
       , A.Ret
-          (A.CApp (A.AForeign "Effect.Console.log", [ A.ALit (LString "x"); A.AVar "c" ]))
-      )
+          (A.CApp
+             ( A.AForeign "Purvasm.Stdio.writeLineImpl"
+             , [ A.ALit (LString "x"); A.AVar "c" ] )) )
   in
   let g_lam = A.CLam ([ "b" ], A.Let ("h", h_lam, A.Ret (A.CAtom (A.AVar "h")))) in
   let f_lam = A.CLam ([ "a" ], A.Let ("g", g_lam, A.Ret (A.CAtom (A.AVar "g")))) in
@@ -195,7 +198,9 @@ let test_point_free_arity () =
   (* point-free effectful: logIt = log "x" is the effect thunk; forcing it performs *)
   let with_log tail =
     A.Let
-      ("logIt", A.CApp (A.AForeign "Effect.Console.log", [ A.ALit (LString "x") ]), tail)
+      ( "logIt"
+      , A.CApp (A.AForeign "Purvasm.Stdio.writeLineImpl", [ A.ALit (LString "x") ])
+      , tail )
   in
   let lsums = ea.analyze (with_log (A.Ret (A.CAtom (A.AVar "logIt")))) in
   Alcotest.(check bool)
@@ -250,7 +255,7 @@ let test_dbe_keeps_effectful () =
           (A.Let
              ( "u"
              , A.CApp
-                 ( A.AForeign "Effect.Console.log"
+                 ( A.AForeign "Purvasm.Stdio.writeLineImpl"
                  , [ A.ALit (LString "x"); A.ALit (LInt 0) ] )
              , ret0 ))))
 

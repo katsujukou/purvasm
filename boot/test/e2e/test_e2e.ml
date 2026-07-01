@@ -920,7 +920,7 @@ let log_show_body var =
   C.Lam
     ( var
     , C.App
-        ( C.Foreign "Effect.Console.log"
+        ( C.Foreign "Purvasm.Stdio.writeLineImpl"
         , C.App (C.Foreign "Data.Show.showIntImpl", C.Var var) ) )
 
 let i4_effect (label : string) (t : C.term) =
@@ -954,7 +954,8 @@ let read_ref r = C.App (foreign_ref "Effect.Ref.read", r)
 let write_ref v r = C.App (C.App (foreign_ref "Effect.Ref.write", v), r)
 
 let log_show n =
-  C.App (C.Foreign "Effect.Console.log", C.App (C.Foreign "Data.Show.showIntImpl", n))
+  C.App
+    (C.Foreign "Purvasm.Stdio.writeLineImpl", C.App (C.Foreign "Data.Show.showIntImpl", n))
 
 (* count 0..4, printing each, while the Ref is < 5. *)
 let test_i4_while () =
