@@ -112,5 +112,6 @@ language and are kept out of version control.)
 | [0063](0063-runtime-implementation-language-rust.md) | Runtime in Rust: a small `unsafe` GC island (`Value`/`TaggedWord`/`HeapPtr`, explicit field APIs — no `Gc<T>`→`&T`) under a safe scheduler/driver shell; Miri for the island only | Accepted |
 | [0064](0064-v1-single-capability-native-abi-codegen-contract.md) | v1 first cut: single-capability native runtime — concrete ABI (63-bit low-tagged immediates → unboxed Int/Char/Bool), `apply`-N + shadow-stack codegen contract, Cheney local GC, boot-parity oracle; all cross-capability deferred to v2 | Accepted |
 | [0065](0065-ulib-one-directory-per-registry-package.md) | `ulib` directory = one registry package: split `foldable-traversable`, testing `unfoldable` on its own | Proposed |
+| [0066](0066-v1-shadow-stack-rooting-and-gc-on-alloc.md) | v1 precise rooting: a `Heap`-owned shadow-stack (`Vec<Value>`) root API with explicit reload-after-safepoint, per-function rooting (self-rooting constructors; `apply` roots over-apply leftovers; `CodeFn`s root their own live values), and `alloc` collects-and-retries (fixed heap, OOM on still-full); the pre-codegen realisation of ADR-0064 §4 | Accepted |
 
 ## Scope

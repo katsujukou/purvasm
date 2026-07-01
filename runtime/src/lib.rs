@@ -15,8 +15,10 @@
 //!
 //! This crate currently implements the v1 **value representation** and **object-header layout**
 //! (ADR-0064 §1–§2), the **local Cheney copying collector + allocator** ([`gc::Heap`], ADR-0064 §5),
-//! and the **eval/apply calling convention** ([`Heap::apply`], ADR-0064 §3). The shadow-stack root
-//! API + GC-on-alloc and the C-ABI boundary land in following increments.
+//! the **eval/apply calling convention** ([`Heap::apply`], ADR-0064 §3), and **precise rooting**
+//! (ADR-0066): a `Heap`-owned shadow stack ([`Heap::root`]/[`Heap::get`]/[`Heap::frame`]) with
+//! self-rooting constructors, so `alloc` **collects on overflow and retries** (GC-on-alloc). The
+//! C-ABI boundary and the direct known-arity fast path land in following increments.
 //!
 //! Scope reminder (ADR-0064 §0): v1 is **single-capability, sequential, 64-bit, boot-parity**; the
 //! whole cross-capability side is v2.

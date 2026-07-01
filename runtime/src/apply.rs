@@ -6,16 +6,21 @@
 //! **under-apply** (too few → build a `PAP`). Tail calls and over-application chains run as a
 //! **trampoline** (v1 TCE, ADR-0064 §4; `musttail` is deferred with the direct fast path).
 //!
+//! **Rooting (ADR-0066 §3), per-function.** `alloc` is a safepoint, so each function roots the
+//! values *it* holds across a safepoint — the same discipline codegen emits per generated function,
+//! not a caller-roots-callee scheme. In `apply` the only such value is the **over-apply leftover
+//! args** (used after the `code` call); they are rooted across the call and reloaded. `apply` does
+//! *not* root `f` (unused after `code` — over-apply replaces it) nor the saturated call args (handed
+//! to `code` at entry with no intervening allocation), because those do not outlive a safepoint
+//! *within `apply`*. The `code` callee owns rooting *its* view — see [`CodeFn`].
+//!
 //! v1 boundaries (lifted with later increments):
 //! - `apply` materialises `&mut Heap` and threads it into each [`CodeFn`] by reborrow — sound, one
 //!   `&mut` active per level. The C-ABI (`extern "C"`, a raw heap-context pointer, args as ptr+len)
 //!   arrives with codegen.
-//! - The in-flight argument [`Value`]s are **not GC-rooted**. This is safe *only* because no
-//!   collection can occur mid-`apply` in v1 (`alloc` panics on overflow rather than collecting);
-//!   shadow-stack rooting of these lands with GC-on-alloc.
 //! - The working argument list is a `Vec` for simplicity; codegen lowers it to a stack array.
 
-use crate::gc::Heap;
+use crate::gc::{Heap, Root};
 use crate::heap::{HeapPtr, Kind};
 use crate::Value;
 
@@ -23,6 +28,14 @@ use crate::Value;
 /// closure itself (for its env / free variables), and exactly `arity` arguments, and returns the
 /// result. (v1 uses a Rust fn pointer over `&mut Heap`; codegen adopts the `extern "C"` + raw-pointer
 /// ABI.)
+///
+/// **Rooting contract (ADR-0066 §3).** The `closure` and `args` are valid **on entry**. Because the
+/// body may allocate — and `alloc` is a safepoint that can relocate the heap — a `CodeFn` that holds
+/// `closure` or any `arg` (or any other heap `Value`) *across an allocation it performs* must root it
+/// on the shadow stack ([`Heap::root`]/[`Heap::get`]) and reload it after, exactly as the constructors
+/// and `apply` do. A body that touches its inputs only *before* it allocates (a leaf primop, or one
+/// that reads its env into locals first) needs no rooting. The caller (`apply`) does **not** root the
+/// callee's inputs on its behalf; this is the per-function rooting codegen emits.
 pub type CodeFn = fn(heap: &mut Heap, closure: Value, args: &[Value]) -> Value;
 
 impl Heap {
@@ -33,7 +46,8 @@ impl Heap {
     /// lookup — never an integer→fn transmute, which would be a provenance-free (UB) call.
     pub fn new_closure(&mut self, code: CodeFn, arity: u32, env: Value) -> HeapPtr {
         let idx = self.intern_code(code);
-        // SAFETY: `idx` is a valid code-table index by construction.
+        // SAFETY: `idx` is a valid code-table index by construction. `new_closure_raw` self-roots
+        // `env` across its allocation (ADR-0066 §3).
         unsafe { self.new_closure_raw(idx, arity, env) }
     }
 
@@ -66,22 +80,39 @@ impl Heap {
                 Kind::Closure => {
                     let arity = self.read_raw_unchecked(p, 1) as usize;
                     if args.len() < arity {
-                        // Under-apply: a PAP capturing the args supplied so far.
+                        // Under-apply: a PAP capturing the args supplied so far. `new_pap` self-roots
+                        // `f` and `args` across its own allocation (ADR-0066 §3), so nothing to root here.
                         let remaining = (arity - args.len()) as u32;
                         return self.new_pap(f, remaining, &args).as_word();
                     }
-                    // Saturate: call the code with exactly `arity` args (reborrowing `&mut *self`).
+                    // Saturate / over-apply. `code(…)` is a safepoint (ADR-0066 §3). Between reading
+                    // `f`/`args` (at `checked_ptr` above) and this call nothing allocates, so the call
+                    // slice snapshot is current. The only values that must survive `code` are the
+                    // **leftover** args (read after the call on over-application) — `f` is not read
+                    // after `code`, and `result` is `code`'s own (post-collection) return. Root the
+                    // leftovers, call, then reload them.
+                    let call_args: Vec<Value> = args[..arity].to_vec();
+                    let frame = self.frame();
+                    let mut leftover: Vec<Root> = Vec::with_capacity(args.len() - arity);
+                    for a in &args[arity..] {
+                        leftover.push(self.root(*a));
+                    }
                     // The `code` word is a code-table index (v1); `code_at` recovers the real fn
-                    // pointer with a bounds check — no integer→fn transmute (which would call a
-                    // provenance-free pointer, UB). Copy the `CodeFn` out before the `&mut self` call.
+                    // pointer with a bounds check — no integer→fn transmute (a provenance-free call, UB).
                     let code = self.code_at(self.read_raw_unchecked(p, 0));
-                    let result = code(self, f, &args[..arity]);
-                    if args.len() == arity {
+                    let result = code(self, f, &call_args);
+                    if leftover.is_empty() {
+                        self.pop_frame(frame);
                         return result;
                     }
-                    // Over-apply: `result` must itself be callable; continue with the leftover args.
+                    // Over-apply: reload the (possibly relocated) leftovers, continue with `result`.
+                    let mut next_args: Vec<Value> = Vec::with_capacity(leftover.len());
+                    for r in &leftover {
+                        next_args.push(self.get(*r));
+                    }
+                    self.pop_frame(frame);
                     f = result;
-                    args = args[arity..].to_vec();
+                    args = next_args;
                 }
                 other => panic!("apply: not a callable value (kind {other:?})"),
             }
@@ -209,6 +240,46 @@ mod tests {
 
         let r = h.apply(pap, &[Value::int(12)]); // 10 (env) + 20 + 12
         assert_eq!(r.as_int(), 42);
+    }
+
+    #[test]
+    fn apply_survives_forced_gc_mid_evaluation() {
+        // An over-application whose inner `code` (`make_adder`) allocates enough to force a collection
+        // mid-`apply`. The leftover arg (`4`) is rooted across the `code` call and the captured env
+        // (`[3]`) is kept live by `new_closure`'s self-rooting, so the result is still correct
+        // (ADR-0066 §3/§4). The small heap guarantees the GC actually fires.
+        let mut h = Heap::new(8);
+        let mk = h.new_closure(make_adder, 1, Value::unit()); // 4 words
+        let r = h.apply(mk.as_word(), &[Value::int(3), Value::int(4)]);
+        assert_eq!(r.as_int(), 7);
+    }
+
+    /// A `CodeFn` that holds a **heap-pointer arg** across an allocation *it* performs — the case the
+    /// [`CodeFn`] rooting contract governs (ADR-0066 §3). It roots the arg, forces a collection, then
+    /// reloads and reads it: `\n -> (force GC); Number (unbox n + 1)`.
+    fn add_one_across_gc(h: &mut Heap, _clo: Value, args: &[Value]) -> Value {
+        let frame = h.frame();
+        let n = h.root(args[0]); // a NumberBox pointer — must survive the collection below
+        for _ in 0..8 {
+            let _ = h.new_number(0.0); // unrooted garbage; overflows the small heap → forces GC
+        }
+        let np = unsafe { HeapPtr::from_word(h.get(n)) }; // reload the relocated arg
+        let v = f64::from_bits(h.read_raw(np, 0));
+        h.pop_frame(frame);
+        h.new_number(v + 1.0).as_word()
+    }
+
+    #[test]
+    fn codefn_roots_its_arg_across_its_own_gc() {
+        // The `CodeFn` rooting contract end-to-end: the callee (not `apply`) roots its own heap-pointer
+        // input across a collection it triggers, and the result is correct. A missed root here would be
+        // a use-after-move Miri catches.
+        let mut h = Heap::new(8);
+        let clo = h.new_closure(add_one_across_gc, 1, Value::unit());
+        let n = h.new_number(41.0);
+        let r = h.apply(clo.as_word(), &[n.as_word()]);
+        let rp = unsafe { HeapPtr::from_word(r) };
+        assert_eq!(f64::from_bits(h.read_raw(rp, 0)), 42.0);
     }
 
     #[test]

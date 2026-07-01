@@ -1,9 +1,9 @@
 //! The v1 local heap: a semi-space (Cheney) copying collector (ADR-0064 §5).
 //!
 //! This is the **unsafe GC island** (ADR-0063): raw memory, tagged words, object relocation. It
-//! exposes a small typed API (the `new_*` constructors, `read_field`/`write_field`, `collect`) and
-//! never hands out a Rust reference into the moving heap. The low-level `alloc` is crate-internal —
-//! the public surface fully initialises objects via `new_*`.
+//! exposes a small typed API (the self-rooting `new_*` constructors, `read_field`/`write_field`, the
+//! shadow-stack root API) and never hands out a Rust reference into the moving heap. `alloc` is
+//! `pub(crate)` (a safepoint); the public surface fully initialises objects via `new_*`.
 //!
 //! Layout matches [`crate::heap`]: an object is `[Header][payload word; size]`, a [`HeapPtr`] points
 //! at the header. Collection is **layout-directed** (ADR-0064 §2): for each live object the header
@@ -11,9 +11,12 @@
 //! which are *raw* (skipped). Forwarding stores the new address in the object's first payload word,
 //! after a full copy (the [`Header`] contract — every object has `size >= 1`).
 //!
+//! Roots come from a `Heap`-owned **shadow stack** (ADR-0066): [`Heap::root`]/[`Heap::get`] with
+//! frame marks, fed to the collector by [`Heap::alloc`] on overflow (GC-on-alloc). The value-storing
+//! constructors self-root their inputs across the allocation.
+//!
 //! Scope (ADR-0064 §0): single-capability, sequential; the shared arena, promotion, generational
-//! collection, `gc.statepoint`, and precise shadow-stack integration are v2 / later. Here the caller
-//! passes its roots to [`Heap::collect`] explicitly (the shadow-stack API lands with codegen).
+//! collection, `gc.statepoint`, and codegen-emitted stack maps are v2 / later.
 
 use crate::apply::CodeFn;
 use crate::heap::{Color, Header, HeapPtr, Kind};
@@ -41,11 +44,42 @@ pub struct Heap {
     cap: usize,
     /// Bump cursor: words used in `space`.
     top: usize,
+    /// The **shadow stack** (ADR-0066 §1): the authoritative root set for a collection. Each entry is
+    /// a value slot the collector rewrites in place on relocation; a [`Root`] indexes it. `alloc`
+    /// feeds this to the collector on overflow, so a value rooted here survives (and is reloaded via
+    /// [`Heap::get`]). A `Value`/`TaggedWord`, never a Rust reference into the heap (ADR-0063 §2).
+    roots: Vec<TaggedWord>,
+    /// Debug-only per-slot generation stamps (ADR-0066 §2): let [`Heap::get`] catch a stale `Root`
+    /// whose slot index was popped and reused (an ABA the bare bounds check misses). No release cost.
+    #[cfg(debug_assertions)]
+    root_gens: Vec<u64>,
+    /// Debug-only monotonic generation source for [`root_gens`](Heap::root_gens).
+    #[cfg(debug_assertions)]
+    next_gen: u64,
     /// v1 bring-up code registry: real [`CodeFn`] pointers (with provenance) keyed by the index a
     /// closure stores in its `code` word. `apply` calls by index — no integer→fn transmute, which
     /// would be a provenance-free (UB) call. The native ABI stores a real code address here instead
     /// (ADR-0064 §3 Correction). Never relocated by GC.
     code_table: Vec<CodeFn>,
+}
+
+/// A handle to a value rooted on the shadow stack (ADR-0066 §2). `Copy`, borrows nothing, and is only
+/// a slot index (plus a debug generation stamp) — so it survives shadow-stack growth and never locks
+/// the [`Heap`]. Valid only within its [`RootFrame`]; the API is `pub(crate)`, a trusted discipline.
+#[derive(Clone, Copy)]
+pub(crate) struct Root {
+    index: usize,
+    /// Debug-only: the slot's generation at `root` time — checked by [`Heap::get`] to reject a stale
+    /// handle whose index was popped and reused.
+    #[cfg(debug_assertions)]
+    generation: u64,
+}
+
+/// A shadow-stack frame mark (ADR-0066 §2): the stack length captured on frame open. `Copy`, borrows
+/// nothing. [`Heap::pop_frame`] truncates back to it, releasing every root pushed since.
+#[derive(Clone, Copy)]
+pub(crate) struct RootFrame {
+    len: usize,
 }
 
 impl Heap {
@@ -57,6 +91,11 @@ impl Heap {
             reserve: alloc_space(words_per_space),
             cap: words_per_space,
             top: 0,
+            roots: Vec::new(),
+            #[cfg(debug_assertions)]
+            root_gens: Vec::new(),
+            #[cfg(debug_assertions)]
+            next_gen: 0,
             code_table: Vec::new(),
         }
     }
@@ -83,18 +122,101 @@ impl Heap {
         self.code_table[idx as usize]
     }
 
+    // --- shadow-stack rooting (ADR-0066 §2) ---------------------------------
+    //
+    // A trusted `pub(crate)` discipline used by the value-storing constructors, `apply`, and (later)
+    // codegen — all of which emit statically balanced, stack-ordered frames. The debug build stamps
+    // each slot with a generation so a stale/reused-index `Root` is caught (§2 misuse boundary).
+
+    /// Open a shadow-stack frame — capture the current stack length as a [`RootFrame`] mark.
+    #[inline]
+    pub(crate) fn frame(&self) -> RootFrame {
+        RootFrame {
+            len: self.roots.len(),
+        }
+    }
+
+    /// Push `v` onto the shadow stack; return a [`Root`] handle to its slot. The collector rewrites
+    /// the slot on relocation, so [`get`](Heap::get) reads the current (post-collection) value.
+    #[inline]
+    pub(crate) fn root(&mut self, v: TaggedWord) -> Root {
+        let index = self.roots.len();
+        self.roots.push(v);
+        #[cfg(debug_assertions)]
+        let generation = {
+            let g = self.next_gen;
+            self.next_gen += 1;
+            self.root_gens.push(g);
+            g
+        };
+        Root {
+            index,
+            #[cfg(debug_assertions)]
+            generation,
+        }
+    }
+
+    /// Read the **current** value of a root — the reload-after-safepoint step (ADR-0066 §2). In debug,
+    /// asserts the slot has not been popped and reused (generation match); in release, a stale handle
+    /// whose index is past the top panics on the bounds check (safe — never out-of-bounds UB).
+    #[inline]
+    pub(crate) fn get(&self, r: Root) -> TaggedWord {
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            self.root_gens[r.index], r.generation,
+            "stale Root: shadow-stack slot was popped and reused"
+        );
+        self.roots[r.index]
+    }
+
+    /// Close a frame: truncate the shadow stack back to the mark, releasing every root pushed since.
+    #[inline]
+    pub(crate) fn pop_frame(&mut self, f: RootFrame) {
+        debug_assert!(
+            f.len <= self.roots.len(),
+            "pop_frame: mark exceeds shadow-stack top (double-pop / stale frame)"
+        );
+        self.roots.truncate(f.len);
+        #[cfg(debug_assertions)]
+        self.root_gens.truncate(f.len);
+    }
+
+    /// Read the raw shadow-stack slot at absolute index `i` (crate-internal; used by the self-rooting
+    /// constructors that just pushed a contiguous run and know their base). No generation check —
+    /// the caller pushed the slot within the current frame.
+    #[inline]
+    fn root_slot(&self, i: usize) -> TaggedWord {
+        self.roots[i]
+    }
+
     // --- allocation ---------------------------------------------------------
 
     /// Bump-allocate an object of `kind` with `size` payload words, returning a pointer to its
     /// header. The payload is **uninitialised**; the caller must write every field before the object
     /// becomes reachable / a collection scans it (v1: codegen writes all fields with no safepoint in
-    /// between — ADR-0064 §4). Panics on overflow (GC-on-overflow needs the roots; deferred).
-    fn alloc(&mut self, kind: Kind, size: u64, colour: Color) -> HeapPtr {
+    /// between — ADR-0064 §4).
+    ///
+    /// **This is a safepoint** (ADR-0066 §4): on overflow it collects the live set reachable from the
+    /// shadow stack and retries once. Any `Value` that must survive the call must therefore be rooted
+    /// (ADR-0066 §3) — the safe `new_*` constructors do this for their inputs; `pub(crate)` for
+    /// `apply`'s closure constructor. A still-full heap after collection is a fatal OOM.
+    pub(crate) fn alloc(&mut self, kind: Kind, size: u64, colour: Color) -> HeapPtr {
         let words = 1 + size as usize;
+        // A single object cannot exceed a semi-space (no large-object region in v1).
         assert!(
-            self.top + words <= self.cap,
-            "heap overflow (GC-on-alloc lands with the shadow-stack roots)"
+            words <= self.cap,
+            "object of {words} words exceeds the semi-space capacity ({} words)",
+            self.cap
         );
+        // GC-on-alloc (ADR-0066 §4): collect on overflow (roots = the shadow stack), then retry once.
+        if self.top + words > self.cap {
+            self.gc();
+            assert!(
+                self.top + words <= self.cap,
+                "heap OOM: live set + {words} words exceed the semi-space ({} words)",
+                self.cap
+            );
+        }
         let base = self.top;
         self.top += words;
         // Derive the header pointer from the stable base (never a fresh buffer re-borrow — see the
@@ -105,61 +227,93 @@ impl Heap {
         unsafe { HeapPtr::from_raw(NonNull::new_unchecked(hdr as *mut Header)) }
     }
 
-    /// An `Adt` object: payload `[tag: raw] ++ fields`.
+    /// An `Adt` object: payload `[tag: raw] ++ fields`. Self-rooting (ADR-0066 §3): the incoming
+    /// field `Value`s are rooted across `alloc` (a safepoint) and re-read from their slots when
+    /// written, so a collection during construction cannot leave a stale pointer in the object.
     pub fn new_adt(&mut self, tag: u32, fields: &[TaggedWord]) -> HeapPtr {
+        let frame = self.frame();
+        let base = frame.len;
+        for f in fields {
+            self.root(*f);
+        }
         let p = self.alloc(Kind::Adt, 1 + fields.len() as u64, Color::White);
         self.write_raw_unchecked(p, 0, tag as u64);
-        for (i, f) in fields.iter().enumerate() {
-            self.write_field_unchecked(p, 1 + i as u64, *f);
+        for i in 0..fields.len() {
+            let v = self.root_slot(base + i);
+            self.write_field_unchecked(p, 1 + i as u64, v);
         }
+        self.pop_frame(frame);
         p
     }
 
-    /// A boxed `Number` (`f64`).
+    /// A boxed `Number` (`f64`). No `Value` input, so nothing to root across `alloc`.
     pub fn new_number(&mut self, x: f64) -> HeapPtr {
         let p = self.alloc(Kind::NumberBox, 1, Color::White);
         self.write_raw_unchecked(p, 0, x.to_bits());
         p
     }
 
-    /// A `Ref` cell holding `init`.
+    /// A `Ref` cell holding `init`. Self-rooting (ADR-0066 §3).
     pub fn new_ref(&mut self, init: TaggedWord) -> HeapPtr {
+        let frame = self.frame();
+        let base = frame.len;
+        self.root(init);
         let p = self.alloc(Kind::Ref, 1, Color::White);
-        self.write_field_unchecked(p, 0, init);
+        let v = self.root_slot(base);
+        self.write_field_unchecked(p, 0, v);
+        self.pop_frame(frame);
         p
     }
 
     /// An `Array` (value-slot array) of `elems`. **Non-empty**: the empty-array singleton is deferred
     /// (ADR-0064 §5), so a zero-length array would otherwise trip the `size >= 1` header invariant.
+    /// Self-rooting (ADR-0066 §3).
     pub fn new_array(&mut self, elems: &[TaggedWord]) -> HeapPtr {
         assert!(
             !elems.is_empty(),
             "empty array is deferred (needs the immortal singleton, ADR-0064 §5)"
         );
-        let p = self.alloc(Kind::Array, elems.len() as u64, Color::White);
-        for (i, e) in elems.iter().enumerate() {
-            self.write_field_unchecked(p, i as u64, *e);
+        let frame = self.frame();
+        let base = frame.len;
+        for e in elems {
+            self.root(*e);
         }
+        let p = self.alloc(Kind::Array, elems.len() as u64, Color::White);
+        for i in 0..elems.len() {
+            let v = self.root_slot(base + i);
+            self.write_field_unchecked(p, i as u64, v);
+        }
+        self.pop_frame(frame);
         p
     }
 
     /// A `Closure` from a **raw** code word `[code: raw][arity: raw][env: value slot]` (ADR-0059 §1).
-    /// For `env` see [`Heap::new_closure`]. Safe Rust callers should use the typed
-    /// [`Heap::new_closure`], which interns a [`crate::CodeFn`] and passes its index here.
+    /// Safe Rust callers should use the typed [`Heap::new_closure`], which interns a [`crate::CodeFn`]
+    /// and passes its index here.
     ///
     /// In v1 `code` is an index into the heap's code table (via [`Heap::intern_code`]); the native
     /// ABI stores a real code address instead (ADR-0064 §3 Correction). `apply` looks the index up
     /// with a bounds check, so a bad `code` word panics rather than reaching UB.
     ///
+    /// `env` **is self-rooted** across the allocation (ADR-0066 §3), exactly like the other value-slot
+    /// constructors — `alloc` is a safepoint, so a heap-pointer `env` would otherwise be left dangling
+    /// by a mid-call collection. This is *not* a caller precondition.
+    ///
     /// # Safety
-    /// Currently sound for any `code` (an out-of-range index panics in `apply`). Kept `unsafe` because
-    /// under the native ABI `code` becomes a real code address `apply` calls directly — a bogus one is
-    /// then UB — and because the caller must still initialise a well-formed closure (valid `env`).
+    /// Only the `code` word is unchecked. In v1 it must be a valid code-table index (an out-of-range
+    /// index merely panics in `apply`, so this is currently sound for any value); the method stays
+    /// `unsafe` because under the native ABI `code` becomes a real code address `apply` calls
+    /// directly, where a bogus word is UB.
     pub unsafe fn new_closure_raw(&mut self, code: u64, arity: u32, env: TaggedWord) -> HeapPtr {
+        // Self-rooting (ADR-0066 §3): `env` may be a heap pointer stored after `alloc` (a safepoint).
+        let frame = self.frame();
+        let env_root = self.root(env);
         let p = self.alloc(Kind::Closure, 3, Color::White);
         self.write_raw_unchecked(p, 0, code);
         self.write_raw_unchecked(p, 1, arity as u64);
+        let env = self.get(env_root);
         self.write_field_unchecked(p, 2, env);
+        self.pop_frame(frame);
         p
     }
 
@@ -172,12 +326,22 @@ impl Heap {
         remaining: u32,
         captured: &[TaggedWord],
     ) -> HeapPtr {
-        let p = self.alloc(Kind::Pap, 2 + captured.len() as u64, Color::White);
-        self.write_field_unchecked(p, 0, function);
-        self.write_raw_unchecked(p, 1, remaining as u64);
-        for (i, c) in captured.iter().enumerate() {
-            self.write_field_unchecked(p, 2 + i as u64, *c);
+        // Self-rooting (ADR-0066 §3): `function` then the `captured` values, in that slot order.
+        let frame = self.frame();
+        let base = frame.len;
+        self.root(function);
+        for c in captured {
+            self.root(*c);
         }
+        let p = self.alloc(Kind::Pap, 2 + captured.len() as u64, Color::White);
+        let f = self.root_slot(base);
+        self.write_field_unchecked(p, 0, f);
+        self.write_raw_unchecked(p, 1, remaining as u64);
+        for i in 0..captured.len() {
+            let v = self.root_slot(base + 1 + i);
+            self.write_field_unchecked(p, 2 + i as u64, v);
+        }
+        self.pop_frame(frame);
         p
     }
 
@@ -241,8 +405,17 @@ impl Heap {
     /// Unchecked [`write_field`](Self::write_field).
     #[inline]
     pub(crate) fn write_field_unchecked(&mut self, p: HeapPtr, i: u64, w: TaggedWord) {
+        self.write_barrier(p, i, w);
         self.write_word(p, i, w.to_bits());
     }
+
+    /// Write-barrier hook (ADR-0066 §5) — **no-op in v1**. Every value-slot pointer store routes
+    /// through here, so the generational remembered-set barrier and the `local → shared` partition
+    /// check drop in at one site later without touching call sites. Its firing condition (a store into
+    /// an already-live/old or shared object) is future logic; v1 has neither generations nor a shared
+    /// partition, so this does nothing.
+    #[inline]
+    fn write_barrier(&mut self, _obj: HeapPtr, _slot: u64, _new: TaggedWord) {}
 
     /// Unchecked [`read_raw`](Self::read_raw).
     #[inline]
@@ -343,62 +516,30 @@ impl Heap {
 
     // --- collection (Cheney) ------------------------------------------------
 
-    /// Collect the local heap, keeping only what is reachable from `roots`. The reachable graph is
-    /// copied into the reserve space; `roots` are **rewritten in place** to the survivors' new
-    /// addresses (any [`HeapPtr`] / pointer `TaggedWord` held elsewhere across a `collect` is stale —
-    /// this models the shadow-stack root-reload contract, ADR-0064 §4). Sharing and cycles are
-    /// preserved by forwarding.
-    pub fn collect(&mut self, roots: &mut [TaggedWord]) {
-        // The from-space object-start oracle, built once (O(top)) before any forwarding rewrites a
-        // header. Both the root check and `evacuate` consult it so that *every* pointer the collector
-        // is about to read as a header — an externally supplied root **and** a value slot GC traces
-        // internally — is proven to address a live object start first. Without the value-slot arm, a
-        // stale/interior pointer stored into a live slot via the safe API would be read as a header
-        // and copied as a forged object ([P1]).
-        let starts = FromStarts::build(self.space, self.top);
+    /// Collect on allocation overflow (ADR-0066 §4): the local heap is collected with the **shadow
+    /// stack** ([`roots`](Heap::roots)) as the root set, then the caller (`alloc`) retries the bump.
+    /// Fed by disjoint field borrows — `self.space`/`self.reserve`/`self.top` are `Copy`, `self.roots`
+    /// is borrowed mutably — so there is no `mem::take` window in which the root set is empty.
+    fn gc(&mut self) {
+        self.top = collect_core(self.space, self.reserve, self.top, &mut self.roots);
+        // Swap the two stable base pointers (a `Copy` of the raw handles — no buffer re-borrow). The
+        // shadow-stack slots were rewritten in place by `collect_core`; `root_gens` is unaffected
+        // (same slots, new values).
+        core::mem::swap(&mut self.space, &mut self.reserve);
+    }
 
-        // Release-on: each pointer root must be a live object *header* in the active (soon-`from`)
-        // space; a stale, foreign, or interior-aliasing root is rejected before any dereference.
-        for r in roots.iter() {
-            if r.is_pointer() {
-                assert!(
-                    starts.is_start(r.addr()),
-                    "collect: a root is not a live object in this heap (stale, foreign, or interior alias)"
-                );
-            }
-        }
-
-        // Both semi-spaces are addressed through their stable raw bases (never `&mut [u64]`, which
-        // would invalidate outstanding `HeapPtr`s — see the struct docs). `from` is scanned, `to`
-        // receives survivors; they are disjoint allocations.
-        let from = self.space;
-        let to = self.reserve;
-        let mut free = 0usize;
-
-        for r in roots.iter_mut() {
-            *r = evacuate(from, to, &mut free, &starts, *r);
-        }
-
-        // Cheney scavenge: walk the objects already in `to`, evacuating their value slots. New
-        // survivors are appended past `free`, so the loop terminates when `scan` catches up.
-        let mut scan = 0usize;
-        while scan < free {
-            // SAFETY: `scan < free <= cap`; read the header just written into `to`.
-            let hdr = Header::from_bits(unsafe { *to.as_ptr().add(scan) });
-            let size = hdr.size_words() as usize;
-            let [(a0, a1), (b0, b1)] = value_slot_ranges(hdr.kind(), hdr.size_words());
-            for i in (a0..a1).chain(b0..b1) {
-                let idx = scan + 1 + i as usize;
-                // SAFETY: `idx` is a value slot of the object at `scan`, within `to`'s allocation.
-                let w = TaggedWord::from_bits(unsafe { *to.as_ptr().add(idx) });
-                let moved = evacuate(from, to, &mut free, &starts, w);
-                unsafe { *to.as_ptr().add(idx) = moved.to_bits() };
-            }
-            scan += 1 + size;
-        }
-
-        self.top = free;
-        // Swap the two stable base pointers (a `Copy` of the raw handles — no buffer re-borrow).
+    /// Collect with an **explicit** root slice — **test-only** (`#[cfg(test)]`, ADR-0066 §4). This is
+    /// *not* a public alternate root path: the runtime always collects via [`gc`](Heap::gc) rooted by
+    /// the shadow stack. A unit test using this form supplies the *complete* root set and keeps the
+    /// shadow stack empty, so the two root sources never coexist and diverge. `roots` are rewritten in
+    /// place.
+    #[cfg(test)]
+    pub(crate) fn collect(&mut self, roots: &mut [TaggedWord]) {
+        debug_assert!(
+            self.roots.is_empty(),
+            "explicit-slice collect must not run with a non-empty shadow stack (ADR-0066 §4)"
+        );
+        self.top = collect_core(self.space, self.reserve, self.top, roots);
         core::mem::swap(&mut self.space, &mut self.reserve);
     }
 }
@@ -428,6 +569,60 @@ impl Drop for Heap {
             )));
         }
     }
+}
+
+/// The Cheney collection core (ADR-0066 §4): a function of the raw semi-space bases and the root
+/// slice — *not* `&mut self` — so a caller can invoke it with disjoint field borrows (`gc` passes
+/// `&mut self.roots` alongside the `Copy` space handles) without a self-alias, and with no `mem::take`
+/// window where the root set is empty. Evacuates everything reachable from `roots` into `to`, rewrites
+/// `roots` in place to the survivors' new addresses, and returns the new `top` (used words in `to`,
+/// which the caller swaps in as the active space). `from` and `to` are disjoint allocations.
+fn collect_core(
+    from: NonNull<u64>,
+    to: NonNull<u64>,
+    top: usize,
+    roots: &mut [TaggedWord],
+) -> usize {
+    // From-space object-start oracle, built once (O(top)) before any forwarding rewrites a header;
+    // both the root check and `evacuate` consult it so every pointer read as a header is proven to be
+    // a live object start first ([P1]).
+    let starts = FromStarts::build(from, top);
+
+    // Release-on: each pointer root must be a live object *header* in the from-space; a stale, foreign,
+    // or interior-aliasing root is rejected before any dereference.
+    for r in roots.iter() {
+        if r.is_pointer() {
+            assert!(
+                starts.is_start(r.addr()),
+                "collect: a root is not a live object in this heap (stale, foreign, or interior alias)"
+            );
+        }
+    }
+
+    let mut free = 0usize;
+    for r in roots.iter_mut() {
+        *r = evacuate(from, to, &mut free, &starts, *r);
+    }
+
+    // Cheney scavenge: walk the objects already in `to`, evacuating their value slots. New survivors
+    // are appended past `free`, so the loop terminates when `scan` catches up.
+    let mut scan = 0usize;
+    while scan < free {
+        // SAFETY: `scan < free`; read the header just written into `to`.
+        let hdr = Header::from_bits(unsafe { *to.as_ptr().add(scan) });
+        let size = hdr.size_words() as usize;
+        let [(a0, a1), (b0, b1)] = value_slot_ranges(hdr.kind(), hdr.size_words());
+        for i in (a0..a1).chain(b0..b1) {
+            let idx = scan + 1 + i as usize;
+            // SAFETY: `idx` is a value slot of the object at `scan`, within `to`'s allocation.
+            let w = TaggedWord::from_bits(unsafe { *to.as_ptr().add(idx) });
+            let moved = evacuate(from, to, &mut free, &starts, w);
+            unsafe { *to.as_ptr().add(idx) = moved.to_bits() };
+        }
+        scan += 1 + size;
+    }
+
+    free
 }
 
 /// A from-space object-start oracle for one collection: which word offsets in the from-space hold an
@@ -791,5 +986,84 @@ mod tests {
         h.write_field(keep2, 1, stale);
         let mut roots2 = [keep2.as_word()];
         h.collect(&mut roots2);
+    }
+
+    // --- GC-on-alloc + shadow-stack rooting (ADR-0066) ----------------------
+
+    #[test]
+    fn gc_on_alloc_relocates_rooted_survivor() {
+        // A rooted object survives (and is relocated by) a collection that `alloc` triggers on
+        // overflow — the mid-evaluation GC the old "alloc panics" note could not exercise.
+        let mut h = Heap::new(8); // small semi-space
+        let frame = h.frame();
+        let keep = h.new_number(3.5); // 2 words
+        let kr = h.root(keep.as_word());
+
+        // Unrooted garbage; each `new_number` is 2 words, so this overflows and forces collections
+        // that keep only `keep`.
+        for _ in 0..20 {
+            let _ = h.new_number(1.0);
+        }
+
+        let keep2 = unsafe { HeapPtr::from_word(h.get(kr)) };
+        assert_eq!(h.header(keep2).kind(), Kind::NumberBox);
+        assert_eq!(f64::from_bits(h.read_raw(keep2, 0)), 3.5);
+        h.pop_frame(frame);
+    }
+
+    #[test]
+    fn gc_during_constructor_preserves_rooted_fields() {
+        // A collection fired by the *constructor's own* `alloc` must not lose the incoming field
+        // values — `new_adt` self-roots them (ADR-0066 §3), so they survive and the object stores the
+        // relocated addresses.
+        let mut h = Heap::new(8);
+        let a = h.new_number(1.0); // top 2
+        let b = h.new_number(2.0); // top 4
+        let _garbage = h.new_number(9.0); // top 6 — unrooted, collected during the adt's alloc
+
+        // adt needs 1 header + 1 tag + 2 fields = 4 words; top 6 + 4 > 8 → GC mid-construction.
+        let adt = h.new_adt(0, &[a.as_word(), b.as_word()]);
+
+        let f1 = unsafe { HeapPtr::from_word(h.read_field(adt, 1)) };
+        let f2 = unsafe { HeapPtr::from_word(h.read_field(adt, 2)) };
+        assert_eq!(f64::from_bits(h.read_raw(f1, 0)), 1.0);
+        assert_eq!(f64::from_bits(h.read_raw(f2, 0)), 2.0);
+        // a(2) + b(2) + adt(4) live; the garbage number is gone.
+        assert_eq!(h.used(), 8);
+    }
+
+    #[test]
+    fn gc_collects_unrooted_between_allocs() {
+        // 20 unrooted 2-word allocations = 40 words pushed through an 8-word semi-space: only possible
+        // because each GC-on-alloc reclaims the unrooted garbage. Reaching the end without OOM *is*
+        // the reclamation proof; `used` never exceeds the semi-space and the rooted `keep` is intact.
+        let mut h = Heap::new(8);
+        let frame = h.frame();
+        let keep = h.new_number(3.5);
+        let kr = h.root(keep.as_word());
+        for _ in 0..20 {
+            let _ = h.new_number(1.0);
+        }
+        assert!(h.used() <= 8, "used exceeded the semi-space: {}", h.used());
+        let keep2 = unsafe { HeapPtr::from_word(h.get(kr)) };
+        assert_eq!(f64::from_bits(h.read_raw(keep2, 0)), 3.5);
+        h.pop_frame(frame);
+    }
+
+    #[test]
+    #[should_panic(expected = "OOM")]
+    fn alloc_oom_when_live_set_exceeds_semispace() {
+        // A live (rooted) set that alone exceeds a semi-space is a fatal OOM after collect-and-retry —
+        // v1 has no heap growth (ADR-0066 §4).
+        let mut h = Heap::new(6);
+        let frame = h.frame();
+        let a = h.new_number(1.0);
+        let _ra = h.root(a.as_word()); // 2 words
+        let b = h.new_number(2.0);
+        let _rb = h.root(b.as_word()); // 4
+        let c = h.new_number(3.0);
+        let _rc = h.root(c.as_word()); // 6 — full, all rooted
+        let _d = h.new_number(4.0); // overflow → GC keeps all 6 → retry still overflows → OOM
+        h.pop_frame(frame); // unreached
     }
 }
