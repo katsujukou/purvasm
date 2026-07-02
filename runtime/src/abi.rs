@@ -438,6 +438,35 @@ pub unsafe extern "C" fn pv_new_byneed(ctx: *mut Heap, suspension: u64) -> u64 {
     })
 }
 
+/// **Static** record field read (ADR-0069): `rec.label` where the codegen already hashed `label` to its
+/// FNV-1a-64 `id`. Faults if `id` is absent (the typed row constraint guarantees presence). This is the
+/// id-keyed core the `Accessor` node lowers to (distinct from the `String`-keyed `RecordGet` primop).
+///
+/// # Safety
+/// `ctx` live; `rec` a `Record` value word.
+#[no_mangle]
+pub unsafe extern "C" fn pv_record_get(ctx: *mut Heap, rec: u64, id: u64) -> u64 {
+    guard(|| {
+        heap(ctx)
+            .record_get(TaggedWord::from_bits(rec), id)
+            .to_bits()
+    })
+}
+
+/// **Static** record functional update (ADR-0069): `rec { label = value }` by the compiler-hashed `id`
+/// (the label must be **present**), returning a new record. The `Update` node folds this over its fields.
+///
+/// # Safety
+/// `ctx` live; `rec` a `Record` value word; `value` a value word.
+#[no_mangle]
+pub unsafe extern "C" fn pv_record_set(ctx: *mut Heap, rec: u64, id: u64, value: u64) -> u64 {
+    guard(|| {
+        heap(ctx)
+            .record_set(TaggedWord::from_bits(rec), id, TaggedWord::from_bits(value))
+            .to_bits()
+    })
+}
+
 // The address path uses `usize→fn` reconstruction (ADR-0071 §3), which Miri's abstract machine rejects,
 // so these end-to-end tests — which actually *call* an `AbiCodeFn` through `pv_apply` — are excluded
 // from Miri. The index path (the `lib` API) carries the Miri coverage (ADR-0063 §4).

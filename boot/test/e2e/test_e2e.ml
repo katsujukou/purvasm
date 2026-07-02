@@ -1011,6 +1011,47 @@ let test_llvm_case_guard_fallthrough () =
          ; { C.binders = [ C.BNull ]; result = C.Unconditional (int 2) }
          ] ))
 
+(* --- slice 3: static records (literal / accessor / update / record binder) ------------------- *)
+
+(* `let r = { a: 3, b: 4 } in r.a + r.b` → 7 (construction + static accessor). *)
+let test_llvm_record_access () =
+  same_on_llvm
+    "record access"
+    (C.Let
+       ( "r"
+       , C.Record [ "a", int 3; "b", int 4 ]
+       , C.Prim (C.AddInt, [ C.Accessor (C.Var "r", "a"); C.Accessor (C.Var "r", "b") ])
+       ))
+
+(* Functional update leaves the original intact:
+   `let r = { a: 1, b: 2 } in (r { a = 10 }).a + r.a` → 11. *)
+let test_llvm_record_update () =
+  same_on_llvm
+    "record update"
+    (C.Let
+       ( "r"
+       , C.Record [ "a", int 1; "b", int 2 ]
+       , C.Let
+           ( "r2"
+           , C.Update (C.Var "r", [ "a", int 10 ])
+           , C.Prim
+               (C.AddInt, [ C.Accessor (C.Var "r2", "a"); C.Accessor (C.Var "r", "a") ])
+           ) ))
+
+(* Record binder (row-poly subset): `case { x: 5, y: 7 } of { x: a, y: b } -> a*10 + b` → 57. *)
+let test_llvm_record_binder () =
+  same_on_llvm
+    "record binder"
+    (C.Case
+       ( [ C.Record [ "x", int 5; "y", int 7 ] ]
+       , [ { C.binders = [ C.BRecord [ "x", C.BVar "a"; "y", C.BVar "b" ] ]
+           ; result =
+               C.Unconditional
+                 (C.Prim
+                    (C.AddInt, [ C.Prim (C.MulInt, [ C.Var "a"; int 10 ]); C.Var "b" ]))
+           }
+         ] ))
+
 let test_ml_recursion () =
   let fact =
     C.Lam
@@ -1661,6 +1702,9 @@ let llvm_groups =
             "case_guard_fallthrough"
             `Quick
             test_llvm_case_guard_fallthrough
+        ; Alcotest.test_case "record_access" `Quick test_llvm_record_access
+        ; Alcotest.test_case "record_update" `Quick test_llvm_record_update
+        ; Alcotest.test_case "record_binder" `Quick test_llvm_record_binder
         ] )
     ]
   else (

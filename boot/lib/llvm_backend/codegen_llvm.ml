@@ -5,8 +5,11 @@
     - **Slice 2 — ADTs + `case`**: saturated constructors (nullary → an immediate tag, field-carrying →
       `pv_new_adt`), and the CPS-cascade matcher over `BNull`/`BVar`/`BNamed`/`BLit`(`Int`/`Bool`)/`BCtor`
       binders, with guarded alternatives.
-    Records / arrays / `letrec` / by-need / strings / `Number` / the full leaf set / unsaturated
-    constructors land in later slices (a clear [failwith] guards each until then).
+    - **Slice 3 — static records**: literals (`pv_new_record` over compile-time FNV-1a-64 label ids,
+      sorted), the static `Accessor` and functional `Update` (id-keyed `pv_record_get`/`pv_record_set`),
+      and the `BRecord` row-poly binder.
+    Arrays / `letrec` / by-need / strings / `Number` / the full leaf set / unsaturated constructors / the
+    dynamic (`String`-keyed) record primops land in later slices (a clear [failwith] guards each).
 
     Every guest value is one `i64` tagged word (ADR-0064 §1); the module calls the runtime's `extern "C"`
     surface (`pv_*`, ADR-0071). Rooting is **root-on-create** (ADR-0072 §6, the conservative first cut):
@@ -28,6 +31,23 @@ let imm (payload : int) : string =
 let imm_int (n : int) : string = imm (Int32.to_int (Int32.of_int n))
 let imm_bool (b : bool) : string = imm (if b then 1 else 0)
 let imm_unit : string = imm 0
+
+(* --- record label ids (ADR-0069 §2): FNV-1a-64, byte-for-byte with the runtime's `record::fnv1a_64`,
+   so a compile-time static label id equals a runtime hash of the same name --------------------------- *)
+
+let fnv1a_64 (s : string) : int64 =
+  let h = ref 0xcbf29ce484222325L in
+  String.iter
+    (fun c ->
+       h := Int64.logxor !h (Int64.of_int (Char.code c));
+       h := Int64.mul !h 0x100000001b3L)
+    s;
+  !h
+
+(* The label's id as an LLVM `i64` constant operand. `Int64.to_string` is signed decimal, but LLVM
+   interprets a negative `i64` literal as its two's-complement bit pattern, so the u64 the runtime reads
+   round-trips exactly. *)
+let label_id (label : string) : string = Int64.to_string (fnv1a_64 label)
 
 (* --- free variables of an ANF term (for lambda-lifting, ADR-0072 §4) ------------------------------- *)
 
@@ -280,6 +300,17 @@ let get_current cx (handle : string) : string =
   emit cx "  %s = call i64 @pv_get(ptr %%ctx, i64 %s)" t handle;
   t
 
+(* Evaluate a list of atoms and return their **current** value operands, mutually protected against
+   each other's allocation. Once `atom` can allocate (slice 4: `String`/`Number` literals, `foreign`
+   closures), collecting several results into registers and then calling — e.g. `CRecord`'s values,
+   `CApp`'s `f`+args, `CCtor`'s fields — would let a later atom's GC stale an earlier value. So each atom
+   is `pv_root`ed as it is produced (left-to-right), and all are read back with `pv_get` *after* every
+   allocation is done. The transient roots live in the enclosing function frame (freed at return);
+   bounding them is the deferred rooting minimisation (ADR-0072 §6). *)
+let eval_atoms cx (env : env) (atoms : A.atom list) : string list =
+  let handles = List.fold_left (fun acc a -> root cx (atom cx env a) :: acc) [] atoms in
+  List.rev_map (get_current cx) handles
+
 (* Emit a `br i1` guarded by [ok]: fall through to a fresh continuation block on true, jump to [fail] on
    false. Returns after emitting the continuation block's label (subsequent code runs on match). *)
 let test_or_fail cx (ok : string) ~(fail : string) (tag : string) : unit =
@@ -350,8 +381,22 @@ let rec match_binder cx (env : env) ~(fail : string) (binder : C.binder) (scrut 
            match_binder cx env ~fail sub fld)
         env
         (List.mapi (fun i s -> i, s) subs))
+  | C.BRecord fields ->
+    (* A row-polymorphic subset match (ADR-0012): the record *has* these labels by typing, so each field
+       read succeeds; only the sub-binders can fail. Reads are allocation-free, so [scrut] stays valid. *)
+    List.fold_left
+      (fun env (label, sub) ->
+         let fld = fresh cx in
+         emit
+           cx
+           "  %s = call i64 @pv_record_get(ptr %%ctx, i64 %s, i64 %s)"
+           fld
+           scrut
+           (label_id label);
+         match_binder cx env ~fail sub fld)
+      env
+      fields
   | C.BArray _ -> failwith "codegen_llvm: array binder not in slice 2"
-  | C.BRecord _ -> failwith "codegen_llvm: record binder not in slice 3"
 
 (* Compile [e]; [tail] = it is in the enclosing function's tail position. Returns [Some operand] when
    not tail (the produced value), [None] when tail (a `ret`/tail-call was emitted). *)
@@ -377,7 +422,7 @@ and cexpr cx (env : env) ~(tail : bool) (c : A.cexpr) : string option =
   | A.CAtom a -> finish (atom cx env a)
   | A.CPrim (op, args) ->
     let sym, needs_ctx = prim_sym op in
-    let ops = List.map (atom cx env) args in
+    let ops = eval_atoms cx env args in
     let t = fresh cx in
     if needs_ctx
     then
@@ -397,8 +442,10 @@ and cexpr cx (env : env) ~(tail : bool) (c : A.cexpr) : string option =
     finish t
   | A.CLam (ps, body) -> finish (make_closure cx env (lift cx ps body))
   | A.CApp (f, args) ->
-    let fv = atom cx env f in
-    let ops = List.map (atom cx env) args in
+    (* `f` and the args are mutually protected: a `foreign` callee or a `String` arg may allocate. *)
+    let all = eval_atoms cx env (f :: args) in
+    let fv = List.hd all
+    and ops = List.tl all in
     if tail
     then (
       (* Trampoline tail call (ADR-0071 §4): stash the pending tail, pop this frame, return (ignored). *)
@@ -464,7 +511,7 @@ and cexpr cx (env : env) ~(tail : bool) (c : A.cexpr) : string option =
     then finish (imm (ctor_index cx name)) (* nullary → an immediate tag (ADR-0064 §1) *)
     else (
       let idx = ctor_index cx name in
-      let ops = List.map (atom cx env) args in
+      let ops = eval_atoms cx env args in
       let p, n = arg_buffer cx ops in
       let t = fresh cx in
       emit cx "  %s = call i64 @pv_new_adt(ptr %%ctx, i32 %d, ptr %s, i64 %d)" t idx p n;
@@ -537,9 +584,63 @@ and cexpr cx (env : env) ~(tail : bool) (c : A.cexpr) : string option =
       in
       emit cx "  %s = phi i64 %s" r (String.concat ", " entries);
       Some r)
-  | A.CArray _ -> failwith "codegen_llvm: array not in slice 2"
-  | A.CRecord _ | A.CAccessor _ | A.CUpdate _ ->
-    failwith "codegen_llvm: records not in slice 3"
+  | A.CRecord fields ->
+    (* Hash each label, sort the (id, value) pairs by *unsigned* id ascending (the runtime `new_record`
+       asserts strictly-ascending u64 ids, ADR-0069 §1), and pass parallel id/value buffers. *)
+    let pairs = List.map (fun (l, a) -> fnv1a_64 l, a) fields in
+    let pairs = List.sort (fun (i1, _) (i2, _) -> Int64.unsigned_compare i1 i2) pairs in
+    let n = List.length pairs in
+    if n = 0
+    then (
+      let t = fresh cx in
+      emit cx "  %s = call i64 @pv_new_record(ptr %%ctx, ptr null, ptr null, i64 0)" t;
+      finish t)
+    else (
+      let ids = List.map (fun (i, _) -> Int64.to_string i) pairs in
+      (* Values are mutually protected: a later `String`/`Number` field must not stale an earlier one. *)
+      let vals = eval_atoms cx env (List.map snd pairs) in
+      let idp, _ = arg_buffer cx ids in
+      let valp, _ = arg_buffer cx vals in
+      let t = fresh cx in
+      emit
+        cx
+        "  %s = call i64 @pv_new_record(ptr %%ctx, ptr %s, ptr %s, i64 %d)"
+        t
+        idp
+        valp
+        n;
+      finish t)
+  | A.CAccessor (a, label) ->
+    let r = atom cx env a in
+    let t = fresh cx in
+    emit
+      cx
+      "  %s = call i64 @pv_record_get(ptr %%ctx, i64 %s, i64 %s)"
+      t
+      r
+      (label_id label);
+    finish t
+  | A.CUpdate (a, ups) ->
+    (* Functional update: fold `record_set` (each returns a new record). The accumulator record is rooted
+       across each value's evaluation (a `String`/`Number` value may allocate) and reloaded before the
+       set; `pv_record_set` self-roots its record + value across its own allocation. *)
+    let rh = ref (root cx (atom cx env a)) in
+    List.iter
+      (fun (label, va) ->
+         let v = atom cx env va in
+         let r = get_current cx !rh in
+         let t = fresh cx in
+         emit
+           cx
+           "  %s = call i64 @pv_record_set(ptr %%ctx, i64 %s, i64 %s, i64 %s)"
+           t
+           r
+           (label_id label)
+           v;
+         rh := root cx t)
+      ups;
+    finish (get_current cx !rh)
+  | A.CArray _ -> failwith "codegen_llvm: array not in slice 3"
 
 (* Emit one lifted function: open a frame, root the params (from the arg buffer) and the captured free
    vars (from the closure env block), then compile the body in tail position. *)
@@ -607,6 +708,9 @@ let declarations : string =
     ; "declare void @pv_pop_frame(ptr, i64)"
     ; "declare i64 @pv_new_array(ptr, ptr, i64)"
     ; "declare i64 @pv_new_adt(ptr, i32, ptr, i64)"
+    ; "declare i64 @pv_new_record(ptr, ptr, ptr, i64)"
+    ; "declare i64 @pv_record_get(ptr, i64, i64)"
+    ; "declare i64 @pv_record_set(ptr, i64, i64, i64)"
     ; "declare i64 @pv_read_field(ptr, i64, i64)"
     ; "declare i64 @pv_read_raw(ptr, i64, i64)"
     ; "declare void @pv_case_fail()"
