@@ -60,6 +60,13 @@ impl Heap {
         }
     }
 
+    /// `Record.has`: whether label `id` is present. Read-only, never faults (ADR-0069 §3 / the
+    /// `RecordHas` primop).
+    pub fn record_has(&self, rec: Value, id: u64) -> bool {
+        let view = self.checked_record(rec);
+        self.record_search(&view, id).1
+    }
+
     /// `Record.insert`: a new record with `id -> value` added (the label must be **absent**).
     pub fn record_insert(&mut self, rec: Value, id: u64, value: Value) -> Value {
         let frame = self.frame();
@@ -175,6 +182,12 @@ impl Heap {
     pub fn record_unsafe_delete(&mut self, key: Value, rec: Value) -> Value {
         let id = self.str_label_id(key);
         self.record_delete(rec, id)
+    }
+
+    /// `RecordHas` performer: `record_has` keyed by the hash of the `String` `key`; returns a `Boolean`.
+    pub fn record_unsafe_has(&self, key: Value, rec: Value) -> Value {
+        let id = self.str_label_id(key);
+        Value::bool(self.record_has(rec, id))
     }
 }
 

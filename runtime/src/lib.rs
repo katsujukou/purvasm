@@ -36,6 +36,8 @@ pub mod byneed;
 pub mod effect;
 pub mod gc;
 pub mod heap;
+pub mod leaf;
+pub mod prim;
 pub mod record;
 pub mod word;
 

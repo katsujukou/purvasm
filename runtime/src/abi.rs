@@ -23,9 +23,9 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 /// Run an FFI-entry body with panic containment (ADR-0071 §7). A caught unwind aborts — no post-panic
 /// runtime state is ever observed across the boundary. `AssertUnwindSafe` is sound because we abort
-/// (never resume) on `Err`.
+/// (never resume) on `Err`. Shared with [`crate::prim`] (the primop entries).
 #[inline]
-fn guard<R>(body: impl FnOnce() -> R) -> R {
+pub(crate) fn guard<R>(body: impl FnOnce() -> R) -> R {
     match catch_unwind(AssertUnwindSafe(body)) {
         Ok(r) => r,
         Err(_) => std::process::abort(),
@@ -33,16 +33,23 @@ fn guard<R>(body: impl FnOnce() -> R) -> R {
 }
 
 /// Reborrow the opaque context as `&mut Heap`. `ctx` must be a live `Heap` from [`pv_runtime_new`].
+///
+/// # Safety
+/// `ctx` must be a live [`Heap`] from [`pv_runtime_new`], with no other live borrow of it.
 #[inline]
-unsafe fn heap<'a>(ctx: *mut Heap) -> &'a mut Heap {
+pub(crate) unsafe fn heap<'a>(ctx: *mut Heap) -> &'a mut Heap {
     debug_assert!(!ctx.is_null(), "pv_* called with a null context");
     &mut *ctx
 }
 
 /// Rebuild an args slice from a codegen-supplied `(ptr, len)`. A zero-length call may pass a null/dangling
-/// pointer, so length 0 yields an empty slice rather than an unsound `from_raw_parts(null, 0)`.
+/// pointer, so length 0 yields an empty slice rather than an unsound `from_raw_parts(null, 0)`. Shared
+/// with [`crate::leaf`] (the native leaves are ordinary `AbiCodeFn`s).
+///
+/// # Safety
+/// `args`/`nargs` describe a valid buffer of `nargs` value words (or `nargs == 0`).
 #[inline]
-unsafe fn args_slice<'a>(args: *const u64, nargs: usize) -> &'a [TaggedWord] {
+pub(crate) unsafe fn args_slice<'a>(args: *const u64, nargs: usize) -> &'a [TaggedWord] {
     if nargs == 0 {
         &[]
     } else {
@@ -126,6 +133,50 @@ pub unsafe extern "C" fn pv_make_closure(
         h.new_closure_raw(code_addr, arity, TaggedWord::from_bits(env))
             .as_word()
             .to_bits()
+    })
+}
+
+// --- effect execution + by-need force (ADR-0071 §6 / ADR-0067 / ADR-0070) ---------------------------
+
+/// Run an `Effect` program: `run_effect(main) = apply(main, unit)` (ADR-0067 §2). Returns the final
+/// value (a `Unit` for `Effect Unit`); effects fire in program order via strict `apply`.
+///
+/// # Safety
+/// `ctx` live; `main` an `Effect` thunk (an arity-1 closure).
+#[no_mangle]
+pub unsafe extern "C" fn pv_run_effect(ctx: *mut Heap, main: u64) -> u64 {
+    guard(|| heap(ctx).run_effect(TaggedWord::from_bits(main)).to_bits())
+}
+
+/// Force a by-need cell (ADR-0070): `Unforced` → evaluate + memoise, `Forced` → the memoised value,
+/// `Building` → a black-hole fault. Codegen emits this at a by-need dereference.
+///
+/// # Safety
+/// `ctx` live; `cell` a `ByNeed` pointer word.
+#[no_mangle]
+pub unsafe extern "C" fn pv_force(ctx: *mut Heap, cell: u64) -> u64 {
+    guard(|| heap(ctx).force(TaggedWord::from_bits(cell)).to_bits())
+}
+
+/// Flush the captured stdio sink (ADR-0067 §5) to real `stdout`, one line each, then clear it. The
+/// compiled entry stub calls this at exit so the process's stdout matches the differential
+/// (production wiring of the sink; tests instead read [`Heap::output`]).
+///
+/// # Safety
+/// `ctx` live.
+#[no_mangle]
+pub unsafe extern "C" fn pv_drain_output(ctx: *mut Heap) {
+    guard(|| {
+        use std::io::Write;
+        let h = heap(ctx);
+        let out = std::io::stdout();
+        let mut lock = out.lock();
+        for line in h.output() {
+            // `writeln!` uses the platform line separator via `\n`; the differential compares the
+            // normalised line sequence, not raw bytes (ADR-0067 §5).
+            let _ = writeln!(lock, "{line}");
+        }
+        let _ = lock.flush();
     })
 }
 
