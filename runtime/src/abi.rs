@@ -182,6 +182,22 @@ pub unsafe extern "C" fn pv_drain_output(ctx: *mut Heap) {
     })
 }
 
+/// Print a **pure `Int` entry**'s value to `stdout` (no trailing newline), matching the oracle's
+/// `Value.to_string` for `Int` (OCaml `string_of_int` == Rust `i32` `Display` over all `i32`). The
+/// codegen entry stub emits this for a pure `Int` program (ADR-0072 §8); type-directed printing for
+/// other entry types is added with the slices that introduce them. A write failure aborts (ADR-0071 §7).
+#[no_mangle]
+pub extern "C" fn pv_print_int(v: u64) {
+    guard(|| {
+        use std::io::Write;
+        let n = TaggedWord::from_bits(v).as_int();
+        let out = std::io::stdout();
+        let mut lock = out.lock();
+        write!(lock, "{n}").expect("pv_print_int: stdout write failed");
+        lock.flush().expect("pv_print_int: stdout flush failed");
+    })
+}
+
 // --- shadow-stack rooting (ADR-0071 §5) -------------------------------------------------------------
 
 /// Open a shadow-stack frame; returns an opaque mark for [`pv_pop_frame`].

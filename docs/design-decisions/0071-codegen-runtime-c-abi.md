@@ -270,6 +270,11 @@ signatures live in the runtime source, kept isomorphic to the value model — no
   _(Corrected 2026-07-02 after the Effect.Ref-structural finding: the earlier draft listed `pv_ref_*` /
   `pv_stdio_write_line` / `pv_record_*` as direct symbols; the implemented surface routes leaves through
   `pv_foreign` and records through the primops.)_
+- **Entry-print helper** — `pv_print_int(v)` writes a **pure `Int` entry**'s value to `stdout` (no
+  trailing newline), matching the oracle's `Value.to_string` for `Int`. The codegen entry stub calls it
+  for a pure `Int` program ([0072](0072-anf-to-llvm-lowering.md) §8); the native value is type-erased, so
+  there is no generic runtime `to_string` — a per-entry-type printer is emitted per the codegen's known
+  entry type, and the other-type printers are added with the slices that introduce them.
 - **Primops** — one `pv_prim_*` per `Cesk.Ast.primop` (the ~40 in `codegen_ml`'s `prim_fn`). Making them
   **runtime helpers keeps one tested source of truth** for the tricky semantics — 32-bit wrapping,
   Euclidean div/mod, ECMAScript `ToInt32`/`Math.round` ([0041](0041-int-number-conversion-primops.md)/

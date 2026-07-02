@@ -777,6 +777,119 @@ let same_on_ocaml_effect (label : string) (t : C.term) =
   in
   Alcotest.(check string) label out (ocaml_run ~is_effect:true t)
 
+(* --- LLVM native backend (ADR-0071/0072) differential equivalence --------- *)
+
+(* Locate the owned runtime `staticlib` (ADR-0071 §1) the LLVM output links against. It is built by
+   `cargo` outside dune, so we take it from `$PURVASM_RT_A` or the conventional built path under the
+   repo root (found by walking up for `runtime/Cargo.toml`). Absent (runtime not built, or no cargo) →
+   the llvm-backend group is skipped with a notice rather than failing the whole suite. *)
+let repo_root : string option =
+  let rec up d =
+    if Sys.file_exists (Filename.concat d "runtime/Cargo.toml")
+    then Some d
+    else (
+      let p = Filename.dirname d in
+      if p = d then None else up p)
+  in
+  up (Sys.getcwd ())
+
+let rt_staticlib : string option =
+  let exists p = if Sys.file_exists p then Some p else None in
+  match Sys.getenv_opt "PURVASM_RT_A" with
+  | Some p when Sys.file_exists p -> Some p
+  | _ ->
+    Option.bind repo_root (fun root ->
+      match exists (Filename.concat root "runtime/target/debug/libpurvasm_rt.a") with
+      | Some p -> Some p
+      | None -> exists (Filename.concat root "runtime/target/release/libpurvasm_rt.a"))
+
+let has_clang : bool = Sys.command "clang --version >/dev/null 2>&1" = 0
+let llvm_available : bool = rt_staticlib <> None && has_clang
+
+(* Compile a term through the LLVM backend to a native executable and run it: ANF (ADR-0025) → LLVM IR
+   → `clang` (link the runtime `staticlib`) → run → its output. The **fourth** differential
+   implementation (ADR-0064 §7), held to the CESK oracle's value / `Effect`-order. *)
+let llvm_run ?(is_effect = false) (t : C.term) : string =
+  let rt = Option.get rt_staticlib in
+  let dir =
+    Filename.concat
+      (Filename.get_temp_dir_name ())
+      (Printf.sprintf "purvasm_ll_%x" (Hashtbl.hash t))
+  in
+  (try Sys.mkdir dir 0o755 with
+   | Sys_error _ -> ());
+  let src = Llvm_backend.Codegen_llvm.program ~is_effect (Middle_end.Transl.transl t) in
+  (* Quote every path (ADR-0072 §10 harness): a `TMPDIR` with spaces must not break the command line. *)
+  let genll = Filename.concat dir "gen.ll" in
+  let genexe = Filename.concat dir "gen" in
+  let err = Filename.concat dir "err" in
+  let out = Filename.concat dir "out" in
+  let oc = open_out genll in
+  output_string oc src;
+  close_out oc;
+  if
+    Sys.command
+      (Printf.sprintf
+         "clang %s %s -o %s 2>%s"
+         (Filename.quote genll)
+         (Filename.quote rt)
+         (Filename.quote genexe)
+         (Filename.quote err))
+    <> 0
+  then Alcotest.failf "clang failed; see %s and %s" err genll;
+  if
+    Sys.command (Printf.sprintf "%s > %s" (Filename.quote genexe) (Filename.quote out))
+    <> 0
+  then Alcotest.fail "generated program crashed";
+  let ic = open_in out in
+  let s = In_channel.input_all ic in
+  close_in ic;
+  s
+
+(* Slice 1 (ADR-0072 §10): the pure first-order subset — its value must match the CESK oracle's
+   printed form. (ADTs/records/case/effects/letrec are later slices, guarded in the codegen.) *)
+let same_on_llvm (label : string) (t : C.term) =
+  Alcotest.(check string)
+    label
+    (V.to_string (Cesk.Machine.eval ~host:Ffi.host t))
+    (llvm_run t)
+
+let test_llvm_arith () =
+  same_on_llvm
+    "(1+2)*3"
+    (C.Prim (C.MulInt, [ C.Prim (C.AddInt, [ int 1; int 2 ]); int 3 ]))
+
+let test_llvm_app () =
+  same_on_llvm
+    "app"
+    (C.App (C.Lam ("x", C.Prim (C.AddInt, [ C.Var "x"; int 1 ])), int 41))
+
+let test_llvm_if () =
+  same_on_llvm "if" (C.If (C.Prim (C.LtInt, [ int 1; int 2 ]), int 10, int 20))
+
+(* `f` is live across `g`'s closure allocation (a safepoint): exercises root-on-create (ADR-0072 §6). *)
+let test_llvm_let () =
+  same_on_llvm
+    "let"
+    (C.Let
+       ( "f"
+       , C.Lam ("x", C.Prim (C.AddInt, [ C.Var "x"; int 1 ]))
+       , C.Let
+           ( "g"
+           , C.Lam ("y", C.Prim (C.MulInt, [ C.Var "y"; int 2 ]))
+           , C.Prim (C.AddInt, [ C.App (C.Var "f", int 10); C.App (C.Var "g", int 20) ])
+           ) ))
+
+(* `f`'s body `g x` is a tail call → the pv_tailcall trampoline path + a captured `g` (ADR-0071 §4). *)
+let test_llvm_tailapp () =
+  same_on_llvm
+    "tailapp"
+    (C.Let
+       ( "g"
+       , C.Lam ("y", C.Prim (C.AddInt, [ C.Var "y"; int 1 ]))
+       , C.Let ("f", C.Lam ("x", C.App (C.Var "g", C.Var "x")), C.App (C.Var "f", int 41))
+       ))
+
 (* Slice 1 (ADR-0036): the pure first-order subset, uniform calling convention. A real
    purs-compiled fixture (`prelude_answer`) plus controlled terms covering each node
    kind. (Value-recursive `let rec` → `lazy`, record binders, foreigns, and Effect are
@@ -1441,186 +1554,209 @@ let test_vm_diamond () =
        ~entry:"both"
        ())
 
+(* The llvm-backend differential runs only when the owned runtime `staticlib` + `clang` are available
+   (ADR-0072 §10); otherwise it is skipped with a notice, so `dune test` never fails merely because the
+   Rust runtime has not been built in this environment. *)
+let llvm_groups =
+  if llvm_available
+  then
+    [ ( "llvm-backend"
+      , [ Alcotest.test_case "arith" `Quick test_llvm_arith
+        ; Alcotest.test_case "app" `Quick test_llvm_app
+        ; Alcotest.test_case "if" `Quick test_llvm_if
+        ; Alcotest.test_case "let" `Quick test_llvm_let
+        ; Alcotest.test_case "tailapp" `Quick test_llvm_tailapp
+        ] )
+    ]
+  else (
+    Printf.eprintf
+      "[e2e] skipping llvm-backend group: %s\n%!"
+      (if rt_staticlib = None
+       then "runtime staticlib not found (build `runtime/` or set PURVASM_RT_A)"
+       else "clang not found");
+    [])
+
 let () =
   Alcotest.run
     "e2e"
-    [ ( "literals"
-      , [ Alcotest.test_case "int" `Quick test_int
-        ; Alcotest.test_case "string" `Quick test_string
-        ; Alcotest.test_case "number" `Quick test_number
-        ; Alcotest.test_case "bool" `Quick test_bool
-        ; Alcotest.test_case "char" `Quick test_char
-        ; Alcotest.test_case "array" `Quick test_array
-        ; Alcotest.test_case "record" `Quick test_record
-        ] )
-    ; ( "constructors"
-      , [ Alcotest.test_case "ctor_nullary" `Quick test_ctor_nullary
-        ; Alcotest.test_case "ctor_partial" `Quick test_ctor_partial
-        ; Alcotest.test_case "mk" `Quick test_mk
-        ] )
-    ; ( "case"
-      , [ Alcotest.test_case "classify_just_zero" `Quick test_classify_just_zero
-        ; Alcotest.test_case "classify_just_n" `Quick test_classify_just_n
-        ; Alcotest.test_case "classify_nothing" `Quick test_classify_nothing
-        ; Alcotest.test_case "first_of" `Quick test_first_of
-        ; Alcotest.test_case "via_record" `Quick test_via_record
-        ; Alcotest.test_case "dup" `Quick test_dup
-        ; Alcotest.test_case "pick_true" `Quick test_pick_true
-        ; Alcotest.test_case "pick_false" `Quick test_pick_false
-        ] )
-    ; ( "recursion"
-      , [ Alcotest.test_case "is_even_2" `Quick test_is_even_2
-        ; Alcotest.test_case "is_even_1" `Quick test_is_even_1
-        ; Alcotest.test_case "is_odd_3" `Quick test_is_odd_3
-        ] )
-    ; ( "linking"
-      , [ Alcotest.test_case "link_result" `Quick test_link_result
-        ; Alcotest.test_case "link_higher_order" `Quick test_link_higher_order
-        ; Alcotest.test_case "link_loads_closure" `Quick test_link_loads_closure
-        ; Alcotest.test_case "link_foreign_unbound" `Quick test_link_foreign_unbound
-        ; Alcotest.test_case "external_unbound" `Quick test_external_unbound
-        ] )
-    ; ( "newtype"
-      , [ Alcotest.test_case "match" `Quick test_newtype_match
-        ; Alcotest.test_case "as_pattern" `Quick test_newtype_as_pattern
-        ; Alcotest.test_case "as_whole" `Quick test_newtype_as_whole
-        ] )
-    ; ( "recursive-value"
-      , [ Alcotest.test_case "lazy_fix" `Quick test_lazy_fix
-        ; Alcotest.test_case "fib_and" `Quick test_recursive_value_fib
-        ] )
-    ; ( "effect"
-      , [ Alcotest.test_case "ref" `Quick test_effect_ref
-        ; Alcotest.test_case "console" `Quick test_effect_console
-        ] )
-    ; ( "lower-ir"
-      , [ Alcotest.test_case "fixture" `Quick test_rt_fixture
-        ; Alcotest.test_case "app" `Quick test_rt_app
-        ; Alcotest.test_case "prelude_answer" `Quick test_rt_prelude_answer
-        ; Alcotest.test_case "prelude_doubled" `Quick test_rt_prelude_doubled
-        ; Alcotest.test_case "prelude_show" `Quick test_rt_prelude_show
-        ; Alcotest.test_case "newtype" `Quick test_rt_newtype
-        ; Alcotest.test_case "fib" `Quick test_rt_fib
-        ; Alcotest.test_case "effect_ref" `Quick test_rt_effect_ref
-        ; Alcotest.test_case "effect_console" `Quick test_rt_effect_console
-        ] )
-    ; ( "dictelim"
-      , [ Alcotest.test_case "prelude_answer" `Quick test_de_prelude_answer
-        ; Alcotest.test_case "prelude_doubled" `Quick test_de_prelude_doubled
-        ; Alcotest.test_case "prelude_show" `Quick test_de_prelude_show
-        ; Alcotest.test_case "fib" `Quick test_de_fib
-        ; Alcotest.test_case "effect_ref" `Quick test_de_effect_ref
-        ; Alcotest.test_case "fires" `Quick test_dictelim_fires
-        ] )
-    ; ( "opt"
-      , [ Alcotest.test_case "prelude_answer" `Quick test_opt_prelude_answer
-        ; Alcotest.test_case "prelude_doubled" `Quick test_opt_prelude_doubled
-        ; Alcotest.test_case "prelude_show" `Quick test_opt_prelude_show
-        ; Alcotest.test_case "app" `Quick test_opt_app
-        ; Alcotest.test_case "newtype" `Quick test_opt_newtype
-        ; Alcotest.test_case "fib" `Quick test_opt_fib
-        ; Alcotest.test_case "effect_ref" `Quick test_opt_effect_ref
-        ; Alcotest.test_case "simplify_fires" `Quick test_simplify_fires
-        ; Alcotest.test_case "dbe_fires_classify" `Quick test_dbe_fires_classify
-        ; Alcotest.test_case "dbe_fires_anint" `Quick test_dbe_fires_anint
-        ] )
-    ; ( "ocaml"
-      , [ Alcotest.test_case "prelude_answer" `Quick test_ml_prelude_answer
-        ; Alcotest.test_case "arith" `Quick test_ml_arith
-        ; Alcotest.test_case "app" `Quick test_ml_app
-        ; Alcotest.test_case "if" `Quick test_ml_if
-        ; Alcotest.test_case "ctor" `Quick test_ml_ctor
-        ; Alcotest.test_case "case_just" `Quick test_ml_case_just
-        ; Alcotest.test_case "case_nothing" `Quick test_ml_case_nothing
-        ; Alcotest.test_case "recursion" `Quick test_ml_recursion
-        ; Alcotest.test_case "record" `Quick test_ml_record
-        ; Alcotest.test_case "array" `Quick test_ml_array
-        ; Alcotest.test_case "anInt" `Quick test_ml_anint
-        ; Alcotest.test_case "classify" `Quick test_ml_classify
-        ; Alcotest.test_case "firstOf" `Quick test_ml_firstof
-        ; Alcotest.test_case "via_record" `Quick test_ml_via_record
-        ; Alcotest.test_case "pick" `Quick test_ml_pick
-        ; Alcotest.test_case "number_binder" `Quick test_ml_number_binder
-        ; Alcotest.test_case "fib" `Quick test_ml_fib
-        ; Alcotest.test_case "show" `Quick test_ml_show
-        ; Alcotest.test_case "doubled" `Quick test_ml_doubled
-        ; Alcotest.test_case "effect_console" `Quick test_ml_effect_console
-        ; Alcotest.test_case "effect_ref" `Quick test_ml_effect_ref
-        ] )
-    ; ( "i4"
-      , [ Alcotest.test_case "forE" `Quick test_i4_fore
-        ; Alcotest.test_case "foreachE" `Quick test_i4_foreach
-        ; Alcotest.test_case "whileE" `Quick test_i4_while
-        ; Alcotest.test_case "untilE" `Quick test_i4_until
-        ] )
-    ; ( "vm"
-      , [ Alcotest.test_case "fixture" `Quick test_vm_fixture
-        ; Alcotest.test_case "app" `Quick test_vm_app
-        ; Alcotest.test_case "prelude_answer" `Quick test_vm_prelude_answer
-        ; Alcotest.test_case "prelude_div" `Quick test_vm_prelude_div
-        ; Alcotest.test_case "prelude_eq" `Quick test_vm_prelude_eq
-        ; Alcotest.test_case "prelude_bool" `Quick test_vm_prelude_bool
-        ; Alcotest.test_case "prelude_map" `Quick test_vm_prelude_map
-        ; Alcotest.test_case "newtype" `Quick test_vm_newtype
-        ; Alcotest.test_case "fib" `Quick test_vm_fib
-        ; Alcotest.test_case "lazy_fix" `Quick test_vm_lazy_fix
-        ; Alcotest.test_case "transitive" `Quick test_vm_transitive
-        ; Alcotest.test_case "diamond" `Quick test_vm_diamond
-        ; Alcotest.test_case "classify_just" `Quick test_vm_classify_just
-        ; Alcotest.test_case "classify_nothing" `Quick test_vm_classify_nothing
-        ; Alcotest.test_case "pick_true" `Quick test_vm_pick_true
-        ; Alcotest.test_case "pick_false" `Quick test_vm_pick_false
-        ; Alcotest.test_case "first_of" `Quick test_vm_first_of
-        ; Alcotest.test_case "via_record" `Quick test_vm_via_record
-        ; Alcotest.test_case "dt_lit" `Quick test_vm_dt_lit
-        ; Alcotest.test_case "dt_nested" `Quick test_vm_dt_nested
-        ; Alcotest.test_case "dt_aspat" `Quick test_vm_dt_aspat
-        ; Alcotest.test_case "dt_shared" `Quick test_vm_dt_shared
-        ; Alcotest.test_case "dt_array" `Quick test_vm_dt_array
-        ; Alcotest.test_case "dt_guard_chain" `Quick test_vm_dt_guard_chain
-        ; Alcotest.test_case "dt_guard_ctor" `Quick test_vm_dt_guard_ctor
-        ; Alcotest.test_case "naive_guard" `Quick test_vm_naive_guard
-        ; Alcotest.test_case "show_int" `Quick test_vm_show_int
-        ; Alcotest.test_case "show_number" `Quick test_vm_show_number
-        ; Alcotest.test_case "show_char" `Quick test_vm_show_char
-        ; Alcotest.test_case "show_string" `Quick test_vm_show_string
-        ; Alcotest.test_case "effect_ref" `Quick test_vm_effect_ref
-        ; Alcotest.test_case "effect_console" `Quick test_vm_effect_console
-        ] )
-    ; ( "image"
-      , [ Alcotest.test_case "float_bits" `Quick test_image_float_bits
-        ; Alcotest.test_case "answer" `Quick test_image_answer
-        ; Alcotest.test_case "doubled" `Quick test_image_doubled
-        ; Alcotest.test_case "show" `Quick test_image_show
-        ; Alcotest.test_case "fib" `Quick test_image_fib
-        ; Alcotest.test_case "effect_console" `Quick test_image_effect_console
-        ] )
-    ; ( "sepcomp"
-      , [ Alcotest.test_case "answer" `Quick test_sc_answer
-        ; Alcotest.test_case "doubled" `Quick test_sc_doubled
-        ; Alcotest.test_case "show" `Quick test_sc_show
-        ; Alcotest.test_case "fib" `Quick test_sc_fib
-        ; Alcotest.test_case "transitive" `Quick test_sc_transitive
-        ; Alcotest.test_case "diamond" `Quick test_sc_diamond
-        ; Alcotest.test_case "interface" `Quick test_sc_interface
-        ; Alcotest.test_case "effect_console" `Quick test_sc_effect_console
-        ] )
-    ; ( "prelude"
-      , [ Alcotest.test_case "answer" `Quick test_prelude_answer
-        ; Alcotest.test_case "div" `Quick test_prelude_div
-        ; Alcotest.test_case "eq" `Quick test_prelude_eq
-        ; Alcotest.test_case "bool" `Quick test_prelude_bool
-        ; Alcotest.test_case "map" `Quick test_prelude_map
-        ; Alcotest.test_case "show_int" `Quick test_prelude_show_int
-        ; Alcotest.test_case "show_number" `Quick test_prelude_show_number
-        ; Alcotest.test_case "show_char" `Quick test_prelude_show_char
-        ; Alcotest.test_case "show_string" `Quick test_prelude_show_string
-        ] )
-    ; ( "module-graph"
-      , [ Alcotest.test_case "transitive" `Quick test_transitive
-        ; Alcotest.test_case "transitive_closure" `Quick test_transitive_closure
-        ; Alcotest.test_case "diamond" `Quick test_diamond
-        ; Alcotest.test_case "diamond_closure" `Quick test_diamond_closure
-        ; Alcotest.test_case "reexport" `Quick test_reexport
-        ] )
-    ]
+    ([ ( "literals"
+       , [ Alcotest.test_case "int" `Quick test_int
+         ; Alcotest.test_case "string" `Quick test_string
+         ; Alcotest.test_case "number" `Quick test_number
+         ; Alcotest.test_case "bool" `Quick test_bool
+         ; Alcotest.test_case "char" `Quick test_char
+         ; Alcotest.test_case "array" `Quick test_array
+         ; Alcotest.test_case "record" `Quick test_record
+         ] )
+     ; ( "constructors"
+       , [ Alcotest.test_case "ctor_nullary" `Quick test_ctor_nullary
+         ; Alcotest.test_case "ctor_partial" `Quick test_ctor_partial
+         ; Alcotest.test_case "mk" `Quick test_mk
+         ] )
+     ; ( "case"
+       , [ Alcotest.test_case "classify_just_zero" `Quick test_classify_just_zero
+         ; Alcotest.test_case "classify_just_n" `Quick test_classify_just_n
+         ; Alcotest.test_case "classify_nothing" `Quick test_classify_nothing
+         ; Alcotest.test_case "first_of" `Quick test_first_of
+         ; Alcotest.test_case "via_record" `Quick test_via_record
+         ; Alcotest.test_case "dup" `Quick test_dup
+         ; Alcotest.test_case "pick_true" `Quick test_pick_true
+         ; Alcotest.test_case "pick_false" `Quick test_pick_false
+         ] )
+     ; ( "recursion"
+       , [ Alcotest.test_case "is_even_2" `Quick test_is_even_2
+         ; Alcotest.test_case "is_even_1" `Quick test_is_even_1
+         ; Alcotest.test_case "is_odd_3" `Quick test_is_odd_3
+         ] )
+     ; ( "linking"
+       , [ Alcotest.test_case "link_result" `Quick test_link_result
+         ; Alcotest.test_case "link_higher_order" `Quick test_link_higher_order
+         ; Alcotest.test_case "link_loads_closure" `Quick test_link_loads_closure
+         ; Alcotest.test_case "link_foreign_unbound" `Quick test_link_foreign_unbound
+         ; Alcotest.test_case "external_unbound" `Quick test_external_unbound
+         ] )
+     ; ( "newtype"
+       , [ Alcotest.test_case "match" `Quick test_newtype_match
+         ; Alcotest.test_case "as_pattern" `Quick test_newtype_as_pattern
+         ; Alcotest.test_case "as_whole" `Quick test_newtype_as_whole
+         ] )
+     ; ( "recursive-value"
+       , [ Alcotest.test_case "lazy_fix" `Quick test_lazy_fix
+         ; Alcotest.test_case "fib_and" `Quick test_recursive_value_fib
+         ] )
+     ; ( "effect"
+       , [ Alcotest.test_case "ref" `Quick test_effect_ref
+         ; Alcotest.test_case "console" `Quick test_effect_console
+         ] )
+     ; ( "lower-ir"
+       , [ Alcotest.test_case "fixture" `Quick test_rt_fixture
+         ; Alcotest.test_case "app" `Quick test_rt_app
+         ; Alcotest.test_case "prelude_answer" `Quick test_rt_prelude_answer
+         ; Alcotest.test_case "prelude_doubled" `Quick test_rt_prelude_doubled
+         ; Alcotest.test_case "prelude_show" `Quick test_rt_prelude_show
+         ; Alcotest.test_case "newtype" `Quick test_rt_newtype
+         ; Alcotest.test_case "fib" `Quick test_rt_fib
+         ; Alcotest.test_case "effect_ref" `Quick test_rt_effect_ref
+         ; Alcotest.test_case "effect_console" `Quick test_rt_effect_console
+         ] )
+     ; ( "dictelim"
+       , [ Alcotest.test_case "prelude_answer" `Quick test_de_prelude_answer
+         ; Alcotest.test_case "prelude_doubled" `Quick test_de_prelude_doubled
+         ; Alcotest.test_case "prelude_show" `Quick test_de_prelude_show
+         ; Alcotest.test_case "fib" `Quick test_de_fib
+         ; Alcotest.test_case "effect_ref" `Quick test_de_effect_ref
+         ; Alcotest.test_case "fires" `Quick test_dictelim_fires
+         ] )
+     ; ( "opt"
+       , [ Alcotest.test_case "prelude_answer" `Quick test_opt_prelude_answer
+         ; Alcotest.test_case "prelude_doubled" `Quick test_opt_prelude_doubled
+         ; Alcotest.test_case "prelude_show" `Quick test_opt_prelude_show
+         ; Alcotest.test_case "app" `Quick test_opt_app
+         ; Alcotest.test_case "newtype" `Quick test_opt_newtype
+         ; Alcotest.test_case "fib" `Quick test_opt_fib
+         ; Alcotest.test_case "effect_ref" `Quick test_opt_effect_ref
+         ; Alcotest.test_case "simplify_fires" `Quick test_simplify_fires
+         ; Alcotest.test_case "dbe_fires_classify" `Quick test_dbe_fires_classify
+         ; Alcotest.test_case "dbe_fires_anint" `Quick test_dbe_fires_anint
+         ] )
+     ; ( "ocaml"
+       , [ Alcotest.test_case "prelude_answer" `Quick test_ml_prelude_answer
+         ; Alcotest.test_case "arith" `Quick test_ml_arith
+         ; Alcotest.test_case "app" `Quick test_ml_app
+         ; Alcotest.test_case "if" `Quick test_ml_if
+         ; Alcotest.test_case "ctor" `Quick test_ml_ctor
+         ; Alcotest.test_case "case_just" `Quick test_ml_case_just
+         ; Alcotest.test_case "case_nothing" `Quick test_ml_case_nothing
+         ; Alcotest.test_case "recursion" `Quick test_ml_recursion
+         ; Alcotest.test_case "record" `Quick test_ml_record
+         ; Alcotest.test_case "array" `Quick test_ml_array
+         ; Alcotest.test_case "anInt" `Quick test_ml_anint
+         ; Alcotest.test_case "classify" `Quick test_ml_classify
+         ; Alcotest.test_case "firstOf" `Quick test_ml_firstof
+         ; Alcotest.test_case "via_record" `Quick test_ml_via_record
+         ; Alcotest.test_case "pick" `Quick test_ml_pick
+         ; Alcotest.test_case "number_binder" `Quick test_ml_number_binder
+         ; Alcotest.test_case "fib" `Quick test_ml_fib
+         ; Alcotest.test_case "show" `Quick test_ml_show
+         ; Alcotest.test_case "doubled" `Quick test_ml_doubled
+         ; Alcotest.test_case "effect_console" `Quick test_ml_effect_console
+         ; Alcotest.test_case "effect_ref" `Quick test_ml_effect_ref
+         ] )
+     ; ( "i4"
+       , [ Alcotest.test_case "forE" `Quick test_i4_fore
+         ; Alcotest.test_case "foreachE" `Quick test_i4_foreach
+         ; Alcotest.test_case "whileE" `Quick test_i4_while
+         ; Alcotest.test_case "untilE" `Quick test_i4_until
+         ] )
+     ; ( "vm"
+       , [ Alcotest.test_case "fixture" `Quick test_vm_fixture
+         ; Alcotest.test_case "app" `Quick test_vm_app
+         ; Alcotest.test_case "prelude_answer" `Quick test_vm_prelude_answer
+         ; Alcotest.test_case "prelude_div" `Quick test_vm_prelude_div
+         ; Alcotest.test_case "prelude_eq" `Quick test_vm_prelude_eq
+         ; Alcotest.test_case "prelude_bool" `Quick test_vm_prelude_bool
+         ; Alcotest.test_case "prelude_map" `Quick test_vm_prelude_map
+         ; Alcotest.test_case "newtype" `Quick test_vm_newtype
+         ; Alcotest.test_case "fib" `Quick test_vm_fib
+         ; Alcotest.test_case "lazy_fix" `Quick test_vm_lazy_fix
+         ; Alcotest.test_case "transitive" `Quick test_vm_transitive
+         ; Alcotest.test_case "diamond" `Quick test_vm_diamond
+         ; Alcotest.test_case "classify_just" `Quick test_vm_classify_just
+         ; Alcotest.test_case "classify_nothing" `Quick test_vm_classify_nothing
+         ; Alcotest.test_case "pick_true" `Quick test_vm_pick_true
+         ; Alcotest.test_case "pick_false" `Quick test_vm_pick_false
+         ; Alcotest.test_case "first_of" `Quick test_vm_first_of
+         ; Alcotest.test_case "via_record" `Quick test_vm_via_record
+         ; Alcotest.test_case "dt_lit" `Quick test_vm_dt_lit
+         ; Alcotest.test_case "dt_nested" `Quick test_vm_dt_nested
+         ; Alcotest.test_case "dt_aspat" `Quick test_vm_dt_aspat
+         ; Alcotest.test_case "dt_shared" `Quick test_vm_dt_shared
+         ; Alcotest.test_case "dt_array" `Quick test_vm_dt_array
+         ; Alcotest.test_case "dt_guard_chain" `Quick test_vm_dt_guard_chain
+         ; Alcotest.test_case "dt_guard_ctor" `Quick test_vm_dt_guard_ctor
+         ; Alcotest.test_case "naive_guard" `Quick test_vm_naive_guard
+         ; Alcotest.test_case "show_int" `Quick test_vm_show_int
+         ; Alcotest.test_case "show_number" `Quick test_vm_show_number
+         ; Alcotest.test_case "show_char" `Quick test_vm_show_char
+         ; Alcotest.test_case "show_string" `Quick test_vm_show_string
+         ; Alcotest.test_case "effect_ref" `Quick test_vm_effect_ref
+         ; Alcotest.test_case "effect_console" `Quick test_vm_effect_console
+         ] )
+     ; ( "image"
+       , [ Alcotest.test_case "float_bits" `Quick test_image_float_bits
+         ; Alcotest.test_case "answer" `Quick test_image_answer
+         ; Alcotest.test_case "doubled" `Quick test_image_doubled
+         ; Alcotest.test_case "show" `Quick test_image_show
+         ; Alcotest.test_case "fib" `Quick test_image_fib
+         ; Alcotest.test_case "effect_console" `Quick test_image_effect_console
+         ] )
+     ; ( "sepcomp"
+       , [ Alcotest.test_case "answer" `Quick test_sc_answer
+         ; Alcotest.test_case "doubled" `Quick test_sc_doubled
+         ; Alcotest.test_case "show" `Quick test_sc_show
+         ; Alcotest.test_case "fib" `Quick test_sc_fib
+         ; Alcotest.test_case "transitive" `Quick test_sc_transitive
+         ; Alcotest.test_case "diamond" `Quick test_sc_diamond
+         ; Alcotest.test_case "interface" `Quick test_sc_interface
+         ; Alcotest.test_case "effect_console" `Quick test_sc_effect_console
+         ] )
+     ; ( "prelude"
+       , [ Alcotest.test_case "answer" `Quick test_prelude_answer
+         ; Alcotest.test_case "div" `Quick test_prelude_div
+         ; Alcotest.test_case "eq" `Quick test_prelude_eq
+         ; Alcotest.test_case "bool" `Quick test_prelude_bool
+         ; Alcotest.test_case "map" `Quick test_prelude_map
+         ; Alcotest.test_case "show_int" `Quick test_prelude_show_int
+         ; Alcotest.test_case "show_number" `Quick test_prelude_show_number
+         ; Alcotest.test_case "show_char" `Quick test_prelude_show_char
+         ; Alcotest.test_case "show_string" `Quick test_prelude_show_string
+         ] )
+     ; ( "module-graph"
+       , [ Alcotest.test_case "transitive" `Quick test_transitive
+         ; Alcotest.test_case "transitive_closure" `Quick test_transitive_closure
+         ; Alcotest.test_case "diamond" `Quick test_diamond
+         ; Alcotest.test_case "diamond_closure" `Quick test_diamond_closure
+         ; Alcotest.test_case "reexport" `Quick test_reexport
+         ] )
+     ]
+     @ llvm_groups)

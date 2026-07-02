@@ -10,6 +10,23 @@
 > forbids cyclic imports ([0016](0016-cross-module-linking.md)), so the module graph is a DAG and there
 > are no cross-module recursive value groups. §5 pins **`CArray []` → the empty-array sentinel**
 > ([0071](0071-codegen-runtime-c-abi.md) §6).
+>
+> **Revision (2026-07-02, post-acceptance — CAF-init strategy):** §3 replaces per-module `pv_init_M`
+> functions with a **link-synthesised, reachability-pruned `pv_init_all`** (the purs-wasm model): the
+> **purvasm linker** does whole-program reachability from the entry (reusing `Link`) and emits one
+> `init.o` that initialises **only reachable bindings, in init-unit-level topological order**; the **system
+> linker's dead-strip** (`ld -dead_strip` / `lld --gc-sections`) does the tree-shaking. This avoids dead
+> init and orders at binding (not module) granularity, while keeping per-module code compilation
+> incremental. §8's entry stub now calls `pv_init_all`. (Slices 1–4 use single self-contained terms — the
+> degenerate one-module case — so this lands with slice 5's cross-module work.) **Three §2/§3 pins:**
+> (1) a top-level binding exports a **root-handle global** `@M.x$root` — an `i64` root handle, *not* a raw
+> value, because a static global is **not a GC root** and a raw value would go stale after a moving
+> collection (v1 has no non-moving S1 — [0066](0066-v1-shadow-stack-rooting-and-gc-on-alloc.md) §5);
+> `pv_init_all` roots each value into a never-popped frame and stores the handle, references `pv_get` it.
+> (2) A **`Gfun` is referenced as a closure value** (its `@M.f$root` handle), arity known in `M`, so **no
+> arity crosses the boundary** (§2's "no `.pmi`" now covers arity, not just rep signatures). (3) The
+> **init-unit topological order is built explicitly by the new link step from `free_vars` edges**, *not*
+> reused from `plink`'s DFS visitation order.
 
 ## Context
 
@@ -53,40 +70,81 @@ chosen — a follow-up, [0060](0060-native-codegen-llvm-owned-runtime.md) §Defe
 
 ### 2. Top-level bindings = module-qualified global symbols; cross-module refs = `extern`
 
-A module's top-level binding `M.x` emits a **global symbol** (its function symbol for a lambda RHS, its
-CAF global otherwise — §3). A reference to another module's `N.y` is an **`external` symbol** the linker
-resolves — the [0033](0033-separate-compilation.md) qualified-key scheme, faithful to `lower.ml`'s
-`qualified_key`. Symbol names use a **total mangling** of the qualified key to LLVM's symbol charset
-(mirroring `codegen_ml`'s `mangle`, retargeted to `.ll` global names). The cross-module calling
-convention is **boxed** ([0059](0059-native-abi-value-representation.md) §3 / [0071](0071-codegen-runtime-c-abi.md)):
-every cross-module value is a plain tagged word, so no `.pmi` rep signature is needed for v1.
+A module's top-level binding `M.x` emits a **root-handle global** `@M.x$root` — an `i64` holding the
+value's shadow-stack root handle, *not* the raw value (a static global is not a GC root; §3). A reference
+to another module's `N.y` is an **`external`** `@N.y$root` the linker resolves — the
+[0033](0033-separate-compilation.md) qualified-key scheme, faithful to `lower.ml`'s `qualified_key` — and
+reads the current value with `pv_get` (§3). Symbol names use a **total mangling** of the qualified key to
+LLVM's symbol charset (mirroring `codegen_ml`'s `mangle`, retargeted to `.ll` global names). The
+cross-module calling convention is **boxed** ([0059](0059-native-abi-value-representation.md) §3 /
+[0071](0071-codegen-runtime-c-abi.md)): every cross-module value is a plain tagged word. **No `.pmi`
+metadata is needed** — not a rep signature (the boundary is boxed) and **not even an arity** (a top-level
+function crosses as its *closure* handle, which carries its own arity, so a referrer never needs the
+callee's arity statically — §3).
 
-### 3. CAF representation and cross-module initialisation order
+### 3. CAF initialisation — a link-synthesised, reachability-pruned `pv_init_all`
 
-Top-level CAFs are strict ([0070](0070-v1-byneed-recursive-caf-force.md): non-recursive CAFs are eager),
-but a module's CAF may read another module's CAF, so initialisation must respect dependency order. This
-mirrors the VM's global classification (`codegen.ml`'s `gdef_of_expr`): the top-level ANF spine
-(`Let`/`LetRec`) *is* the module's **declaration order** — folded in CoreFn dependency order by
-`lower.ml` — and each binding classifies by its RHS into a **`Gfun`** (a syntactic lambda → a function
-symbol, §2/§4), a strict **`Gcaf`** (any other non-recursive top-level value, evaluated eagerly), or a
-**`Grec`** member (a recursive-group value → a by-need `ByNeed` global, below).
+Top-level bindings are strict ([0070](0070-v1-byneed-recursive-caf-force.md): non-recursive CAFs are
+eager), but a binding may read another module's binding, so initialisation must respect dependency order.
+Classification mirrors the VM's `gdef_of_expr` (`codegen.ml`): each is a **`Gfun`** (a syntactic lambda), a
+strict **`Gcaf`** (any other non-recursive value), or a **`Grec`** member (a recursive-group value).
 
-- **Within a module**, an init function `pv_init_M(ctx)` evaluates the `Gcaf`s **in spine order** into
-  their globals. (`Link.free_vars` supplies the dependency *edges* if a finer intra-module reorder is
-  ever needed; it is a *set*, not itself an order — the spine order is the order.)
-- **Across modules**, the entry stub (§8) calls the `pv_init_M`s in **topological module order**, reusing
-  `Link.topo_sort` (already computed for the VM path). This is well-defined because **PureScript forbids
-  cyclic module imports, so the module graph is a DAG** ([0016](0016-cross-module-linking.md)) — a
-  cross-module reference always points "down" the DAG to an already-initialised module.
+**Each top-level binding exports a *root-handle global*, not a raw value — because a static LLVM global is
+not a GC root.** A raw `Value` stored in a global would go **stale after a moving collection** relocates
+its heap object (v1 allocates *everything* in the local moving heap — there is no non-moving S1 arena yet,
+[0066](0066-v1-shadow-stack-rooting-and-gc-on-alloc.md) §5). So the exported global holds the value's
+**shadow-stack root handle** (an `i64`), pinned for the program's lifetime: `pv_init_all` builds the value,
+`pv_root(ctx, value)`s it into a **permanent root frame it never pops**, and stores the handle into the
+global. **Every reference — intra- or cross-module — loads the handle and reads the *current* value via
+`pv_get(ctx, handle)`** (relocation-correct), the global being an `external` symbol cross-module (§2). The
+handle is opaque, so **no arity or rep metadata crosses the boundary** (a value's own arity rides inside
+its closure object). Per class:
 
-A **recursive CAF group is therefore intra-module only** (a single module's binding group = one
-`A.LetRec`): the import DAG rules out cross-module value cycles, so v1 has **no cross-module `Grec`**. A
-`Grec` member is a **by-need `ByNeed` global** ([0070](0070-v1-byneed-recursive-caf-force.md) §4), forced
-on first reference — the knot tied by the runtime's Grec builder, no static order over the cycle required.
-This closes the known *"gdef ordering vs boot on multi-module closures"* gap: **acyclic** (the common and,
-cross-module, the *only*) case uses topological eager init; a **module-local** recursive group uses
-by-need. (A `LetRec` node lowers to the Grec construction whether its members are local `let`-bindings or
-a module's top-level group.)
+- **`Gfun` → a closure-root global `@M.f$root`.** In the all-`apply` v1 even a saturated call goes through
+  `pv_apply` ([0064](0064-v1-single-capability-native-abi-codegen-contract.md) §3), so a top-level function
+  is referenced as a closure *value*. `M` emits its lifted code symbol `@M.f` (§4); the init unit is
+  `pv_root(ctx, pv_make_closure(@M.f, arity, unit))` stored to `@M.f$root`. **Arity is known where the
+  closure is built (in `M`)**, so a referrer never needs it — it loads `@M.f$root`, `pv_get`s the closure,
+  and `pv_apply` reads the arity from the object. The no-capture closure has **no dependencies** → this
+  init unit has no in-edges.
+- **`Gcaf` → a value-root global `@M.x$root`** — the init unit evaluates the CAF, roots the result, stores
+  the handle.
+- **`Grec` → a `ByNeed`-cell root global** per member — the init unit is the one-time Grec construction
+  ([0070](0070-v1-byneed-recursive-caf-force.md) §4), rooting each cell; a dereference `pv_get`s the cell
+  then `pv_force`s it.
+
+(When the non-moving **S1** arena lands — [0061](0061-capability-local-shared-immutable-gc.md)/[0064](0064-v1-single-capability-native-abi-codegen-contract.md)
+§5 — immortal CAF *constants* may instead live in S1 at a stable address and be **raw-value globals** with
+no `pv_get` indirection; v1 has no S1, so every top-level value is a rooted local-heap object.)
+
+**A binding is *not* initialised by a per-module `pv_init_M`.** A **link-time step synthesises one
+whole-program `pv_init_all(ctx)`** (a small emitted `init.o`) that runs the init units **reachable from the
+entry**, in **dependency-topological order**. Responsibility splits cleanly:
+
+- **purvasm's linker computes the reachable set *and* explicitly builds the order.** `Link` already gives
+  the *reachable binding set* from the entry's transitive `free_vars` over the import DAG (the VM's `plink`
+  "visit reachable keys from `main`" — [0016](0016-cross-module-linking.md)/[0033](0033-separate-compilation.md)).
+  But the **binding-level topological order is built by this new link step, not reused from a DFS
+  visitation order**: `free_vars` yields *direct dependency edges* (a set, not an order), so the step
+  **builds the reachable init-unit dependency graph from those edges and topologically sorts it** (a
+  `Gfun`-closure unit, having no in-edges, naturally precedes the `Gcaf` that references it).
+  `pv_init_all` then initialises **only reachable bindings** (no dead init), at binding granularity — the
+  `purs-wasm` reachability-init model.
+- **the system linker (`ld -dead_strip` / `lld --gc-sections`) does the tree-shaking** — a *size*
+  responsibility (not correctness): any symbol not reachable from `main` / `pv_init_all` is dropped.
+  purvasm decides *what to initialise and in what order*; the system linker *removes the dead code*.
+
+Because **PureScript forbids cyclic module imports** ([0016](0016-cross-module-linking.md)), the module
+graph is a DAG and a **recursive group is intra-module only** (a single `A.LetRec`) — there is no
+cross-module `Grec`, so the reachable init-unit graph the step topo-sorts is acyclic *at binding
+granularity*: the only cycles are inside a single `Grec`, which is by-need (its init unit is one atomic
+Grec construction, **never a static order over the cycle**). This closes the *"gdef ordering vs boot
+on multi-module closures"* gap.
+
+**Per-module `.o` compilation of *code* is preserved** (recompile one module → one `.o`, relink); only the
+tiny `init.o` is re-synthesised at link, which is cheap. (The new link step orders the **init units** from
+the `free_vars` dependency edges — a *set*, not itself an order; `Link.topo_sort` on the module DAG is a
+coarser input, not the init order.)
 
 ### 4. Lambda-lifting is required (LLVM has no nested functions)
 
@@ -158,8 +216,10 @@ primop dispatch ([sidenotes/0008](sidenotes/0008-self-compile-profiling.md)).
 
 ### 8. Entry stub and `run_effect`
 
-A generated entry stub (`main`) `pv_runtime_new`s the context, runs the module inits in topological order
-(§3), evaluates the entry global, then: a **pure** entry prints via the `to_string`/`show` leaf; an
+A generated entry stub (`main`) `pv_runtime_new`s the context, calls the link-synthesised `pv_init_all`
+(§3), evaluates the entry global, then: a **pure** entry prints via a type-directed print (e.g.
+`pv_print_int` for an `Int` entry — the native rep is type-erased, so there is no generic runtime
+`to_string`; the codegen emits the printer its known entry type dictates); an
 **`Effect`** entry runs `pv_run_effect` ([0067](0067-v1-effect-execution-and-native-leaves.md) §2),
 performing its effects with the `Unit` result suppressed. Output routes through the sink to `stdout`
 ([0067](0067-v1-effect-execution-and-native-leaves.md) §5) — mirroring `native_action`'s `is_effect`
@@ -219,9 +279,12 @@ degenerate per-module case):
   minimal later without changing observable behaviour
   ([0064](0064-v1-single-capability-native-abi-codegen-contract.md) §Consequences: the ABI is
   representation-transparent to the differential).
-- **Cross-module CAF init order is settled** (§3): topological eager init over the module DAG (cyclic
-  imports are forbidden, [0016](0016-cross-module-linking.md)), with by-need `ByNeed` globals for the
-  *module-local* recursive groups — closing the *"gdef ordering"* gap that whole-program lowering hid.
+- **Initialisation is a link-synthesised, reachability-pruned `pv_init_all`** (§3), *not* a chain of
+  per-module inits: purvasm's linker does the whole-program reachability + init-unit-level ordering (only
+  reachable bindings, no dead init), and the system linker's dead-strip removes dead code — a clean
+  responsibility split. Top-level bindings are **root-handle globals** (moving-GC-safe, §3); by-need
+  `ByNeed` globals cover the *module-local* recursive groups; this closes the *"gdef ordering"* gap while
+  keeping per-module code compilation incremental.
 - Textual IR keeps the **toolchain light and the codegen self-host-portable**
   ([0037](0037-self-hosting-purescript.md)), at the cost of an `.ll` text format and `llc`/`clang`/`lld`
   process invocations per build.
@@ -241,10 +304,16 @@ degenerate per-module case):
   ([0037](0037-self-hosting-purescript.md)), which can emit text but not call C++. Rejected (§1).
 - **Inline primops in IR from the start** (§7). Deferred: re-derives tricky numeric semantics off the one
   tested runtime.
+- **Per-module `pv_init_M` inits called in module topological order** (each module eagerly initialises
+  all its own bindings; the entry calls every module's init). The §3 draft's first form. Rejected: it
+  initialises **dead bindings** (a module's unused exports still run) and orders only at *module*
+  granularity. The link-synthesised, reachability-pruned `pv_init_all` (§3) initialises only reachable
+  bindings at init-unit granularity — strictly better, and the `Link` reachability it needs already
+  exists.
 - **All top-level CAFs by-need** (uniform, sidesteps init order entirely). Simpler than the §3 split, but
-  it pays a force-check per top-level reference for the acyclic majority that eager topological init
-  handles for free, and [0070](0070-v1-byneed-recursive-caf-force.md) keeps non-recursive CAFs strict.
-  Rejected in favour of eager-acyclic + by-need-cyclic.
+  it pays a force-check per top-level reference for the acyclic majority the reachability-ordered eager
+  init handles for free, and [0070](0070-v1-byneed-recursive-caf-force.md) keeps non-recursive CAFs
+  strict. Rejected in favour of eager-acyclic + by-need-cyclic.
 - **A stack-map / `gc.statepoint` rooting emission** instead of shadow-stack calls. The eventual precise
   mechanism, but deferred with the statepoint migration
   ([0064](0064-v1-single-capability-native-abi-codegen-contract.md) §4,
