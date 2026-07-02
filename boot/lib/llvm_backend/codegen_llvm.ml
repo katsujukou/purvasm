@@ -20,8 +20,15 @@
       argument or data field, without static tracking). The **Boolean demand sites** (`if`/guard
       conditions) and the **program's final result** force likewise; construction sites
       (`Ctor`/`Record`/`Array` fields, `apply` head/args) keep the raw cell (the knot-tie).
-    Unsaturated constructors / per-module cross-module linking / pure-`Number`/`String`/`Bool` entry
-    printers land later (a clear [failwith] / `pv_print_int`-only guards each).
+    - **Slice 5b — per-module linking (Part B)**: [program_modular] emits every top-level binding as a
+      root-handle global `@<mangle key>$root` (a shadow-stack handle, not a stale raw value under the moving
+      GC) with a `@<mangle key>$init` unit run by a `pv_init_all`, and references load the handle +
+      `pv_get` (ADR-0072 §2/§3). [program_split] splits this across independent per-module `.o`s + one
+      init/entry object linked by the injective-mangle symbol ABI. The minimal slice initialises **all**
+      bindings in linked-spine (dependency) order; reachability pruning + the system-linker dead-strip are
+      deferred (ADR-0072 §3).
+    Unsaturated constructors / pure-`Number`/`String`/`Bool` entry printers land later (a clear [failwith]
+    / `pv_print_int`-only guards each).
 
     Every guest value is one `i64` tagged word (ADR-0064 §1); the module calls the runtime's `extern "C"`
     surface (`pv_*`, ADR-0071). Rooting is **root-on-create** (ADR-0072 §6, the conservative first cut):
@@ -1127,18 +1134,15 @@ let emit_gdef cx : gdef -> unit = function
          emit cx "  call void @pv_pop_frame(ptr %%ctx, i64 %s)" frame;
          List.iter (fun (m, v) -> store_root_global cx m v) vals)
 
+(* Emit each gdef's root-handle global definition(s) (handle 0 = an invalid sentinel; init overwrites
+   before any read), then its init function. Writes to [cx.md]; queues code functions into [cx.pending]. *)
+
 (** Emit a program as **per-module-style** LLVM IR (ADR-0072 §2/§3): each top-level binding becomes a
-    root-handle global `@M.x$root` + an `@M.x$init` function; a `pv_init_all` runs the inits in dependency
+    root-handle global `@<mangle key>$root` + an `@<mangle key>$init` function; a `pv_init_all` runs the inits in dependency
     (spine) order into a never-popped shadow-stack region; the entry stub calls it, then evaluates the
     entry (reading globals via `pv_get`). B1 emits a single self-contained module (all globals defined
     locally); B2 splits this across `.o` files with a link-synthesised `pv_init_all`. *)
-let program_modular ?(is_effect = false) ?(heap_words = default_heap_words) (e : A.expr)
-  : string
-  =
-  let gdefs, entry = split_spine e in
-  let gkeys = SS.of_list (List.concat_map gdef_keys gdefs) in
-  let cx = make_cx ~gkeys () in
-  (* 1. root-handle global definitions (handle 0 = an invalid sentinel; init overwrites before any read) *)
+let emit_gdefs cx (gdefs : gdef list) : unit =
   List.iter
     (fun g ->
        List.iter
@@ -1148,12 +1152,14 @@ let program_modular ?(is_effect = false) ?(heap_words = default_heap_words) (e :
               (Printf.sprintf "@%s$root = global i64 0\n" (mangle k)))
          (gdef_keys g))
     gdefs;
-  Buffer.add_char cx.md '\n';
-  (* 2. init functions *)
-  List.iter (emit_gdef cx) gdefs;
-  (* 3. pv_init_all: run each init in spine order. The inits push their permanent roots onto the shadow
-     stack; nothing pops them, so the globals stay live and relocation-valid for the program's lifetime. *)
-  let init_calls =
+  if gdefs <> [] then Buffer.add_char cx.md '\n';
+  List.iter (emit_gdef cx) gdefs
+
+(* Emit `pv_init_all`: call each binding's init in [gdefs] order (the dependency / spine order). The inits
+   push their permanent roots onto the shadow stack; nothing pops them, so the globals stay live and
+   relocation-valid for the program's lifetime (ADR-0072 §3). *)
+let emit_init_all cx (gdefs : gdef list) : unit =
+  let calls =
     List.map
       (fun g ->
          Printf.sprintf "  call void @%s$init(ptr %%ctx)" (mangle (gdef_init_key g)))
@@ -1163,8 +1169,11 @@ let program_modular ?(is_effect = false) ?(heap_words = default_heap_words) (e :
     cx.md
     (Printf.sprintf
        "define void @pv_init_all(ptr %%ctx) {\nentry:\n%s\n  ret void\n}\n\n"
-       (String.concat "\n" init_calls));
-  (* 4. entry stub *)
+       (String.concat "\n" calls))
+
+(* Emit the `@main` entry stub into [cx.fn] — `pv_runtime_new` → `pv_init_all` → evaluate the entry (in
+   value position, reading globals via `pv_get`) → print/run → free — and return its body text. *)
+let emit_entry_stub cx ~(is_effect : bool) ~(heap_words : int) (entry : A.expr) : string =
   cx.fn <- Buffer.create 256;
   cx.ssa <- 0;
   cx.frame <- "%frame";
@@ -1181,21 +1190,142 @@ let program_modular ?(is_effect = false) ?(heap_words = default_heap_words) (e :
   emit cx "  call void @pv_pop_frame(ptr %%ctx, i64 %%frame)";
   emit cx "  call void @pv_runtime_free(ptr %%ctx)";
   emit cx "  ret i32 0";
-  let entry_body = Buffer.contents cx.fn in
-  (* 5. flush the code functions queued by the init functions and the entry *)
+  Buffer.contents cx.fn
+
+(* `external` decls for referenced globals not defined in this object. *)
+let extern_global_decls cx ~(defined : SS.t) : string =
+  SS.diff cx.externs defined
+  |> SS.elements
+  |> List.map (fun k -> Printf.sprintf "@%s$root = external global i64" (mangle k))
+  |> String.concat "\n"
+
+(** Emit a program as a **single self-contained** per-module-style module (ADR-0072 §2/§3): every top-level
+    binding as a root-handle global `@<mangle key>$root` + `@<mangle key>$init`, one `pv_init_all`, one
+    `@main`. B1's single-object form (all globals defined locally, so no `external`); [program_split] is the
+    multi-object form. *)
+let program_modular ?(is_effect = false) ?(heap_words = default_heap_words) (e : A.expr)
+  : string
+  =
+  let gdefs, entry = split_spine e in
+  let gkeys = SS.of_list (List.concat_map gdef_keys gdefs) in
+  let cx = make_cx ~gkeys () in
+  emit_gdefs cx gdefs;
+  emit_init_all cx gdefs;
+  let entry_body = emit_entry_stub cx ~is_effect ~heap_words entry in
   emit_pending cx;
-  (* 6. `external` decls for any referenced global not defined in this module (none in B1's single
-     module; the mechanism is exercised by B2's cross-module split) *)
-  let extern_decls =
-    SS.diff cx.externs gkeys
-    |> SS.elements
-    |> List.map (fun k -> Printf.sprintf "@%s$root = external global i64" (mangle k))
-    |> String.concat "\n"
-  in
   Printf.sprintf
     "; ModuleID = 'purvasm'\n\n%s\n%s\n\n%s\n%s\ndefine i32 @main() {\nentry:\n%s}\n"
     declarations
-    extern_decls
+    (extern_global_decls cx ~defined:gkeys)
     (Buffer.contents cx.globals)
     (Buffer.contents cx.md)
     entry_body
+
+(* ==================================================================================================== *)
+(* B2 — real per-module `.o` split (ADR-0072 §1/§3): each module emits an independent object (its own
+   root-handle globals + init functions + internal code), and a synthesised init/entry object carries
+   `pv_init_all` (calling every binding's init in dependency order) + `@main`. The system linker resolves
+   the `@<mangle>$root` / `@<mangle>$init` symbols across objects — the cross-`.o` ABI the injective mangle
+   guarantees. Minimal slice: `pv_init_all` initialises **all** bindings (reachability pruning + the
+   system-linker dead-strip are deferred, ADR-0072 §3). *)
+(* ==================================================================================================== *)
+
+(* The module a qualified key belongs to: everything before its last `.` component (`qualified_key` =
+   "Module.Path.ident", so the id is the final component). A key without a `.` is its own module. *)
+let module_of_key (k : string) : string =
+  match String.rindex_opt k '.' with
+  | Some i -> String.sub k 0 i
+  | None -> k
+
+(** Emit one module object's `.ll`: its own root-handle global definitions + init functions + internal
+    code, plus `external` decls for referenced globals owned by *other* modules. No `pv_init_all`, no
+    `@main` — those live in the init/entry object ([entry_ll]). *)
+let module_ll ~(gkeys : SS.t) ~(defined : SS.t) (gdefs : gdef list) : string =
+  let cx = make_cx ~gkeys () in
+  emit_gdefs cx gdefs;
+  emit_pending cx;
+  Printf.sprintf
+    "; ModuleID = 'purvasm.module'\n\n%s\n%s\n\n%s\n%s"
+    declarations
+    (extern_global_decls cx ~defined)
+    (Buffer.contents cx.globals)
+    (Buffer.contents cx.md)
+
+(** Emit the **init/entry object**: `pv_init_all` (calling each binding's init in dependency order) + the
+    `@main` stub. Every binding's init function and every referenced root-handle global is `external`
+    (defined in a module object). *)
+let entry_ll
+      ?(is_effect = false)
+      ?(heap_words = default_heap_words)
+      ~(gkeys : SS.t)
+      (gdefs : gdef list)
+      (entry : A.expr)
+  : string
+  =
+  let cx = make_cx ~gkeys () in
+  emit_init_all cx gdefs;
+  let entry_body = emit_entry_stub cx ~is_effect ~heap_words entry in
+  emit_pending cx;
+  (* the init functions this object calls are defined in the module objects *)
+  let init_decls =
+    List.map
+      (fun g -> Printf.sprintf "declare void @%s$init(ptr)" (mangle (gdef_init_key g)))
+      gdefs
+    |> String.concat "\n"
+  in
+  Printf.sprintf
+    "; ModuleID = 'purvasm.init'\n\n\
+     %s\n\
+     %s\n\
+     %s\n\n\
+     %s\n\
+     %s\n\
+     define i32 @main() {\n\
+     entry:\n\
+     %s}\n"
+    declarations
+    init_decls
+    (extern_global_decls cx ~defined:SS.empty)
+    (Buffer.contents cx.globals)
+    (Buffer.contents cx.md)
+    entry_body
+
+type split_output =
+  { modules : (string * string) list (* (module name, its `.ll`) *)
+  ; entry : string (* the init/entry object `.ll` *)
+  }
+
+(** Lower a linked program to **separate module objects + one init/entry object** (ADR-0072 §1/§3). Top-level
+    bindings are partitioned by their owning module (via [module_of_key]); each partition is an independent
+    `.ll`. `pv_init_all` runs the bindings in the linked-spine dependency order (a valid topological order:
+    [Link] already spine-orders the DAG). B2's minimal slice initialises all bindings. *)
+let program_split ?(is_effect = false) ?(heap_words = default_heap_words) (e : A.expr)
+  : split_output
+  =
+  let gdefs, entry = split_spine e in
+  let gkeys = SS.of_list (List.concat_map gdef_keys gdefs) in
+  (* partition gdefs by module, preserving first-appearance module order and per-module spine order *)
+  let order = ref [] in
+  let tbl : (string, gdef list ref) Hashtbl.t = Hashtbl.create 16 in
+  List.iter
+    (fun g ->
+       let m = module_of_key (gdef_init_key g) in
+       let bucket =
+         match Hashtbl.find_opt tbl m with
+         | Some r -> r
+         | None ->
+           let r = ref [] in
+           Hashtbl.add tbl m r;
+           order := m :: !order;
+           r
+       in
+       bucket := g :: !bucket)
+    gdefs;
+  let modules =
+    List.rev !order
+    |> List.map (fun m ->
+      let gs = List.rev !(Hashtbl.find tbl m) in
+      let defined = SS.of_list (List.concat_map gdef_keys gs) in
+      m, module_ll ~gkeys ~defined gs)
+  in
+  { modules; entry = entry_ll ~is_effect ~heap_words ~gkeys gdefs entry }

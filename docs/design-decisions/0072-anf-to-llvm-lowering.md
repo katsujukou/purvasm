@@ -19,7 +19,7 @@
 > init and orders at binding (not module) granularity, while keeping per-module code compilation
 > incremental. §8's entry stub now calls `pv_init_all`. (Slices 1–4 use single self-contained terms — the
 > degenerate one-module case — so this lands with slice 5's cross-module work.) **Three §2/§3 pins:**
-> (1) a top-level binding exports a **root-handle global** `@M.x$root` — an `i64` root handle, *not* a raw
+> (1) a top-level binding exports a **root-handle global** `@<mangle(M.x)>$root` — an `i64` root handle, *not* a raw
 > value, because a static global is **not a GC root** and a raw value would go stale after a moving
 > collection (v1 has no non-moving S1 — [0066](0066-v1-shadow-stack-rooting-and-gc-on-alloc.md) §5);
 > `pv_init_all` roots each value into a never-popped frame and stores the handle, references `pv_get` it.
@@ -41,6 +41,16 @@
 > `.o`s. The constructor **tag is a deterministic name hash** (`fnv1a_64`, 31-bit-masked), not a per-module
 > first-seen counter, so a ctor built in one `.o` matches its pattern in another. Lifted functions are
 > emitted with **`internal` linkage** (referenced only by address within their own module).
+>
+> **Scope (2026-07-03, B2 — maintainer-directed minimal slice):** the first per-module slice lands
+> **root-handle globals + real per-`.o` separate compilation** (each module → its own object, an
+> `init`/entry object carrying `pv_init_all` + `@main`, linked by the mangle symbol ABI), but `pv_init_all`
+> initialises **all** bindings in **linked-spine (dependency) order** — the explicit binding-level
+> reachability graph, its pruning, and the system-linker dead-strip (`ld -dead_strip` / `lld
+> --gc-sections`) of §3 are **deferred to a follow-up slice**. Spine order is a valid topological order
+> ([Link] already spine-orders the import DAG), so init ordering is correct; only *dead-init elimination*
+> and *tree-shaking* (size, not correctness) are deferred. Bindings with a bare (non-module-qualified) key
+> — synthesised fresh-names — each form a singleton module object.
 
 ## Context
 
@@ -118,15 +128,15 @@ global. **Every reference — intra- or cross-module — loads the handle and re
 handle is opaque, so **no arity or rep metadata crosses the boundary** (a value's own arity rides inside
 its closure object). Per class:
 
-- **`Gfun` → a closure-root global `@M.f$root`.** In the all-`apply` v1 even a saturated call goes through
-  `pv_apply` ([0064](0064-v1-single-capability-native-abi-codegen-contract.md) §3), so a top-level function
-  is referenced as a closure *value*. `M` emits its lifted code symbol `@M.f` (§4); the init unit is
-  `pv_root(ctx, pv_make_closure(@M.f, arity, unit))` stored to `@M.f$root`. **Arity is known where the
-  closure is built (in `M`)**, so a referrer never needs it — it loads `@M.f$root`, `pv_get`s the closure,
-  and `pv_apply` reads the arity from the object. The no-capture closure has **no dependencies** → this
-  init unit has no in-edges.
-- **`Gcaf` → a value-root global `@M.x$root`** — the init unit evaluates the CAF, roots the result, stores
-  the handle.
+- **`Gfun` → a closure-root global `@<mangle(M.f)>$root`.** In the all-`apply` v1 even a saturated call goes
+  through `pv_apply` ([0064](0064-v1-single-capability-native-abi-codegen-contract.md) §3), so a top-level
+  function is referenced as a closure *value*. `M` emits its lifted code symbol `@<mangle(M.f)>` (§4); the
+  init unit is `pv_root(ctx, pv_make_closure(@<mangle(M.f)>, arity, unit))` stored to `@<mangle(M.f)>$root`.
+  **Arity is known where the closure is built (in `M`)**, so a referrer never needs it — it loads
+  `@<mangle(M.f)>$root`, `pv_get`s the closure, and `pv_apply` reads the arity from the object. The
+  no-capture closure has **no dependencies** → this init unit has no in-edges.
+- **`Gcaf` → a value-root global `@<mangle(M.x)>$root`** — the init unit evaluates the CAF, roots the
+  result, stores the handle.
 - **`Grec` → a `ByNeed`-cell root global** per member — the init unit is the one-time Grec construction
   ([0070](0070-v1-byneed-recursive-caf-force.md) §4), rooting each cell; a dereference `pv_get`s the cell
   then `pv_force`s it.

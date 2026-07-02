@@ -851,6 +851,72 @@ let llvm_run ?(is_effect = false) ?(modular = false) ?heap_words (t : C.term) : 
   close_in ic;
   s
 
+(* Part B2 (ADR-0072 §1/§3): lower a program to **separate module objects + one init/entry object**,
+   compile **each independently** to a `.o` (`clang -c`), and link them together with the runtime — the
+   real per-module separate-compilation path. Exercises the cross-`.o` symbol ABI: each module's
+   `@<mangle>$root` / `@<mangle>$init` are resolved by the system linker, so a non-injective or
+   double-defined symbol would fail here rather than in one merged module. *)
+let llvm_run_split ?(is_effect = false) ?heap_words (t : C.term) : string =
+  let rt = Option.get rt_staticlib in
+  let dir =
+    Filename.concat
+      (Filename.get_temp_dir_name ())
+      (Printf.sprintf "purvasm_lls_%x" (Hashtbl.hash (t, heap_words)))
+  in
+  (try Sys.mkdir dir 0o755 with
+   | Sys_error _ -> ());
+  let out =
+    Llvm_backend.Codegen_llvm.program_split
+      ~is_effect
+      ?heap_words
+      (Middle_end.Transl.transl t)
+  in
+  (* one `.ll` → `.o` (`clang -c`), quoting every path; return the `.o` path *)
+  let compile_obj (tag : string) (src : string) : string =
+    let ll = Filename.concat dir (tag ^ ".ll") in
+    let obj = Filename.concat dir (tag ^ ".o") in
+    let err = Filename.concat dir (tag ^ ".err") in
+    let oc = open_out ll in
+    output_string oc src;
+    close_out oc;
+    if
+      Sys.command
+        (Printf.sprintf
+           "clang -c %s -o %s 2>%s"
+           (Filename.quote ll)
+           (Filename.quote obj)
+           (Filename.quote err))
+      <> 0
+    then Alcotest.failf "clang -c failed; see %s and %s" err ll;
+    obj
+  in
+  let objs =
+    (* index-based object filenames (module names carry dots/specials); entry object last *)
+    List.mapi (fun i (_, src) -> compile_obj (Printf.sprintf "mod_%d" i) src) out.modules
+    @ [ compile_obj "entry" out.entry ]
+  in
+  let genexe = Filename.concat dir "gen" in
+  let err = Filename.concat dir "link.err" in
+  let outf = Filename.concat dir "out" in
+  if
+    Sys.command
+      (Printf.sprintf
+         "clang %s %s -o %s 2>%s"
+         (String.concat " " (List.map Filename.quote objs))
+         (Filename.quote rt)
+         (Filename.quote genexe)
+         (Filename.quote err))
+    <> 0
+  then Alcotest.failf "link failed; see %s" err;
+  if
+    Sys.command (Printf.sprintf "%s > %s" (Filename.quote genexe) (Filename.quote outf))
+    <> 0
+  then Alcotest.fail "generated program crashed";
+  let ic = open_in outf in
+  let s = In_channel.input_all ic in
+  close_in ic;
+  s
+
 (* Slice 1 (ADR-0072 §10): the pure first-order subset — its value must match the CESK oracle's
    printed form. (ADTs/records/case/effects/letrec are later slices, guarded in the codegen.) *)
 let same_on_llvm ?heap_words (label : string) (t : C.term) =
@@ -882,6 +948,20 @@ let same_on_llvm_modular_effect (label : string) (t : C.term) =
     with_captured_stdout (fun () -> ignore (Cesk.Machine.run_effect ~host:Ffi.host t))
   in
   Alcotest.(check string) label out (llvm_run ~is_effect:true ~modular:true t)
+
+(* The **separate-compilation** path (ADR-0072 §1/§3, Part B2): each module compiled to its own `.o`, all
+   linked with the runtime. Same differential contract against the CESK oracle. *)
+let same_on_llvm_split ?heap_words (label : string) (t : C.term) =
+  Alcotest.(check string)
+    label
+    (V.to_string (Cesk.Machine.eval ~host:Ffi.host t))
+    (llvm_run_split ?heap_words t)
+
+let same_on_llvm_split_effect (label : string) (t : C.term) =
+  let out =
+    with_captured_stdout (fun () -> ignore (Cesk.Machine.run_effect ~host:Ffi.host t))
+  in
+  Alcotest.(check string) label out (llvm_run_split ~is_effect:true t)
 
 let test_llvm_arith () =
   same_on_llvm
@@ -1375,6 +1455,54 @@ let test_llvm_mod_prelude_quotient () =
 let test_llvm_mod_effect_console () =
   same_on_llvm_modular_effect
     "mod effect_console"
+    (Link.link_program
+       ~resolver:Ffi.resolver
+       ~outdir:"../fixtures/effect_console"
+       ~entry_module:[ "ConsoleMain" ]
+       ~entry:"main"
+       ())
+
+(* --- Part B2: separate compilation — each module to its own `.o`, linked with the runtime. ----------- *)
+
+(* One module object + the init/entry object: the entry reads `@fib$root` as an `external` global resolved
+   at link. `letrec fib …` → 55. *)
+let test_llvm_split_fib () =
+  let fib =
+    C.Lam
+      ( "n"
+      , C.If
+          ( C.Prim (C.LtInt, [ C.Var "n"; int 2 ])
+          , C.Var "n"
+          , C.Prim
+              ( C.AddInt
+              , [ C.App (C.Var "fib", C.Prim (C.SubInt, [ C.Var "n"; int 1 ]))
+                ; C.App (C.Var "fib", C.Prim (C.SubInt, [ C.Var "n"; int 2 ]))
+                ] ) ) )
+  in
+  same_on_llvm_split "split fib" (C.Letrec ([ "fib", fib ], C.App (C.Var "fib", int 10)))
+
+(* The injective-mangle collision term through separate compilation: `A.B` and `A_B` are two `external`
+   globals the linker must keep distinct (a non-injective mangle → a duplicate-symbol link error). → 7. *)
+let test_llvm_split_mangle_injective () =
+  same_on_llvm_split
+    "split mangle injective"
+    (C.Let
+       ( "A.B"
+       , int 3
+       , C.Let ("A_B", int 4, C.Prim (C.AddInt, [ C.Var "A.B"; C.Var "A_B" ])) ))
+
+(* Real compiled-PureScript programs spanning **multiple modules**, each compiled to its own `.o` and
+   linked: the genuine separate-compilation exercise (`Main` + `Data.*`/`Prelude` module objects + the
+   init/entry object), differential-checked against the oracle. *)
+let test_llvm_split_prelude_answer () =
+  same_on_llvm_split "split prelude answer" (prelude_term "answer")
+
+let test_llvm_split_prelude_quotient () =
+  same_on_llvm_split "split prelude quotient" (prelude_term "quotient")
+
+let test_llvm_split_effect_console () =
+  same_on_llvm_split_effect
+    "split effect_console"
     (Link.link_program
        ~resolver:Ffi.resolver
        ~outdir:"../fixtures/effect_console"
@@ -2061,6 +2189,17 @@ let llvm_groups =
         ; Alcotest.test_case "mod_prelude_answer" `Quick test_llvm_mod_prelude_answer
         ; Alcotest.test_case "mod_prelude_quotient" `Quick test_llvm_mod_prelude_quotient
         ; Alcotest.test_case "mod_effect_console" `Quick test_llvm_mod_effect_console
+        ; Alcotest.test_case "split_fib" `Quick test_llvm_split_fib
+        ; Alcotest.test_case
+            "split_mangle_injective"
+            `Quick
+            test_llvm_split_mangle_injective
+        ; Alcotest.test_case "split_prelude_answer" `Quick test_llvm_split_prelude_answer
+        ; Alcotest.test_case
+            "split_prelude_quotient"
+            `Quick
+            test_llvm_split_prelude_quotient
+        ; Alcotest.test_case "split_effect_console" `Quick test_llvm_split_effect_console
         ] )
     ]
   else (
