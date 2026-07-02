@@ -158,9 +158,11 @@ pub unsafe extern "C" fn pv_force(ctx: *mut Heap, cell: u64) -> u64 {
     guard(|| heap(ctx).force(TaggedWord::from_bits(cell)).to_bits())
 }
 
-/// Flush the captured stdio sink (ADR-0067 §5) to real `stdout`, one line each, then clear it. The
-/// compiled entry stub calls this at exit so the process's stdout matches the differential
-/// (production wiring of the sink; tests instead read [`Heap::output`]).
+/// **Drain** the captured stdio sink (ADR-0067 §5) to real `stdout`, one line each, **clearing** it. The
+/// compiled entry stub calls this at exit so the process's stdout matches the differential (production
+/// wiring of the sink; tests instead read [`Heap::output`]). Draining (not just reading) makes a second
+/// call a no-op rather than re-printing. A `stdout` write/flush failure is a fatal boundary fault —
+/// `expect` → [`guard`] → abort (ADR-0071 §7), never a silently swallowed error.
 ///
 /// # Safety
 /// `ctx` live.
@@ -168,15 +170,15 @@ pub unsafe extern "C" fn pv_force(ctx: *mut Heap, cell: u64) -> u64 {
 pub unsafe extern "C" fn pv_drain_output(ctx: *mut Heap) {
     guard(|| {
         use std::io::Write;
-        let h = heap(ctx);
+        let lines = heap(ctx).take_output();
         let out = std::io::stdout();
         let mut lock = out.lock();
-        for line in h.output() {
-            // `writeln!` uses the platform line separator via `\n`; the differential compares the
-            // normalised line sequence, not raw bytes (ADR-0067 §5).
-            let _ = writeln!(lock, "{line}");
+        for line in &lines {
+            // `writeln!`'s `\n` is the line separator; the differential compares the normalised line
+            // sequence, not raw bytes (ADR-0067 §5).
+            writeln!(lock, "{line}").expect("pv_drain_output: stdout write failed");
         }
-        let _ = lock.flush();
+        lock.flush().expect("pv_drain_output: stdout flush failed");
     })
 }
 

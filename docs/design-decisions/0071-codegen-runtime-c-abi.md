@@ -16,6 +16,12 @@
 > argument is redone around that. §5 — the root handle is an **opaque `u64` that codegen round-trips
 > verbatim**, into which the runtime **packs a debug generation** (a bare index cannot carry the
 > generation the stale-reuse check compares).
+>
+> **Correction (2026-07-02, during implementation):** §6's *Effect + leaves* surface is synced to the
+> implemented reality: **`Effect.Ref` / `ST` are structural guest terms, not leaves** (so there is **no
+> `pv_ref_*` / `pv_stdio_write_line` symbol** — leaves resolve through `pv_foreign`, records through the
+> `pv_prim_record_*` primops), and `pv_drain_output` is added. This averts a codegen author emitting
+> non-existent symbols.
 
 ## Context
 
@@ -250,11 +256,20 @@ signatures live in the runtime source, kept isomorphic to the value model — no
   ([0066](0066-v1-shadow-stack-rooting-and-gc-on-alloc.md) §5).
 - **Apply / force** — `pv_apply`, `pv_tailcall` (§4), `pv_force`
   ([0070](0070-v1-byneed-recursive-caf-force.md)).
-- **Effect + leaves** — `pv_run_effect`, `pv_ref_new/read/write/modify`, `pv_stdio_write_line`
-  ([0067](0067-v1-effect-execution-and-native-leaves.md)); the **foreign-leaf resolver** `pv_foreign(ctx,
-  key_ptr, key_len) -> u64` returning the leaf closure (mirroring `codegen_ml`'s `foreign`; the set grows
-  in the runtime on demand); record ops `pv_record_*` and `pv_str_label_id`
-  ([0069](0069-v1-dynamic-record-operations.md)).
+- **Effect + leaves** — `pv_run_effect` and `pv_force`
+  ([0067](0067-v1-effect-execution-and-native-leaves.md)/[0070](0070-v1-byneed-recursive-caf-force.md)),
+  plus `pv_drain_output` (flush the capture sink to real `stdout` at exit, ADR-0067 §5). The **native
+  leaves are not individual `extern` symbols**: they resolve through the **foreign-leaf resolver**
+  `pv_foreign(ctx, key_ptr, key_len) -> u64`, which returns the leaf as a closure (mirroring
+  `codegen_ml`'s `foreign` — `Data.Show.*`, `Purvasm.Stdio.writeLineImpl`, `Partial._crashWith`,
+  `Purvasm.String.*`, `Data.Number.*`, `Purvasm.FS/System.*`; the set grows on demand). **`Effect.Ref`
+  and `ST` are *not* leaves** — they are *structural* guest terms (`boot`'s `Ffi.structural`) that the
+  linker substitutes to array primops before codegen ([0072](0072-anf-to-llvm-lowering.md) §9), so the
+  runtime exposes **no `pv_ref_*` / `pv_stdio_write_line` symbol**. The dynamic record operations are the
+  `pv_prim_record_{get,set,has,delete}` primops (below), with `str_label_id` internal to them.
+  _(Corrected 2026-07-02 after the Effect.Ref-structural finding: the earlier draft listed `pv_ref_*` /
+  `pv_stdio_write_line` / `pv_record_*` as direct symbols; the implemented surface routes leaves through
+  `pv_foreign` and records through the primops.)_
 - **Primops** — one `pv_prim_*` per `Cesk.Ast.primop` (the ~40 in `codegen_ml`'s `prim_fn`). Making them
   **runtime helpers keeps one tested source of truth** for the tricky semantics — 32-bit wrapping,
   Euclidean div/mod, ECMAScript `ToInt32`/`Math.round` ([0041](0041-int-number-conversion-primops.md)/

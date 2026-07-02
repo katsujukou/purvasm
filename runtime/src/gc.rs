@@ -179,6 +179,14 @@ impl Heap {
         &self.output
     }
 
+    /// Take and **clear** the output sink, returning the captured lines (ADR-0067 §5). Used by
+    /// `pv_drain_output` to flush to real `stdout` exactly once — draining, so a second flush emits
+    /// nothing rather than re-printing.
+    #[inline]
+    pub(crate) fn take_output(&mut self) -> Vec<String> {
+        core::mem::take(&mut self.output)
+    }
+
     /// Append a line to the output sink (the stdio write-line leaf's write). `pub(crate)`.
     #[inline]
     pub(crate) fn push_output(&mut self, line: String) {
