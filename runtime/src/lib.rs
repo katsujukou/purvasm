@@ -22,12 +22,15 @@
 //! leaf, ADR-0067), **dynamic Records** ([`Heap::new_record`] + [`record`], ADR-0069:
 //! `get`/`insert`/`set`/`delete`/`modify` on the hash-id layout), and **by-need recursive CAFs**
 //! ([`Heap::force`] + [`byneed`], ADR-0070: the `ByNeed` 3-state memoising suspension that unblocks the
-//! recursive `Monad Effect` dictionary). The C-ABI / native FFI boundary and the direct known-arity
-//! fast path land in following increments.
+//! recursive `Monad Effect` dictionary), and the **codegen↔runtime `extern "C"` boundary** ([`abi`],
+//! ADR-0071: the `staticlib` surface LLVM-generated code links — `pv_*` apply/tailcall trampoline over
+//! real-address code words, rooting, constructors, field access — with the `lib` API retaining the Miri
+//! path). The direct known-arity fast path (and `musttail`) land in following increments.
 //!
 //! Scope reminder (ADR-0064 §0): v1 is **single-capability, sequential, 64-bit, boot-parity**; the
 //! whole cross-capability side is v2.
 
+pub mod abi;
 pub mod apply;
 pub mod byneed;
 pub mod effect;
@@ -36,7 +39,7 @@ pub mod heap;
 pub mod record;
 pub mod word;
 
-pub use apply::CodeFn;
+pub use apply::{AbiCodeFn, CodeFn};
 pub use gc::Heap;
 pub use heap::{Color, Header, HeapPtr, Kind};
 pub use word::TaggedWord;

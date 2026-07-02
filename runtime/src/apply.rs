@@ -20,7 +20,7 @@
 //!   arrives with codegen.
 //! - The working argument list is a `Vec` for simplicity; codegen lowers it to a stack array.
 
-use crate::gc::{Heap, Root};
+use crate::gc::{Heap, Root, RootFrame};
 use crate::heap::{HeapPtr, Kind};
 use crate::Value;
 
@@ -38,6 +38,16 @@ use crate::Value;
 /// callee's inputs on its behalf; this is the per-function rooting codegen emits.
 pub type CodeFn = fn(heap: &mut Heap, closure: Value, args: &[Value]) -> Value;
 
+/// The **codegen / native-ABI** entry a [`Closure`](Kind::Closure) points to when the heap is in
+/// address mode ([`Heap::new_native`], ADR-0071 §3). The `extern "C"` C-ABI form of [`CodeFn`]: the
+/// runtime context as a raw `*mut Heap`, the closure and each argument as raw `u64` value words
+/// (ptr+len for the args), returning the result word. LLVM-generated functions have exactly this
+/// signature; the runtime's own leaves expose it too. On the address path [`Heap::apply`] reconstructs
+/// this pointer from the closure's `code` word — a linker-provided symbol address, sound on the
+/// supported 64-bit targets (ADR-0071 §3), never exercised under Miri (which runs the index path only).
+pub type AbiCodeFn =
+    extern "C" fn(ctx: *mut Heap, closure: u64, args: *const u64, nargs: usize) -> u64;
+
 impl Heap {
     /// A `Closure` over the type-safe [`CodeFn`] entry. `env` is a shared env block's pointer word
     /// (via [`HeapPtr::as_word`]) or an immediate sentinel for a no-capture closure. The safe wrapper
@@ -51,23 +61,36 @@ impl Heap {
         unsafe { self.new_closure_raw(idx, arity, env) }
     }
 
-    /// Apply callable `f` to `args` (ADR-0064 §3). `f` must be a [`Closure`](Kind::Closure) or a
-    /// [`Pap`](Kind::Pap); applying anything else is a codegen bug and panics.
+    /// Apply callable `f` to `args` (ADR-0064 §3 / the ADR-0071 §4 trampoline). `f` must be a
+    /// [`Closure`](Kind::Closure) or a [`Pap`](Kind::Pap); applying anything else is a codegen bug and
+    /// panics.
+    ///
+    /// **Trampoline (ADR-0071 §4).** The loop is the trampoline. `conts` is this activation's
+    /// continuation stack — leftover-arg groups still owed application (from over-application),
+    /// innermost-last, applied once the current `(f, args)` chain yields a *real* value. It is a local,
+    /// never shared through the `Heap`, so a callee's nested `apply` cannot pop *this* activation's
+    /// leftovers. A tail call (address path) is a body's `pv_tailcall` stashing the pending-tail slot;
+    /// after `code`, [`take_pending_tail`](Heap::take_pending_tail) drives the bounce with the just-pushed
+    /// leftover still deferred on `conts`. On the index path the slot is always `None`, so this reduces
+    /// to the plain over-application loop (push-then-immediately-pop).
     pub fn apply(&mut self, f: Value, args: &[Value]) -> Value {
         let mut f = f;
         let mut args: Vec<Value> = args.to_vec();
+        // Each group is rooted on the shadow stack (LIFO with the frame mark), so it survives every
+        // subsequent `code` safepoint until consumed.
+        let mut conts: Vec<(RootFrame, Vec<Root>)> = Vec::new();
         loop {
             // `apply` is safe public API. A non-pointer, foreign/forged, stale, or forwarded callee
-            // would make the header deref below — and the transmute-and-call of the code word — UB.
-            // `checked_ptr` release-rejects all of those before any dereference (ADR-0064 §4).
+            // would make the header deref below — and the code-word call — UB. `checked_ptr`
+            // release-rejects all of those before any dereference (ADR-0064 §4).
             let p = self.checked_ptr(f);
-            // `p` is now a validated live object header, so the unchecked field tier is sound here
-            // (and avoids re-walking the object-start check on every field — see the tier note in
-            // `gc`). The `header_unchecked` read is what `checked_ptr` licensed.
+            // `p` is a validated live object header, so the unchecked field tier is sound here (see the
+            // tier note in `gc`).
             match self.header_unchecked(p).kind() {
                 // A by-need callee (a projected dictionary member used as a function) is forced, then
                 // re-dispatched on the forced value (ADR-0070 §3). `force` is a safepoint, so the
-                // in-flight `args` are rooted across it and reloaded (`f` is replaced by the result).
+                // in-flight `args` are rooted across it and reloaded (`f` is replaced by the result;
+                // `conts` roots are independent and untouched).
                 Kind::ByNeed => {
                     let frame = self.frame();
                     let mut arg_roots: Vec<Root> = Vec::with_capacity(args.len());
@@ -94,43 +117,94 @@ impl Heap {
                 Kind::Closure => {
                     let arity = self.read_raw_unchecked(p, 1) as usize;
                     if args.len() < arity {
-                        // Under-apply: a PAP capturing the args supplied so far. `new_pap` self-roots
-                        // `f` and `args` across its own allocation (ADR-0066 §3), so nothing to root here.
+                        // Under-apply: a PAP capturing the args supplied so far — the current call's
+                        // value. `new_pap` self-roots `f`/`args` across its own allocation (ADR-0066 §3).
                         let remaining = (arity - args.len()) as u32;
-                        return self.new_pap(f, remaining, &args).as_word();
+                        let pap = self.new_pap(f, remaining, &args).as_word();
+                        match self.resolve_cont(&mut conts) {
+                            None => return pap,
+                            Some(next) => {
+                                f = pap;
+                                args = next;
+                            }
+                        }
+                        continue;
                     }
                     // Saturate / over-apply. `code(…)` is a safepoint (ADR-0066 §3). Between reading
-                    // `f`/`args` (at `checked_ptr` above) and this call nothing allocates, so the call
-                    // slice snapshot is current. The only values that must survive `code` are the
-                    // **leftover** args (read after the call on over-application) — `f` is not read
-                    // after `code`, and `result` is `code`'s own (post-collection) return. Root the
-                    // leftovers, call, then reload them.
+                    // `f`/`args` and this call nothing allocates (rooting a leftover group is host
+                    // allocation only), so the call slice snapshot is current. `f` is not read after
+                    // `code`. The **leftover** is pushed onto `conts` (rooted) *before* the call, so it
+                    // is deferred correctly whether the call returns a value or tail-bounces.
                     let call_args: Vec<Value> = args[..arity].to_vec();
-                    let frame = self.frame();
-                    let mut leftover: Vec<Root> = Vec::with_capacity(args.len() - arity);
-                    for a in &args[arity..] {
-                        leftover.push(self.root(*a));
+                    if args.len() > arity {
+                        let frame = self.frame();
+                        let roots: Vec<Root> =
+                            args[arity..].iter().map(|a| self.root(*a)).collect();
+                        conts.push((frame, roots));
                     }
-                    // The `code` word is a code-table index (v1); `code_at` recovers the real fn
-                    // pointer with a bounds check — no integer→fn transmute (a provenance-free call, UB).
-                    let code = self.code_at(self.read_raw_unchecked(p, 0));
-                    let result = code(self, f, &call_args);
-                    if leftover.is_empty() {
-                        self.pop_frame(frame);
-                        return result;
+                    let code_word = self.read_raw_unchecked(p, 0);
+                    let result = self.call_code(code_word, f, &call_args);
+                    match self.take_pending_tail() {
+                        // Tail bounce (ADR-0071 §4): continue with the stashed callee; the just-pushed
+                        // leftover stays on `conts`, deferred behind this new chain.
+                        Some((nf, nargs)) => {
+                            f = nf;
+                            args = nargs;
+                        }
+                        // A real value: resolve it against the continuation stack.
+                        None => match self.resolve_cont(&mut conts) {
+                            None => return result,
+                            Some(next) => {
+                                f = result;
+                                args = next;
+                            }
+                        },
                     }
-                    // Over-apply: reload the (possibly relocated) leftovers, continue with `result`.
-                    let mut next_args: Vec<Value> = Vec::with_capacity(leftover.len());
-                    for r in &leftover {
-                        next_args.push(self.get(*r));
-                    }
-                    self.pop_frame(frame);
-                    f = result;
-                    args = next_args;
                 }
                 other => panic!("apply: not a callable value (kind {other:?})"),
             }
         }
+    }
+
+    /// Call a closure's `code` word on `call_args` (ADR-0071 §3). Index path
+    /// ([`Heap::new`]): [`code_at`](Heap::code_at) recovers the real [`CodeFn`] by a bounds-checked
+    /// lookup — no integer→fn transmute (a provenance-free call, UB), so it stays Miri-clean. Address
+    /// path ([`Heap::new_native`]): the word is a real [`AbiCodeFn`] address, called via the C-ABI —
+    /// the supported-target reconstruction (ADR-0071 §3), never run under Miri.
+    #[inline]
+    fn call_code(&mut self, code_word: u64, f: Value, call_args: &[Value]) -> Value {
+        if self.code_is_address() {
+            // SAFETY (ADR-0071 §3): on the address path `code_word` is a linker-provided `extern "C"`
+            // symbol address with provenance; transmuting a `usize` to the fn pointer and calling it is
+            // ordinary indirect dispatch on the supported 64-bit targets. It is *not* valid under Miri's
+            // abstract machine, but this branch is unreachable on an index-path (Miri) heap. The raw
+            // `self` pointer is re-borrowed as `&mut Heap` inside the callee via `pv_*` — the standard
+            // FFI "pass the context by raw pointer" pattern, with no other access to `self` across the
+            // opaque call.
+            let code: AbiCodeFn =
+                unsafe { core::mem::transmute::<usize, AbiCodeFn>(code_word as usize) };
+            let ret = code(
+                self as *mut Heap,
+                f.to_bits(),
+                call_args.as_ptr() as *const u64,
+                call_args.len(),
+            );
+            Value::from_bits(ret)
+        } else {
+            let code = self.code_at(code_word);
+            code(self, f, call_args)
+        }
+    }
+
+    /// Resolve a produced value against this activation's continuation stack (ADR-0071 §4): pop the
+    /// next owed leftover group, reload it (post-safepoint), release its roots, and return it as the
+    /// next call's args — or `None` when the stack is empty (the caller returns the value).
+    #[inline]
+    fn resolve_cont(&mut self, conts: &mut Vec<(RootFrame, Vec<Root>)>) -> Option<Vec<Value>> {
+        let (frame, roots) = conts.pop()?;
+        let vals: Vec<Value> = roots.iter().map(|r| self.get(*r)).collect();
+        self.pop_frame(frame);
+        Some(vals)
     }
 }
 

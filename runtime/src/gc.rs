@@ -73,6 +73,18 @@ pub struct Heap {
     /// [`output`](Heap::output). (`Effect.Console.log` is a `ulib` shadow over the leaf, not a runtime
     /// concern.)
     output: Vec<String>,
+    /// Interpretation of a closure's `code` word (ADR-0071 §3). `false` (the [`Heap::new`] bring-up /
+    /// Miri path): an index into [`code_table`](Heap::code_table). `true` (the [`Heap::new_native`]
+    /// codegen path): a **real `extern "C"` fn address** [`apply`](Heap::apply) calls directly. A single
+    /// heap is one or the other, never both — Miri only ever runs the index path, so the address
+    /// transmute is never *executed* under Miri (ADR-0071 §3 / ADR-0063 §4).
+    code_is_address: bool,
+    /// The trampoline **pending-tail slot** (ADR-0071 §4): `(f, args)` a `CodeFn` body stashed via
+    /// `pv_tailcall` as its final action, taken by the enclosing [`apply`](Heap::apply) after the body
+    /// returns. `Some` *is* the status flag — no reserved sentinel value. Single slot: written then read
+    /// with no intervening `code` call, so it never crosses `apply` activations (only the innermost
+    /// active loop reads it). `None` on every index-path heap (no `pv_tailcall`).
+    pending_tail: Option<(TaggedWord, Vec<TaggedWord>)>,
 }
 
 /// A handle to a value rooted on the shadow stack (ADR-0066 §2). `Copy`, borrows nothing, and is only
@@ -119,7 +131,45 @@ impl Heap {
             next_gen: 0,
             code_table: Vec::new(),
             output: Vec::new(),
+            code_is_address: false,
+            pending_tail: None,
         }
+    }
+
+    /// A heap for the **codegen / native-ABI path** (ADR-0071 §3): identical to [`Heap::new`] except a
+    /// closure's `code` word is a **real `extern "C"` fn address** (`apply` calls it directly) rather
+    /// than a [`code_table`](Heap::code_table) index. The `extern "C"` boundary (`pv_runtime_new`) builds
+    /// heaps this way; hand-written `CodeFn` tests / Miri use [`Heap::new`].
+    pub fn new_native(words_per_space: usize) -> Heap {
+        let mut h = Heap::new(words_per_space);
+        h.code_is_address = true;
+        h
+    }
+
+    /// Whether the `code` word is a real address (ADR-0071 §3) — read by [`apply`](Heap::apply).
+    #[inline]
+    pub(crate) fn code_is_address(&self) -> bool {
+        self.code_is_address
+    }
+
+    /// Stash the trampoline pending-tail `(f, args)` (ADR-0071 §4). Called by `pv_tailcall` as a body's
+    /// final action; the enclosing `apply` loop takes it after the body returns.
+    #[inline]
+    pub(crate) fn set_pending_tail(&mut self, f: TaggedWord, args: Vec<TaggedWord>) {
+        // The slot is read-and-cleared before any further stash, so a live `Some` here would be a
+        // protocol violation (two `pv_tailcall`s with no intervening `apply` take).
+        debug_assert!(
+            self.pending_tail.is_none(),
+            "pv_tailcall: pending-tail slot already set (protocol violation)"
+        );
+        self.pending_tail = Some((f, args));
+    }
+
+    /// Take the pending-tail `(f, args)`, clearing the slot (ADR-0071 §4). `None` = the body returned a
+    /// real value (index-path heaps never set it).
+    #[inline]
+    pub(crate) fn take_pending_tail(&mut self) -> Option<(TaggedWord, Vec<TaggedWord>)> {
+        self.pending_tail.take()
     }
 
     /// The captured stdio write-line output (ADR-0067 §5), in program order — the test/differential
@@ -222,6 +272,58 @@ impl Heap {
     #[inline]
     fn root_slot(&self, i: usize) -> TaggedWord {
         self.roots[i]
+    }
+
+    // --- C-ABI rooting (ADR-0071 §5): opaque `u64` handles codegen round-trips verbatim -----------
+    //
+    // The `Root` / `RootFrame` structs cannot cross the C-ABI, and `Root`'s debug generation stamp
+    // must not make the ABI vary by build profile. So the boundary passes plain `u64`s codegen never
+    // interprets, into which (debug only) the generation is packed so the stale-reuse check survives.
+
+    /// `pv_frame` (ADR-0071 §5): a frame mark as an opaque `u64` (the shadow-stack length).
+    #[inline]
+    pub(crate) fn abi_frame(&self) -> u64 {
+        self.frame().len as u64
+    }
+
+    /// `pv_pop_frame` (ADR-0071 §5): truncate back to an `abi_frame` mark.
+    #[inline]
+    pub(crate) fn abi_pop_frame(&mut self, mark: u64) {
+        self.pop_frame(RootFrame { len: mark as usize });
+    }
+
+    /// `pv_root` (ADR-0071 §5): root `v` (a raw value word) and return an opaque handle. Debug packs
+    /// the slot's generation into the high 32 bits so [`abi_get`](Heap::abi_get) can reject a stale
+    /// reused index; release returns the bare index. Codegen treats the handle as opaque either way.
+    #[inline]
+    pub(crate) fn abi_root(&mut self, v: u64) -> u64 {
+        let r = self.root(TaggedWord::from_bits(v));
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(r.index < (1 << 32), "shadow stack deeper than 2^32 slots");
+            ((r.generation & 0xFFFF_FFFF) << 32) | (r.index as u64)
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            r.index as u64
+        }
+    }
+
+    /// `pv_get` (ADR-0071 §5): the current value of an `abi_root` handle — the reload-after-safepoint
+    /// step. Debug reconstructs the generation-stamped [`Root`] so [`get`](Heap::get)'s stale-handle
+    /// assert fires; release reads by bare index.
+    #[inline]
+    pub(crate) fn abi_get(&self, handle: u64) -> u64 {
+        #[cfg(debug_assertions)]
+        let r = Root {
+            index: (handle & 0xFFFF_FFFF) as usize,
+            generation: handle >> 32,
+        };
+        #[cfg(not(debug_assertions))]
+        let r = Root {
+            index: handle as usize,
+        };
+        self.get(r).to_bits()
     }
 
     // --- allocation ---------------------------------------------------------
