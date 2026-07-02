@@ -61,6 +61,34 @@ let fnv1a_64 (s : string) : int64 =
    round-trips exactly. *)
 let label_id (label : string) : string = Int64.to_string (fnv1a_64 label)
 
+(* A constructor's runtime tag — a **deterministic** hash of its name (ADR-0064 §1/§2), so a ctor built in
+   one independently-compiled module matches the same ctor pattern-matched in another (§2 cross-module
+   linking; record labels hash the same way, ADR-0069 §2). Masked to 31 bits so a nullary ctor's immediate
+   `(tag << 1) | 1` stays inside the 63-bit payload; only construct/match *consistency* matters (the tag is
+   internal, never observed). *)
+let ctor_tag (name : string) : int =
+  Int64.to_int (Int64.logand (fnv1a_64 name) 0x7fffffffL)
+
+(* --- symbol mangling (ADR-0072 §2): a qualified key → a legal, **injective** LLVM link symbol. This is a
+   cross-`.o` ABI (B2 resolves `@<mangle>$root` between objects), so the map must be both a valid LLVM
+   identifier and collision-free. An alphabetic prefix `pv_g_` avoids a leading digit (LLVM rejects
+   `@1_foo`) and namespaces the symbol away from the runtime's `pv_*`; every non-alphanumeric byte —
+   **including `_` itself** — is escaped as `_HH` (hex), so the escape is unambiguous and distinct keys can
+   never collide (e.g. `A.B` → `pv_g_A_2eB`, `A_B` → `pv_g_A_5fB`). The code symbol is `@<mangle>`, its
+   root-handle global `@<mangle>$root`, its init function `@<mangle>$init` (`$` is a legal LLVM identifier
+   char). ------------------------------------------------------------------------------------------------ *)
+
+let mangle (key : string) : string =
+  let b = Buffer.create (String.length key + 8) in
+  Buffer.add_string b "pv_g_";
+  String.iter
+    (fun c ->
+       match c with
+       | 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9' -> Buffer.add_char b c
+       | _ -> Buffer.add_string b (Printf.sprintf "_%02x" (Char.code c)))
+    key;
+  Buffer.contents b
+
 (* --- free variables of an ANF term (for lambda-lifting, ADR-0072 §4) ------------------------------- *)
 
 let rec binder_vars : C.binder -> SS.t = function
@@ -180,23 +208,11 @@ type ctx =
   ; mutable strs : int (* string-constant counter *)
   ; mutable pending : lifted list (* lambdas to emit *)
   ; mutable frame : string (* the current function's shadow-stack frame handle operand *)
-  ; ctors :
-      ( string
-        , int )
-        Hashtbl.t (* constructor name → tag index (program-wide, first-seen order) *)
+  ; gkeys : SS.t
+    (* top-level qualified keys → referenced as `@<mangle>$root` globals (ADR-0072 §2) *)
+  ; mutable externs :
+      SS.t (* referenced globals not defined here → emitted as `external` decls *)
   }
-
-(* A constructor's runtime tag index (ADR-0064 §1/§2). The name → index map is program-wide and assigned
-   in first-seen order; only *consistency* between construction and matching matters (the index is
-   internal — a `case` result is observed, never the tag). Cross-module determinism (a hash of the
-   qualified name) is a slice-5 concern; slice 2 is single-module. *)
-let ctor_index cx (name : string) : int =
-  match Hashtbl.find_opt cx.ctors name with
-  | Some i -> i
-  | None ->
-    let i = Hashtbl.length cx.ctors in
-    Hashtbl.add cx.ctors name i;
-    i
 
 let fresh cx : string =
   cx.ssa <- cx.ssa + 1;
@@ -221,13 +237,24 @@ type env = (string * string) list
 
 let bind (env : env) (x : string) (handle : string) : env = (x, handle) :: env
 
-(* Read a variable's current value (post-safepoint) through its root handle. Raw: a by-need cell stays a
-   cell (it propagates and `apply` auto-forces it in callee position). *)
+(* Read a variable's current value (post-safepoint). A **local** reloads its value through its root handle
+   ([pv_get]); a **top-level global** (a qualified key in [gkeys], ADR-0072 §2) loads its persistent
+   root-handle global `@<mangle>$root` and `pv_get`s that — relocation-correct, since a static global is
+   not itself a GC root (§3). Raw: a by-need cell stays a cell (it propagates and `apply` auto-forces it in
+   callee position). Locals use bare keys and globals qualified keys ([lower.ml]), so they never collide;
+   the local lookup is tried first regardless. *)
 let read_var cx (env : env) (x : string) : string =
   match List.assoc_opt x env with
   | Some h ->
     let t = fresh cx in
     emit cx "  %s = call i64 @pv_get(ptr %%ctx, i64 %s)" t h;
+    t
+  | None when SS.mem x cx.gkeys ->
+    cx.externs <- SS.add x cx.externs;
+    let handle = fresh cx in
+    emit cx "  %s = load i64, ptr @%s$root" handle (mangle x);
+    let t = fresh cx in
+    emit cx "  %s = call i64 @pv_get(ptr %%ctx, i64 %s)" t handle;
     t
   | None ->
     failwith (Printf.sprintf "codegen_llvm: unbound variable %s (unresolved foreign?)" x)
@@ -362,7 +389,9 @@ let make_closure cx (env : env) (l : lifted) : string =
 let lift cx (params : string list) (body : A.expr) : lifted =
   cx.fns <- cx.fns + 1;
   let bound = List.fold_left (fun s p -> SS.add p s) SS.empty params in
-  let captures = SS.elements (fv_expr bound body) in
+  (* A top-level global is read via its `@<mangle>$root` handle at the reference (ADR-0072 §2), never
+     captured, so it never rides a closure env — subtract [gkeys] from the free-var set. *)
+  let captures = SS.elements (SS.diff (fv_expr bound body) cx.gkeys) in
   let l = { name = Printf.sprintf "fn_%d" cx.fns; params; captures; body } in
   cx.pending <- l :: cx.pending;
   l
@@ -423,7 +452,7 @@ let rec match_binder cx (env : env) ~(fail : string) (binder : C.binder) (scrut 
     test_or_fail cx ok ~fail "lit_ok";
     env
   | C.BCtor (name, subs) ->
-    let idx = ctor_index cx name in
+    let idx = ctor_tag name in
     let low = fresh cx in
     emit cx "  %s = and i64 %s, 1" low scrut;
     if subs = []
@@ -477,6 +506,79 @@ let rec match_binder cx (env : env) ~(fail : string) (binder : C.binder) (scrut 
       fields
   | C.BArray _ -> failwith "codegen_llvm: array binder not in slice 2"
 
+(* Build a recursive group as **all-by-need `ByNeed` cells over one shared env** (ADR-0070 §4, mirroring
+   the runtime `build_group`) and return [env] extended with each member bound to its (rooted) cell handle.
+   Each member is a cell; its suspension is a nullary thunk over the shared env, whose body is the member's
+   RHS with sibling references resolving to the sibling cells (a function member's cell forces to its
+   closure on first use; `apply` auto-forces a by-need callee, ADR-0070 §3). Distinguishing function
+   members as back-patched closures (ADR-0059 §1) is a deferred optimisation. Shared by the in-function
+   [A.LetRec] and the top-level `Grec` init unit (ADR-0072 §3). *)
+let build_grec cx (env : env) (binds : (string * A.expr) list) : env =
+  let members = List.map fst binds in
+  let k = List.length members in
+  let member_set = List.fold_left (fun s m -> SS.add m s) SS.empty members in
+  (* free vars of the group captured from *outside* it (members excluded) *)
+  let outside =
+    SS.elements
+      (List.fold_left
+         (fun acc (_, rhs) -> SS.union acc (fv_expr member_set rhs))
+         SS.empty
+         binds)
+  in
+  (* the shared env layout: the k member cells, then the outside captures *)
+  let shared_layout = members @ outside in
+  (* one suspension per member: `\$u -> rhs_i` over the shared env (registered for hoisting) *)
+  let susp_names =
+    List.map
+      (fun (_, rhs) ->
+         cx.fns <- cx.fns + 1;
+         let name = Printf.sprintf "susp_%d" cx.fns in
+         cx.pending
+         <- { name; params = [ "$u" ]; captures = shared_layout; body = rhs }
+            :: cx.pending;
+         name)
+      binds
+  in
+  (* 1. shared env array = [unit × k] ++ [outside-capture values]; root it. *)
+  let elems = List.init k (fun _ -> imm_unit) @ List.map (read_var cx env) outside in
+  let env_p, env_n = arg_buffer cx elems in
+  let env_arr = fresh cx in
+  emit cx "  %s = call i64 @pv_new_array(ptr %%ctx, ptr %s, i64 %d)" env_arr env_p env_n;
+  let env_h = root cx env_arr in
+  (* 2. placeholder cells; store each into env[i] (reloading env/cell after each allocation). *)
+  let cell_hs =
+    List.init k (fun i ->
+      let cell = fresh cx in
+      emit cx "  %s = call i64 @pv_new_byneed_placeholder(ptr %%ctx)" cell;
+      let ch = root cx cell in
+      let envp = get_current cx env_h in
+      let cw = get_current cx ch in
+      emit cx "  call void @pv_write_field(ptr %%ctx, i64 %s, i64 %d, i64 %s)" envp i cw;
+      ch)
+  in
+  (* 3. build each suspension closure over the shared env; backpatch it into its cell. *)
+  List.iteri
+    (fun i name ->
+       let envp = get_current cx env_h in
+       let addr = fresh cx in
+       emit cx "  %s = ptrtoint ptr @%s to i64" addr name;
+       let susp = fresh cx in
+       emit
+         cx
+         "  %s = call i64 @pv_make_closure(ptr %%ctx, i64 %s, i32 1, i64 %s)"
+         susp
+         addr
+         envp;
+       let cellp = get_current cx (List.nth cell_hs i) in
+       emit
+         cx
+         "  call void @pv_byneed_set_suspension(ptr %%ctx, i64 %s, i64 %s)"
+         cellp
+         susp)
+    susp_names;
+  (* 4. bind each member to its cell. *)
+  List.fold_left2 bind env members cell_hs
+
 (* Compile [e]; [tail] = it is in the enclosing function's tail position. Returns [Some operand] when
    not tail (the produced value), [None] when tail (a `ret`/tail-call was emitted). *)
 let rec expr cx (env : env) ~(tail : bool) (e : A.expr) : string option =
@@ -486,78 +588,7 @@ let rec expr cx (env : env) ~(tail : bool) (e : A.expr) : string option =
     let v = Option.get (cexpr cx env ~tail:false c) in
     let h = root cx v in
     expr cx (bind env x h) ~tail body
-  | A.LetRec (binds, body) ->
-    (* A recursive group as **all-by-need `ByNeed` cells over one shared env** (ADR-0070 §4, mirroring the
-       runtime `build_group`). Each member is a cell; its suspension is a nullary thunk over the shared
-       env, whose body is the member's RHS with sibling references resolving to the sibling cells (a
-       function member's cell forces to its closure on first use; `apply` auto-forces a by-need callee,
-       ADR-0070 §3). Distinguishing function members as back-patched closures (ADR-0059 §1) is a deferred
-       optimisation. *)
-    let members = List.map fst binds in
-    let k = List.length members in
-    let member_set = List.fold_left (fun s m -> SS.add m s) SS.empty members in
-    (* free vars of the group captured from *outside* it (members excluded) *)
-    let outside =
-      SS.elements
-        (List.fold_left
-           (fun acc (_, rhs) -> SS.union acc (fv_expr member_set rhs))
-           SS.empty
-           binds)
-    in
-    (* the shared env layout: the k member cells, then the outside captures *)
-    let shared_layout = members @ outside in
-    (* one suspension per member: `\$u -> rhs_i` over the shared env (registered for hoisting) *)
-    let susp_names =
-      List.map
-        (fun (_, rhs) ->
-           cx.fns <- cx.fns + 1;
-           let name = Printf.sprintf "susp_%d" cx.fns in
-           cx.pending
-           <- { name; params = [ "$u" ]; captures = shared_layout; body = rhs }
-              :: cx.pending;
-           name)
-        binds
-    in
-    (* 1. shared env array = [unit × k] ++ [outside-capture values]; root it. *)
-    let elems = List.init k (fun _ -> imm_unit) @ List.map (read_var cx env) outside in
-    let env_p, env_n = arg_buffer cx elems in
-    let env_arr = fresh cx in
-    emit cx "  %s = call i64 @pv_new_array(ptr %%ctx, ptr %s, i64 %d)" env_arr env_p env_n;
-    let env_h = root cx env_arr in
-    (* 2. placeholder cells; store each into env[i] (reloading env/cell after each allocation). *)
-    let cell_hs =
-      List.init k (fun i ->
-        let cell = fresh cx in
-        emit cx "  %s = call i64 @pv_new_byneed_placeholder(ptr %%ctx)" cell;
-        let ch = root cx cell in
-        let envp = get_current cx env_h in
-        let cw = get_current cx ch in
-        emit cx "  call void @pv_write_field(ptr %%ctx, i64 %s, i64 %d, i64 %s)" envp i cw;
-        ch)
-    in
-    (* 3. build each suspension closure over the shared env; backpatch it into its cell. *)
-    List.iteri
-      (fun i name ->
-         let envp = get_current cx env_h in
-         let addr = fresh cx in
-         emit cx "  %s = ptrtoint ptr @%s to i64" addr name;
-         let susp = fresh cx in
-         emit
-           cx
-           "  %s = call i64 @pv_make_closure(ptr %%ctx, i64 %s, i32 1, i64 %s)"
-           susp
-           addr
-           envp;
-         let cellp = get_current cx (List.nth cell_hs i) in
-         emit
-           cx
-           "  call void @pv_byneed_set_suspension(ptr %%ctx, i64 %s, i64 %s)"
-           cellp
-           susp)
-      susp_names;
-    (* 4. bind each member to its cell and compile the body. *)
-    let env' = List.fold_left2 bind env members cell_hs in
-    expr cx env' ~tail body
+  | A.LetRec (binds, body) -> expr cx (build_grec cx env binds) ~tail body
 
 and cexpr cx (env : env) ~(tail : bool) (c : A.cexpr) : string option =
   (* Finish a produced value in the current tail context. *)
@@ -661,9 +692,9 @@ and cexpr cx (env : env) ~(tail : bool) (c : A.cexpr) : string option =
            nargs
            arity)
     else if arity = 0
-    then finish (imm (ctor_index cx name)) (* nullary → an immediate tag (ADR-0064 §1) *)
+    then finish (imm (ctor_tag name)) (* nullary → an immediate tag (ADR-0064 §1) *)
     else (
-      let idx = ctor_index cx name in
+      let idx = ctor_tag name in
       let ops = eval_atoms cx env args in
       let p, n = arg_buffer cx ops in
       let t = fresh cx in
@@ -846,10 +877,15 @@ let emit_function cx (l : lifted) : unit =
            env)
   in
   ignore (expr cx env ~tail:true l.body);
+  (* `internal` linkage: a lifted function is referenced only by address within its own module (never by
+     symbol name cross-module), so it must not clash with an equally-named lifted function in another
+     per-module `.o` (ADR-0072 §1). *)
   Buffer.add_string
     cx.md
     (Printf.sprintf
-       "define i64 @%s(ptr %%ctx, i64 %%clo, ptr %%args, i64 %%nargs) {\nentry:\n%s}\n\n"
+       "define internal i64 @%s(ptr %%ctx, i64 %%clo, ptr %%args, i64 %%nargs) {\n\
+        entry:\n\
+        %s}\n\n"
        l.name
        (Buffer.contents cx.fn))
 
@@ -936,24 +972,29 @@ let declarations : string =
    (ADR-0066 §4). Overridable per program (a small heap forces GC, exercising the emitted rooting). *)
 let default_heap_words = 1 lsl 20
 
+(* A fresh codegen context. [gkeys] is the set of top-level qualified keys that resolve to root-handle
+   globals (empty on the whole-program path, which nests every binding as an in-`main` SSA value). *)
+
 (** Emit a whole ANF program as a self-contained LLVM IR module string. A **pure** entry (`is_effect =
     false`) computes its `Int` value and prints it (`pv_print_int`, matching the oracle's `to_string`); an
     **`Effect`** entry runs `pv_run_effect` then drains the output sink (ADR-0072 §8). The entry body is
     compiled in non-tail (value) position, then the stub prints/runs, frees the runtime, and returns. *)
+let make_cx ?(gkeys = SS.empty) () : ctx =
+  { md = Buffer.create 4096
+  ; globals = Buffer.create 256
+  ; fn = Buffer.create 256
+  ; ssa = 0
+  ; lbl = 0
+  ; fns = 0
+  ; strs = 0
+  ; pending = []
+  ; frame = "%frame"
+  ; gkeys
+  ; externs = SS.empty
+  }
+
 let program ?(is_effect = false) ?(heap_words = default_heap_words) (e : A.expr) : string =
-  let cx =
-    { md = Buffer.create 4096
-    ; globals = Buffer.create 256
-    ; fn = Buffer.create 256
-    ; ssa = 0
-    ; lbl = 0
-    ; fns = 0
-    ; strs = 0
-    ; pending = []
-    ; frame = "%frame"
-    ; ctors = Hashtbl.create 16
-    }
-  in
+  let cx = make_cx () in
   (* the entry stub's own body buffer *)
   cx.frame <- "%frame";
   emit cx "  %%ctx = call ptr @pv_runtime_new(i64 %d)" heap_words;
@@ -978,6 +1019,183 @@ let program ?(is_effect = false) ?(heap_words = default_heap_words) (e : A.expr)
   Printf.sprintf
     "; ModuleID = 'purvasm'\n\n%s\n\n%s\n%s\ndefine i32 @main() {\nentry:\n%s}\n"
     declarations
+    (Buffer.contents cx.globals)
+    (Buffer.contents cx.md)
+    entry_body
+
+(* ==================================================================================================== *)
+(* Per-module lowering (ADR-0072 §2/§3): top-level bindings as **root-handle globals**, each with an init
+   function, so modules compile to independent `.o` files linked by symbol. B1 emits one module's `.ll`
+   (its globals + init functions + code); the whole-program `Grec`/by-need machinery above is reused. *)
+(* ==================================================================================================== *)
+
+(** A classified top-level binding (ADR-0072 §3), the `gdef` rule at the ANF level: a syntactic lambda is a
+    [Gfun] (a closed global closure); any other non-recursive value is a strict [Gcaf]; a recursive group is
+    a [Grec] built by-need (ADR-0070 §4). *)
+type gdef =
+  | Gfun of string * string list * A.expr (* key, params, body *)
+  | Gcaf of string * A.expr (* key, strict value *)
+  | Grec of (string * A.expr) list (* recursive-group members: keys + bodies *)
+
+(* Classify a non-recursive binding: a `Ret (CLam …)` is a function, anything else a strict CAF. *)
+let classify_nonrec (key : string) (e : A.expr) : gdef =
+  match e with
+  | A.Ret (A.CLam (ps, b)) -> Gfun (key, ps, b)
+  | _ -> Gcaf (key, e)
+
+(* The root-handle-global keys a gdef defines. *)
+let gdef_keys : gdef -> string list = function
+  | Gfun (k, _, _) | Gcaf (k, _) -> [ k ]
+  | Grec ms -> List.map fst ms
+
+(* The init symbol a gdef exposes for `pv_init_all` (a group is named after its first member). *)
+let gdef_init_key : gdef -> string = function
+  | Gfun (k, _, _) | Gcaf (k, _) -> k
+  | Grec ms -> fst (List.hd ms)
+
+(** Split a linked top-level spine into its global definitions (in spine = dependency order) and the entry
+    expression (the first non-binding node = `main`). Mirrors `Vm.Codegen.program`; B1's single-module
+    stand-in until B2 drives real per-module ANF. *)
+let split_spine (e : A.expr) : gdef list * A.expr =
+  let rec walk acc = function
+    | A.Let (k, c, rest) -> walk (classify_nonrec k (A.Ret c) :: acc) rest
+    | A.LetRec (binds, rest) -> walk (Grec binds :: acc) rest
+    | main -> List.rev acc, main
+  in
+  walk [] e
+
+(* Root value word [v] into the top-level global `@<mangle key>$root` and store the handle. The caller must
+   already have popped any transient frame, so the root lands in the persistent init region of the shadow
+   stack (never popped) and the global's handle stays relocation-valid for the program's lifetime. *)
+let store_root_global cx (key : string) (v : string) : unit =
+  let h = fresh cx in
+  emit cx "  %s = call i64 @pv_root(ptr %%ctx, i64 %s)" h v;
+  emit cx "  store i64 %s, ptr @%s$root" h (mangle key)
+
+(* Wrap an init-body emitter in `define void @<mangle name>$init(ptr %ctx)`, using a fresh function buffer
+   (like [emit_function]) and flushing to the module buffer. *)
+let emit_init_fn cx ~(name : string) (emit_body : unit -> unit) : unit =
+  cx.fn <- Buffer.create 256;
+  cx.ssa <- 0;
+  emit_body ();
+  emit cx "  ret void";
+  Buffer.add_string
+    cx.md
+    (Printf.sprintf
+       "define void @%s$init(ptr %%ctx) {\nentry:\n%s}\n\n"
+       (mangle name)
+       (Buffer.contents cx.fn))
+
+(* Emit one gdef's root-handle global(s) init function. Each opens a **transient** frame for its
+   allocating computation, pops it, then roots the final value(s) permanently into their `@…$root`
+   globals (so intermediates are not leaked; only the CAF value stays rooted — ADR-0072 §3). *)
+let emit_gdef cx : gdef -> unit = function
+  | Gfun (key, ps, body) ->
+    (* the code symbol (a closed top-level function, no captures) is hoisted like any lambda *)
+    cx.pending <- { name = mangle key; params = ps; captures = []; body } :: cx.pending;
+    emit_init_fn cx ~name:key (fun () ->
+      let addr = fresh cx in
+      emit cx "  %s = ptrtoint ptr @%s to i64" addr (mangle key);
+      let clo = fresh cx in
+      emit
+        cx
+        "  %s = call i64 @pv_make_closure(ptr %%ctx, i64 %s, i32 %d, i64 %s)"
+        clo
+        addr
+        (List.length ps)
+        imm_unit;
+      store_root_global cx key clo)
+  | Gcaf (key, e) ->
+    emit_init_fn cx ~name:key (fun () ->
+      let frame = "%frame" in
+      cx.frame <- frame;
+      emit cx "  %s = call i64 @pv_frame(ptr %%ctx)" frame;
+      let v = Option.get (expr cx [] ~tail:false e) in
+      emit cx "  call void @pv_pop_frame(ptr %%ctx, i64 %s)" frame;
+      store_root_global cx key v)
+  | Grec binds ->
+    emit_init_fn
+      cx
+      ~name:(fst (List.hd binds))
+      (fun () ->
+         let frame = "%frame" in
+         cx.frame <- frame;
+         emit cx "  %s = call i64 @pv_frame(ptr %%ctx)" frame;
+         let env' = build_grec cx [] binds in
+         (* read each member's current cell value *before* popping the transient roots *)
+         let vals = List.map (fun (m, _) -> m, read_var cx env' m) binds in
+         emit cx "  call void @pv_pop_frame(ptr %%ctx, i64 %s)" frame;
+         List.iter (fun (m, v) -> store_root_global cx m v) vals)
+
+(** Emit a program as **per-module-style** LLVM IR (ADR-0072 §2/§3): each top-level binding becomes a
+    root-handle global `@M.x$root` + an `@M.x$init` function; a `pv_init_all` runs the inits in dependency
+    (spine) order into a never-popped shadow-stack region; the entry stub calls it, then evaluates the
+    entry (reading globals via `pv_get`). B1 emits a single self-contained module (all globals defined
+    locally); B2 splits this across `.o` files with a link-synthesised `pv_init_all`. *)
+let program_modular ?(is_effect = false) ?(heap_words = default_heap_words) (e : A.expr)
+  : string
+  =
+  let gdefs, entry = split_spine e in
+  let gkeys = SS.of_list (List.concat_map gdef_keys gdefs) in
+  let cx = make_cx ~gkeys () in
+  (* 1. root-handle global definitions (handle 0 = an invalid sentinel; init overwrites before any read) *)
+  List.iter
+    (fun g ->
+       List.iter
+         (fun k ->
+            Buffer.add_string
+              cx.md
+              (Printf.sprintf "@%s$root = global i64 0\n" (mangle k)))
+         (gdef_keys g))
+    gdefs;
+  Buffer.add_char cx.md '\n';
+  (* 2. init functions *)
+  List.iter (emit_gdef cx) gdefs;
+  (* 3. pv_init_all: run each init in spine order. The inits push their permanent roots onto the shadow
+     stack; nothing pops them, so the globals stay live and relocation-valid for the program's lifetime. *)
+  let init_calls =
+    List.map
+      (fun g ->
+         Printf.sprintf "  call void @%s$init(ptr %%ctx)" (mangle (gdef_init_key g)))
+      gdefs
+  in
+  Buffer.add_string
+    cx.md
+    (Printf.sprintf
+       "define void @pv_init_all(ptr %%ctx) {\nentry:\n%s\n  ret void\n}\n\n"
+       (String.concat "\n" init_calls));
+  (* 4. entry stub *)
+  cx.fn <- Buffer.create 256;
+  cx.ssa <- 0;
+  cx.frame <- "%frame";
+  emit cx "  %%ctx = call ptr @pv_runtime_new(i64 %d)" heap_words;
+  emit cx "  call void @pv_init_all(ptr %%ctx)";
+  emit cx "  %%frame = call i64 @pv_frame(ptr %%ctx)";
+  let v = Option.get (expr cx [] ~tail:false entry) in
+  if is_effect
+  then (
+    let r = fresh cx in
+    emit cx "  %s = call i64 @pv_run_effect(ptr %%ctx, i64 %s)" r v;
+    emit cx "  call void @pv_drain_output(ptr %%ctx)")
+  else emit cx "  call void @pv_print_int(i64 %s)" (force_value cx v);
+  emit cx "  call void @pv_pop_frame(ptr %%ctx, i64 %%frame)";
+  emit cx "  call void @pv_runtime_free(ptr %%ctx)";
+  emit cx "  ret i32 0";
+  let entry_body = Buffer.contents cx.fn in
+  (* 5. flush the code functions queued by the init functions and the entry *)
+  emit_pending cx;
+  (* 6. `external` decls for any referenced global not defined in this module (none in B1's single
+     module; the mechanism is exercised by B2's cross-module split) *)
+  let extern_decls =
+    SS.diff cx.externs gkeys
+    |> SS.elements
+    |> List.map (fun k -> Printf.sprintf "@%s$root = external global i64" (mangle k))
+    |> String.concat "\n"
+  in
+  Printf.sprintf
+    "; ModuleID = 'purvasm'\n\n%s\n%s\n\n%s\n%s\ndefine i32 @main() {\nentry:\n%s}\n"
+    declarations
+    extern_decls
     (Buffer.contents cx.globals)
     (Buffer.contents cx.md)
     entry_body

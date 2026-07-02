@@ -34,6 +34,13 @@
 > same. §8's **pure entry forces its final result** before the printer (the entry value may be a by-need
 > cell); the `Effect` entry needs no force (`pv_run_effect` → `pv_apply` auto-forces a by-need callee).
 > Construction sites and `apply` head/args keep the raw cell (the knot-tie is preserved).
+>
+> **Correction (2026-07-03, B1 implementation):** §2's symbol mangling is pinned to an **injective link
+> ABI** — a `pv_g_` prefix + `_HH` escaping of every non-alphanumeric byte (`_` included) — because a
+> `codegen_ml`-style `.`→`_` map collides (`A.B`/`A_B`) and would double-define / clash `@…$root` across
+> `.o`s. The constructor **tag is a deterministic name hash** (`fnv1a_64`, 31-bit-masked), not a per-module
+> first-seen counter, so a ctor built in one `.o` matches its pattern in another. Lifted functions are
+> emitted with **`internal` linkage** (referenced only by address within their own module).
 
 ## Context
 
@@ -77,12 +84,16 @@ chosen — a follow-up, [0060](0060-native-codegen-llvm-owned-runtime.md) §Defe
 
 ### 2. Top-level bindings = module-qualified global symbols; cross-module refs = `extern`
 
-A module's top-level binding `M.x` emits a **root-handle global** `@M.x$root` — an `i64` holding the
-value's shadow-stack root handle, *not* the raw value (a static global is not a GC root; §3). A reference
-to another module's `N.y` is an **`external`** `@N.y$root` the linker resolves — the
+A module's top-level binding `M.x` emits a **root-handle global** `@<mangle(M.x)>$root` — an `i64` holding
+the value's shadow-stack root handle, *not* the raw value (a static global is not a GC root; §3). A
+reference to another module's `N.y` is an **`external`** `@<mangle(N.y)>$root` the linker resolves — the
 [0033](0033-separate-compilation.md) qualified-key scheme, faithful to `lower.ml`'s `qualified_key` — and
-reads the current value with `pv_get` (§3). Symbol names use a **total mangling** of the qualified key to
-LLVM's symbol charset (mirroring `codegen_ml`'s `mangle`, retargeted to `.ll` global names). The
+reads the current value with `pv_get` (§3). Because this is a **cross-`.o` link ABI**, the mangling must be
+both a valid LLVM identifier and **injective**: an alphabetic prefix `pv_g_` (avoids a leading digit —
+LLVM rejects `@1_foo` — and namespaces away from the runtime's `pv_*`) followed by each qualified-key byte,
+alphanumerics verbatim and **every other byte, `_` included, escaped as `_HH` (hex)** so the escape is
+unambiguous and distinct keys can never collide (`A.B` → `pv_g_A_2eB`, `A_B` → `pv_g_A_5fB`; a
+`codegen_ml`-style `.`→`_` map is *not* injective and is unsafe as a link ABI). The
 cross-module calling convention is **boxed** ([0059](0059-native-abi-value-representation.md) §3 /
 [0071](0071-codegen-runtime-c-abi.md)): every cross-module value is a plain tagged word. **No `.pmi`
 metadata is needed** — not a rep signature (the boundary is boxed) and **not even an arity** (a top-level

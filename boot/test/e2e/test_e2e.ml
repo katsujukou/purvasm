@@ -809,17 +809,20 @@ let llvm_available : bool = rt_staticlib <> None && has_clang
 (* Compile a term through the LLVM backend to a native executable and run it: ANF (ADR-0025) → LLVM IR
    → `clang` (link the runtime `staticlib`) → run → its output. The **fourth** differential
    implementation (ADR-0064 §7), held to the CESK oracle's value / `Effect`-order. *)
-let llvm_run ?(is_effect = false) ?heap_words (t : C.term) : string =
+let llvm_run ?(is_effect = false) ?(modular = false) ?heap_words (t : C.term) : string =
   let rt = Option.get rt_staticlib in
   let dir =
     Filename.concat
       (Filename.get_temp_dir_name ())
-      (Printf.sprintf "purvasm_ll_%x" (Hashtbl.hash (t, heap_words)))
+      (Printf.sprintf "purvasm_ll_%x" (Hashtbl.hash (t, heap_words, modular)))
   in
   (try Sys.mkdir dir 0o755 with
    | Sys_error _ -> ());
+  let anf = Middle_end.Transl.transl t in
   let src =
-    Llvm_backend.Codegen_llvm.program ~is_effect ?heap_words (Middle_end.Transl.transl t)
+    if modular
+    then Llvm_backend.Codegen_llvm.program_modular ~is_effect ?heap_words anf
+    else Llvm_backend.Codegen_llvm.program ~is_effect ?heap_words anf
   in
   (* Quote every path (ADR-0072 §10 harness): a `TMPDIR` with spaces must not break the command line. *)
   let genll = Filename.concat dir "gen.ll" in
@@ -863,6 +866,22 @@ let same_on_llvm_effect (label : string) (t : C.term) =
     with_captured_stdout (fun () -> ignore (Cesk.Machine.run_effect ~host:Ffi.host t))
   in
   Alcotest.(check string) label out (llvm_run ~is_effect:true t)
+
+(* The **per-module** path (ADR-0072 §2/§3, Part B): the same term, but every top-level binding lowered to
+   a root-handle global `@M.x$root` + an `@M.x$init`, run through a `pv_init_all`. B1 emits a single
+   self-contained module, so this reuses the existing terms to differential-check the globals / init /
+   root-handle machinery against the CESK oracle before B2's real multi-`.o` split. *)
+let same_on_llvm_modular ?heap_words (label : string) (t : C.term) =
+  Alcotest.(check string)
+    label
+    (V.to_string (Cesk.Machine.eval ~host:Ffi.host t))
+    (llvm_run ~modular:true ?heap_words t)
+
+let same_on_llvm_modular_effect (label : string) (t : C.term) =
+  let out =
+    with_captured_stdout (fun () -> ignore (Cesk.Machine.run_effect ~host:Ffi.host t))
+  in
+  Alcotest.(check string) label out (llvm_run ~is_effect:true ~modular:true t)
 
 let test_llvm_arith () =
   same_on_llvm
@@ -1282,6 +1301,80 @@ let test_llvm_prelude_quotient () =
 let test_llvm_effect_console () =
   same_on_llvm_effect
     "effect_console"
+    (Link.link_program
+       ~resolver:Ffi.resolver
+       ~outdir:"../fixtures/effect_console"
+       ~entry_module:[ "ConsoleMain" ]
+       ~entry:"main"
+       ())
+
+(* --- Part B1: the per-module lowering (root-handle globals + init + pv_init_all), differential-checked
+   against the oracle on the same terms. --------------------------------------------------------------- *)
+
+(* Two top-level keys that a non-injective mangle would collide (`A.B` and `A_B` both → `@A_B$root`),
+   producing a duplicate global (a clang redefinition / cross-`.o` symbol clash). The injective mangle
+   keeps them distinct: `let A.B = 3 in let A_B = 4 in A.B + A_B` → 7. *)
+let test_llvm_mod_mangle_injective () =
+  same_on_llvm_modular
+    "mod mangle injective"
+    (C.Let
+       ( "A.B"
+       , int 3
+       , C.Let ("A_B", int 4, C.Prim (C.AddInt, [ C.Var "A.B"; C.Var "A_B" ])) ))
+
+(* A degenerate no-binding program: `split_spine` yields no globals and an empty `pv_init_all`. *)
+let test_llvm_mod_no_globals () =
+  same_on_llvm_modular
+    "mod no-globals"
+    (C.Prim (C.MulInt, [ C.Prim (C.AddInt, [ int 1; int 2 ]); int 3 ]))
+
+(* A top-level `Grec` global (a recursive function member): its cell is a root-handle global, forced at
+   each self-call via `apply`. `letrec fib n = … in fib 10` → 55. *)
+let test_llvm_mod_fib () =
+  let fib =
+    C.Lam
+      ( "n"
+      , C.If
+          ( C.Prim (C.LtInt, [ C.Var "n"; int 2 ])
+          , C.Var "n"
+          , C.Prim
+              ( C.AddInt
+              , [ C.App (C.Var "fib", C.Prim (C.SubInt, [ C.Var "n"; int 1 ]))
+                ; C.App (C.Var "fib", C.Prim (C.SubInt, [ C.Var "n"; int 2 ]))
+                ] ) ) )
+  in
+  same_on_llvm_modular "mod fib" (C.Letrec ([ "fib", fib ], C.App (C.Var "fib", int 10)))
+
+(* A top-level `Grec` value member (a dictionary) read across an init boundary: its global is a `ByNeed`
+   cell forced at the projection. Exercises a value global + a function global in one group. *)
+let test_llvm_mod_value_dict () =
+  same_on_llvm_modular
+    "mod value dict"
+    (C.Letrec
+       ( [ ( "dict"
+           , C.Record
+               [ ( "call"
+                 , C.Lam
+                     ( "x"
+                     , C.Prim (C.AddInt, [ C.Var "x"; C.Accessor (C.Var "dict", "base") ])
+                     ) )
+               ; "base", int 10
+               ] )
+         ]
+       , C.App (C.Accessor (C.Var "dict", "call"), int 5) ))
+
+(* Real compiled-PureScript multi-module programs through the **per-module** path: every top-level binding
+   of every linked module becomes a root-handle global, `pv_init_all` runs them in dependency order. The
+   strongest B1 check — genuine `Gfun`/`Gcaf`/`Grec` bindings and cross-binding references. *)
+let test_llvm_mod_prelude_answer () =
+  same_on_llvm_modular "mod prelude answer" (prelude_term "answer")
+
+let test_llvm_mod_prelude_quotient () =
+  same_on_llvm_modular "mod prelude quotient" (prelude_term "quotient")
+
+let test_llvm_mod_effect_console () =
+  same_on_llvm_modular_effect
+    "mod effect_console"
     (Link.link_program
        ~resolver:Ffi.resolver
        ~outdir:"../fixtures/effect_console"
@@ -1961,6 +2054,13 @@ let llvm_groups =
         ; Alcotest.test_case "prelude_answer" `Quick test_llvm_prelude_answer
         ; Alcotest.test_case "prelude_quotient" `Quick test_llvm_prelude_quotient
         ; Alcotest.test_case "effect_console" `Quick test_llvm_effect_console
+        ; Alcotest.test_case "mod_mangle_injective" `Quick test_llvm_mod_mangle_injective
+        ; Alcotest.test_case "mod_no_globals" `Quick test_llvm_mod_no_globals
+        ; Alcotest.test_case "mod_fib" `Quick test_llvm_mod_fib
+        ; Alcotest.test_case "mod_value_dict" `Quick test_llvm_mod_value_dict
+        ; Alcotest.test_case "mod_prelude_answer" `Quick test_llvm_mod_prelude_answer
+        ; Alcotest.test_case "mod_prelude_quotient" `Quick test_llvm_mod_prelude_quotient
+        ; Alcotest.test_case "mod_effect_console" `Quick test_llvm_mod_effect_console
         ] )
     ]
   else (
