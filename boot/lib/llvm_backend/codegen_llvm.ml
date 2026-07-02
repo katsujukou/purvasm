@@ -1,8 +1,12 @@
 (** ANF → LLVM textual IR (ADR-0072), the native backend that lowers onto the owned Rust runtime
-    (ADR-0071). Slice 1 (ADR-0072 §10): the **pure first-order** subset — literals (`Int`/`Boolean`),
-    arithmetic/comparison primops, `let`, `if`, uncurried lambdas (lambda-lifted), and application
-    through the eval/`apply` trampoline. ADTs / `case` / records / `letrec` / by-need / strings and the
-    full leaf set land in later slices (a clear [failwith] guards each until then).
+    (ADR-0071). Implemented so far (ADR-0072 §10 slice plan):
+    - **Slice 1 — pure first-order**: literals (`Int`/`Boolean`), arithmetic/comparison primops, `let`,
+      `if`, uncurried lambdas (lambda-lifted), and application through the eval/`apply` trampoline.
+    - **Slice 2 — ADTs + `case`**: saturated constructors (nullary → an immediate tag, field-carrying →
+      `pv_new_adt`), and the CPS-cascade matcher over `BNull`/`BVar`/`BNamed`/`BLit`(`Int`/`Bool`)/`BCtor`
+      binders, with guarded alternatives.
+    Records / arrays / `letrec` / by-need / strings / `Number` / the full leaf set / unsaturated
+    constructors land in later slices (a clear [failwith] guards each until then).
 
     Every guest value is one `i64` tagged word (ADR-0064 §1); the module calls the runtime's `extern "C"`
     surface (`pv_*`, ADR-0071). Rooting is **root-on-create** (ADR-0072 §6, the conservative first cut):
@@ -107,7 +111,7 @@ let prim_sym : C.primop -> string * bool = function
     (* Number/String/Array/Record primops need the ctx + allocation; wired with their slices. *)
     failwith
       (Printf.sprintf
-         "codegen_llvm: primop not in slice 1 (%s)"
+         "codegen_llvm: Number/String/Array/Record primop not yet supported (%s)"
          (match op with
           | C.AddNumber -> "AddNumber"
           | C.SubNumber -> "SubNumber"
@@ -149,7 +153,23 @@ type ctx =
   ; mutable fns : int (* lifted-function counter *)
   ; mutable pending : lifted list (* lambdas to emit *)
   ; mutable frame : string (* the current function's shadow-stack frame handle operand *)
+  ; ctors :
+      ( string
+        , int )
+        Hashtbl.t (* constructor name → tag index (program-wide, first-seen order) *)
   }
+
+(* A constructor's runtime tag index (ADR-0064 §1/§2). The name → index map is program-wide and assigned
+   in first-seen order; only *consistency* between construction and matching matters (the index is
+   internal — a `case` result is observed, never the tag). Cross-module determinism (a hash of the
+   qualified name) is a slice-5 concern; slice 2 is single-module. *)
+let ctor_index cx (name : string) : int =
+  match Hashtbl.find_opt cx.ctors name with
+  | Some i -> i
+  | None ->
+    let i = Hashtbl.length cx.ctors in
+    Hashtbl.add cx.ctors name i;
+    i
 
 let fresh cx : string =
   cx.ssa <- cx.ssa + 1;
@@ -254,6 +274,85 @@ let emit_ret cx (v : string) : unit =
   emit cx "  call void @pv_pop_frame(ptr %%ctx, i64 %s)" cx.frame;
   emit cx "  ret i64 %s" v
 
+(* Read the current value of a rooted handle (post-safepoint) — [pv_get] on a bare handle operand. *)
+let get_current cx (handle : string) : string =
+  let t = fresh cx in
+  emit cx "  %s = call i64 @pv_get(ptr %%ctx, i64 %s)" t handle;
+  t
+
+(* Emit a `br i1` guarded by [ok]: fall through to a fresh continuation block on true, jump to [fail] on
+   false. Returns after emitting the continuation block's label (subsequent code runs on match). *)
+let test_or_fail cx (ok : string) ~(fail : string) (tag : string) : unit =
+  let cont = fresh_label cx tag in
+  emit cx "  br i1 %s, label %%%s, label %%%s" ok cont fail;
+  emit cx "%s:" cont
+
+(* Match [binder] against value operand [scrut] (ADR-0072 §5, the CPS cascade). On a mismatch, branch to
+   [fail]; on a match, fall through (in a new block) with the env extended by the binder's bindings. No
+   guest allocation happens inside a match, so [scrut] stays valid throughout (the body may allocate, but
+   its bound values are rooted on capture — root-on-create). Records/arrays are later slices. *)
+let rec match_binder cx (env : env) ~(fail : string) (binder : C.binder) (scrut : string)
+  : env
+  =
+  match binder with
+  | C.BNull -> env
+  | C.BVar x -> bind env x (root cx scrut)
+  | C.BNamed (x, inner) ->
+    let env = bind env x (root cx scrut) in
+    match_binder cx env ~fail inner scrut
+  | C.BLit l ->
+    let lit =
+      match l with
+      | C.LInt n -> imm_int n
+      | C.LBool b -> imm_bool b
+      | C.LNumber _ | C.LString _ ->
+        failwith "codegen_llvm: Number/String literal binder not in slice 2"
+    in
+    let ok = fresh cx in
+    emit cx "  %s = icmp eq i64 %s, %s" ok scrut lit;
+    test_or_fail cx ok ~fail "lit_ok";
+    env
+  | C.BCtor (name, subs) ->
+    let idx = ctor_index cx name in
+    let low = fresh cx in
+    emit cx "  %s = and i64 %s, 1" low scrut;
+    if subs = []
+    then (
+      (* Nullary → an immediate whose payload is the tag index (ADR-0064 §1). *)
+      let is_imm = fresh cx in
+      emit cx "  %s = icmp eq i64 %s, 1" is_imm low;
+      test_or_fail cx is_imm ~fail "nl_imm";
+      let pay = fresh cx in
+      emit cx "  %s = ashr i64 %s, 1" pay scrut;
+      let ok = fresh cx in
+      emit cx "  %s = icmp eq i64 %s, %d" ok pay idx;
+      test_or_fail cx ok ~fail "nl_tag";
+      env)
+    else (
+      (* Field-carrying → a pointer to an `Adt` (tag at raw word 0, field i at value slot 1+i). *)
+      let is_ptr = fresh cx in
+      emit cx "  %s = icmp eq i64 %s, 0" is_ptr low;
+      test_or_fail cx is_ptr ~fail "adt_ptr";
+      let tag = fresh cx in
+      emit cx "  %s = call i64 @pv_read_raw(ptr %%ctx, i64 %s, i64 0)" tag scrut;
+      let ok = fresh cx in
+      emit cx "  %s = icmp eq i64 %s, %d" ok tag idx;
+      test_or_fail cx ok ~fail "adt_tag";
+      List.fold_left
+        (fun env (i, sub) ->
+           let fld = fresh cx in
+           emit
+             cx
+             "  %s = call i64 @pv_read_field(ptr %%ctx, i64 %s, i64 %d)"
+             fld
+             scrut
+             (1 + i);
+           match_binder cx env ~fail sub fld)
+        env
+        (List.mapi (fun i s -> i, s) subs))
+  | C.BArray _ -> failwith "codegen_llvm: array binder not in slice 2"
+  | C.BRecord _ -> failwith "codegen_llvm: record binder not in slice 3"
+
 (* Compile [e]; [tail] = it is in the enclosing function's tail position. Returns [Some operand] when
    not tail (the produced value), [None] when tail (a `ret`/tail-call was emitted). *)
 let rec expr cx (env : env) ~(tail : bool) (e : A.expr) : string option =
@@ -349,11 +448,98 @@ and cexpr cx (env : env) ~(tail : bool) (c : A.cexpr) : string option =
       let r = fresh cx in
       emit cx "  %s = phi i64 [ %s, %%%s ], [ %s, %%%s ]" r vt bt ve be;
       Some r)
-  | A.CCtor _ -> failwith "codegen_llvm: constructor not in slice 1"
-  | A.CArray _ -> failwith "codegen_llvm: array not in slice 1"
+  | A.CCtor (name, arity, args) ->
+    let nargs = List.length args in
+    if nargs <> arity
+    then
+      (* A partial (or over-) application is a constructor *function* — a closure that accumulates the
+         remaining args, then builds the ADT. Deferred: needs a synthetic constructor closure. *)
+      failwith
+        (Printf.sprintf
+           "codegen_llvm: unsaturated constructor %s (%d/%d) not in slice 2"
+           name
+           nargs
+           arity)
+    else if arity = 0
+    then finish (imm (ctor_index cx name)) (* nullary → an immediate tag (ADR-0064 §1) *)
+    else (
+      let idx = ctor_index cx name in
+      let ops = List.map (atom cx env) args in
+      let p, n = arg_buffer cx ops in
+      let t = fresh cx in
+      emit cx "  %s = call i64 @pv_new_adt(ptr %%ctx, i32 %d, ptr %s, i64 %d)" t idx p n;
+      finish t)
+  | A.CCase (scruts, alts) ->
+    (* The CPS cascade (ADR-0072 §5): try each alt in order; a binder mismatch jumps to the next alt;
+       an exhausted tail is `pv_case_fail`. Scrutinees are rooted and re-read per alt (`get_current`). *)
+    let scrut_handles = List.map (fun a -> root cx (atom cx env a)) scruts in
+    let n = List.length alts in
+    let try_labels = List.init n (fun _ -> fresh_label cx "alt") in
+    let fail_label = fresh_label cx "nomatch" in
+    let merge = if tail then "" else fresh_label cx "casejoin" in
+    let results = ref [] in
+    (* A matched body's value reaches the phi through a fresh single-predecessor block (the CIf idiom). *)
+    let run_body env' e =
+      if tail
+      then ignore (expr cx env' ~tail:true e)
+      else (
+        let v = Option.get (expr cx env' ~tail:false e) in
+        let vb = fresh_label cx "altv" in
+        emit cx "  br label %%%s" vb;
+        emit cx "%s:" vb;
+        emit cx "  br label %%%s" merge;
+        results := (v, vb) :: !results)
+    in
+    emit cx "  br label %%%s" (List.hd try_labels);
+    List.iteri
+      (fun i (alt : A.alt) ->
+         emit cx "%s:" (List.nth try_labels i);
+         let next_fail = if i + 1 < n then List.nth try_labels (i + 1) else fail_label in
+         let env' =
+           List.fold_left2
+             (fun env b h -> match_binder cx env ~fail:next_fail b (get_current cx h))
+             env
+             alt.binders
+             scrut_handles
+         in
+         match alt.result with
+         | A.Uncond e -> run_body env' e
+         | A.Guarded gs ->
+           (* Test guards in order; the first true runs its body, all-false falls to the next alt. *)
+           let rec guards = function
+             | [] -> emit cx "  br label %%%s" next_fail
+             | (g, body) :: rest ->
+               let gv = Option.get (expr cx env' ~tail:false g) in
+               let pay = fresh cx in
+               emit cx "  %s = ashr i64 %s, 1" pay gv;
+               let bb = fresh cx in
+               emit cx "  %s = icmp ne i64 %s, 0" bb pay;
+               let yes = fresh_label cx "gyes"
+               and no = fresh_label cx "gno" in
+               emit cx "  br i1 %s, label %%%s, label %%%s" bb yes no;
+               emit cx "%s:" yes;
+               run_body env' body;
+               emit cx "%s:" no;
+               guards rest
+           in
+           guards gs)
+      alts;
+    emit cx "%s:" fail_label;
+    emit cx "  call void @pv_case_fail()";
+    emit cx "  unreachable";
+    if tail
+    then None
+    else (
+      emit cx "%s:" merge;
+      let r = fresh cx in
+      let entries =
+        List.rev_map (fun (v, b) -> Printf.sprintf "[ %s, %%%s ]" v b) !results
+      in
+      emit cx "  %s = phi i64 %s" r (String.concat ", " entries);
+      Some r)
+  | A.CArray _ -> failwith "codegen_llvm: array not in slice 2"
   | A.CRecord _ | A.CAccessor _ | A.CUpdate _ ->
-    failwith "codegen_llvm: records not in slice 1"
-  | A.CCase _ -> failwith "codegen_llvm: case not in slice 1"
+    failwith "codegen_llvm: records not in slice 3"
 
 (* Emit one lifted function: open a frame, root the params (from the arg buffer) and the captured free
    vars (from the closure env block), then compile the body in tail position. *)
@@ -420,7 +606,10 @@ let declarations : string =
     ; "declare i64 @pv_get(ptr, i64)"
     ; "declare void @pv_pop_frame(ptr, i64)"
     ; "declare i64 @pv_new_array(ptr, ptr, i64)"
+    ; "declare i64 @pv_new_adt(ptr, i32, ptr, i64)"
     ; "declare i64 @pv_read_field(ptr, i64, i64)"
+    ; "declare i64 @pv_read_raw(ptr, i64, i64)"
+    ; "declare void @pv_case_fail()"
     ; "declare i64 @pv_run_effect(ptr, i64)"
     ; "declare void @pv_drain_output(ptr)"
     ; "declare void @pv_print_int(i64)"
@@ -460,6 +649,7 @@ let program ?(is_effect = false) (e : A.expr) : string =
     ; fns = 0
     ; pending = []
     ; frame = "%frame"
+    ; ctors = Hashtbl.create 16
     }
   in
   (* the entry stub's own body buffer *)

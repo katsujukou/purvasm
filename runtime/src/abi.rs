@@ -182,6 +182,15 @@ pub unsafe extern "C" fn pv_drain_output(ctx: *mut Heap) {
     })
 }
 
+/// A `case` with no matching alternative (a partial match falling through every arm, ADR-0072 §5) —
+/// a fatal runtime fault, mirroring the oracle's *stuck* "no match". Codegen emits this at a matcher's
+/// exhausted tail; for a total match it is unreachable. The panic is contained at the boundary → abort
+/// (ADR-0071 §7).
+#[no_mangle]
+pub extern "C" fn pv_case_fail() {
+    guard(|| panic!("purvasm: no matching case alternative"));
+}
+
 /// Print a **pure `Int` entry**'s value to `stdout` (no trailing newline), matching the oracle's
 /// `Value.to_string` for `Int` (OCaml `string_of_int` == Rust `i32` `Display` over all `i32`). The
 /// codegen entry stub emits this for a pure `Int` program (ADR-0072 §8); type-directed printing for

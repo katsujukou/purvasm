@@ -926,6 +926,91 @@ let test_ml_case_just () =
 let test_ml_case_nothing () =
   same_on_ocaml "case Nothing" (classify_term (C.Ctor ("Nothing", 0)))
 
+(* --- slice 2: ADT construction + case matching on the LLVM backend --------- *)
+
+let test_llvm_case_just () =
+  same_on_llvm "case Just 5" (classify_term (C.App (C.Ctor ("Just", 1), int 5)))
+
+let test_llvm_case_nothing () =
+  same_on_llvm "case Nothing" (classify_term (C.Ctor ("Nothing", 0)))
+
+(* Nested constructor binder: `case Just (Just 3) of Just (Just y) -> y ; _ -> 0` → 3. *)
+let test_llvm_case_nested () =
+  same_on_llvm
+    "nested ctor"
+    (C.Case
+       ( [ C.App (C.Ctor ("Just", 1), C.App (C.Ctor ("Just", 1), int 3)) ]
+       , [ { C.binders = [ C.BCtor ("Just", [ C.BCtor ("Just", [ C.BVar "y" ]) ]) ]
+           ; result = C.Unconditional (C.Var "y")
+           }
+         ; { C.binders = [ C.BNull ]; result = C.Unconditional (int 0) }
+         ] ))
+
+(* Guarded alternative with guard fall-through: `case 5 of x | x < 3 -> 100 | true -> 200` → 200. *)
+let test_llvm_case_guard () =
+  same_on_llvm
+    "guarded"
+    (C.Case
+       ( [ int 5 ]
+       , [ { C.binders = [ C.BVar "x" ]
+           ; result =
+               C.Guarded
+                 [ C.Prim (C.LtInt, [ C.Var "x"; int 3 ]), int 100
+                 ; C.Lit (C.LBool true), int 200
+                 ]
+           }
+         ] ))
+
+(* As-pattern: `case Just 5 of a@(Just x) -> case a of Just y -> x*10 + y` → 55 (binds the whole `a`). *)
+let test_llvm_case_aspat () =
+  same_on_llvm
+    "as-pattern"
+    (C.Case
+       ( [ C.App (C.Ctor ("Just", 1), int 5) ]
+       , [ { C.binders = [ C.BNamed ("a", C.BCtor ("Just", [ C.BVar "x" ])) ]
+           ; result =
+               C.Unconditional
+                 (C.Case
+                    ( [ C.Var "a" ]
+                    , [ { C.binders = [ C.BCtor ("Just", [ C.BVar "y" ]) ]
+                        ; result =
+                            C.Unconditional
+                              (C.Prim
+                                 ( C.AddInt
+                                 , [ C.Prim (C.MulInt, [ C.Var "x"; int 10 ]); C.Var "y" ]
+                                 ))
+                        }
+                      ] ))
+           }
+         ] ))
+
+(* Multi-field constructor: `case Pair 3 4 of Pair a b -> a*10 + b` → 34 (reads fields 0 and 1). *)
+let test_llvm_case_multifield () =
+  same_on_llvm
+    "multi-field"
+    (C.Case
+       ( [ C.App (C.App (C.Ctor ("Pair", 2), int 3), int 4) ]
+       , [ { C.binders = [ C.BCtor ("Pair", [ C.BVar "a"; C.BVar "b" ]) ]
+           ; result =
+               C.Unconditional
+                 (C.Prim
+                    (C.AddInt, [ C.Prim (C.MulInt, [ C.Var "a"; int 10 ]); C.Var "b" ]))
+           }
+         ] ))
+
+(* Guard false falls through to the *next alternative* (not just the next guard):
+   `case Just 5 of Just x | 10 < x -> 1 ; _ -> 2` → 2. *)
+let test_llvm_case_guard_fallthrough () =
+  same_on_llvm
+    "guard-fallthrough"
+    (C.Case
+       ( [ C.App (C.Ctor ("Just", 1), int 5) ]
+       , [ { C.binders = [ C.BCtor ("Just", [ C.BVar "x" ]) ]
+           ; result = C.Guarded [ C.Prim (C.LtInt, [ int 10; C.Var "x" ]), int 1 ]
+           }
+         ; { C.binders = [ C.BNull ]; result = C.Unconditional (int 2) }
+         ] ))
+
 let test_ml_recursion () =
   let fact =
     C.Lam
@@ -1566,6 +1651,16 @@ let llvm_groups =
         ; Alcotest.test_case "if" `Quick test_llvm_if
         ; Alcotest.test_case "let" `Quick test_llvm_let
         ; Alcotest.test_case "tailapp" `Quick test_llvm_tailapp
+        ; Alcotest.test_case "case_just" `Quick test_llvm_case_just
+        ; Alcotest.test_case "case_nothing" `Quick test_llvm_case_nothing
+        ; Alcotest.test_case "case_nested" `Quick test_llvm_case_nested
+        ; Alcotest.test_case "case_guard" `Quick test_llvm_case_guard
+        ; Alcotest.test_case "case_aspat" `Quick test_llvm_case_aspat
+        ; Alcotest.test_case "case_multifield" `Quick test_llvm_case_multifield
+        ; Alcotest.test_case
+            "case_guard_fallthrough"
+            `Quick
+            test_llvm_case_guard_fallthrough
         ] )
     ]
   else (
