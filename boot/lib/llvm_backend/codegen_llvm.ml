@@ -8,8 +8,13 @@
     - **Slice 3 — static records**: literals (`pv_new_record` over compile-time FNV-1a-64 label ids,
       sorted), the static `Accessor` and functional `Update` (id-keyed `pv_record_get`/`pv_record_set`),
       and the `BRecord` row-poly binder.
-    Arrays / `letrec` / by-need / strings / `Number` / the full leaf set / unsaturated constructors / the
-    dynamic (`String`-keyed) record primops land in later slices (a clear [failwith] guards each).
+    - **Slice 4 — strings, numbers, arrays, leaves, `Effect`**: `String`/`Number` literals
+      (`pv_new_str`/`pv_new_number`), `Array` literals, the full primop set (Number/String/Array + the
+      dynamic `String`-keyed record ops), `foreign` leaves (`pv_foreign`), and the `Effect` entry
+      (`pv_run_effect` + drain to `stdout`). Multi-atom sites are `eval_atoms`-protected (root-on-collect,
+      since literals now allocate); a small-heap fixture exercises the rooting under a forced collection.
+    `letrec` / by-need / unsaturated constructors / per-module cross-module linking / pure-`Number`/`String`
+    entry printers land in later slices (a clear [failwith] / `pv_print_int`-only guards each).
 
     Every guest value is one `i64` tagged word (ADR-0064 §1); the module calls the runtime's `extern "C"`
     surface (`pv_*`, ADR-0071). Rooting is **root-on-create** (ADR-0072 §6, the conservative first cut):
@@ -106,8 +111,8 @@ and fv_alt (bound : SS.t) (alt : A.alt) : SS.t =
 
 (* --- primop → runtime helper (ADR-0071 §6) --------------------------------------------------------- *)
 
-(* [(symbol, needs_ctx)]; scalar ops are pure (no ctx / no safepoint), heap ops take the ctx. Only the
-   slice-1 pure arithmetic/comparison set is wired; the allocating ones arrive with their slices. *)
+(* [(symbol, needs_ctx)]: scalar `Int`/`Boolean` ops are **pure** (no ctx, no safepoint); ops that read
+   or allocate a boxed value (`Number`/`String`/`Array`/`Record`) take the ctx (ADR-0071 §6). *)
 let prim_sym : C.primop -> string * bool = function
   | C.AddInt -> "pv_prim_add_int", false
   | C.SubInt -> "pv_prim_sub_int", false
@@ -127,32 +132,25 @@ let prim_sym : C.primop -> string * bool = function
   | C.AndBool -> "pv_prim_and_bool", false
   | C.OrBool -> "pv_prim_or_bool", false
   | C.NotBool -> "pv_prim_not_bool", false
-  | op ->
-    (* Number/String/Array/Record primops need the ctx + allocation; wired with their slices. *)
-    failwith
-      (Printf.sprintf
-         "codegen_llvm: Number/String/Array/Record primop not yet supported (%s)"
-         (match op with
-          | C.AddNumber -> "AddNumber"
-          | C.SubNumber -> "SubNumber"
-          | C.MulNumber -> "MulNumber"
-          | C.DivNumber -> "DivNumber"
-          | C.IntToNumber -> "IntToNumber"
-          | C.NumberToInt -> "NumberToInt"
-          | C.EqNumber -> "EqNumber"
-          | C.EqString -> "EqString"
-          | C.LtNumber -> "LtNumber"
-          | C.LtString -> "LtString"
-          | C.Append -> "Append"
-          | C.IndexArray -> "IndexArray"
-          | C.LengthArray -> "LengthArray"
-          | C.NewArray -> "NewArray"
-          | C.SetArray -> "SetArray"
-          | C.RecordGet -> "RecordGet"
-          | C.RecordSet -> "RecordSet"
-          | C.RecordHas -> "RecordHas"
-          | C.RecordDelete -> "RecordDelete"
-          | _ -> "?"))
+  | C.AddNumber -> "pv_prim_add_number", true
+  | C.SubNumber -> "pv_prim_sub_number", true
+  | C.MulNumber -> "pv_prim_mul_number", true
+  | C.DivNumber -> "pv_prim_div_number", true
+  | C.IntToNumber -> "pv_prim_int_to_number", true
+  | C.NumberToInt -> "pv_prim_number_to_int", true
+  | C.EqNumber -> "pv_prim_eq_number", true
+  | C.LtNumber -> "pv_prim_lt_number", true
+  | C.EqString -> "pv_prim_eq_string", true
+  | C.LtString -> "pv_prim_lt_string", true
+  | C.Append -> "pv_prim_append", true
+  | C.IndexArray -> "pv_prim_index_array", true
+  | C.LengthArray -> "pv_prim_length_array", true
+  | C.NewArray -> "pv_prim_new_array", true
+  | C.SetArray -> "pv_prim_set_array", true
+  | C.RecordGet -> "pv_prim_record_get", true
+  | C.RecordSet -> "pv_prim_record_set", true
+  | C.RecordHas -> "pv_prim_record_has", true
+  | C.RecordDelete -> "pv_prim_record_delete", true
 
 (* --- the emitter ----------------------------------------------------------------------------------- *)
 
@@ -167,10 +165,12 @@ type lifted =
 
 type ctx =
   { md : Buffer.t (* the whole module *)
+  ; globals : Buffer.t (* module-level byte constants (String literals / foreign keys) *)
   ; mutable fn : Buffer.t (* the current function body *)
   ; mutable ssa : int
   ; mutable lbl : int
   ; mutable fns : int (* lifted-function counter *)
+  ; mutable strs : int (* string-constant counter *)
   ; mutable pending : lifted list (* lambdas to emit *)
   ; mutable frame : string (* the current function's shadow-stack frame handle operand *)
   ; ctors :
@@ -222,13 +222,59 @@ let read_var cx (env : env) (x : string) : string =
   | None ->
     failwith (Printf.sprintf "codegen_llvm: unbound variable %s (unresolved foreign?)" x)
 
+(* Emit a module-level byte constant for [s] and return `(ptr-to-first-byte, len)`. Used for `String`
+   literals (`pv_new_str`) and foreign keys (`pv_foreign`). The empty string needs no global — a null
+   pointer with length 0 is the runtime's empty-buffer convention. *)
+let string_constant cx (s : string) : string * int =
+  let len = String.length s in
+  if len = 0
+  then "null", 0
+  else (
+    cx.strs <- cx.strs + 1;
+    let name = Printf.sprintf "@.str.%d" cx.strs in
+    let esc = Buffer.create (len + 2) in
+    String.iter
+      (fun c ->
+         let b = Char.code c in
+         if b >= 0x20 && b <= 0x7e && c <> '"' && c <> '\\'
+         then Buffer.add_char esc c
+         else Buffer.add_string esc (Printf.sprintf "\\%02X" b))
+      s;
+    Buffer.add_string
+      cx.globals
+      (Printf.sprintf
+         "%s = private unnamed_addr constant [%d x i8] c\"%s\"\n"
+         name
+         len
+         (Buffer.contents esc));
+    let p = fresh cx in
+    emit cx "  %s = getelementptr [%d x i8], ptr %s, i64 0, i64 0" p len name;
+    p, len)
+
 let atom cx (env : env) : A.atom -> string = function
   | A.AVar x -> read_var cx env x
   | A.ALit (C.LInt n) -> imm_int n
   | A.ALit (C.LBool b) -> imm_bool b
-  | A.ALit (C.LNumber _) -> failwith "codegen_llvm: Number literal not in slice 1"
-  | A.ALit (C.LString _) -> failwith "codegen_llvm: String literal not in slice 1"
-  | A.AForeign k -> failwith (Printf.sprintf "codegen_llvm: foreign %s not in slice 1" k)
+  | A.ALit (C.LNumber f) ->
+    (* Boxed `Number` (ADR-0064 §1): pass the IEEE-754 bit pattern. *)
+    let t = fresh cx in
+    emit
+      cx
+      "  %s = call i64 @pv_new_number(ptr %%ctx, i64 %s)"
+      t
+      (Int64.to_string (Int64.bits_of_float f));
+    t
+  | A.ALit (C.LString s) ->
+    let p, len = string_constant cx s in
+    let t = fresh cx in
+    emit cx "  %s = call i64 @pv_new_str(ptr %%ctx, ptr %s, i64 %d)" t p len;
+    t
+  | A.AForeign k ->
+    (* An unresolved foreign leaf → the runtime resolver returns it as a closure (ADR-0072 §9). *)
+    let p, len = string_constant cx k in
+    let t = fresh cx in
+    emit cx "  %s = call i64 @pv_foreign(ptr %%ctx, ptr %s, i64 %d)" t p len;
+    t
 
 (* Root a freshly produced value and return its handle operand (root-on-create). *)
 let root cx (v : string) : string =
@@ -640,7 +686,18 @@ and cexpr cx (env : env) ~(tail : bool) (c : A.cexpr) : string option =
          rh := root cx t)
       ups;
     finish (get_current cx !rh)
-  | A.CArray _ -> failwith "codegen_llvm: array not in slice 3"
+  | A.CArray elems ->
+    if elems = []
+    then (
+      let t = fresh cx in
+      emit cx "  %s = call i64 @pv_empty_array()" t;
+      finish t)
+    else (
+      let ops = eval_atoms cx env elems in
+      let p, n = arg_buffer cx ops in
+      let t = fresh cx in
+      emit cx "  %s = call i64 @pv_new_array(ptr %%ctx, ptr %s, i64 %d)" t p n;
+      finish t)
 
 (* Emit one lifted function: open a frame, root the params (from the arg buffer) and the captured free
    vars (from the closure env block), then compile the body in tail position. *)
@@ -709,6 +766,9 @@ let declarations : string =
     ; "declare i64 @pv_new_array(ptr, ptr, i64)"
     ; "declare i64 @pv_new_adt(ptr, i32, ptr, i64)"
     ; "declare i64 @pv_new_record(ptr, ptr, ptr, i64)"
+    ; "declare i64 @pv_new_str(ptr, ptr, i64)"
+    ; "declare i64 @pv_new_number(ptr, i64)"
+    ; "declare i64 @pv_foreign(ptr, ptr, i64)"
     ; "declare i64 @pv_record_get(ptr, i64, i64)"
     ; "declare i64 @pv_record_set(ptr, i64, i64, i64)"
     ; "declare i64 @pv_read_field(ptr, i64, i64)"
@@ -735,22 +795,45 @@ let declarations : string =
     ; "declare i64 @pv_prim_and_bool(i64, i64)"
     ; "declare i64 @pv_prim_or_bool(i64, i64)"
     ; "declare i64 @pv_prim_not_bool(i64)"
+    ; "declare i64 @pv_prim_add_number(ptr, i64, i64)"
+    ; "declare i64 @pv_prim_sub_number(ptr, i64, i64)"
+    ; "declare i64 @pv_prim_mul_number(ptr, i64, i64)"
+    ; "declare i64 @pv_prim_div_number(ptr, i64, i64)"
+    ; "declare i64 @pv_prim_int_to_number(ptr, i64)"
+    ; "declare i64 @pv_prim_number_to_int(ptr, i64)"
+    ; "declare i64 @pv_prim_eq_number(ptr, i64, i64)"
+    ; "declare i64 @pv_prim_lt_number(ptr, i64, i64)"
+    ; "declare i64 @pv_prim_eq_string(ptr, i64, i64)"
+    ; "declare i64 @pv_prim_lt_string(ptr, i64, i64)"
+    ; "declare i64 @pv_prim_append(ptr, i64, i64)"
+    ; "declare i64 @pv_prim_index_array(ptr, i64, i64)"
+    ; "declare i64 @pv_prim_length_array(ptr, i64)"
+    ; "declare i64 @pv_prim_new_array(ptr, i64)"
+    ; "declare i64 @pv_prim_set_array(ptr, i64, i64, i64)"
+    ; "declare i64 @pv_prim_record_get(ptr, i64, i64)"
+    ; "declare i64 @pv_prim_record_set(ptr, i64, i64, i64)"
+    ; "declare i64 @pv_prim_record_has(ptr, i64, i64)"
+    ; "declare i64 @pv_prim_record_delete(ptr, i64, i64)"
+    ; "declare i64 @pv_empty_array()"
     ]
 
-(* Heap size in words per semi-space for the entry runtime. A generous fixed size for v1 (ADR-0066 §4). *)
-let heap_words = 1 lsl 20
+(* Default heap size in words per semi-space for the entry runtime — a generous fixed size for v1
+   (ADR-0066 §4). Overridable per program (a small heap forces GC, exercising the emitted rooting). *)
+let default_heap_words = 1 lsl 20
 
 (** Emit a whole ANF program as a self-contained LLVM IR module string. A **pure** entry (`is_effect =
     false`) computes its `Int` value and prints it (`pv_print_int`, matching the oracle's `to_string`); an
     **`Effect`** entry runs `pv_run_effect` then drains the output sink (ADR-0072 §8). The entry body is
     compiled in non-tail (value) position, then the stub prints/runs, frees the runtime, and returns. *)
-let program ?(is_effect = false) (e : A.expr) : string =
+let program ?(is_effect = false) ?(heap_words = default_heap_words) (e : A.expr) : string =
   let cx =
     { md = Buffer.create 4096
+    ; globals = Buffer.create 256
     ; fn = Buffer.create 256
     ; ssa = 0
     ; lbl = 0
     ; fns = 0
+    ; strs = 0
     ; pending = []
     ; frame = "%frame"
     ; ctors = Hashtbl.create 16
@@ -774,7 +857,8 @@ let program ?(is_effect = false) (e : A.expr) : string =
   (* emit the lifted functions the entry (and transitively) queued *)
   emit_pending cx;
   Printf.sprintf
-    "; ModuleID = 'purvasm'\n\n%s\n\n%s\ndefine i32 @main() {\nentry:\n%s}\n"
+    "; ModuleID = 'purvasm'\n\n%s\n\n%s\n%s\ndefine i32 @main() {\nentry:\n%s}\n"
     declarations
+    (Buffer.contents cx.globals)
     (Buffer.contents cx.md)
     entry_body

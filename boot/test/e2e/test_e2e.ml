@@ -809,16 +809,18 @@ let llvm_available : bool = rt_staticlib <> None && has_clang
 (* Compile a term through the LLVM backend to a native executable and run it: ANF (ADR-0025) → LLVM IR
    → `clang` (link the runtime `staticlib`) → run → its output. The **fourth** differential
    implementation (ADR-0064 §7), held to the CESK oracle's value / `Effect`-order. *)
-let llvm_run ?(is_effect = false) (t : C.term) : string =
+let llvm_run ?(is_effect = false) ?heap_words (t : C.term) : string =
   let rt = Option.get rt_staticlib in
   let dir =
     Filename.concat
       (Filename.get_temp_dir_name ())
-      (Printf.sprintf "purvasm_ll_%x" (Hashtbl.hash t))
+      (Printf.sprintf "purvasm_ll_%x" (Hashtbl.hash (t, heap_words)))
   in
   (try Sys.mkdir dir 0o755 with
    | Sys_error _ -> ());
-  let src = Llvm_backend.Codegen_llvm.program ~is_effect (Middle_end.Transl.transl t) in
+  let src =
+    Llvm_backend.Codegen_llvm.program ~is_effect ?heap_words (Middle_end.Transl.transl t)
+  in
   (* Quote every path (ADR-0072 §10 harness): a `TMPDIR` with spaces must not break the command line. *)
   let genll = Filename.concat dir "gen.ll" in
   let genexe = Filename.concat dir "gen" in
@@ -848,11 +850,19 @@ let llvm_run ?(is_effect = false) (t : C.term) : string =
 
 (* Slice 1 (ADR-0072 §10): the pure first-order subset — its value must match the CESK oracle's
    printed form. (ADTs/records/case/effects/letrec are later slices, guarded in the codegen.) *)
-let same_on_llvm (label : string) (t : C.term) =
+let same_on_llvm ?heap_words (label : string) (t : C.term) =
   Alcotest.(check string)
     label
     (V.to_string (Cesk.Machine.eval ~host:Ffi.host t))
-    (llvm_run t)
+    (llvm_run ?heap_words t)
+
+(* An `Effect` entry's observable is its stdout: the native binary performs the effects (`pv_run_effect`
+   then drains the sink to `stdout`), matching the oracle's captured `run_effect` output (ADR-0072 §8). *)
+let same_on_llvm_effect (label : string) (t : C.term) =
+  let out =
+    with_captured_stdout (fun () -> ignore (Cesk.Machine.run_effect ~host:Ffi.host t))
+  in
+  Alcotest.(check string) label out (llvm_run ~is_effect:true t)
 
 let test_llvm_arith () =
   same_on_llvm
@@ -1051,6 +1061,104 @@ let test_llvm_record_binder () =
                     (C.AddInt, [ C.Prim (C.MulInt, [ C.Var "a"; int 10 ]); C.Var "b" ]))
            }
          ] ))
+
+(* --- slice 4: strings, foreign leaves, Effect (run_effect + stdout drain) ------------------- *)
+
+(* `writeLine "hello"` as an `Effect Unit` → the native binary prints "hello\n", matching the oracle.
+   Exercises a `String` literal (pv_new_str), a foreign leaf (pv_foreign → the two-level thunk), and the
+   effect entry (pv_run_effect + pv_drain_output). *)
+let test_llvm_effect_writeline () =
+  same_on_llvm_effect
+    "writeLine"
+    (C.App (C.Foreign "Purvasm.Stdio.writeLineImpl", C.Lit (C.LString "hello")))
+
+(* `Number` via a boxed literal + arithmetic, observed as an `Int`: `toInt (3.0 + 4.0)` → 7. *)
+let test_llvm_number () =
+  same_on_llvm
+    "number"
+    (C.Prim
+       ( C.NumberToInt
+       , [ C.Prim (C.AddNumber, [ C.Lit (C.LNumber 3.0); C.Lit (C.LNumber 4.0) ]) ] ))
+
+(* `String` literal + `Append` + `EqString`, observed as an `Int`:
+   `if ("ab" <> "cd") == "abcd" then 1 else 0` → 1. *)
+let test_llvm_string () =
+  same_on_llvm
+    "string"
+    (C.If
+       ( C.Prim
+           ( C.EqString
+           , [ C.Prim (C.Append, [ C.Lit (C.LString "ab"); C.Lit (C.LString "cd") ])
+             ; C.Lit (C.LString "abcd")
+             ] )
+       , int 1
+       , int 0 ))
+
+(* `Array` literal + index/length: `[10,20,30] !! 1` → 20 ; `length [10,20,30]` → 3. *)
+let test_llvm_array_index () =
+  same_on_llvm
+    "array index"
+    (C.Prim (C.IndexArray, [ C.Array [ int 10; int 20; int 30 ]; int 1 ]))
+
+let test_llvm_array_length () =
+  same_on_llvm
+    "array length"
+    (C.Prim (C.LengthArray, [ C.Array [ int 10; int 20; int 30 ] ]))
+
+(* Dynamic (`String`-keyed) record access: `Record.get "a" { a: 5, b: 6 }` → 5. *)
+let test_llvm_record_dynamic () =
+  same_on_llvm
+    "dynamic record get"
+    (C.Prim (C.RecordGet, [ C.Lit (C.LString "a"); C.Record [ "a", int 5; "b", int 6 ] ]))
+
+(* A foreign `show` leaf feeding a `writeLine`: `writeLine (showInt 42)` → "42\n". *)
+let test_llvm_effect_show () =
+  same_on_llvm_effect
+    "writeLine (show 42)"
+    (C.App
+       ( C.Foreign "Purvasm.Stdio.writeLineImpl"
+       , C.App (C.Foreign "Data.Show.showIntImpl", int 42) ))
+
+(* In-place array mutation (the `Effect.Ref` core, structural over `NewArray`/`SetArray`/`IndexArray`):
+   `(newArray 3){1 := 99}[1]` → 99. *)
+let test_llvm_array_set () =
+  same_on_llvm
+    "array set"
+    (C.Prim
+       ( C.IndexArray
+       , [ C.Prim (C.SetArray, [ C.Prim (C.NewArray, [ int 3 ]); int 1; int 99 ]); int 1 ]
+       ))
+
+(* Forced GC (ADR-0072 §10): a tiny heap makes throwaway allocations collect mid-run, so the emitted
+   root-on-create rooting must keep a live pointer valid across a real relocating collection. The garbage
+   comes from *sequential* calls to `g x = (allocate & discard a string); x` — each call's transient is
+   rooted only for its own frame, so it dies on return and is reclaimable. The threaded `String` `keep`
+   ("aabb") is `g`'s argument every call, so it must survive: `if keep == "aabb" then 1 else 0` → 1. *)
+let test_llvm_forced_gc () =
+  let g =
+    C.Lam
+      ( "x"
+      , C.Let
+          ( "_j"
+          , C.Prim (C.Append, [ C.Lit (C.LString "zzzz"); C.Lit (C.LString "zzzz") ])
+          , C.Var "x" ) )
+  in
+  let names = List.init 40 (fun i -> Printf.sprintf "a%d" (i + 1)) in
+  let rec chain prev = function
+    | [] ->
+      C.If (C.Prim (C.EqString, [ C.Var prev; C.Lit (C.LString "aabb") ]), int 1, int 0)
+    | name :: rest -> C.Let (name, C.App (C.Var "g", C.Var prev), chain name rest)
+  in
+  same_on_llvm
+    ~heap_words:96
+    "forced gc"
+    (C.Let
+       ( "g"
+       , g
+       , C.Let
+           ( "keep"
+           , C.Prim (C.Append, [ C.Lit (C.LString "aa"); C.Lit (C.LString "bb") ])
+           , chain "keep" names ) ))
 
 let test_ml_recursion () =
   let fact =
@@ -1705,6 +1813,15 @@ let llvm_groups =
         ; Alcotest.test_case "record_access" `Quick test_llvm_record_access
         ; Alcotest.test_case "record_update" `Quick test_llvm_record_update
         ; Alcotest.test_case "record_binder" `Quick test_llvm_record_binder
+        ; Alcotest.test_case "effect_writeline" `Quick test_llvm_effect_writeline
+        ; Alcotest.test_case "number" `Quick test_llvm_number
+        ; Alcotest.test_case "string" `Quick test_llvm_string
+        ; Alcotest.test_case "array_index" `Quick test_llvm_array_index
+        ; Alcotest.test_case "array_length" `Quick test_llvm_array_length
+        ; Alcotest.test_case "record_dynamic" `Quick test_llvm_record_dynamic
+        ; Alcotest.test_case "effect_show" `Quick test_llvm_effect_show
+        ; Alcotest.test_case "array_set" `Quick test_llvm_array_set
+        ; Alcotest.test_case "forced_gc" `Quick test_llvm_forced_gc
         ] )
     ]
   else (
