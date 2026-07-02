@@ -22,6 +22,11 @@
 > `pv_ref_*` / `pv_stdio_write_line` symbol** — leaves resolve through `pv_foreign`, records through the
 > `pv_prim_record_*` primops), and `pv_drain_output` is added. This averts a codegen author emitting
 > non-existent symbols.
+>
+> **Correction (2026-07-03, during slice-5 implementation):** §6's *Apply / force* surface adds
+> **`pv_force_if_byneed`** — the conditional force (a by-need cell chain, else pass-through) codegen emits
+> at every value-demand site, alongside the unconditional `pv_force`. It was implemented (a directly
+> depended-on C-ABI symbol) but not listed.
 
 ## Context
 
@@ -254,8 +259,11 @@ signatures live in the runtime source, kept isomorphic to the value model — no
 - **Field access** — `pv_read_field` / `pv_write_field` / `pv_read_raw` / `pv_write_raw`; the
   write-barrier no-op hook stays at the store choke point
   ([0066](0066-v1-shadow-stack-rooting-and-gc-on-alloc.md) §5).
-- **Apply / force** — `pv_apply`, `pv_tailcall` (§4), `pv_force`
-  ([0070](0070-v1-byneed-recursive-caf-force.md)).
+- **Apply / force** — `pv_apply`, `pv_tailcall` (§4), `pv_force`, and `pv_force_if_byneed(ctx, v) -> u64`
+  ([0070](0070-v1-byneed-recursive-caf-force.md)) — the latter forces `v` **iff** it is a `ByNeed` cell
+  (looping a cell chain) and passes any other value through, so codegen can emit it unconditionally at a
+  **value-demand site** where a by-need cell may have arrived through an argument or data field, without
+  static by-need tracking (`pv_force` is the unconditional force of a known cell).
 - **Effect + leaves** — `pv_run_effect` and `pv_force`
   ([0067](0067-v1-effect-execution-and-native-leaves.md)/[0070](0070-v1-byneed-recursive-caf-force.md)),
   plus `pv_drain_output` (flush the capture sink to real `stdout` at exit, ADR-0067 §5). The **native

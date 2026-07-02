@@ -13,8 +13,15 @@
       dynamic `String`-keyed record ops), `foreign` leaves (`pv_foreign`), and the `Effect` entry
       (`pv_run_effect` + drain to `stdout`). Multi-atom sites are `eval_atoms`-protected (root-on-collect,
       since literals now allocate); a small-heap fixture exercises the rooting under a forced collection.
-    `letrec` / by-need / unsaturated constructors / per-module cross-module linking / pure-`Number`/`String`
-    entry printers land in later slices (a clear [failwith] / `pv_print_int`-only guards each).
+    - **Slice 5a — recursive groups (`letrec`)**: a group is all-by-need `ByNeed` cells over one shared
+      env (ADR-0070 §4), so function members recurse (self/sibling) via the env and `apply` auto-forces a
+      by-need callee, while a value member (a dictionary) is a cell forced at each value-dereference site
+      by `pv_force_if_byneed` (robust to a cell reaching a projection / `case` / primop through an
+      argument or data field, without static tracking). The **Boolean demand sites** (`if`/guard
+      conditions) and the **program's final result** force likewise; construction sites
+      (`Ctor`/`Record`/`Array` fields, `apply` head/args) keep the raw cell (the knot-tie).
+    Unsaturated constructors / per-module cross-module linking / pure-`Number`/`String`/`Bool` entry
+    printers land later (a clear [failwith] / `pv_print_int`-only guards each).
 
     Every guest value is one `i64` tagged word (ADR-0064 §1); the module calls the runtime's `extern "C"`
     surface (`pv_*`, ADR-0071). Rooting is **root-on-create** (ADR-0072 §6, the conservative first cut):
@@ -207,12 +214,15 @@ let emit cx fmt =
     fmt
 
 (* env: a guest variable → the SSA operand holding its **root handle** (root-on-create). A reference
-   reloads the current value via [pv_get]. *)
+   reloads the current value via [pv_get]. A by-need cell may reach a value-dereference site through any
+   binding (a member, a function argument, a data field), so forcing is a *runtime* check at the site
+   ([force_atom] → `pv_force_if_byneed`), not a static per-binding flag. *)
 type env = (string * string) list
 
 let bind (env : env) (x : string) (handle : string) : env = (x, handle) :: env
 
-(* Read a variable's current value (post-safepoint) through its root handle. *)
+(* Read a variable's current value (post-safepoint) through its root handle. Raw: a by-need cell stays a
+   cell (it propagates and `apply` auto-forces it in callee position). *)
 let read_var cx (env : env) (x : string) : string =
   match List.assoc_opt x env with
   | Some h ->
@@ -275,6 +285,28 @@ let atom cx (env : env) : A.atom -> string = function
     let t = fresh cx in
     emit cx "  %s = call i64 @pv_foreign(ptr %%ctx, ptr %s, i64 %d)" t p len;
     t
+
+(* An atom evaluated at a **value-dereference** site (ADR-0070 §3): a dictionary read for a method, a
+   `case` scrutinee, a primop operand. A variable might hold a by-need cell (a recursive member, or one
+   passed through an argument / data field), so it is run through `pv_force_if_byneed` — a runtime check
+   that forces a cell to its value and passes anything else through (literals never are cells).
+   Construction sites (`Ctor`/`Record`/`Array` fields, `apply` head/args) use the raw [atom], so the cell
+   propagates and the knot-tie stores it unforced. *)
+let force_atom cx (env : env) (a : A.atom) : string =
+  match a with
+  | A.AVar _ ->
+    let v = atom cx env a in
+    let t = fresh cx in
+    emit cx "  %s = call i64 @pv_force_if_byneed(ptr %%ctx, i64 %s)" t v;
+    t
+  | A.ALit _ | A.AForeign _ -> atom cx env a
+
+(* Force an arbitrary produced value iff it is a by-need cell — for a demand site whose value is an
+   `expr` result (a guard, the entry's final output), not an `atom` reachable by `force_atom`. *)
+let force_value cx (v : string) : string =
+  let t = fresh cx in
+  emit cx "  %s = call i64 @pv_force_if_byneed(ptr %%ctx, i64 %s)" t v;
+  t
 
 (* Root a freshly produced value and return its handle operand (root-on-create). *)
 let root cx (v : string) : string =
@@ -353,8 +385,9 @@ let get_current cx (handle : string) : string =
    is `pv_root`ed as it is produced (left-to-right), and all are read back with `pv_get` *after* every
    allocation is done. The transient roots live in the enclosing function frame (freed at return);
    bounding them is the deferred rooting minimisation (ADR-0072 §6). *)
-let eval_atoms cx (env : env) (atoms : A.atom list) : string list =
-  let handles = List.fold_left (fun acc a -> root cx (atom cx env a) :: acc) [] atoms in
+let eval_atoms cx ?(force = false) (env : env) (atoms : A.atom list) : string list =
+  let one = if force then force_atom else atom in
+  let handles = List.fold_left (fun acc a -> root cx (one cx env a) :: acc) [] atoms in
   List.rev_map (get_current cx) handles
 
 (* Emit a `br i1` guarded by [ok]: fall through to a fresh continuation block on true, jump to [fail] on
@@ -453,7 +486,78 @@ let rec expr cx (env : env) ~(tail : bool) (e : A.expr) : string option =
     let v = Option.get (cexpr cx env ~tail:false c) in
     let h = root cx v in
     expr cx (bind env x h) ~tail body
-  | A.LetRec _ -> failwith "codegen_llvm: letrec not in slice 1"
+  | A.LetRec (binds, body) ->
+    (* A recursive group as **all-by-need `ByNeed` cells over one shared env** (ADR-0070 §4, mirroring the
+       runtime `build_group`). Each member is a cell; its suspension is a nullary thunk over the shared
+       env, whose body is the member's RHS with sibling references resolving to the sibling cells (a
+       function member's cell forces to its closure on first use; `apply` auto-forces a by-need callee,
+       ADR-0070 §3). Distinguishing function members as back-patched closures (ADR-0059 §1) is a deferred
+       optimisation. *)
+    let members = List.map fst binds in
+    let k = List.length members in
+    let member_set = List.fold_left (fun s m -> SS.add m s) SS.empty members in
+    (* free vars of the group captured from *outside* it (members excluded) *)
+    let outside =
+      SS.elements
+        (List.fold_left
+           (fun acc (_, rhs) -> SS.union acc (fv_expr member_set rhs))
+           SS.empty
+           binds)
+    in
+    (* the shared env layout: the k member cells, then the outside captures *)
+    let shared_layout = members @ outside in
+    (* one suspension per member: `\$u -> rhs_i` over the shared env (registered for hoisting) *)
+    let susp_names =
+      List.map
+        (fun (_, rhs) ->
+           cx.fns <- cx.fns + 1;
+           let name = Printf.sprintf "susp_%d" cx.fns in
+           cx.pending
+           <- { name; params = [ "$u" ]; captures = shared_layout; body = rhs }
+              :: cx.pending;
+           name)
+        binds
+    in
+    (* 1. shared env array = [unit × k] ++ [outside-capture values]; root it. *)
+    let elems = List.init k (fun _ -> imm_unit) @ List.map (read_var cx env) outside in
+    let env_p, env_n = arg_buffer cx elems in
+    let env_arr = fresh cx in
+    emit cx "  %s = call i64 @pv_new_array(ptr %%ctx, ptr %s, i64 %d)" env_arr env_p env_n;
+    let env_h = root cx env_arr in
+    (* 2. placeholder cells; store each into env[i] (reloading env/cell after each allocation). *)
+    let cell_hs =
+      List.init k (fun i ->
+        let cell = fresh cx in
+        emit cx "  %s = call i64 @pv_new_byneed_placeholder(ptr %%ctx)" cell;
+        let ch = root cx cell in
+        let envp = get_current cx env_h in
+        let cw = get_current cx ch in
+        emit cx "  call void @pv_write_field(ptr %%ctx, i64 %s, i64 %d, i64 %s)" envp i cw;
+        ch)
+    in
+    (* 3. build each suspension closure over the shared env; backpatch it into its cell. *)
+    List.iteri
+      (fun i name ->
+         let envp = get_current cx env_h in
+         let addr = fresh cx in
+         emit cx "  %s = ptrtoint ptr @%s to i64" addr name;
+         let susp = fresh cx in
+         emit
+           cx
+           "  %s = call i64 @pv_make_closure(ptr %%ctx, i64 %s, i32 1, i64 %s)"
+           susp
+           addr
+           envp;
+         let cellp = get_current cx (List.nth cell_hs i) in
+         emit
+           cx
+           "  call void @pv_byneed_set_suspension(ptr %%ctx, i64 %s, i64 %s)"
+           cellp
+           susp)
+      susp_names;
+    (* 4. bind each member to its cell and compile the body. *)
+    let env' = List.fold_left2 bind env members cell_hs in
+    expr cx env' ~tail body
 
 and cexpr cx (env : env) ~(tail : bool) (c : A.cexpr) : string option =
   (* Finish a produced value in the current tail context. *)
@@ -468,7 +572,8 @@ and cexpr cx (env : env) ~(tail : bool) (c : A.cexpr) : string option =
   | A.CAtom a -> finish (atom cx env a)
   | A.CPrim (op, args) ->
     let sym, needs_ctx = prim_sym op in
-    let ops = eval_atoms cx env args in
+    (* A primop consumes its operands' *values* (e.g. `RecordGet` on a by-need dict), so force them. *)
+    let ops = eval_atoms ~force:true cx env args in
     let t = fresh cx in
     if needs_ctx
     then
@@ -506,7 +611,9 @@ and cexpr cx (env : env) ~(tail : bool) (c : A.cexpr) : string option =
       emit cx "  %s = call i64 @pv_apply(ptr %%ctx, i64 %s, ptr %s, i64 %d)" t fv p n;
       Some t)
   | A.CIf (a, t, e) ->
-    let c = atom cx env a in
+    (* A Boolean demand site: a by-need cell reaching the condition (e.g. `letrec b = false in
+       if b …`) must be forced before its payload bit is read (mirroring the VM's `Jump_unless`). *)
+    let c = force_atom cx env a in
     (* payload != 0 ⇒ true (ADR-0064 §1). *)
     let p = fresh cx in
     emit cx "  %s = ashr i64 %s, 1" p c;
@@ -565,7 +672,8 @@ and cexpr cx (env : env) ~(tail : bool) (c : A.cexpr) : string option =
   | A.CCase (scruts, alts) ->
     (* The CPS cascade (ADR-0072 §5): try each alt in order; a binder mismatch jumps to the next alt;
        an exhausted tail is `pv_case_fail`. Scrutinees are rooted and re-read per alt (`get_current`). *)
-    let scrut_handles = List.map (fun a -> root cx (atom cx env a)) scruts in
+    (* matching dereferences the scrutinee's structure, so force a by-need scrutinee. *)
+    let scrut_handles = List.map (fun a -> root cx (force_atom cx env a)) scruts in
     let n = List.length alts in
     let try_labels = List.init n (fun _ -> fresh_label cx "alt") in
     let fail_label = fresh_label cx "nomatch" in
@@ -602,7 +710,8 @@ and cexpr cx (env : env) ~(tail : bool) (c : A.cexpr) : string option =
            let rec guards = function
              | [] -> emit cx "  br label %%%s" next_fail
              | (g, body) :: rest ->
-               let gv = Option.get (expr cx env' ~tail:false g) in
+               (* A Boolean demand site: force a by-need guard result before reading its bit. *)
+               let gv = force_value cx (Option.get (expr cx env' ~tail:false g)) in
                let pay = fresh cx in
                emit cx "  %s = ashr i64 %s, 1" pay gv;
                let bb = fresh cx in
@@ -657,7 +766,8 @@ and cexpr cx (env : env) ~(tail : bool) (c : A.cexpr) : string option =
         n;
       finish t)
   | A.CAccessor (a, label) ->
-    let r = atom cx env a in
+    (* A dictionary projection (ADR-0070 §5): force a by-need record before reading its field. *)
+    let r = force_atom cx env a in
     let t = fresh cx in
     emit
       cx
@@ -669,8 +779,9 @@ and cexpr cx (env : env) ~(tail : bool) (c : A.cexpr) : string option =
   | A.CUpdate (a, ups) ->
     (* Functional update: fold `record_set` (each returns a new record). The accumulator record is rooted
        across each value's evaluation (a `String`/`Number` value may allocate) and reloaded before the
-       set; `pv_record_set` self-roots its record + value across its own allocation. *)
-    let rh = ref (root cx (atom cx env a)) in
+       set; `pv_record_set` self-roots its record + value across its own allocation. The base record is
+       forced (a by-need dict update); the update values stay raw (stored, possibly by-need). *)
+    let rh = ref (root cx (force_atom cx env a)) in
     List.iter
       (fun (label, va) ->
          let v = atom cx env va in
@@ -772,6 +883,7 @@ let declarations : string =
     ; "declare i64 @pv_record_get(ptr, i64, i64)"
     ; "declare i64 @pv_record_set(ptr, i64, i64, i64)"
     ; "declare i64 @pv_read_field(ptr, i64, i64)"
+    ; "declare void @pv_write_field(ptr, i64, i64, i64)"
     ; "declare i64 @pv_read_raw(ptr, i64, i64)"
     ; "declare void @pv_case_fail()"
     ; "declare i64 @pv_run_effect(ptr, i64)"
@@ -815,6 +927,9 @@ let declarations : string =
     ; "declare i64 @pv_prim_record_has(ptr, i64, i64)"
     ; "declare i64 @pv_prim_record_delete(ptr, i64, i64)"
     ; "declare i64 @pv_empty_array()"
+    ; "declare i64 @pv_new_byneed_placeholder(ptr)"
+    ; "declare void @pv_byneed_set_suspension(ptr, i64, i64)"
+    ; "declare i64 @pv_force_if_byneed(ptr, i64)"
     ]
 
 (* Default heap size in words per semi-space for the entry runtime — a generous fixed size for v1
@@ -849,7 +964,11 @@ let program ?(is_effect = false) ?(heap_words = default_heap_words) (e : A.expr)
     let r = fresh cx in
     emit cx "  %s = call i64 @pv_run_effect(ptr %%ctx, i64 %s)" r v;
     emit cx "  call void @pv_drain_output(ptr %%ctx)")
-  else emit cx "  call void @pv_print_int(i64 %s)" v;
+  else
+    (* The program's final result is an `Int` demand site: force a by-need cell (e.g. `letrec x = 7 in
+       x`, or a call returning a by-need value) before `pv_print_int` reads its payload. The `Effect`
+       path needs no force — `pv_run_effect`→`pv_apply` auto-forces a by-need callee. *)
+    emit cx "  call void @pv_print_int(i64 %s)" (force_value cx v);
   emit cx "  call void @pv_pop_frame(ptr %%ctx, i64 %%frame)";
   emit cx "  call void @pv_runtime_free(ptr %%ctx)";
   emit cx "  ret i32 0";

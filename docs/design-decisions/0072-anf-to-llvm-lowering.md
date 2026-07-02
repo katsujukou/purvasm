@@ -27,6 +27,13 @@
 > arity crosses the boundary** (§2's "no `.pmi`" now covers arity, not just rep signatures). (3) The
 > **init-unit topological order is built explicitly by the new link step from `free_vars` edges**, *not*
 > reused from `plink`'s DFS visitation order.
+>
+> **Correction (2026-07-03, during slice-5 implementation):** §5's `CIf` is no longer "no call" — the
+> condition is a **Boolean demand site** that forces a by-need cell via `pv_force_if_byneed`
+> ([0071](0071-codegen-runtime-c-abi.md) §6) before reading the payload bit; a `case` **guard** is the
+> same. §8's **pure entry forces its final result** before the printer (the entry value may be a by-need
+> cell); the `Effect` entry needs no force (`pv_run_effect` → `pv_apply` auto-forces a by-need callee).
+> Construction sites and `apply` head/args keep the raw cell (the knot-tie is preserved).
 
 ## Context
 
@@ -182,7 +189,11 @@ mirroring `codegen_ml`:
   **hashed and sorted at compile time** (`fnv1a_64`, matching the runtime —
   [0069](0069-v1-dynamic-record-operations.md) §2), so a literal lowers to one `pv_new_record` with
   compiler-sorted ids and static field access uses the compiler-emitted id.
-- **`CIf`** — branch on the unboxed `Boolean` immediate (no call).
+- **`CIf`** — branch on the unboxed `Boolean` immediate. The condition is a **Boolean demand site**, so a
+  by-need cell reaching it (a `Grec` member, or one arrived through an argument/field) is forced first via
+  `pv_force_if_byneed` ([0071](0071-codegen-runtime-c-abi.md) §6) — mirroring the VM's `Jump_unless` force
+  — then the branch reads the payload bit with no further call. A `case` **guard** is the same demand site
+  (its Boolean result is forced before its bit is read).
 - **`CCase`** — the `codegen_ml` matcher, ported: friendly binders → a **decision tree** (tag `switch` via
   the ADT tag / immediate compare / positional field reads / array-length check / record-id lookup);
   a record-bearing (unfriendly) case → the **CPS cascade** with a shared fail continuation. Nullary vs
@@ -221,7 +232,10 @@ A generated entry stub (`main`) `pv_runtime_new`s the context, calls the link-sy
 `pv_print_int` for an `Int` entry — the native rep is type-erased, so there is no generic runtime
 `to_string`; the codegen emits the printer its known entry type dictates); an
 **`Effect`** entry runs `pv_run_effect` ([0067](0067-v1-effect-execution-and-native-leaves.md) §2),
-performing its effects with the `Unit` result suppressed. Output routes through the sink to `stdout`
+performing its effects with the `Unit` result suppressed. The **pure entry's final result is itself a
+demand site** — it is `pv_force_if_byneed`d before the printer reads it, since the entry value may be a
+by-need cell (`letrec x = 7 in x`, or a call returning one); the `Effect` entry needs no such force, as
+`pv_run_effect` → `pv_apply` already auto-forces a by-need callee. Output routes through the sink to `stdout`
 ([0067](0067-v1-effect-execution-and-native-leaves.md) §5) — mirroring `native_action`'s `is_effect`
 split (`boot/bin/main.ml`).
 

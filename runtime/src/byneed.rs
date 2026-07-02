@@ -45,6 +45,23 @@ impl Heap {
             other => panic!("force: corrupt ByNeed state {other}"),
         }
     }
+
+    /// Force `v` **iff it is a `ByNeed` cell**, looping through a chain of cells to the underlying value;
+    /// any non-`ByNeed` value passes through unchanged (ADR-0070 §3). Codegen emits this at a
+    /// value-dereference site (a record projection, a `case` scrutinee, a primop operand) because a
+    /// by-need cell can reach such a site through a function argument or a data field, where static
+    /// by-need tracking cannot see it — the same robustness `apply` gives a by-need callee.
+    pub fn force_if_byneed(&mut self, v: Value) -> Value {
+        let mut v = v;
+        while v.is_pointer() {
+            let p = self.checked_ptr(v);
+            if self.header_unchecked(p).kind() != Kind::ByNeed {
+                break;
+            }
+            v = self.force(v); // a self-cycle black-holes inside `force`, so this terminates
+        }
+        v
+    }
 }
 
 #[cfg(test)]

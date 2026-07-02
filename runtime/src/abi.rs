@@ -158,6 +158,21 @@ pub unsafe extern "C" fn pv_force(ctx: *mut Heap, cell: u64) -> u64 {
     guard(|| heap(ctx).force(TaggedWord::from_bits(cell)).to_bits())
 }
 
+/// Force `v` **iff it is a `ByNeed` cell** (ADR-0070 §3), passing any other value through. Codegen emits
+/// this at a value-dereference site to force a by-need cell that reached it through an argument or data
+/// field — robustly, without static by-need tracking.
+///
+/// # Safety
+/// `ctx` live; `v` a value word.
+#[no_mangle]
+pub unsafe extern "C" fn pv_force_if_byneed(ctx: *mut Heap, v: u64) -> u64 {
+    guard(|| {
+        heap(ctx)
+            .force_if_byneed(TaggedWord::from_bits(v))
+            .to_bits()
+    })
+}
+
 /// **Drain** the captured stdio sink (ADR-0067 §5) to real `stdout`, one line each, **clearing** it. The
 /// compiled entry stub calls this at exit so the process's stdout matches the differential (production
 /// wiring of the sink; tests instead read [`Heap::output`]). Draining (not just reading) makes a second
@@ -435,6 +450,31 @@ pub unsafe extern "C" fn pv_new_byneed(ctx: *mut Heap, suspension: u64) -> u64 {
             .new_byneed(TaggedWord::from_bits(suspension))
             .as_word()
             .to_bits()
+    })
+}
+
+/// A **placeholder** `ByNeed` cell for the `Grec` recursive-group builder (ADR-0070 §4): `Unforced` with a
+/// `unit` result, its real suspension backpatched by [`pv_byneed_set_suspension`] once the shared env is
+/// complete. Codegen emits the §4 sequence (env array → placeholder cells → backpatch).
+///
+/// # Safety
+/// `ctx` live.
+#[no_mangle]
+pub unsafe extern "C" fn pv_new_byneed_placeholder(ctx: *mut Heap) -> u64 {
+    guard(|| heap(ctx).new_byneed_placeholder().as_word().to_bits())
+}
+
+/// Backpatch a placeholder cell's suspension (`Grec` builder, ADR-0070 §4) — a plain value-slot store that
+/// does **not** force it. The cell must still be `Unforced`.
+///
+/// # Safety
+/// `ctx` live; `cell` a placeholder `ByNeed` pointer; `susp` an arity-1 thunk closure value.
+#[no_mangle]
+pub unsafe extern "C" fn pv_byneed_set_suspension(ctx: *mut Heap, cell: u64, susp: u64) {
+    guard(|| {
+        let h = heap(ctx);
+        let cp = HeapPtr::from_word(TaggedWord::from_bits(cell));
+        h.byneed_set_suspension(cp, TaggedWord::from_bits(susp));
     })
 }
 

@@ -694,9 +694,6 @@ impl Heap {
     /// complete. `pub(crate)`: builder-internal, kept off the public API so `new_byneed`'s
     /// born-with-its-suspension invariant stays clean. No `Value` input.
     ///
-    /// `#[allow(dead_code)]`: the `Grec` builder that calls this is emitted by codegen (not yet
-    /// present); v1 exercises it only from the by-need recursive-group tests.
-    #[allow(dead_code)]
     pub(crate) fn new_byneed_placeholder(&mut self) -> HeapPtr {
         let p = self.alloc(Kind::ByNeed, 2, Color::White);
         self.write_raw_unchecked(p, 0, BYNEED_UNFORCED);
@@ -706,8 +703,6 @@ impl Heap {
 
     /// Backpatch a placeholder cell's suspension (`Grec` builder only; the cell must still be
     /// `Unforced`). A plain value-slot store — it does **not** force the suspension (ADR-0070 §4).
-    /// `#[allow(dead_code)]` for the same reason as [`new_byneed_placeholder`](Heap::new_byneed_placeholder).
-    #[allow(dead_code)]
     pub(crate) fn byneed_set_suspension(&mut self, cell: HeapPtr, suspension: TaggedWord) {
         debug_assert_eq!(
             self.read_raw_unchecked(cell, 0),

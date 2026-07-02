@@ -1160,6 +1160,135 @@ let test_llvm_forced_gc () =
            , C.Prim (C.Append, [ C.Lit (C.LString "aa"); C.Lit (C.LString "bb") ])
            , chain "keep" names ) ))
 
+(* --- slice 5a: recursive groups (letrec → by-need Grec) ------------------------------------- *)
+
+(* Self-recursion: `letrec fib n = if n < 2 then n else fib (n-1) + fib (n-2) in fib 10` → 55.
+   The member is a by-need cell; `apply` auto-forces it at each call (ADR-0070 §3). *)
+let test_llvm_fib () =
+  let fib =
+    C.Lam
+      ( "n"
+      , C.If
+          ( C.Prim (C.LtInt, [ C.Var "n"; int 2 ])
+          , C.Var "n"
+          , C.Prim
+              ( C.AddInt
+              , [ C.App (C.Var "fib", C.Prim (C.SubInt, [ C.Var "n"; int 1 ]))
+                ; C.App (C.Var "fib", C.Prim (C.SubInt, [ C.Var "n"; int 2 ]))
+                ] ) ) )
+  in
+  same_on_llvm "fib" (C.Letrec ([ "fib", fib ], C.App (C.Var "fib", int 10)))
+
+(* Mutual recursion (two members referencing each other via the shared env):
+   `letrec isEven n = n==0 ? 1 : isOdd (n-1) ; isOdd n = n==0 ? 0 : isEven (n-1) in isEven 10` → 1. *)
+let test_llvm_mutual_rec () =
+  let branch self other =
+    C.Lam
+      ( "n"
+      , C.If
+          ( C.Prim (C.EqInt, [ C.Var "n"; int 0 ])
+          , self
+          , C.App (C.Var other, C.Prim (C.SubInt, [ C.Var "n"; int 1 ])) ) )
+  in
+  same_on_llvm
+    "mutual"
+    (C.Letrec
+       ( [ "isEven", branch (int 1) "isOdd"; "isOdd", branch (int 0) "isEven" ]
+       , C.App (C.Var "isEven", int 10) ))
+
+(* A recursive *value* member (a dictionary: a record whose method fields reference the dict itself,
+   lazily via their closures — a strict self-*value* field would black-hole, ADR-0002). `dict` is a
+   by-need cell; each `dict.field` projection forces it via `pv_force_if_byneed`, and the method's body
+   re-projects the (memoised) dict. `letrec dict = { call: \x -> x + dict.base, base: 10 } in
+   (dict.call) 5` → 15. *)
+let test_llvm_recursive_value_dict () =
+  same_on_llvm
+    "recursive value dict"
+    (C.Letrec
+       ( [ ( "dict"
+           , C.Record
+               [ ( "call"
+                 , C.Lam
+                     ( "x"
+                     , C.Prim (C.AddInt, [ C.Var "x"; C.Accessor (C.Var "dict", "base") ])
+                     ) )
+               ; "base", int 10
+               ] )
+         ]
+       , C.App (C.Accessor (C.Var "dict", "call"), int 5) ))
+
+(* A recursive closure whose captured value must survive a collection *during the recursion*: `go`
+   allocates garbage each (tail-)call on a tiny heap, threading a captured `String` `keep`; the shared
+   env keeps `keep` rooted across the forced GC. → `if go 40 == "aabb" then 1 else 0` → 1. *)
+let test_llvm_forced_gc_recursive () =
+  let go =
+    C.Lam
+      ( "n"
+      , C.If
+          ( C.Prim (C.EqInt, [ C.Var "n"; int 0 ])
+          , C.Var "keep"
+          , C.Let
+              ( "_j"
+              , C.Prim (C.Append, [ C.Lit (C.LString "zzzz"); C.Lit (C.LString "zzzz") ])
+              , C.App (C.Var "go", C.Prim (C.SubInt, [ C.Var "n"; int 1 ])) ) ) )
+  in
+  same_on_llvm
+    ~heap_words:96
+    "forced gc recursive"
+    (C.Let
+       ( "keep"
+       , C.Prim (C.Append, [ C.Lit (C.LString "aa"); C.Lit (C.LString "bb") ])
+       , C.Letrec
+           ( [ "go", go ]
+           , C.If
+               ( C.Prim
+                   (C.EqString, [ C.App (C.Var "go", int 40); C.Lit (C.LString "aabb") ])
+               , int 1
+               , int 0 ) ) ))
+
+(* A by-need cell reaching a Boolean demand site must be forced, not branched on by its pointer bits.
+   `letrec b = false in if b then 1 else 0`: `b` is a `Grec` member (a `ByNeed` cell), so a raw `ashr`
+   of the cell pointer (nonzero) would wrongly take the `then` branch → 1; forcing yields `false` → 0. *)
+let test_llvm_letrec_if_byneed () =
+  same_on_llvm
+    "letrec if byneed"
+    (C.Letrec ([ "b", C.Lit (C.LBool false) ], C.If (C.Var "b", int 1, int 0)))
+
+(* The same demand site inside a `case` guard: `letrec ok = false in case 5 of x | ok -> 111 ; _ -> 222`.
+   Unforced, the cell pointer reads as truthy → 111; forced, the guard fails → the wildcard alt → 222. *)
+let test_llvm_letrec_guard_byneed () =
+  same_on_llvm
+    "letrec guard byneed"
+    (C.Letrec
+       ( [ "ok", C.Lit (C.LBool false) ]
+       , C.Case
+           ( [ int 5 ]
+           , [ { C.binders = [ C.BVar "x" ]; result = C.Guarded [ C.Var "ok", int 111 ] }
+             ; { C.binders = [ C.BVar "_w" ]; result = C.Unconditional (int 222) }
+             ] ) ))
+
+(* The program's final result is itself a by-need cell: `letrec x = 7 in x`. The entry must force it
+   before `pv_print_int`, else the raw cell pointer is printed instead of 7. *)
+let test_llvm_letrec_entry_byneed () =
+  same_on_llvm "letrec entry byneed" (C.Letrec ([ "x", int 7 ], C.Var "x"))
+
+(* Real compiled-PureScript multi-module programs through the whole-program path. *)
+let test_llvm_prelude_answer () = same_on_llvm "prelude answer" (prelude_term "answer")
+
+let test_llvm_prelude_quotient () =
+  same_on_llvm "prelude quotient" (prelude_term "quotient")
+
+(* A real `Effect` program (compiled PureScript with `Console.log`): its stdout must match the oracle. *)
+let test_llvm_effect_console () =
+  same_on_llvm_effect
+    "effect_console"
+    (Link.link_program
+       ~resolver:Ffi.resolver
+       ~outdir:"../fixtures/effect_console"
+       ~entry_module:[ "ConsoleMain" ]
+       ~entry:"main"
+       ())
+
 let test_ml_recursion () =
   let fact =
     C.Lam
@@ -1822,6 +1951,16 @@ let llvm_groups =
         ; Alcotest.test_case "effect_show" `Quick test_llvm_effect_show
         ; Alcotest.test_case "array_set" `Quick test_llvm_array_set
         ; Alcotest.test_case "forced_gc" `Quick test_llvm_forced_gc
+        ; Alcotest.test_case "fib" `Quick test_llvm_fib
+        ; Alcotest.test_case "mutual_rec" `Quick test_llvm_mutual_rec
+        ; Alcotest.test_case "recursive_value_dict" `Quick test_llvm_recursive_value_dict
+        ; Alcotest.test_case "forced_gc_recursive" `Quick test_llvm_forced_gc_recursive
+        ; Alcotest.test_case "letrec_if_byneed" `Quick test_llvm_letrec_if_byneed
+        ; Alcotest.test_case "letrec_guard_byneed" `Quick test_llvm_letrec_guard_byneed
+        ; Alcotest.test_case "letrec_entry_byneed" `Quick test_llvm_letrec_entry_byneed
+        ; Alcotest.test_case "prelude_answer" `Quick test_llvm_prelude_answer
+        ; Alcotest.test_case "prelude_quotient" `Quick test_llvm_prelude_quotient
+        ; Alcotest.test_case "effect_console" `Quick test_llvm_effect_console
         ] )
     ]
   else (
