@@ -1,0 +1,7 @@
+package:
+  name: ex-transformer
+  dependencies:
+    - console
+    - effect
+    - prelude
+    - transformers
