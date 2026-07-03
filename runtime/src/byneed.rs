@@ -16,6 +16,7 @@ impl Heap {
     /// **release-validates** its input first: `cell` is a live `ByNeed` object and its `state` is one
     /// of the three legal values (a `state` word corrupted via the public `write_raw` faults here).
     pub fn force(&mut self, cell: Value) -> Value {
+        self.trace_value("force cell", cell);
         let cp = self.checked_ptr(cell);
         assert_eq!(
             self.header_unchecked(cp).kind(),

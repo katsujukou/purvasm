@@ -36,6 +36,7 @@ extern "C" fn leaf_write_line(ctx: *mut Heap, _clo: u64, args: *const u64, nargs
     guard(|| unsafe {
         let h = heap(ctx);
         let s = args_slice(args, nargs)[0];
+        h.trace_value("writeLine arg", s);
         let env = h.new_array(&[s]); // capture `s`; `new_array` self-roots it across the alloc
         h.new_closure_raw(leaf_write_line_thunk as usize as u64, 1, env.as_word())
             .as_word()

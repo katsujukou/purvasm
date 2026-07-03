@@ -74,6 +74,12 @@ impl Heap {
     /// leftover still deferred on `conts`. On the index path the slot is always `None`, so this reduces
     /// to the plain over-application loop (push-then-immediately-pop).
     pub fn apply(&mut self, f: Value, args: &[Value]) -> Value {
+        if self.trace_on() {
+            self.trace_value(&format!("apply f (nargs={})", args.len()), f);
+            for (i, a) in args.iter().enumerate() {
+                self.trace_value(&format!("  arg{i}"), *a);
+            }
+        }
         let mut f = f;
         let mut args: Vec<Value> = args.to_vec();
         // Each group is rooted on the shadow stack (LIFO with the frame mark), so it survives every
@@ -144,6 +150,9 @@ impl Heap {
                     }
                     let code_word = self.read_raw_unchecked(p, 0);
                     let result = self.call_code(code_word, f, &call_args);
+                    if self.trace_on() {
+                        self.trace_value(&format!("  = code 0x{code_word:x} returned"), result);
+                    }
                     match self.take_pending_tail() {
                         // Tail bounce (ADR-0071 §4): continue with the stashed callee; the just-pushed
                         // leftover stays on `conts`, deferred behind this new chain.

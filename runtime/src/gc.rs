@@ -85,6 +85,11 @@ pub struct Heap {
     /// with no intervening `code` call, so it never crosses `apply` activations (only the innermost
     /// active loop reads it). `None` on every index-path heap (no `pv_tailcall`).
     pending_tail: Option<(TaggedWord, Vec<TaggedWord>)>,
+    /// Debug tracing (ADR-0072 §11): when set, `apply`/`force`/leaf entry points log a compact
+    /// value-flow trace to `stderr`. Enabled by the `PURVASM_TRACE` environment variable on a native
+    /// (`new_native`) heap only — the compiled binary reads it, so any program can be traced with
+    /// `PURVASM_TRACE=1 ./app` without recompiling. Always `false` on a `lib`/Miri heap.
+    trace: bool,
 }
 
 /// A handle to a value rooted on the shadow stack (ADR-0066 §2). `Copy`, borrows nothing, and is only
@@ -133,6 +138,7 @@ impl Heap {
             output: Vec::new(),
             code_is_address: false,
             pending_tail: None,
+            trace: false,
         }
     }
 
@@ -143,7 +149,34 @@ impl Heap {
     pub fn new_native(words_per_space: usize) -> Heap {
         let mut h = Heap::new(words_per_space);
         h.code_is_address = true;
+        // Opt-in value-flow tracing for the compiled binary; read here (not in `new`) so `lib`/Miri
+        // heaps never touch the environment (ADR-0072 §11).
+        h.trace = std::env::var_os("PURVASM_TRACE").is_some();
         h
+    }
+
+    /// Whether debug tracing is on (the `PURVASM_TRACE` env var, native heaps only).
+    #[inline]
+    pub(crate) fn trace_on(&self) -> bool {
+        self.trace
+    }
+
+    /// Log a labelled value's runtime kind/arity when tracing is on (ADR-0072 §11) — the compact form
+    /// used to follow a value through `apply`/`force`/leaves. A pointer prints its `Kind` and the header's
+    /// arity/tag word; an immediate prints its bits.
+    pub(crate) fn trace_value(&self, label: &str, v: TaggedWord) {
+        if !self.trace {
+            return;
+        }
+        if v.is_pointer() {
+            let p = self.checked_ptr(v);
+            let k = self.header_unchecked(p).kind();
+            let w0 = self.read_raw_unchecked(p, 0);
+            let w1 = self.read_raw_unchecked(p, 1);
+            eprintln!("[trace] {label}: {k:?} w0=0x{w0:x} w1={w1}");
+        } else {
+            eprintln!("[trace] {label}: imm=0x{:x}", v.to_bits());
+        }
     }
 
     /// Whether the `code` word is a real address (ADR-0071 §3) — read by [`apply`](Heap::apply).
