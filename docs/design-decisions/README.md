@@ -120,5 +120,6 @@ language and are kept out of version control.)
 | [0071](0071-codegen-runtime-c-abi.md) | Native runtime C ABI: exported context, allocation, root, apply, effect, record, by-need, and primitive helper surface for LLVM-generated code | Accepted |
 | [0072](0072-anf-to-llvm-lowering.md) | ANF → LLVM lowering: per-module textual IR, lambda-lifting, rooting emission, and the native differential | Accepted |
 | [0073](0073-ulib-shipped-native-foreign-and-link-time-resolution.md) | `ulib`-shipped native foreign for the native backend: `.c` over the `pv_*` C-ABI (opaque `PVWord` + `ctx`-taking scalar accessors + a rooting contract), resolved by link-time `pvf_*` symbols; PS-first with arity/effect from the `foreign import` signature | Accepted |
+| [0074](0074-effect-exception-throw-only-ulib-shadow.md) | `Effect.Exception` as a throw-only `ulib` shadow: pure-PS `Error`, `throwException` = stderr + `exit 1` (fatal, unrecoverable), `catchException` passes through; LLVM runtime completes the `writeErrLineImpl`/`exitImpl` leaves under a write-before-exit contract (stderr direct+flush; exit drains the stdout sink); real unwinding deferred | Accepted |
 
 ## Scope
