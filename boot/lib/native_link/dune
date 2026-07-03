@@ -1,4 +1,4 @@
 (library
  (name native_link)
  (public_name purvasm.native_link)
- (libraries yojson))
+ (libraries yojson unix))

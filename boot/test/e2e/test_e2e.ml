@@ -822,7 +822,8 @@ let compile_foreign_c ~(dir : string) (csrc : string) : string =
   if
     Sys.command
       (Printf.sprintf
-         "clang -c -I%s %s -o %s 2>%s"
+         "clang -c %s -I%s %s -o %s 2>%s"
+         (Native_link.section_cflags ())
          (Filename.quote inc)
          (Filename.quote csrc)
          (Filename.quote obj)
@@ -871,7 +872,9 @@ let llvm_run
     Sys.command
       (* `-lm` resolves a native `foreign` `.c`'s libm calls on Linux (macOS folds libm into libSystem). *)
       (Printf.sprintf
-         "clang -Wl,-dead_strip %s %s %s -lm -o %s 2>%s"
+         "clang %s %s %s %s %s -lm -o %s 2>%s"
+         (Native_link.section_cflags ())
+         (Native_link.dead_strip_link_flag ())
          (Filename.quote genll)
          (String.concat " " (List.map Filename.quote foreign_objs))
          (Filename.quote rt)
@@ -894,8 +897,10 @@ let llvm_run
    `@<mangle>$root` / `@<mangle>$init` are resolved by the system linker, so a non-injective or
    double-defined symbol would fail here rather than in one merged module. *)
 (* Compile a program's per-module `.ll`s to independent `.o`s and dead-strip-link them with the runtime,
-   returning the executable path (in [dir]). The link passes `-Wl,-dead_strip` (ld64) so unreferenced
-   symbols — a pruned dead binding's code/globals — are removed (ADR-0072 §3 tree-shaking). *)
+   returning the executable path (in [dir]). The link passes the host linker's dead-strip flag
+   (`-dead_strip` on ld64, `--gc-sections` + per-function sections on GNU ld/lld — [Native_link])
+   so unreferenced symbols — a pruned dead binding's code/globals — are removed (ADR-0072 §3
+   tree-shaking). *)
 let build_split_exe ?(is_effect = false) ?heap_words ~(dir : string) (t : C.term) : string
   =
   let rt = Option.get rt_staticlib in
@@ -918,7 +923,8 @@ let build_split_exe ?(is_effect = false) ?heap_words ~(dir : string) (t : C.term
     if
       Sys.command
         (Printf.sprintf
-           "clang -c %s -o %s 2>%s"
+           "clang -c %s %s -o %s 2>%s"
+           (Native_link.section_cflags ())
            (Filename.quote ll)
            (Filename.quote obj)
            (Filename.quote err))
@@ -937,7 +943,8 @@ let build_split_exe ?(is_effect = false) ?heap_words ~(dir : string) (t : C.term
     Sys.command
       (* `-lm` for parity with the single-object link (a `.c` foreign's libm calls, Linux). *)
       (Printf.sprintf
-         "clang -Wl,-dead_strip %s %s -lm -o %s 2>%s"
+         "clang %s %s %s -lm -o %s 2>%s"
+         (Native_link.dead_strip_link_flag ())
          (String.concat " " (List.map Filename.quote objs))
          (Filename.quote rt)
          (Filename.quote genexe)
@@ -1010,11 +1017,9 @@ let same_on_llvm_split_effect (label : string) (t : C.term) =
   Alcotest.(check string) label out (llvm_run_split ~is_effect:true t)
 
 (* The prelude ulib's native `foreign` in `.c` (ADR-0073): `showNumberImpl` shipped as C over the `pv_*`
-   C-ABI, resolved by its `pvf_*` symbol from the compiled `Data.Show.foreign.c`. *)
+   C-ABI, resolved by its `pvf_*` symbol from the compiled `Data.Show.c`. *)
 let dshow_foreign_c : string option =
-  Option.map
-    (fun root -> Filename.concat root "ulib/prelude/Data.Show.foreign.c")
-    repo_root
+  Option.map (fun root -> Filename.concat root "ulib/prelude/Data.Show.c") repo_root
 
 (* An Effect differential whose leaf `pvf_*` symbol is provided by a ulib-shipped `.c` (ADR-0073), not the
    runtime. The oracle runs the same first-order host leaf (`Ffi.host`'s `show_number`), so the outputs
@@ -1065,13 +1070,13 @@ let staged_ulib_with_show_number () : string =
     close_in ic;
     s
   in
-  let oc = open_out_bin (Filename.concat nd "Data.Show.foreign.c") in
+  let oc = open_out_bin (Filename.concat nd "Data.Show.c") in
   output_string oc contents;
   close_out oc;
   let oc = open_out (Filename.concat d "ulib.json") in
   output_string
     oc
-    {|{ "foreign": { "Data.Show.showNumberImpl": "native/prelude/Data.Show.foreign.c" } }|};
+    {|{ "foreign": { "Data.Show.showNumberImpl": "native/prelude/Data.Show.c" } }|};
   close_out oc;
   d
 
@@ -1799,7 +1804,8 @@ let test_llvm_split_dead_binding () =
     (C.Let ("dead", int 999, C.Let ("live", int 5, C.Var "live")))
 
 (* The system linker's dead-strip actually removes the pruned binding's symbol from the binary (ADR-0072
-   §3 tree-shaking): after `-Wl,-dead_strip`, `nm` shows no `pv_g_dead*`. Skipped if `nm` is unavailable. *)
+   §3 tree-shaking): after the dead-strip link, `nm` shows no `pv_g_dead*`. Skipped if `nm` is
+   unavailable. *)
 let test_llvm_deadstrip_nm () =
   let dir = Filename.concat (Filename.get_temp_dir_name ()) "purvasm_deadstrip_nm" in
   let t = C.Let ("dead", int 999, C.Let ("live", int 5, C.Var "live")) in

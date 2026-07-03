@@ -8,6 +8,33 @@
     exactly one provider (the compiled `.c` or the runtime staticlib). Kept free of shell/compile
     orchestration so the manifest logic is unit-testable. *)
 
+(** Whether the host linker is Apple ld64 (macOS), detected once from [uname -s]. The LLVM link
+    step's flags are linker-dialect-specific (below), and OCaml exposes no finer grain than
+    [Sys.os_type = "Unix"], so the standard [uname] probe decides. *)
+let host_is_macos : bool Lazy.t =
+  lazy
+    (try
+       let ic = Unix.open_process_in "uname -s" in
+       let line = In_channel.input_line ic in
+       ignore (Unix.close_process_in ic);
+       line = Some "Darwin"
+     with
+     | _ -> false)
+
+(** The link flag that drops unreferenced symbols (ADR-0072 §3 tree-shaking — a *size*
+    responsibility, not correctness): ld64 spells it [-dead_strip]; GNU ld / lld spell it
+    [--gc-sections], which strips at *section* granularity and therefore only bites when
+    [section_cflags] split the object into per-function sections. *)
+let dead_strip_link_flag () : string =
+  if Lazy.force host_is_macos then "-Wl,-dead_strip" else "-Wl,--gc-sections"
+
+(** Compile flags pairing [dead_strip_link_flag]: GNU ld's [--gc-sections] needs each
+    function/datum in its own section to strip anything; ld64 dead-strips per symbol and needs
+    nothing. Included in every `clang -c` of the native pipeline so the tree-shaking property
+    holds on both linkers. *)
+let section_cflags () : string =
+  if Lazy.force host_is_macos then "" else "-ffunction-sections -fdata-sections"
+
 (** The ["foreign"] map of `<ulib_dir>/ulib.json`: [(qualified key, relative `.c` path)]. An absent file
     or absent/ill-typed ["foreign"] field yields [[]] — those keys then resolve from the runtime staticlib
     (or a truly unbound one becomes a link error). Malformed JSON is tolerated as "no mapping" rather than

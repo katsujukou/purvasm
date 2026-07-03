@@ -308,7 +308,8 @@ let emit_native_llvm ~bdir ~output ~is_effect ~runtime_lib ~ulib anf =
     sh
       "clang -c"
       (Stdlib.Printf.sprintf
-         "clang -c %s -o %s 2>%s"
+         "clang -c %s %s -o %s 2>%s"
+         (Native_link.section_cflags ())
          (Filename.quote ll)
          (Filename.quote obj)
          (Filename.quote (Filename.concat bdir (tag ^ ".clang.log"))));
@@ -344,7 +345,8 @@ let emit_native_llvm ~bdir ~output ~is_effect ~runtime_lib ~ulib anf =
              sh
                "clang -c foreign"
                (Stdlib.Printf.sprintf
-                  "clang -c -I%s %s -o %s 2>%s"
+                  "clang -c %s -I%s %s -o %s 2>%s"
+                  (Native_link.section_cflags ())
                   (Filename.quote inc)
                   (Filename.quote src)
                   (Filename.quote obj)
@@ -366,7 +368,8 @@ let emit_native_llvm ~bdir ~output ~is_effect ~runtime_lib ~ulib anf =
   sh
     "link"
     (Stdlib.Printf.sprintf
-       "clang -Wl,-dead_strip %s %s -lm -o %s 2>%s"
+       "clang %s %s %s -lm -o %s 2>%s"
+       (Native_link.dead_strip_link_flag ())
        (String.concat " " (List.map Filename.quote objs))
        (Filename.quote rt)
        (Filename.quote exe)
