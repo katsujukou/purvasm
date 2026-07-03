@@ -1,0 +1,5 @@
+{
+  "foreign": {
+    "Data.Show.showNumberImpl": "Data.Show.foreign.c"
+  }
+}
