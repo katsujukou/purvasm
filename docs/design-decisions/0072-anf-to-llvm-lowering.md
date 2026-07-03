@@ -51,6 +51,17 @@
 > ([Link] already spine-orders the import DAG), so init ordering is correct; only *dead-init elimination*
 > and *tree-shaking* (size, not correctness) are deferred. Bindings with a bare (non-module-qualified) key
 > — synthesised fresh-names — each form a singleton module object.
+>
+> **Update (2026-07-03, reachability slice):** the deferred pruning + tree-shaking of the previous note
+> now lands. `pv_init_all` initialises **only the bindings reachable from the entry** — the transitive
+> closure of the entry's global references over each binding's body free-vars (a `Grec` group reached as a
+> unit). Modules still emit *all* their bindings (a module compiles without knowing the entry), so a
+> pruned dead binding's code/globals become **unreferenced symbols the system linker's dead-strip removes**
+> (`-Wl,-dead_strip` on ld64; `nm` confirms the symbol is gone). Init order remains **linked-spine order
+> restricted to the reachable set** — still a valid topological order, so ordering stays correct without
+> rebuilding the edge graph; the explicit edge-topo (§3 pin 3) is only needed once the driver consumes
+> per-module *artifacts* rather than a single linked spine. Responsibility split per §3: purvasm decides
+> *what* to initialise (reachability), the system linker removes the *dead code* (size).
 
 ## Context
 

@@ -24,9 +24,11 @@
       root-handle global `@<mangle key>$root` (a shadow-stack handle, not a stale raw value under the moving
       GC) with a `@<mangle key>$init` unit run by a `pv_init_all`, and references load the handle +
       `pv_get` (ADR-0072 §2/§3). [program_split] splits this across independent per-module `.o`s + one
-      init/entry object linked by the injective-mangle symbol ABI. The minimal slice initialises **all**
-      bindings in linked-spine (dependency) order; reachability pruning + the system-linker dead-strip are
-      deferred (ADR-0072 §3).
+      init/entry object linked by the injective-mangle symbol ABI. `pv_init_all` initialises **only the
+      bindings reachable from the entry** ([reachable_gdefs]); modules still emit all their bindings, so a
+      pruned dead binding's now-unreferenced code/globals are removed by the system linker's dead-strip
+      (`-Wl,-dead_strip`). Init order is linked-spine order restricted to the reachable set (a valid
+      topological order).
     Unsaturated constructors / pure-`Number`/`String`/`Bool` entry printers land later (a clear [failwith]
     / `pv_print_int`-only guards each).
 
@@ -1071,6 +1073,41 @@ let split_spine (e : A.expr) : gdef list * A.expr =
   in
   walk [] e
 
+(* The top-level keys a gdef references (in its bodies), for reachability. `∩ gkeys` keeps only global
+   references (params/locals are bare/fresh, never in [gkeys]); its own keys are excluded. *)
+let gdef_refs ~(gkeys : SS.t) (g : gdef) : SS.t =
+  let bodies =
+    match g with
+    | Gfun (_, _, b) | Gcaf (_, b) -> [ b ]
+    | Grec ms -> List.map snd ms
+  in
+  let fvs = List.fold_left (fun a b -> SS.union a (fv_expr SS.empty b)) SS.empty bodies in
+  SS.diff (SS.inter fvs gkeys) (SS.of_list (gdef_keys g))
+
+(** The gdefs **reachable** from the entry (ADR-0072 §3), in the original spine order — the transitive
+    closure of the entry's global references over each binding's [gdef_refs]. `pv_init_all` initialises
+    only these (no dead init); the system linker's dead-strip removes the unreferenced rest. A `Grec` group
+    is reached as a unit (any member pulls the whole atomic init). Spine order restricted to the reachable
+    set is still a valid topological order ([Link] spine-orders the dependency DAG), so init ordering stays
+    correct without rebuilding the edge graph — the explicit edge-topo is only needed by the future
+    artifact-input driver (§3 pin 3). *)
+let reachable_gdefs ~(gkeys : SS.t) (entry : A.expr) (gdefs : gdef list) : gdef list =
+  let by_key : (string, gdef) Hashtbl.t = Hashtbl.create 64 in
+  List.iter (fun g -> List.iter (fun k -> Hashtbl.replace by_key k g) (gdef_keys g)) gdefs;
+  let reached : (string, unit) Hashtbl.t = Hashtbl.create 64 in
+  let rec visit k =
+    match Hashtbl.find_opt by_key k with
+    | None -> () (* not a top-level binding here (a foreign leaf, or an entry-only key) *)
+    | Some g ->
+      let ik = gdef_init_key g in
+      if not (Hashtbl.mem reached ik)
+      then (
+        Hashtbl.add reached ik ();
+        SS.iter visit (gdef_refs ~gkeys g))
+  in
+  SS.iter visit (SS.inter (fv_expr SS.empty entry) gkeys);
+  List.filter (fun g -> Hashtbl.mem reached (gdef_init_key g)) gdefs
+
 (* Root value word [v] into the top-level global `@<mangle key>$root` and store the handle. The caller must
    already have popped any transient frame, so the root lands in the persistent init region of the shadow
    stack (never popped) and the global's handle stays relocation-valid for the program's lifetime. *)
@@ -1155,9 +1192,10 @@ let emit_gdefs cx (gdefs : gdef list) : unit =
   if gdefs <> [] then Buffer.add_char cx.md '\n';
   List.iter (emit_gdef cx) gdefs
 
-(* Emit `pv_init_all`: call each binding's init in [gdefs] order (the dependency / spine order). The inits
-   push their permanent roots onto the shadow stack; nothing pops them, so the globals stay live and
-   relocation-valid for the program's lifetime (ADR-0072 §3). *)
+(* Emit `pv_init_all`: call each given binding's init in [gdefs] order (the dependency / spine order).
+   Callers pass the **reachable** subset ([reachable_gdefs]), so this emits calls only for what is
+   initialised. The inits push their permanent roots onto the shadow stack; nothing pops them, so the
+   globals stay live and relocation-valid for the program's lifetime (ADR-0072 §3). *)
 let emit_init_all cx (gdefs : gdef list) : unit =
   let calls =
     List.map
@@ -1209,8 +1247,10 @@ let program_modular ?(is_effect = false) ?(heap_words = default_heap_words) (e :
   let gdefs, entry = split_spine e in
   let gkeys = SS.of_list (List.concat_map gdef_keys gdefs) in
   let cx = make_cx ~gkeys () in
+  (* every binding is emitted, but only the reachable ones are initialised (dead init is pruned; the
+     dead-strip link removes their now-unreferenced code/globals — ADR-0072 §3). *)
   emit_gdefs cx gdefs;
-  emit_init_all cx gdefs;
+  emit_init_all cx (reachable_gdefs ~gkeys entry gdefs);
   let entry_body = emit_entry_stub cx ~is_effect ~heap_words entry in
   emit_pending cx;
   Printf.sprintf
@@ -1224,10 +1264,10 @@ let program_modular ?(is_effect = false) ?(heap_words = default_heap_words) (e :
 (* ==================================================================================================== *)
 (* B2 — real per-module `.o` split (ADR-0072 §1/§3): each module emits an independent object (its own
    root-handle globals + init functions + internal code), and a synthesised init/entry object carries
-   `pv_init_all` (calling every binding's init in dependency order) + `@main`. The system linker resolves
-   the `@<mangle>$root` / `@<mangle>$init` symbols across objects — the cross-`.o` ABI the injective mangle
-   guarantees. Minimal slice: `pv_init_all` initialises **all** bindings (reachability pruning + the
-   system-linker dead-strip are deferred, ADR-0072 §3). *)
+   `pv_init_all` (calling each **reachable** binding's init in dependency order) + `@main`. The system
+   linker resolves the `@<mangle>$root` / `@<mangle>$init` symbols across objects — the cross-`.o` ABI the
+   injective mangle guarantees — and dead-strips the symbols of bindings a module emits but the entry does
+   not reach ([reachable_gdefs], ADR-0072 §3). *)
 (* ==================================================================================================== *)
 
 (* The module a qualified key belongs to: everything before its last `.` component (`qualified_key` =
@@ -1251,7 +1291,7 @@ let module_ll ~(gkeys : SS.t) ~(defined : SS.t) (gdefs : gdef list) : string =
     (Buffer.contents cx.globals)
     (Buffer.contents cx.md)
 
-(** Emit the **init/entry object**: `pv_init_all` (calling each binding's init in dependency order) + the
+(** Emit the **init/entry object**: `pv_init_all` (calling each **reachable** binding's init in dependency order) + the
     `@main` stub. Every binding's init function and every referenced root-handle global is `external`
     (defined in a module object). *)
 let entry_ll
@@ -1263,14 +1303,17 @@ let entry_ll
   : string
   =
   let cx = make_cx ~gkeys () in
-  emit_init_all cx gdefs;
+  (* initialise only the bindings reachable from the entry (ADR-0072 §3); the unreachable module objects'
+     code/globals are dropped by the dead-strip link. *)
+  let reach = reachable_gdefs ~gkeys entry gdefs in
+  emit_init_all cx reach;
   let entry_body = emit_entry_stub cx ~is_effect ~heap_words entry in
   emit_pending cx;
   (* the init functions this object calls are defined in the module objects *)
   let init_decls =
     List.map
       (fun g -> Printf.sprintf "declare void @%s$init(ptr)" (mangle (gdef_init_key g)))
-      gdefs
+      reach
     |> String.concat "\n"
   in
   Printf.sprintf
@@ -1297,8 +1340,9 @@ type split_output =
 
 (** Lower a linked program to **separate module objects + one init/entry object** (ADR-0072 §1/§3). Top-level
     bindings are partitioned by their owning module (via [module_of_key]); each partition is an independent
-    `.ll`. `pv_init_all` runs the bindings in the linked-spine dependency order (a valid topological order:
-    [Link] already spine-orders the DAG). B2's minimal slice initialises all bindings. *)
+    `.ll`. `pv_init_all` runs the **reachable** bindings ([reachable_gdefs]) in linked-spine order restricted
+    to that set — a valid topological order ([Link] already spine-orders the DAG); modules still emit their
+    unreachable bindings, whose symbols the dead-strip link removes. *)
 let program_split ?(is_effect = false) ?(heap_words = default_heap_words) (e : A.expr)
   : split_output
   =

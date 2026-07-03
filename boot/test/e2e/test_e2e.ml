@@ -835,7 +835,7 @@ let llvm_run ?(is_effect = false) ?(modular = false) ?heap_words (t : C.term) : 
   if
     Sys.command
       (Printf.sprintf
-         "clang %s %s -o %s 2>%s"
+         "clang -Wl,-dead_strip %s %s -o %s 2>%s"
          (Filename.quote genll)
          (Filename.quote rt)
          (Filename.quote genexe)
@@ -856,13 +856,12 @@ let llvm_run ?(is_effect = false) ?(modular = false) ?heap_words (t : C.term) : 
    real per-module separate-compilation path. Exercises the cross-`.o` symbol ABI: each module's
    `@<mangle>$root` / `@<mangle>$init` are resolved by the system linker, so a non-injective or
    double-defined symbol would fail here rather than in one merged module. *)
-let llvm_run_split ?(is_effect = false) ?heap_words (t : C.term) : string =
+(* Compile a program's per-module `.ll`s to independent `.o`s and dead-strip-link them with the runtime,
+   returning the executable path (in [dir]). The link passes `-Wl,-dead_strip` (ld64) so unreferenced
+   symbols — a pruned dead binding's code/globals — are removed (ADR-0072 §3 tree-shaking). *)
+let build_split_exe ?(is_effect = false) ?heap_words ~(dir : string) (t : C.term) : string
+  =
   let rt = Option.get rt_staticlib in
-  let dir =
-    Filename.concat
-      (Filename.get_temp_dir_name ())
-      (Printf.sprintf "purvasm_lls_%x" (Hashtbl.hash (t, heap_words)))
-  in
   (try Sys.mkdir dir 0o755 with
    | Sys_error _ -> ());
   let out =
@@ -897,17 +896,26 @@ let llvm_run_split ?(is_effect = false) ?heap_words (t : C.term) : string =
   in
   let genexe = Filename.concat dir "gen" in
   let err = Filename.concat dir "link.err" in
-  let outf = Filename.concat dir "out" in
   if
     Sys.command
       (Printf.sprintf
-         "clang %s %s -o %s 2>%s"
+         "clang -Wl,-dead_strip %s %s -o %s 2>%s"
          (String.concat " " (List.map Filename.quote objs))
          (Filename.quote rt)
          (Filename.quote genexe)
          (Filename.quote err))
     <> 0
   then Alcotest.failf "link failed; see %s" err;
+  genexe
+
+let llvm_run_split ?(is_effect = false) ?heap_words (t : C.term) : string =
+  let dir =
+    Filename.concat
+      (Filename.get_temp_dir_name ())
+      (Printf.sprintf "purvasm_lls_%x" (Hashtbl.hash (t, heap_words)))
+  in
+  let genexe = build_split_exe ~is_effect ?heap_words ~dir t in
+  let outf = Filename.concat dir "out" in
   if
     Sys.command (Printf.sprintf "%s > %s" (Filename.quote genexe) (Filename.quote outf))
     <> 0
@@ -1509,6 +1517,60 @@ let test_llvm_split_effect_console () =
        ~entry_module:[ "ConsoleMain" ]
        ~entry:"main"
        ())
+
+(* --- Reachability pruning + system-linker dead-strip (ADR-0072 §3). ---------------------------------- *)
+
+let str_contains ~(needle : string) (hay : string) : bool =
+  let nl = String.length needle
+  and hl = String.length hay in
+  let rec go i = i + nl <= hl && (String.sub hay i nl = needle || go (i + 1)) in
+  nl = 0 || go 0
+
+(* A binding unreachable from the entry (`dead`) is still emitted in its module object but **pruned from
+   `pv_init_all`** (ADR-0072 §3). A pure dead binding is observationally invisible, so this proves the
+   pruning *structurally*: the init/entry object initialises `live` but never `dead`. *)
+let test_llvm_prune_omits_dead () =
+  let t = C.Let ("dead", int 999, C.Let ("live", int 5, C.Var "live")) in
+  let out = Llvm_backend.Codegen_llvm.program_split (Middle_end.Transl.transl t) in
+  Alcotest.(check bool)
+    "live is initialised"
+    true
+    (str_contains ~needle:"pv_g_live$init" out.entry);
+  Alcotest.(check bool)
+    "dead is pruned from pv_init_all"
+    false
+    (str_contains ~needle:"pv_g_dead$init" out.entry)
+
+(* End-to-end correctness with a pruned dead binding present in a module object: `let dead = 999 in let
+   live = 5 in live` → 5. The dead binding is init-pruned and dead-stripped; the program still matches the
+   oracle (which eagerly evaluates the pure `dead` and discards it). *)
+let test_llvm_split_dead_binding () =
+  same_on_llvm_split
+    "split dead binding"
+    (C.Let ("dead", int 999, C.Let ("live", int 5, C.Var "live")))
+
+(* The system linker's dead-strip actually removes the pruned binding's symbol from the binary (ADR-0072
+   §3 tree-shaking): after `-Wl,-dead_strip`, `nm` shows no `pv_g_dead*`. Skipped if `nm` is unavailable. *)
+let test_llvm_deadstrip_nm () =
+  let dir = Filename.concat (Filename.get_temp_dir_name ()) "purvasm_deadstrip_nm" in
+  let t = C.Let ("dead", int 999, C.Let ("live", int 5, C.Var "live")) in
+  let exe = build_split_exe ~dir t in
+  let syms = Filename.concat dir "syms" in
+  if
+    Sys.command
+      (Printf.sprintf "nm %s > %s 2>/dev/null" (Filename.quote exe) (Filename.quote syms))
+    = 0
+  then (
+    let ic = open_in syms in
+    let s = In_channel.input_all ic in
+    close_in ic;
+    (* `live` is initialised → its symbol survives; `dead` is pruned + dead-stripped → gone. *)
+    Alcotest.(check bool) "live symbol kept" true (str_contains ~needle:"pv_g_live" s);
+    Alcotest.(check bool)
+      "dead symbol stripped"
+      false
+      (str_contains ~needle:"pv_g_dead" s))
+  else Printf.printf "  (nm unavailable — skipping dead-strip symbol check)\n"
 
 let test_ml_recursion () =
   let fact =
@@ -2200,6 +2262,9 @@ let llvm_groups =
             `Quick
             test_llvm_split_prelude_quotient
         ; Alcotest.test_case "split_effect_console" `Quick test_llvm_split_effect_console
+        ; Alcotest.test_case "prune_omits_dead" `Quick test_llvm_prune_omits_dead
+        ; Alcotest.test_case "split_dead_binding" `Quick test_llvm_split_dead_binding
+        ; Alcotest.test_case "deadstrip_nm" `Quick test_llvm_deadstrip_nm
         ] )
     ]
   else (
