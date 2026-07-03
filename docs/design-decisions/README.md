@@ -119,5 +119,6 @@ language and are kept out of version control.)
 | [0070](0070-v1-byneed-recursive-caf-force.md) | v1 by-need recursive CAFs: the `ByNeed` cell `[state][result]` as a 3-state (`Unforced`/`Building`/`Forced`) memoising suspension, `force` = black-hole-then-`apply(thunk,unit)`-then-memoise (cell rooted across the safepoint), `apply` auto-forces a `ByNeed` callee, `Grec` groups over a shared env; builds on the ADR-0069 record store (a field store does not force), unblocks the recursive `Monad Effect` dictionary (ADR-0067 §2 prerequisite) | Accepted |
 | [0071](0071-codegen-runtime-c-abi.md) | Native runtime C ABI: exported context, allocation, root, apply, effect, record, by-need, and primitive helper surface for LLVM-generated code | Accepted |
 | [0072](0072-anf-to-llvm-lowering.md) | ANF → LLVM lowering: per-module textual IR, lambda-lifting, rooting emission, and the native differential | Accepted |
+| [0073](0073-ulib-shipped-native-foreign-and-link-time-resolution.md) | `ulib`-shipped native foreign for the native backend: `.c` over the `pv_*` C-ABI (opaque `PVWord` + `ctx`-taking scalar accessors + a rooting contract), resolved by link-time `pvf_*` symbols; PS-first with arity/effect from the `foreign import` signature | Accepted |
 
 ## Scope
