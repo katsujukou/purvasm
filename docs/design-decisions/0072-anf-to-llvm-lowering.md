@@ -62,6 +62,16 @@
 > rebuilding the edge graph; the explicit edge-topo (§3 pin 3) is only needed once the driver consumes
 > per-module *artifacts* rather than a single linked spine. Responsibility split per §3: purvasm decides
 > *what* to initialise (reachability), the system linker removes the *dead code* (size).
+>
+> **Correction (2026-07-03, capture/shadowing fix):** §4's lambda-lift must **respect a local variable
+> shadowing a bare-key top-level global**. A `where`-hoisted helper (e.g. `go`) becomes a *bare-key*
+> top-level binding; another definition may bind a **local** `go`. When lifting a nested lambda, the
+> free-var capture set excludes globals so they are read via `@<mangle>$root` — but it must exclude only
+> globals **not shadowed by a local in scope** (`fv \ (gkeys \ locals)`), else the lifted lambda calls the
+> wrong `go` (the arity-3 global instead of the captured local), leaking a partial application into a value
+> position. `read_var` already prefers the local (env before `gkeys`); the capture set must match. This is
+> split-path-only (the whole-program path captures everything). A follow-up may instead give bare-key
+> hoisted helpers module-qualified keys so the collision cannot arise.
 
 ## Context
 
@@ -299,6 +309,19 @@ degenerate per-module case):
    ([0067](0067-v1-effect-execution-and-native-leaves.md)).
 5. **`LetRec` + by-need + cross-module** — the Grec construction, `ByNeed` globals, multi-module linking
    and topological init (§3/§4).
+
+### 11. Debug tracing (`PURVASM_TRACE`)
+
+Following a value through the compiled runtime — a partial application leaking into a value position, a
+by-need cell not forcing, a mis-resolved capture — is the load-bearing debugging tool for this backend (it
+localised the split-path capture/shadowing bug, §4). Rather than hand-edited `eprintln!`s, the runtime
+carries a permanent **opt-in value-flow trace**: a `trace` flag on the `Heap`, set from the
+**`PURVASM_TRACE` environment variable** in `new_native` only (a native/compiled heap; the `lib`/Miri heap
+never reads the environment). When on, `apply` logs each call's callee + arguments and each `code`
+return, `force` logs the cell, and the native leaves log their argument — a compact `[trace] …` line per
+event to `stderr`. Because the gate is a runtime env var, **any** compiled binary is traceable with
+`PURVASM_TRACE=1 ./app` **without recompiling or a codegen flag** (mirroring `RUST_BACKTRACE`); the trace
+is inert (a single bool check) when off, so it costs nothing on a normal run.
 
 ### Deferred
 

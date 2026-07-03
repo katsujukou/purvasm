@@ -1499,6 +1499,37 @@ let test_llvm_split_mangle_injective () =
        , int 3
        , C.Let ("A_B", int 4, C.Prim (C.AddInt, [ C.Var "A.B"; C.Var "A_B" ])) ))
 
+(* A **local variable shadowing a bare-key top-level global** (ADR-0072 §2/§4). `go` is a top-level
+   binding (a bare key → a global); `f`'s body binds a *local* `go` and references it inside a nested
+   lambda `\z -> go z`. The lambda-lift must **capture the local `go`** (not read `@go$root`): excluding it
+   because `"go"` is a gkey would make `\z -> go z` call the arity-3 global, returning a partial
+   application instead of a value. `f 10 5` = local `go 5` = `5 + 10` = 15 (the global `go` is never
+   applied). Regressions here surfaced as a `Pap` reaching a leaf in real `where`-hoisted code. *)
+let test_llvm_split_local_shadows_global () =
+  same_on_llvm_split
+    "split local shadows global"
+    (C.Let
+       ( "go"
+       , C.Lam
+           ( "a"
+           , C.Lam
+               ( "b"
+               , C.Lam
+                   ( "c"
+                   , C.Prim
+                       ( C.AddInt
+                       , [ C.Prim (C.AddInt, [ C.Var "a"; C.Var "b" ]); C.Var "c" ] ) ) )
+           )
+       , C.Let
+           ( "f"
+           , C.Lam
+               ( "x"
+               , C.Let
+                   ( "go"
+                   , C.Lam ("y", C.Prim (C.AddInt, [ C.Var "y"; C.Var "x" ]))
+                   , C.Lam ("z", C.App (C.Var "go", C.Var "z")) ) )
+           , C.App (C.App (C.Var "f", int 10), int 5) ) ))
+
 (* Real compiled-PureScript programs spanning **multiple modules**, each compiled to its own `.o` and
    linked: the genuine separate-compilation exercise (`Main` + `Data.*`/`Prelude` module objects + the
    init/entry object), differential-checked against the oracle. *)
@@ -2256,6 +2287,10 @@ let llvm_groups =
             "split_mangle_injective"
             `Quick
             test_llvm_split_mangle_injective
+        ; Alcotest.test_case
+            "split_local_shadows_global"
+            `Quick
+            test_llvm_split_local_shadows_global
         ; Alcotest.test_case "split_prelude_answer" `Quick test_llvm_split_prelude_answer
         ; Alcotest.test_case
             "split_prelude_quotient"

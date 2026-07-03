@@ -28,7 +28,11 @@
       bindings reachable from the entry** ([reachable_gdefs]); modules still emit all their bindings, so a
       pruned dead binding's now-unreferenced code/globals are removed by the system linker's dead-strip
       (`-Wl,-dead_strip`). Init order is linked-spine order restricted to the reachable set (a valid
-      topological order).
+      topological order). A **local variable may share a name with a bare-key top-level global** (a
+      `where`-hoisted helper like `go` collides with another definition's local `go`); [read_var] resolves
+      the local first (env before `gkeys`), and lambda-lift ([lift]) captures such a shadowed name rather
+      than reading `@<mangle>$root` — excluding it as a global would make a nested lambda call the wrong
+      binding (a partial application leaking out of a mis-resolved recursive helper).
     Unsaturated constructors / pure-`Number`/`String`/`Bool` entry printers land later (a clear [failwith]
     / `pv_print_int`-only guards each).
 
@@ -394,13 +398,20 @@ let make_closure cx (env : env) (l : lifted) : string =
     env_word;
   clo
 
-(* Register a lambda for hoisting and return the [lifted] record (its captures fixed in a stable order). *)
-let lift cx (params : string list) (body : A.expr) : lifted =
+(* Register a lambda for hoisting and return the [lifted] record (its captures fixed in a stable order).
+   [env] is the enclosing local scope at the `CLam` site. *)
+let lift cx (env : env) (params : string list) (body : A.expr) : lifted =
   cx.fns <- cx.fns + 1;
   let bound = List.fold_left (fun s p -> SS.add p s) SS.empty params in
   (* A top-level global is read via its `@<mangle>$root` handle at the reference (ADR-0072 §2), never
-     captured, so it never rides a closure env — subtract [gkeys] from the free-var set. *)
-  let captures = SS.elements (SS.diff (fv_expr bound body) cx.gkeys) in
+     captured — subtract it from the free-var set. But a **global whose name is shadowed by an enclosing
+     local** (a bare-key top-level binding colliding with a local variable, e.g. a `where`-hoisted `go`
+     against another definition's local `go`) must still be **captured**: it is lexically the local, and
+     [read_var] resolves the local from the closure env. So exclude only the globals *not* shadowed by a
+     local in scope — else the lifted body would read the wrong `@<mangle>$root`. *)
+  let local_names = List.fold_left (fun s (x, _) -> SS.add x s) SS.empty env in
+  let globals_unshadowed = SS.diff cx.gkeys local_names in
+  let captures = SS.elements (SS.diff (fv_expr bound body) globals_unshadowed) in
   let l = { name = Printf.sprintf "fn_%d" cx.fns; params; captures; body } in
   cx.pending <- l :: cx.pending;
   l
@@ -631,7 +642,7 @@ and cexpr cx (env : env) ~(tail : bool) (c : A.cexpr) : string option =
         sym
         (String.concat ", " (List.map (fun o -> "i64 " ^ o) ops));
     finish t
-  | A.CLam (ps, body) -> finish (make_closure cx env (lift cx ps body))
+  | A.CLam (ps, body) -> finish (make_closure cx env (lift cx env ps body))
   | A.CApp (f, args) ->
     (* `f` and the args are mutually protected: a `foreign` callee or a `String` arg may allocate. *)
     let all = eval_atoms cx env (f :: args) in
