@@ -119,6 +119,7 @@
           "dependencies": [
             "console",
             "effect",
+            "fmt",
             "prelude",
             "record-studio"
           ]
