@@ -10,6 +10,7 @@
   purvasm.vm
   purvasm.pvm
   purvasm.ocaml_backend
+  purvasm.llvm_backend
   purvasm.ffi
   cmdliner
   unix))

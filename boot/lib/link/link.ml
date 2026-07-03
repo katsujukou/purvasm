@@ -223,6 +223,17 @@ let link
   in
   let entry_key = Lower.qualified_key entry_module entry in
   visit_key entry_key;
+  (* The entry must actually be defined — an unbound entry key would otherwise become a bare `Var` that
+     only fails downstream in a backend (an opaque "unbound variable" crash). Fail here, clearly. *)
+  if not (Hashtbl.mem defs entry_key || Hashtbl.mem foreign entry_key)
+  then
+    failwith
+      (Printf.sprintf
+         "entry not found: %s (from --entry-module %s --entry %s). Check the module \
+          name, the entry binding, and --corefn-dir."
+         entry_key
+         (String.concat "." entry_module)
+         entry);
   (* Emit only reached groups: foreign leaves outermost (closed, order-free), then
      the reached module groups in their original outermost-first order. *)
   let foreign_groups =

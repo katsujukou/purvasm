@@ -235,12 +235,90 @@ let build_action corefn_dir output entry_module entry arg value ulib =
 
 let abspath p = if Filename.is_relative p then Filename.concat (Sys.getcwd ()) p else p
 
-(* Compile a program to a *native* executable via the OCaml backend (ADR-0035/0036):
-   link the CoreFn closure to one term, normalise to optimised ANF, emit OCaml source,
-   and hand it to `ocamlopt`. The entry is treated as an `Effect` by default (the
-   generated runner forces it to unit); `--arg N` applies an `Int -> Int` entry and
-   `--value` takes a bare value. *)
-let native_action corefn_dir output entry_module entry arg value ulib =
+(* Locate the runtime staticlib (ADR-0071 §1) the LLVM backend links against: `--runtime-lib`, else
+   `$PURVASM_RT_A`, else the conventional built path under a repo root (walked up for `runtime/Cargo.toml`).
+   The compiler only *locates* it — the staticlib is a co-distributed, separately `cargo build`t artifact,
+   not something the compiler builds. *)
+let resolve_runtime_lib runtime_lib =
+  let exists p = if Sys.file_exists p then Some p else None in
+  let from_repo () =
+    let rec up d =
+      if Sys.file_exists (Filename.concat d "runtime/Cargo.toml")
+      then Some d
+      else (
+        let p = Filename.dirname d in
+        if p = d then None else up p)
+    in
+    Option.bind
+      (up (Sys.getcwd ()))
+      (fun root ->
+         match exists (Filename.concat root "runtime/target/debug/libpurvasm_rt.a") with
+         | Some p -> Some p
+         | None -> exists (Filename.concat root "runtime/target/release/libpurvasm_rt.a"))
+  in
+  let found =
+    match runtime_lib with
+    | Some p -> exists p
+    | None ->
+      (match Sys.getenv_opt "PURVASM_RT_A" with
+       | Some p when Sys.file_exists p -> Some p
+       | _ -> from_repo ())
+  in
+  match found with
+  | Some p -> p
+  | None ->
+    Stdlib.prerr_endline
+      "error: runtime staticlib (libpurvasm_rt.a) not found. Pass --runtime-lib PATH, \
+       set $PURVASM_RT_A, or `cargo build` in runtime/.";
+    Stdlib.exit 1
+
+(* The LLVM native backend (ADR-0071/0072): lower optimised ANF to per-module `.ll` objects + an
+   init/entry object (ADR-0072 §2/§3), compile each with `clang -c`, and dead-strip-link them with the
+   runtime staticlib into a native executable — the CLI form of the e2e differential harness. *)
+let emit_native_llvm ~bdir ~output ~is_effect ~runtime_lib anf =
+  let rt = resolve_runtime_lib runtime_lib in
+  let split = Llvm_backend.Codegen_llvm.program_split ~is_effect anf in
+  let sh label cmd =
+    if Sys.command cmd <> 0
+    then (
+      Stdlib.Printf.eprintf "%s failed (see logs under %s)\n" label bdir;
+      Stdlib.exit 1)
+  in
+  let compile_obj tag src =
+    let ll = Filename.concat bdir (tag ^ ".ll") in
+    let obj = Filename.concat bdir (tag ^ ".o") in
+    write_file ll src;
+    sh
+      "clang -c"
+      (Stdlib.Printf.sprintf
+         "clang -c %s -o %s 2>%s"
+         (Filename.quote ll)
+         (Filename.quote obj)
+         (Filename.quote (Filename.concat bdir (tag ^ ".clang.log"))));
+    obj
+  in
+  let objs =
+    List.mapi
+      (fun i (_, src) -> compile_obj (Stdlib.Printf.sprintf "mod_%d" i) src)
+      split.modules
+    @ [ compile_obj "entry" split.entry ]
+  in
+  let exe = abspath (Filename.concat output "app") in
+  sh
+    "link"
+    (Stdlib.Printf.sprintf
+       "clang -Wl,-dead_strip %s %s -o %s 2>%s"
+       (String.concat " " (List.map Filename.quote objs))
+       (Filename.quote rt)
+       (Filename.quote exe)
+       (Filename.quote (Filename.concat bdir "link.log")));
+  Stdlib.Printf.printf "wrote %s\n" exe
+
+(* Compile a program to a *native* executable (ADR-0035/0036 OCaml backend, or ADR-0071/0072 LLVM backend):
+   link the CoreFn closure to one term, normalise to optimised ANF, then emit via the chosen [backend]. The
+   entry is treated as an `Effect` by default (the runner forces it to unit); `--arg N` applies an
+   `Int -> Int` entry and `--value` takes a bare value. *)
+let native_action backend runtime_lib corefn_dir output entry_module entry arg value ulib =
   mkdir_p (build_dir output);
   let em = split_module entry_module in
   let term0 =
@@ -266,24 +344,30 @@ let native_action corefn_dir output entry_module entry arg value ulib =
          (Middle_end.Passes.Dict_elim.run (Middle_end.Transl.transl main_term)))
   in
   let bdir = build_dir output in
-  write_file
-    (Filename.concat bdir "app.ml")
-    (Ocaml_backend.Codegen_ml.program ~is_effect anf);
-  let exe = abspath (Filename.concat output "app") in
-  let rc =
-    Sys.command
-      (Stdlib.Printf.sprintf
-         "cd %s && ocamlfind ocamlopt app.ml -o %s 2>ocamlopt.log"
-         (Filename.quote (abspath bdir))
-         (Filename.quote exe))
-  in
-  if rc <> 0
-  then (
-    Stdlib.Printf.eprintf
-      "ocamlopt failed; see %s\n"
-      (Filename.concat bdir "ocamlopt.log");
-    Stdlib.exit 1);
-  Stdlib.Printf.printf "wrote %s\n" exe
+  match backend with
+  | "llvm" -> emit_native_llvm ~bdir ~output ~is_effect ~runtime_lib anf
+  | "ocaml" ->
+    write_file
+      (Filename.concat bdir "app.ml")
+      (Ocaml_backend.Codegen_ml.program ~is_effect anf);
+    let exe = abspath (Filename.concat output "app") in
+    let rc =
+      Sys.command
+        (Stdlib.Printf.sprintf
+           "cd %s && ocamlfind ocamlopt app.ml -o %s 2>ocamlopt.log"
+           (Filename.quote (abspath bdir))
+           (Filename.quote exe))
+    in
+    if rc <> 0
+    then (
+      Stdlib.Printf.eprintf
+        "ocamlopt failed; see %s\n"
+        (Filename.concat bdir "ocamlopt.log");
+      Stdlib.exit 1);
+    Stdlib.Printf.printf "wrote %s\n" exe
+  | other ->
+    Stdlib.Printf.eprintf "unknown backend: %s (expected ocaml|llvm)\n" other;
+    Stdlib.exit 1
 
 let compile_action corefn output =
   mkdir_p (build_dir output);
@@ -400,12 +484,45 @@ let native_cmd =
             "A ulib corefn dir of registry-package patches, overlaid over --corefn-dir \
              (ADR-0038).")
   in
+  let backend =
+    Arg.(
+      value
+      & opt (enum [ "ocaml", "ocaml"; "llvm", "llvm" ]) "ocaml"
+      & info
+          [ "backend" ]
+          ~docv:"BACKEND"
+          ~doc:
+            "Native backend: $(b,ocaml) (OCaml source + ocamlopt) or $(b,llvm) (LLVM IR \
+             + clang, linked with the runtime staticlib).")
+  in
+  let runtime_lib =
+    Arg.(
+      value
+      & opt (some string) None
+      & info
+          [ "runtime-lib" ]
+          ~docv:"PATH"
+          ~doc:
+            "Path to the runtime staticlib libpurvasm_rt.a ($(b,llvm) backend). Defaults \
+             to $(b,\\$PURVASM_RT_A) or runtime/target/{debug,release}.")
+  in
   Cmd.v
     (Cmd.info
        "native"
        ~doc:
-         "Compile a CoreFn dir to a native executable via the OCaml backend (ocamlopt).")
-    Term.(const native_action $ corefn_dir_arg $ output_arg $ em $ e $ arg $ value $ ulib)
+         "Compile a CoreFn dir to a native executable via the $(b,ocaml) (ocamlopt) or \
+          $(b,llvm) (clang + runtime staticlib) backend.")
+    Term.(
+      const native_action
+      $ backend
+      $ runtime_lib
+      $ corefn_dir_arg
+      $ output_arg
+      $ em
+      $ e
+      $ arg
+      $ value
+      $ ulib)
 
 let compile_cmd =
   let open Cmdliner in
@@ -429,4 +546,13 @@ let cmd =
     (Cmd.info "purvm" ~version:"0.1.0" ~doc:"The PURVASM bytecode toolchain.")
     [ build_cmd; native_cmd; compile_cmd; run_cmd; demo_cmd ]
 
-let () = Stdlib.exit (Cmdliner.Cmd.eval cmd)
+(* A toolchain error (a bad entry, a missing runtime lib, an unimplemented codegen path) is raised as
+   [Failure]; surface it as a clean one-line CLI error rather than an uncaught-exception stack trace. *)
+let () =
+  (* [~catch:false] so a toolchain [Failure] propagates here instead of cmdliner printing it as an
+     "internal error" with a backtrace; we surface it as a clean one-line CLI error. *)
+  match Cmdliner.Cmd.eval ~catch:false cmd with
+  | code -> Stdlib.exit code
+  | exception Failure msg ->
+    Stdlib.prerr_endline ("purvm: error: " ^ msg);
+    Stdlib.exit 1
