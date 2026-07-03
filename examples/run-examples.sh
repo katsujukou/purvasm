@@ -130,6 +130,13 @@ echo "$EXAMPLES" | while read -r name module xfail; do
         printf '%-18s XFAIL (%s)\n' "$name" "${xfail#XFAIL:}"
       else
         printf '%-18s %s   (logs: %s)\n' "$name" "$status" "$base"
+        # The work dir is a temp dir (gone after the run, e.g. on CI), so a failure dumps its
+        # evidence inline: the tail of every non-empty build log / runtime stderr / column output.
+        for f in "$base"/*.build.log "$base"/*.err "$base"/*.out; do
+          [ -s "$f" ] || continue
+          echo "----- $(basename "$f") (last 15 lines) -----" >&2
+          tail -15 "$f" >&2
+        done
         echo 1 >"$WORK/.failed"
       fi
       ;;

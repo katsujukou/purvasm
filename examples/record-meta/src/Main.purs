@@ -36,7 +36,7 @@ main = do
     nameAndProfile = shrink (alice // { profile: aboutAlice })
   logShow nameAndProfile
   logShow (recordKeys nameAndProfile)
-  let 
+  let
     nameOnly :: { name :: String }
     nameOnly = shrink nameAndProfile
     nameKey = reflectSymbol $ SingletonRecord.key nameOnly

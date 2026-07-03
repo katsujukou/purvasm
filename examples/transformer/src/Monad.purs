@@ -37,11 +37,11 @@ derive newtype instance MonadError Error AppM
 runAppM :: forall a. Env -> State -> AppM a -> Effect (Tuple (Either Error a) State)
 runAppM env state (AppM m) = runStateT (runReaderT (runExceptT m) env) state
 
-consume :: AppM Unit 
+consume :: AppM Unit
 consume = AppM do
   s0 <- get
-  { enthusiasm } <- ask 
-  let 
+  { enthusiasm } <- ask
+  let
     s1 = case enthusiasm of
       Passionate -> s0 { energy = s0.energy - 3 }
       Mild -> s0 { energy = s0.energy - 1 }
@@ -50,17 +50,17 @@ consume = AppM do
   when (s1.energy < 0) do
     Console.log "I've exhausted. Please let me rest..."
     throwError OutOfEnergy
-  
+
 speak :: String -> AppM Unit
 speak str = do
   env@{ enthusiasm } <- ask
   s0 <- get
   when (env.debug) $ Console.logShow s0
-  if s0.energy >= 0 then do 
-      Console.log $ str <> punctuaion enthusiasm
-      consume
+  if s0.energy >= 0 then do
+    Console.log $ str <> punctuaion enthusiasm
+    consume
   else do
-      Console.log "(Cannot speak more...)"
+    Console.log "(Cannot speak more...)"
   where
   punctuaion = case _ of
     Passionate -> "!!"

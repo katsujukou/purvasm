@@ -14,15 +14,15 @@ run = runAppM env initialState >=> fst >>> either (describe >>> Exn.throw) pure
   where
   env = { debug: false, enthusiasm: Passionate }
   initialState = { energy: 7 }
-  describe = case _ of 
+  describe = case _ of
     OutOfEnergy -> "Out of energy!"
 
 main :: Effect Unit
 main = run do
-  (do 
-    speak "Hello"
-    speak "I'm a Purvasm Native program"
-    speak "It's a really cool app"
+  ( do
+      speak "Hello"
+      speak "I'm a Purvasm Native program"
+      speak "It's a really cool app"
   ) `catchError` handleOutOfEnergy
   where
   handleOutOfEnergy = case _ of
