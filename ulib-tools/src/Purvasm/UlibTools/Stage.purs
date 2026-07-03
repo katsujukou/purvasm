@@ -17,6 +17,7 @@ module Purvasm.UlibTools.Stage
   , compileCorefn
   , validate
   , stageDeclaredDeps
+  , stageNativeForeign
   ) where
 
 import Prelude
@@ -210,6 +211,49 @@ stageDeclaredDeps { ulibDir, packagesDir } patches srcDir = do
   for_ (Set.toUnfoldable toStage :: Array String) \name -> do
     src <- FS.joinPath [ packagesDir, name, "src" ]
     copyTree src srcDir
+
+-- ADR-0073: stage the packages' native `foreign` `.c` sources for boot's native link.
+
+-- | Copy each package's native-foreign `.c` (declared in `ulib/<pkg>/ulib.json`'s `foreign` map) into
+-- | `<out>/native/<pkg>/…` and write an aggregated `<out>/ulib.json` whose `foreign` map keys each
+-- | qualified foreign to its `.c` path relative to `<out>`. boot's native backend reads this manifest and
+-- | compiles the reachable `.c`, resolving each `pvf_*` symbol from exactly one provider (ADR-0073 §3).
+-- | Namespacing the copies by package avoids a name clash between two packages' `.c` files. No native
+-- | foreign anywhere ⇒ no manifest is written (the overlay is presence-driven, ADR-0038).
+stageNativeForeign
+  :: forall r
+   . FilePath
+  -> FilePath
+  -> Array Patch
+  -> Run (FS + EXCEPT String + r) Unit
+stageNativeForeign ulibDir out patches = do
+  let ulibPkgs = Array.nub (map _.package patches)
+  perPkg <- traverse readPkgForeign ulibPkgs
+  case Array.concat perPkg of
+    [] -> pure unit
+    entries -> do
+      staged <- traverse copyOne entries
+      manifestPath <- FS.joinPath [ out, "ulib.json" ]
+      FS.writeText manifestPath (Manifest.renderForeignManifest staged)
+  where
+  readPkgForeign pkg = do
+    path <- FS.joinPath [ ulibDir, pkg, "ulib.json" ]
+    FS.readText path >>= case _ of
+      Nothing -> pure []
+      Just src -> either
+        (\e -> throw $ Fmt.fmt @"ulib: {pkg}/ulib.json: {e}" { pkg, e })
+        (\pairs -> pure (map (\(Tuple k v) -> { pkg, key: k, srcRel: v }) pairs))
+        (Manifest.parseForeign src)
+  copyOne { pkg, key, srcRel } = do
+    src <- FS.joinPath [ ulibDir, pkg, srcRel ]
+    dest <- FS.joinPath [ out, "native", pkg, srcRel ]
+    content <- FS.readText src >>= maybe
+      (throw $ Fmt.fmt @"ulib: cannot read native foreign {src}" { src })
+      pure
+    FS.dirname dest >>= FS.mkdirP
+    FS.writeText dest content
+    relInOut <- FS.joinPath [ "native", pkg, srcRel ]
+    pure (Tuple key relInOut)
 
 -- | Directory entries via the FS effect (`Nothing`/absent → empty).
 listDir :: forall r. FilePath -> Run (FS + r) (Array String)

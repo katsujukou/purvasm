@@ -7,6 +7,8 @@ module Purvasm.UlibTools.Manifest
   , Fidelity(..)
   , TestSpec
   , parseDependencies
+  , parseForeign
+  , renderForeignManifest
   , parseTest
   , parseBowerDependencies
   , parseRegistryVersion
@@ -21,7 +23,7 @@ module Purvasm.UlibTools.Manifest
 
 import Prelude
 
-import Data.Argonaut.Core (toArray, toObject, toString)
+import Data.Argonaut.Core (fromObject, fromString, stringify, toArray, toObject, toString)
 import Data.Argonaut.Parser (jsonParser)
 import Data.Array as Array
 import Data.Either (Either(..), note)
@@ -34,6 +36,7 @@ import Data.String (Pattern(..))
 import Data.String as String
 import Data.String.CodeUnits as SCU
 import Data.Traversable (traverse)
+import Data.Tuple (Tuple(..))
 import Foreign.Object as Object
 
 -- | Where a declared dependency resolves. `Resolved` = present in the staged `.spago/p`;
@@ -145,6 +148,31 @@ parseDependencies src = do
     Just d -> do
       arr <- note "ulib.json: 'dependencies' must be an array" (toArray d)
       traverse (note "ulib.json: 'dependencies' must contain only strings" <<< toString) arr
+
+-- | The `foreign` object of a `ulib.json` (ADR-0073 §3): each native foreign's qualified key → the `.c`
+-- | source implementing it (a path relative to the package dir). Absent field ⇒ no native foreigns. A
+-- | non-string value is a hard error (a malformed `source` mapping should not silently drop a foreign).
+parseForeign :: String -> Either String (Array (Tuple String String))
+parseForeign src = do
+  json <- jsonParser src
+  obj <- note "ulib.json: top level is not an object" (toObject json)
+  case Object.lookup "foreign" obj of
+    Nothing -> Right []
+    Just f -> do
+      fo <- note "ulib.json: 'foreign' must be an object" (toObject f)
+      traverse pair (Object.toUnfoldable fo :: Array (Tuple String _))
+  where
+  pair (Tuple k v) =
+    Tuple k <$> note ("ulib.json: 'foreign." <> k <> "' must be a string") (toString v)
+
+-- | Render the aggregated native-foreign manifest boot's native backend reads (ADR-0073 §3): a JSON
+-- | object `{ "foreign": { <key>: <path>, … } }`, where each path is relative to the staged `ulib` dir.
+-- | The inverse of [parseForeign] at the aggregation seam (staging writes it; boot reads it).
+renderForeignManifest :: Array (Tuple String String) -> String
+renderForeignManifest entries =
+  stringify (fromObject (Object.singleton "foreign" (fromObject inner)))
+  where
+  inner = Object.fromFoldable (map (\(Tuple k p) -> Tuple k (fromString p)) entries)
 
 -- | The package names of a `spago.yaml`'s first `dependencies:` block (its `package.dependencies`,
 -- | which precedes any `test.dependencies`). Block list form only — the form the in-repo packages

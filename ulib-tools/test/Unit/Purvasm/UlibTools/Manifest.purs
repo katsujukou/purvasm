@@ -7,7 +7,7 @@ import Data.Map as Map
 import Data.Maybe (Maybe(..))
 import Data.Set as Set
 import Data.Tuple (Tuple(..))
-import Purvasm.UlibTools.Manifest (Fidelity(..), Resolution(..), classifyDep, findCycle, inRepoClosure, parseBowerDependencies, parseDependencies, parsePackageSet, parseRegistryVersion, parseSpagoDependencies, parseTest, repoSlug, stripVersion)
+import Purvasm.UlibTools.Manifest (Fidelity(..), Resolution(..), classifyDep, findCycle, inRepoClosure, parseBowerDependencies, parseDependencies, parseForeign, parsePackageSet, parseRegistryVersion, parseSpagoDependencies, parseTest, renderForeignManifest, repoSlug, stripVersion)
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
 
@@ -24,6 +24,27 @@ spec = do
         isLeft (parseDependencies """{"dependencies":5}""") `shouldEqual` true
       it "fails on a non-object top level" do
         isLeft (parseDependencies "[]") `shouldEqual` true
+
+    describe "parseForeign" do
+      it "reads the foreign map as key/source pairs" do
+        map Map.fromFoldable (parseForeign """{"foreign":{"Data.Show.showNumberImpl":"Data.Show.foreign.c"}}""")
+          `shouldEqual` Right (Map.fromFoldable [ Tuple "Data.Show.showNumberImpl" "Data.Show.foreign.c" ])
+      it "treats a missing foreign field as no native foreigns" do
+        parseForeign """{"dependencies":["prelude"]}""" `shouldEqual` Right []
+      it "fails on a non-object foreign field" do
+        isLeft (parseForeign """{"foreign":5}""") `shouldEqual` true
+      it "fails on a non-string source value" do
+        isLeft (parseForeign """{"foreign":{"A.f":42}}""") `shouldEqual` true
+      it "fails on a non-object top level" do
+        isLeft (parseForeign "[]") `shouldEqual` true
+
+    describe "renderForeignManifest" do
+      it "round-trips through parseForeign" do
+        let entries = [ Tuple "A.f" "native/p/A.foreign.c", Tuple "B.g" "native/q/B.foreign.c" ]
+        map Map.fromFoldable (parseForeign (renderForeignManifest entries))
+          `shouldEqual` Right (Map.fromFoldable entries)
+      it "renders an empty map as an empty foreign object" do
+        parseForeign (renderForeignManifest []) `shouldEqual` Right []
 
     describe "parseTest" do
       it "treats a missing test block as not-yet-tested" do

@@ -154,6 +154,20 @@
           "dependencies": []
         }
       },
+      "ex-transformer": {
+        "path": "examples/transformer",
+        "core": {
+          "dependencies": [
+            "console",
+            "effect",
+            "prelude",
+            "transformers"
+          ]
+        },
+        "test": {
+          "dependencies": []
+        }
+      },
       "purvasm-base": {
         "path": "packages/purvasm-base",
         "core": {

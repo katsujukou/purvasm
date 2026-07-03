@@ -93,6 +93,8 @@ cmd opts = do
 
   FS.mkdirP out
   for_ patches (extractCorefn outputDir out)
+  -- ADR-0073: stage any native `foreign` `.c` + the aggregated manifest beside the corefn.
+  Stage.stageNativeForeign opts.ulibDir out patches
 
   _ <- Proc.exec "rm" [ "-rf", work ]
   Log.info $ Fmt.fmt @"ulib: wrote patched corefn to {out}" { out }
