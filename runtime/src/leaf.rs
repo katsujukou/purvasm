@@ -64,6 +64,86 @@ extern "C" fn leaf_write_line_thunk(ctx: *mut Heap, clo: u64, _args: *const u64,
     })
 }
 
+/// `Purvasm.Stdio.writeErrLineImpl :: String -> Effect Unit` (ADR-0068) — the stderr sibling of
+/// [`leaf_write_line`], same `\s -> thunk` shape.
+#[export_name = "pvf_Purvasm_2eStdio_2ewriteErrLineImpl"]
+extern "C" fn leaf_write_err_line(
+    ctx: *mut Heap,
+    _clo: u64,
+    args: *const u64,
+    nargs: usize,
+) -> u64 {
+    // SAFETY: as [`leaf_write_line`].
+    guard(|| unsafe {
+        let h = heap(ctx);
+        let s = args_slice(args, nargs)[0];
+        h.trace_value("writeErrLine arg", s);
+        let env = h.new_array(&[s]);
+        h.new_closure_raw(leaf_write_err_line_thunk as usize as u64, 1, env.as_word())
+            .as_word()
+            .to_bits()
+    })
+}
+
+/// The `writeErrLine` thunk: `\_u -> (write stderr; flush; unit)`. Unlike [`leaf_write_line_thunk`]
+/// this **writes `stderr` directly and flushes per call — never the drained capture sink** (ADR-0074
+/// §5 write-before-exit): `exit` skips the sink drain of anything still buffered there, and stderr is
+/// not part of the differential's captured-stdout comparison, so nothing may buffer it.
+extern "C" fn leaf_write_err_line_thunk(
+    ctx: *mut Heap,
+    clo: u64,
+    _args: *const u64,
+    _n: usize,
+) -> u64 {
+    // SAFETY: as [`leaf_write_line_thunk`].
+    guard(|| unsafe {
+        use std::io::Write;
+        let h = heap(ctx);
+        let cp = HeapPtr::from_word(TaggedWord::from_bits(clo));
+        let env = HeapPtr::from_word(h.read_field(cp, 2));
+        let s = h.str_read(HeapPtr::from_word(h.read_field(env, 0)));
+        let err = std::io::stderr();
+        let mut lock = err.lock();
+        // A stderr write/flush failure is a fatal boundary fault (ADR-0071 §7), as in `pv_drain_output`.
+        writeln!(lock, "{s}").expect("writeErrLine: stderr write failed");
+        lock.flush().expect("writeErrLine: stderr flush failed");
+        TaggedWord::unit().to_bits()
+    })
+}
+
+/// `Purvasm.System.Process.exitImpl :: Int -> Effect Unit` (ADR-0056) — `\code -> thunk`; the force
+/// terminates the process (ADR-0074 §5).
+#[export_name = "pvf_Purvasm_2eSystem_2eProcess_2eexitImpl"]
+extern "C" fn leaf_exit(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: usize) -> u64 {
+    // SAFETY: as [`leaf_write_line`]; `args[0]` is an `Int` immediate, captured as an ordinary value.
+    guard(|| unsafe {
+        let h = heap(ctx);
+        let code = args_slice(args, nargs)[0];
+        h.trace_value("exit arg", code);
+        let env = h.new_array(&[code]);
+        h.new_closure_raw(leaf_exit_thunk as usize as u64, 1, env.as_word())
+            .as_word()
+            .to_bits()
+    })
+}
+
+/// The `exit` thunk: `\_u -> (drain the stdout sink; terminate)`. **Draining before terminating is the
+/// ADR-0074 §5 write-before-exit contract**: the v1 stdout is a captured sink flushed at exit
+/// (`pv_drain_output`), so terminating without the drain would silently drop every line the program
+/// already wrote. Exit is the one leaf allowed to run the drain mid-program — nothing runs after it.
+extern "C" fn leaf_exit_thunk(ctx: *mut Heap, clo: u64, _args: *const u64, _n: usize) -> u64 {
+    // SAFETY: as [`leaf_write_line_thunk`]; `pv_drain_output` is called after the last `h` use (fresh
+    // exclusive borrow), and `exit` never returns.
+    guard(|| unsafe {
+        let h = heap(ctx);
+        let cp = HeapPtr::from_word(TaggedWord::from_bits(clo));
+        let env = HeapPtr::from_word(h.read_field(cp, 2));
+        let code = h.read_field(env, 0).as_int();
+        crate::abi::pv_drain_output(ctx);
+        std::process::exit(code)
+    })
+}
+
 /// `Partial._crashWith :: String -> a` — a pure partial crash: forcing it halts with the message
 /// (matches `codegen_ml`'s `stuck`). The panic is contained at the FFI boundary (ADR-0071 §7) → abort.
 #[export_name = "pvf_Partial_2e_5fcrashWith"]
@@ -181,6 +261,33 @@ mod tests {
             let unit = [TaggedWord::unit().to_bits()];
             let _ = pv_apply(ctx, thunk, unit.as_ptr(), unit.len());
             assert_eq!(heap(ctx).output(), ["hi".to_string()]);
+            pv_runtime_free(ctx);
+        }
+    }
+
+    /// The testable halves of the ADR-0074 §5 contract: `writeErrLine`'s force must **not** touch the
+    /// captured stdout sink (it writes stderr directly), and `exitImpl` applied to its argument returns
+    /// the thunk **without** terminating (the exit fires only on force — which a test cannot run).
+    #[test]
+    fn write_err_line_bypasses_the_sink_and_exit_is_thunked() {
+        let ctx = pv_runtime_new(1 << 12);
+        unsafe {
+            let wel = leaf(ctx, leaf_write_err_line, 1);
+            let s = heap(ctx).new_str(b"boom").as_word().to_bits();
+            let sarg = [s];
+            let thunk = pv_apply(ctx, wel, sarg.as_ptr(), sarg.len());
+            let unit = [TaggedWord::unit().to_bits()];
+            let r = pv_apply(ctx, thunk, unit.as_ptr(), unit.len());
+            assert_eq!(TaggedWord::from_bits(r), TaggedWord::unit());
+            assert!(
+                heap(ctx).output().is_empty(),
+                "stderr write must never ride the stdout sink"
+            );
+            // exitImpl 0 returns the thunk un-forced: the test process is still alive to assert it.
+            let ex = leaf(ctx, leaf_exit, 1);
+            let zero = [TaggedWord::int(0).to_bits()];
+            let exit_thunk = pv_apply(ctx, ex, zero.as_ptr(), zero.len());
+            assert!(!TaggedWord::from_bits(exit_thunk).is_immediate());
             pv_runtime_free(ctx);
         }
     }
