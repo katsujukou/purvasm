@@ -36,8 +36,8 @@
       binding (a partial application leaking out of a mis-resolved recursive helper).
     Pure-`Number`/`String`/`Bool` entry printers land later (a `pv_print_int`-only guard). A top-level
     **bare-key shadow** — two top-level bindings sharing an unqualified key (both `where`-hoisted to the
-    same name) — is not yet handled by the flat root-handle-global scheme (they would double-define
-    `@<mangle>$root`); it needs alpha-renaming at the spine, a follow-up.
+    same name), which the flat root-handle-global scheme cannot double-define — is resolved before
+    splitting by [uniquify_toplevel] (spine-level alpha-renaming of the shadowing binding).
 
     Every guest value is one `i64` tagged word (ADR-0064 §1); the module calls the runtime's `extern "C"`
     surface (`pv_*`, ADR-0071). Rooting is **root-on-create** (ADR-0072 §6, the conservative first cut):
@@ -49,6 +49,7 @@
 module A = Middle_end.Anf
 module C = Cesk.Ast
 module SS = Set.Make (String)
+module SM = Map.Make (String)
 
 (* --- immediates (ADR-0064 §1): a scalar is `(payload << 1) | 1`, an i64 constant, no call ---------- *)
 
@@ -1098,6 +1099,97 @@ let gdef_init_key : gdef -> string = function
   | Gfun (k, _, _) | Gcaf (k, _) -> k
   | Grec ms -> fst (List.hd ms)
 
+(* --- top-level key uniquification (ADR-0072 §2) ---------------------------------------------------- *)
+
+(* Capture-avoiding rename of *free* variable occurrences per [ren] (a name → replacement map). A local
+   binder shadowing a renamed name removes it from [ren] within that scope, so only the intended free
+   references are rewritten. Used to disambiguate two top-level bindings that share a bare key. *)
+let ren_atom (ren : string SM.t) : A.atom -> A.atom = function
+  | A.AVar x as a ->
+    (match SM.find_opt x ren with
+     | Some x' -> A.AVar x'
+     | None -> a)
+  | (A.ALit _ | A.AForeign _) as a -> a
+
+let rec ren_expr (ren : string SM.t) (e : A.expr) : A.expr =
+  match e with
+  | A.Ret c -> A.Ret (ren_cexpr ren c)
+  | A.Let (x, c, body) -> A.Let (x, ren_cexpr ren c, ren_expr (SM.remove x ren) body)
+  | A.LetRec (binds, body) ->
+    let ren' = List.fold_left (fun r (x, _) -> SM.remove x r) ren binds in
+    A.LetRec (List.map (fun (x, rhs) -> x, ren_expr ren' rhs) binds, ren_expr ren' body)
+
+and ren_cexpr (ren : string SM.t) (c : A.cexpr) : A.cexpr =
+  match c with
+  | A.CAtom a -> A.CAtom (ren_atom ren a)
+  | A.CLam (ps, b) ->
+    A.CLam (ps, ren_expr (List.fold_left (fun r p -> SM.remove p r) ren ps) b)
+  | A.CApp (f, args) -> A.CApp (ren_atom ren f, List.map (ren_atom ren) args)
+  | A.CPrim (op, args) -> A.CPrim (op, List.map (ren_atom ren) args)
+  | A.CArray args -> A.CArray (List.map (ren_atom ren) args)
+  | A.CCtor (n, ar, args) -> A.CCtor (n, ar, List.map (ren_atom ren) args)
+  | A.CRecord fs -> A.CRecord (List.map (fun (l, a) -> l, ren_atom ren a) fs)
+  | A.CAccessor (a, l) -> A.CAccessor (ren_atom ren a, l)
+  | A.CUpdate (a, fs) ->
+    A.CUpdate (ren_atom ren a, List.map (fun (l, x) -> l, ren_atom ren x) fs)
+  | A.CIf (a, t, e) -> A.CIf (ren_atom ren a, ren_expr ren t, ren_expr ren e)
+  | A.CCase (scruts, alts) ->
+    A.CCase (List.map (ren_atom ren) scruts, List.map (ren_alt ren) alts)
+
+and ren_alt (ren : string SM.t) (alt : A.alt) : A.alt =
+  let bvs = List.fold_left (fun a b -> SS.union a (binder_vars b)) SS.empty alt.binders in
+  let ren' = SS.fold SM.remove bvs ren in
+  let result =
+    match alt.result with
+    | A.Uncond e -> A.Uncond (ren_expr ren' e)
+    | A.Guarded gs ->
+      A.Guarded (List.map (fun (g, e) -> ren_expr ren' g, ren_expr ren' e) gs)
+  in
+  { alt with result }
+
+(** Make every top-level binding key **unique** (ADR-0072 §2). The flat root-handle-global scheme cannot
+    represent two top-level bindings that share a bare key — e.g. two `where`-hoisted helpers both named
+    `alg` lexically shadow in the linked spine but would double-define `@<mangle>$root`. The whole-program
+    path handles this via SSA shadowing; the per-module path needs distinct keys. So walk the spine and, on
+    a re-bound key, rename the *shadowing* (later) binding and capture-avoidingly rewrite its references in
+    scope (the rest of the spine, and its own RHS for a recursive group). References before the shadow keep
+    the earlier binding. A no-op when no key repeats. *)
+let uniquify_toplevel (e : A.expr) : A.expr =
+  let counter = ref 0 in
+  let fresh base =
+    incr counter;
+    Printf.sprintf "%s$sh%d" base !counter
+  in
+  let rec walk (ren : string SM.t) (seen : SS.t) (e : A.expr) : A.expr =
+    match e with
+    | A.Let (k, c, rest) ->
+      (* the RHS is in the enclosing scope (before this binding shadows), so it uses the current [ren] *)
+      let c = ren_cexpr ren c in
+      if SS.mem k seen
+      then (
+        let k' = fresh k in
+        A.Let (k', c, walk (SM.add k k' ren) seen rest))
+      else A.Let (k, c, walk ren (SS.add k seen) rest)
+    | A.LetRec (binds, rest) ->
+      (* a recursive group: rename any member key already seen, then rewrite the members' RHS *and* the
+         rest with the group's renames (members reference each other by key) *)
+      let seen', ren', renamed =
+        List.fold_left
+          (fun (seen, ren, acc) (k, rhs) ->
+             if SS.mem k seen
+             then (
+               let k' = fresh k in
+               seen, SM.add k k' ren, (k', rhs) :: acc)
+             else SS.add k seen, ren, (k, rhs) :: acc)
+          (seen, ren, [])
+          binds
+      in
+      let binds' = List.rev_map (fun (k, rhs) -> k, ren_expr ren' rhs) renamed in
+      A.LetRec (binds', walk ren' seen' rest)
+    | main -> ren_expr ren main
+  in
+  walk SM.empty SS.empty e
+
 (** Split a linked top-level spine into its global definitions (in spine = dependency order) and the entry
     expression (the first non-binding node = `main`). Mirrors `Vm.Codegen.program`; B1's single-module
     stand-in until B2 drives real per-module ANF. *)
@@ -1280,7 +1372,7 @@ let extern_global_decls cx ~(defined : SS.t) : string =
 let program_modular ?(is_effect = false) ?(heap_words = default_heap_words) (e : A.expr)
   : string
   =
-  let gdefs, entry = split_spine e in
+  let gdefs, entry = split_spine (uniquify_toplevel e) in
   let gkeys = SS.of_list (List.concat_map gdef_keys gdefs) in
   let cx = make_cx ~gkeys () in
   (* every binding is emitted, but only the reachable ones are initialised (dead init is pruned; the
@@ -1382,7 +1474,7 @@ type split_output =
 let program_split ?(is_effect = false) ?(heap_words = default_heap_words) (e : A.expr)
   : split_output
   =
-  let gdefs, entry = split_spine e in
+  let gdefs, entry = split_spine (uniquify_toplevel e) in
   let gkeys = SS.of_list (List.concat_map gdef_keys gdefs) in
   (* partition gdefs by module, preserving first-appearance module order and per-module spine order *)
   let order = ref [] in

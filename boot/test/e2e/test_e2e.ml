@@ -1573,6 +1573,25 @@ let test_llvm_split_local_shadows_global () =
                    , C.Lam ("z", C.App (C.Var "go", C.Var "z")) ) )
            , C.App (C.App (C.Var "f", int 10), int 5) ) ))
 
+(* **Two top-level bindings sharing a bare key** (ADR-0072 §2). The flat root-handle-global scheme cannot
+   double-define `@<mangle alg>$root`; [uniquify_toplevel] renames the shadowing binding and rewrites its
+   in-scope references, so the two `alg`s become distinct globals. `let alg = 10 in let g = alg in let alg
+   = \x -> x + g in alg 100` → 110 (the outer `alg` is read by `g` before the inner shadows; `alg 100`
+   uses the inner). Unfixed, this is a duplicate-symbol link error (both `alg`s reachable). *)
+let test_llvm_split_toplevel_shadow () =
+  same_on_llvm_split
+    "split toplevel shadow"
+    (C.Let
+       ( "alg"
+       , int 10
+       , C.Let
+           ( "g"
+           , C.Var "alg"
+           , C.Let
+               ( "alg"
+               , C.Lam ("x", C.Prim (C.AddInt, [ C.Var "x"; C.Var "g" ]))
+               , C.App (C.Var "alg", int 100) ) ) ))
+
 (* Real compiled-PureScript programs spanning **multiple modules**, each compiled to its own `.o` and
    linked: the genuine separate-compilation exercise (`Main` + `Data.*`/`Prelude` module objects + the
    init/entry object), differential-checked against the oracle. *)
@@ -2341,6 +2360,10 @@ let llvm_groups =
             "split_local_shadows_global"
             `Quick
             test_llvm_split_local_shadows_global
+        ; Alcotest.test_case
+            "split_toplevel_shadow"
+            `Quick
+            test_llvm_split_toplevel_shadow
         ; Alcotest.test_case "split_prelude_answer" `Quick test_llvm_split_prelude_answer
         ; Alcotest.test_case
             "split_prelude_quotient"

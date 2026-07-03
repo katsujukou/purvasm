@@ -72,6 +72,14 @@
 > position. `read_var` already prefers the local (env before `gkeys`); the capture set must match. This is
 > split-path-only (the whole-program path captures everything). A follow-up may instead give bare-key
 > hoisted helpers module-qualified keys so the collision cannot arise.
+>
+> **Correction (2026-07-03, top-level-shadow fix):** the complementary case — **two top-level bindings
+> sharing a bare key** (both `where`-hoisted to the same name, lexically shadowing in the linked spine) —
+> is fixed by a pre-split **`uniquify_toplevel`** pass (§2): it walks the spine and renames the *shadowing*
+> binding, capture-avoidingly rewriting its in-scope references (rest of spine + a recursive group's own
+> RHS), so distinct globals result. The whole-program path handles this via SSA shadowing and is untouched;
+> the flat root-handle-global scheme cannot represent two `@<mangle>$root` of the same key, so the per-module
+> path needs the rename. (Surfaced once unsaturated constructors let a real program reach the link stage.)
 
 ## Context
 
