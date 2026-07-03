@@ -7,9 +7,10 @@
 //! `ord_cmp`, …) are guest terms the linker's `Ffi.resolver` substitutes before codegen (they lower to
 //! ordinary primops/`apply`), so they are **not** leaves.
 //!
-//! v1 provides the leaves on demand (the minimal-FFI policy): the CORE set that effect demos need is
-//! here; the `String`-byte / `Number`-math / `FS` / `System` families and the float-formatting `show`s
-//! are added when the self-compiler differential reaches them. An unknown key is a clear fault.
+//! v1 provides the leaves on demand (the minimal-FFI policy): the CORE set that effect demos need, plus
+//! the `Purvasm.String` byte primitives the `show`/`Semigroup` `ulib` builds strings from (ADR-0052).
+//! The `Number`-math / `FS` / `System` families and the float-formatting `show`s are added when the
+//! self-compiler differential reaches them. An unknown key is a clear fault.
 //!
 //! An **effectful** leaf follows the ADR-0067 "foreign returns the thunk; forcing performs" shape: the
 //! outer `CodeFn` returns a thunk closure whose body performs the effect when forced.
@@ -69,6 +70,57 @@ extern "C" fn leaf_crash_with(ctx: *mut Heap, _clo: u64, args: *const u64, nargs
     })
 }
 
+/// `Purvasm.String.byteLength :: String -> Int` — the UTF-8 byte length (ADR-0052).
+extern "C" fn leaf_byte_length(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: usize) -> u64 {
+    // SAFETY: as [`leaf_show_int`]; `args[0]` is a `String`.
+    guard(|| unsafe {
+        let h = heap(ctx);
+        let s = h.checked_ptr(args_slice(args, nargs)[0]);
+        TaggedWord::int(h.str_len(s) as i32).to_bits()
+    })
+}
+
+/// `Purvasm.String.byteAt :: String -> Int -> Int` — the byte at index `i` (0-based), bounds-checked.
+extern "C" fn leaf_byte_at(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: usize) -> u64 {
+    // SAFETY: as [`leaf_show_int`]; `args[0]` a `String`, `args[1]` an `Int`.
+    guard(|| unsafe {
+        let h = heap(ctx);
+        let a = args_slice(args, nargs);
+        let s = h.checked_ptr(a[0]);
+        TaggedWord::int(h.str_byte_get(s, a[1].as_int() as usize) as i32).to_bits()
+    })
+}
+
+/// `Purvasm.String.unsafeNew :: Int -> String` — a fresh zero-filled buffer for the linear byte-build
+/// protocol (ADR-0052); [`leaf_unsafe_set_byte`] fills it in place.
+extern "C" fn leaf_unsafe_new(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: usize) -> u64 {
+    // SAFETY: as [`leaf_show_int`]; `args[0]` is an `Int`.
+    guard(|| unsafe {
+        let h = heap(ctx);
+        let n = args_slice(args, nargs)[0].as_int();
+        h.new_str_uninit(n as usize).as_word().to_bits()
+    })
+}
+
+/// `Purvasm.String.unsafeSetByte :: String -> Int -> Int -> String` — write byte `i` in place (low 8
+/// bits of the value) and return the **same** buffer (ADR-0052 linear build; no allocation).
+extern "C" fn leaf_unsafe_set_byte(
+    ctx: *mut Heap,
+    _clo: u64,
+    args: *const u64,
+    nargs: usize,
+) -> u64 {
+    // SAFETY: as [`leaf_show_int`]; `args` = `(String, Int, Int)`.
+    guard(|| unsafe {
+        let h = heap(ctx);
+        let a = args_slice(args, nargs);
+        let s = a[0];
+        let sp = h.checked_ptr(s);
+        h.str_byte_set(sp, a[1].as_int() as usize, (a[2].as_int() & 0xff) as u8);
+        s.to_bits()
+    })
+}
+
 /// Resolve a native foreign `key` to its leaf as a closure value (ADR-0072 §9). Each leaf is a
 /// no-capture closure over its `AbiCodeFn`; an unknown key faults (grow the set on demand).
 ///
@@ -84,6 +136,11 @@ pub unsafe extern "C" fn pv_foreign(ctx: *mut Heap, key_ptr: *const u8, key_len:
             "Data.Show.showIntImpl" => (leaf_show_int as usize as u64, 1),
             "Purvasm.Stdio.writeLineImpl" => (leaf_write_line as usize as u64, 1),
             "Partial._crashWith" => (leaf_crash_with as usize as u64, 1),
+            // `Purvasm.String` byte primitives (ADR-0052 linear string build).
+            "Purvasm.String.byteLength" => (leaf_byte_length as usize as u64, 1),
+            "Purvasm.String.byteAt" => (leaf_byte_at as usize as u64, 2),
+            "Purvasm.String.unsafeNew" => (leaf_unsafe_new as usize as u64, 1),
+            "Purvasm.String.unsafeSetByte" => (leaf_unsafe_set_byte as usize as u64, 3),
             other => panic!("pv_foreign: unbound foreign leaf {other:?}"),
         };
         let h = heap(ctx);
@@ -135,6 +192,35 @@ mod tests {
             let unit = [TaggedWord::unit().to_bits()];
             let _ = pv_apply(ctx, thunk, unit.as_ptr(), unit.len());
             assert_eq!(heap(ctx).output(), ["hi".to_string()]);
+            pv_runtime_free(ctx);
+        }
+    }
+
+    /// The linear byte-build protocol end to end (ADR-0052): `unsafeNew` a buffer, `unsafeSetByte` each
+    /// byte (returning the same buffer), then read it back via `byteLength` / `byteAt` and `str_read`.
+    #[test]
+    fn string_byte_build_round_trip() {
+        let ctx = pv_runtime_new(1 << 12);
+        unsafe {
+            let new = foreign(ctx, "Purvasm.String.unsafeNew");
+            let set = foreign(ctx, "Purvasm.String.unsafeSetByte");
+            let at = foreign(ctx, "Purvasm.String.byteAt");
+            let len = foreign(ctx, "Purvasm.String.byteLength");
+            let call = |f: u64, a: &[u64]| pv_apply(ctx, f, a.as_ptr(), a.len());
+            let int = |n: i32| TaggedWord::int(n).to_bits();
+            // unsafeNew 2; unsafeSetByte 0 'H'(72); unsafeSetByte 1 'i'(105) — same buffer threaded through
+            let s = call(new, &[int(2)]);
+            let s = call(set, &[s, int(0), int(72)]);
+            let s = call(set, &[s, int(1), int(105)]);
+            // byteLength = 2; byteAt 0 = 72; byteAt 1 = 105
+            assert_eq!(TaggedWord::from_bits(call(len, &[s])).as_int(), 2);
+            assert_eq!(TaggedWord::from_bits(call(at, &[s, int(0)])).as_int(), 72);
+            assert_eq!(TaggedWord::from_bits(call(at, &[s, int(1)])).as_int(), 105);
+            // the completed buffer is valid UTF-8 "Hi"
+            assert_eq!(
+                heap(ctx).str_read(HeapPtr::from_word(TaggedWord::from_bits(s))),
+                "Hi"
+            );
             pv_runtime_free(ctx);
         }
     }

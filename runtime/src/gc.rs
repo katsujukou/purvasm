@@ -584,6 +584,55 @@ impl Heap {
         String::from_utf8(bytes.to_vec()).expect("Str invariant: valid UTF-8")
     }
 
+    /// A fresh **zero-filled** `len`-byte `Str` — `Purvasm.String.unsafeNew` (ADR-0052). The linear
+    /// byte-build protocol allocates the buffer here and fills it with [`str_byte_set`], so — unlike
+    /// [`new_str`] — the UTF-8 invariant is **not** asserted at allocation (zeros are valid anyway; an
+    /// intermediate fill may be transiently invalid, but the protocol reads only the completed string).
+    /// No `Value` input, so nothing to root across the allocation.
+    pub(crate) fn new_str_uninit(&mut self, len: usize) -> HeapPtr {
+        let byte_words = len.div_ceil(WORD);
+        let p = self.alloc(Kind::Str, 1 + byte_words as u64, Color::White);
+        self.write_raw_unchecked(p, 0, len as u64);
+        for i in 0..byte_words {
+            self.write_raw_unchecked(p, 1 + i as u64, 0);
+        }
+        p
+    }
+
+    /// Byte `i` of a `Str` — `Purvasm.String.byteAt`. Release-checked (reachable from the safe leaf API):
+    /// [`str_len`] validates the object and its length, and `i` is bounds-checked against it.
+    #[inline]
+    pub(crate) fn str_byte_get(&self, s: HeapPtr, i: usize) -> u8 {
+        let len = self.str_len(s);
+        assert!(
+            i < len,
+            "byteAt: index {i} out of bounds (Str length {len})"
+        );
+        // SAFETY: byte `i < len` lies in the `len` bytes at payload word 1 (`2 * WORD` into the object),
+        // within the allocation `str_len` bounded; `s` is a validated header.
+        unsafe { *(s.as_ptr() as *const u8).add(2 * WORD + i) }
+    }
+
+    /// Write byte `i` of a `Str` in place — `Purvasm.String.unsafeSetByte` (ADR-0052 linear build).
+    /// Release-checked bounds. No **write barrier**: a `Str` holds no GC-tracked pointers (its payload is
+    /// raw bytes, ADR-0064 §4), so an in-place byte write is invisible to the collector. No UTF-8 re-check
+    /// (an intermediate build may be transiently invalid); soundness rests on the linear-build protocol
+    /// (the buffer comes from [`new_str_uninit`], is threaded without aliasing, and is read only once
+    /// complete — the same discipline as the `boot` reference, ADR-0052).
+    #[inline]
+    pub(crate) fn str_byte_set(&mut self, s: HeapPtr, i: usize, b: u8) {
+        let len = self.str_len(s);
+        assert!(
+            i < len,
+            "unsafeSetByte: index {i} out of bounds (Str length {len})"
+        );
+        // SAFETY: as [`str_byte_get`]; `&mut self` is exclusive, and the byte carries no provenance the
+        // collector tracks, so no barrier is required.
+        unsafe {
+            *(s.as_ptr() as *mut u8).add(2 * WORD + i) = b;
+        }
+    }
+
     // --- records (ADR-0069) -------------------------------------------------
 
     /// A `RawIds` object of the sorted label `ids` — `[count][id; count]` (ADR-0069 §1). Non-empty
@@ -1560,5 +1609,34 @@ mod tests {
         let _rc = h.root(c.as_word()); // 6 — full, all rooted
         let _d = h.new_number(4.0); // overflow → GC keeps all 6 → retry still overflows → OOM
         h.pop_frame(frame); // unreached
+    }
+
+    #[test]
+    fn str_byte_build_and_read() {
+        // `new_str_uninit` allocates a zero-filled buffer; `str_byte_set` fills it; `str_byte_get`/
+        // `str_len` read it back; `str_read` sees the completed UTF-8 (ADR-0052 linear build).
+        let mut h = Heap::new(64);
+        let s = h.new_str_uninit(3);
+        assert_eq!(h.str_len(s), 3);
+        assert_eq!(h.str_byte_get(s, 0), 0); // zero-filled
+        h.str_byte_set(s, 0, b'a');
+        h.str_byte_set(s, 1, b'b');
+        h.str_byte_set(s, 2, b'c');
+        assert_eq!(h.str_byte_get(s, 1), b'b');
+        assert_eq!(h.str_read(s), "abc");
+        // a multi-byte word boundary: 9 bytes span two payload words
+        let t = h.new_str_uninit(9);
+        for i in 0..9 {
+            h.str_byte_set(t, i, b'0' + i as u8);
+        }
+        assert_eq!(h.str_read(t), "012345678");
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn str_byte_set_rejects_out_of_bounds() {
+        let mut h = Heap::new(16);
+        let s = h.new_str_uninit(2);
+        h.str_byte_set(s, 2, b'x'); // index == len → out of bounds
     }
 }

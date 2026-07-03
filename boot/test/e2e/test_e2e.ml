@@ -1269,6 +1269,30 @@ let test_llvm_effect_show () =
        ( C.Foreign "Purvasm.Stdio.writeLineImpl"
        , C.App (C.Foreign "Data.Show.showIntImpl", int 42) ))
 
+(* The `Purvasm.String` byte primitives (ADR-0052): build `"Hi"` in place via `unsafeNew` + `unsafeSetByte`
+   (72='H', 105='i'), then `writeLine` it. Exercises the linear-build native leaves end to end (codegen →
+   `pv_foreign` → the mutating Str primitives), differential-checked against the oracle's host leaves. *)
+let string_byte_build_term =
+  let set s i b =
+    C.App (C.App (C.App (C.Foreign "Purvasm.String.unsafeSetByte", s), int i), int b)
+  in
+  C.Let
+    ( "s0"
+    , C.App (C.Foreign "Purvasm.String.unsafeNew", int 2)
+    , C.Let
+        ( "s1"
+        , set (C.Var "s0") 0 72
+        , C.Let
+            ( "s2"
+            , set (C.Var "s1") 1 105
+            , C.App (C.Foreign "Purvasm.Stdio.writeLineImpl", C.Var "s2") ) ) )
+
+let test_llvm_string_byte_build () =
+  same_on_llvm_effect "byte-built \"Hi\"" string_byte_build_term
+
+let test_llvm_split_string_byte_build () =
+  same_on_llvm_split_effect "split byte-built \"Hi\"" string_byte_build_term
+
 (* In-place array mutation (the `Effect.Ref` core, structural over `NewArray`/`SetArray`/`IndexArray`):
    `(newArray 3){1 := 99}[1]` → 99. *)
 let test_llvm_array_set () =
@@ -2332,6 +2356,11 @@ let llvm_groups =
         ; Alcotest.test_case "array_length" `Quick test_llvm_array_length
         ; Alcotest.test_case "record_dynamic" `Quick test_llvm_record_dynamic
         ; Alcotest.test_case "effect_show" `Quick test_llvm_effect_show
+        ; Alcotest.test_case "string_byte_build" `Quick test_llvm_string_byte_build
+        ; Alcotest.test_case
+            "split_string_byte_build"
+            `Quick
+            test_llvm_split_string_byte_build
         ; Alcotest.test_case "array_set" `Quick test_llvm_array_set
         ; Alcotest.test_case "forced_gc" `Quick test_llvm_forced_gc
         ; Alcotest.test_case "fib" `Quick test_llvm_fib
