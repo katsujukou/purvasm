@@ -1,16 +1,19 @@
-//! Native foreign leaves and the `pv_foreign` resolver (ADR-0071 §6 / ADR-0072 §9).
+//! Native foreign leaves, resolved by **link-time `pvf_*` symbols** (ADR-0071 §6 / ADR-0073 §3).
 //!
-//! A native leaf is a first-order host function over the value representation (ADR-0022). Codegen lowers
-//! an unresolved `foreign import` to `pv_foreign(key)`, which returns the leaf as a closure value —
-//! mirroring `boot`'s `codegen_ml`'s `foreign`, held at parity by the differential (ADR-0072 §10). Only
-//! the genuine **host** leaves live here; the *structural* foreigns (`Effect.Ref`, `Effect.pureE`/`bindE`,
-//! `ord_cmp`, …) are guest terms the linker's `Ffi.resolver` substitutes before codegen (they lower to
-//! ordinary primops/`apply`), so they are **not** leaves.
+//! A native leaf is a first-order host function over the value representation (ADR-0022). Each leaf is an
+//! `AbiCodeFn` (ADR-0071 §3) exported under the name `pvf_<mangle key>` — the injective mangling of the
+//! foreign's qualified key (ADR-0072 §2 / ADR-0073 §3). Codegen references that symbol directly and wraps
+//! it in a no-capture closure of the leaf's arity (`pv_make_closure(@pvf_…, arity, unit)`), so foreign
+//! resolution is the linker's job, not a runtime string dispatch — mirroring `boot`'s `codegen_ml`'s
+//! `foreign`, held at parity by the differential (ADR-0072 §10). Only the genuine **host** leaves live
+//! here (the intrinsic floor, ADR-0073 §1/§4); the *structural* foreigns (`Effect.Ref`, `Effect.pureE`/
+//! `bindE`, `ord_cmp`, …) are guest terms the linker's `Ffi.resolver` substitutes before codegen (they
+//! lower to ordinary primops/`apply`), so they are **not** leaves. A missing symbol is a **link error**.
 //!
 //! v1 provides the leaves on demand (the minimal-FFI policy): the CORE set that effect demos need, plus
 //! the `Purvasm.String` byte primitives the `show`/`Semigroup` `ulib` builds strings from (ADR-0052).
 //! The `Number`-math / `FS` / `System` families and the float-formatting `show`s are added when the
-//! self-compiler differential reaches them. An unknown key is a clear fault.
+//! self-compiler differential reaches them (or, per ADR-0073, ship from a `ulib`'s compiled `.c`).
 //!
 //! An **effectful** leaf follows the ADR-0067 "foreign returns the thunk; forcing performs" shape: the
 //! outer `CodeFn` returns a thunk closure whose body performs the effect when forced.
@@ -21,6 +24,7 @@ use crate::heap::HeapPtr;
 use crate::word::TaggedWord;
 
 /// `Data.Show.showIntImpl :: Int -> String` — the decimal spelling (matches OCaml `string_of_int`).
+#[export_name = "pvf_Data_2eShow_2eshowIntImpl"]
 extern "C" fn leaf_show_int(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: usize) -> u64 {
     // SAFETY: the `AbiCodeFn` contract — `ctx` is live and `args`/`nargs` a valid buffer (ADR-0071 §3).
     guard(|| unsafe {
@@ -32,6 +36,7 @@ extern "C" fn leaf_show_int(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: 
 
 /// `Purvasm.Stdio.writeLineImpl :: String -> Effect Unit` (ADR-0068) — the outer `\s -> thunk`: it
 /// captures `s` in a thunk closure whose force writes the line (ADR-0067 §3/§5).
+#[export_name = "pvf_Purvasm_2eStdio_2ewriteLineImpl"]
 extern "C" fn leaf_write_line(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: usize) -> u64 {
     // SAFETY: as [`leaf_show_int`]; `new_closure_raw`'s only unsafe input is the raw code address.
     guard(|| unsafe {
@@ -61,6 +66,7 @@ extern "C" fn leaf_write_line_thunk(ctx: *mut Heap, clo: u64, _args: *const u64,
 
 /// `Partial._crashWith :: String -> a` — a pure partial crash: forcing it halts with the message
 /// (matches `codegen_ml`'s `stuck`). The panic is contained at the FFI boundary (ADR-0071 §7) → abort.
+#[export_name = "pvf_Partial_2e_5fcrashWith"]
 extern "C" fn leaf_crash_with(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: usize) -> u64 {
     // SAFETY: as [`leaf_show_int`]; `args[0]` is a `String`.
     guard(|| unsafe {
@@ -71,6 +77,7 @@ extern "C" fn leaf_crash_with(ctx: *mut Heap, _clo: u64, args: *const u64, nargs
 }
 
 /// `Purvasm.String.byteLength :: String -> Int` — the UTF-8 byte length (ADR-0052).
+#[export_name = "pvf_Purvasm_2eString_2ebyteLength"]
 extern "C" fn leaf_byte_length(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: usize) -> u64 {
     // SAFETY: as [`leaf_show_int`]; `args[0]` is a `String`.
     guard(|| unsafe {
@@ -81,6 +88,7 @@ extern "C" fn leaf_byte_length(ctx: *mut Heap, _clo: u64, args: *const u64, narg
 }
 
 /// `Purvasm.String.byteAt :: String -> Int -> Int` — the byte at index `i` (0-based), bounds-checked.
+#[export_name = "pvf_Purvasm_2eString_2ebyteAt"]
 extern "C" fn leaf_byte_at(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: usize) -> u64 {
     // SAFETY: as [`leaf_show_int`]; `args[0]` a `String`, `args[1]` an `Int`.
     guard(|| unsafe {
@@ -93,6 +101,7 @@ extern "C" fn leaf_byte_at(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: u
 
 /// `Purvasm.String.unsafeNew :: Int -> String` — a fresh zero-filled buffer for the linear byte-build
 /// protocol (ADR-0052); [`leaf_unsafe_set_byte`] fills it in place.
+#[export_name = "pvf_Purvasm_2eString_2eunsafeNew"]
 extern "C" fn leaf_unsafe_new(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: usize) -> u64 {
     // SAFETY: as [`leaf_show_int`]; `args[0]` is an `Int`.
     guard(|| unsafe {
@@ -104,6 +113,7 @@ extern "C" fn leaf_unsafe_new(ctx: *mut Heap, _clo: u64, args: *const u64, nargs
 
 /// `Purvasm.String.unsafeSetByte :: String -> Int -> Int -> String` — write byte `i` in place (low 8
 /// bits of the value) and return the **same** buffer (ADR-0052 linear build; no allocation).
+#[export_name = "pvf_Purvasm_2eString_2eunsafeSetByte"]
 extern "C" fn leaf_unsafe_set_byte(
     ctx: *mut Heap,
     _clo: u64,
@@ -121,50 +131,29 @@ extern "C" fn leaf_unsafe_set_byte(
     })
 }
 
-/// Resolve a native foreign `key` to its leaf as a closure value (ADR-0072 §9). Each leaf is a
-/// no-capture closure over its `AbiCodeFn`; an unknown key faults (grow the set on demand).
-///
-/// # Safety
-/// `ctx` live; `key_ptr`/`key_len` a valid UTF-8 buffer.
-#[no_mangle]
-pub unsafe extern "C" fn pv_foreign(ctx: *mut Heap, key_ptr: *const u8, key_len: usize) -> u64 {
-    guard(|| {
-        let key = std::str::from_utf8(std::slice::from_raw_parts(key_ptr, key_len))
-            .expect("pv_foreign: key not UTF-8");
-        // (code address, arity) of the leaf's outer `AbiCodeFn`.
-        let (code, arity): (u64, u32) = match key {
-            "Data.Show.showIntImpl" => (leaf_show_int as usize as u64, 1),
-            "Purvasm.Stdio.writeLineImpl" => (leaf_write_line as usize as u64, 1),
-            "Partial._crashWith" => (leaf_crash_with as usize as u64, 1),
-            // `Purvasm.String` byte primitives (ADR-0052 linear string build).
-            "Purvasm.String.byteLength" => (leaf_byte_length as usize as u64, 1),
-            "Purvasm.String.byteAt" => (leaf_byte_at as usize as u64, 2),
-            "Purvasm.String.unsafeNew" => (leaf_unsafe_new as usize as u64, 1),
-            "Purvasm.String.unsafeSetByte" => (leaf_unsafe_set_byte as usize as u64, 3),
-            other => panic!("pv_foreign: unbound foreign leaf {other:?}"),
-        };
-        let h = heap(ctx);
-        h.new_closure_raw(code, arity, TaggedWord::unit())
-            .as_word()
-            .to_bits()
-    })
-}
-
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
-    use crate::abi::{pv_apply, pv_runtime_free, pv_runtime_new};
+    use crate::abi::{pv_apply, pv_make_closure, pv_runtime_free, pv_runtime_new};
 
-    /// Look a leaf up by key (as codegen's `pv_foreign(key)` would).
-    unsafe fn foreign(ctx: *mut Heap, key: &str) -> u64 {
-        pv_foreign(ctx, key.as_ptr(), key.len())
+    type AbiCodeFn = extern "C" fn(*mut Heap, u64, *const u64, usize) -> u64;
+
+    /// Build the closure codegen would for a leaf reference (ADR-0073 §3): a no-capture closure over the
+    /// leaf's `AbiCodeFn` symbol and its arity — i.e. `pv_make_closure(@pvf_…, arity, unit)`.
+    unsafe fn leaf(ctx: *mut Heap, code: AbiCodeFn, arity: u32) -> u64 {
+        pv_make_closure(
+            ctx,
+            code as usize as u64,
+            arity,
+            TaggedWord::unit().to_bits(),
+        )
     }
 
     #[test]
     fn show_int_leaf_returns_the_decimal_string() {
         let ctx = pv_runtime_new(1 << 12);
         unsafe {
-            let show = foreign(ctx, "Data.Show.showIntImpl");
+            let show = leaf(ctx, leaf_show_int, 1);
             let arg = [TaggedWord::int(-42).to_bits()];
             let r = pv_apply(ctx, show, arg.as_ptr(), arg.len());
             let h = heap(ctx);
@@ -181,7 +170,7 @@ mod tests {
         let ctx = pv_runtime_new(1 << 12);
         unsafe {
             // `writeLine "hi"` returns the thunk (nothing written yet); forcing it (apply to unit) writes.
-            let wl = foreign(ctx, "Purvasm.Stdio.writeLineImpl");
+            let wl = leaf(ctx, leaf_write_line, 1);
             let s = heap(ctx).new_str(b"hi").as_word().to_bits();
             let sarg = [s];
             let thunk = pv_apply(ctx, wl, sarg.as_ptr(), sarg.len());
@@ -202,10 +191,10 @@ mod tests {
     fn string_byte_build_round_trip() {
         let ctx = pv_runtime_new(1 << 12);
         unsafe {
-            let new = foreign(ctx, "Purvasm.String.unsafeNew");
-            let set = foreign(ctx, "Purvasm.String.unsafeSetByte");
-            let at = foreign(ctx, "Purvasm.String.byteAt");
-            let len = foreign(ctx, "Purvasm.String.byteLength");
+            let new = leaf(ctx, leaf_unsafe_new, 1);
+            let set = leaf(ctx, leaf_unsafe_set_byte, 3);
+            let at = leaf(ctx, leaf_byte_at, 2);
+            let len = leaf(ctx, leaf_byte_length, 1);
             let call = |f: u64, a: &[u64]| pv_apply(ctx, f, a.as_ptr(), a.len());
             let int = |n: i32| TaggedWord::int(n).to_bits();
             // unsafeNew 2; unsafeSetByte 0 'H'(72); unsafeSetByte 1 'i'(105) — same buffer threaded through

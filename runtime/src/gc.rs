@@ -571,6 +571,20 @@ impl Heap {
         len
     }
 
+    /// The raw IEEE-754 bit pattern of a boxed `Number` — the read side of `pv_number_bits` (ADR-0073 §2),
+    /// so a `.c` foreign can format a `Number` without knowing the encoding. **Release-checked**: asserts
+    /// the object is a `NumberBox`, so a non-`Number` word cannot be mis-read as a float bit pattern.
+    #[inline]
+    pub fn number_bits(&self, n: HeapPtr) -> u64 {
+        let hdr = self.header(n); // checked: validates `n` is a live object header
+        assert_eq!(
+            hdr.kind(),
+            Kind::NumberBox,
+            "number_bits on a non-Number object"
+        );
+        self.read_raw(n, 0)
+    }
+
     /// Copy a `Str`'s bytes out to an owned `String`. Copies (never borrows into the moving heap,
     /// ADR-0063 §2); valid UTF-8 by the `new_str` invariant.
     pub fn str_read(&self, s: HeapPtr) -> String {

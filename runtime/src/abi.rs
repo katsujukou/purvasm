@@ -351,6 +351,43 @@ pub unsafe extern "C" fn pv_new_number(ctx: *mut Heap, bits: u64) -> u64 {
     })
 }
 
+/// Read a boxed `Number`'s IEEE-754 bit pattern — the FFI read side of ADR-0064's `Number` rep (ADR-0073
+/// §2), so a `.c` foreign (e.g. `showNumberImpl`) can format it without knowing the encoding. A `Number`
+/// is **boxed** (ADR-0064 §1), so this takes `ctx` to reach — and shape-validate — the heap object; a C
+/// leaf can never deref the word itself without breaking representation-opacity (ADR-0069).
+///
+/// # Safety
+/// `ctx` live; `n` a value word denoting a `Number`.
+#[no_mangle]
+pub unsafe extern "C" fn pv_number_bits(ctx: *mut Heap, n: u64) -> u64 {
+    guard(|| {
+        let h = heap(ctx);
+        let p = h.checked_ptr(TaggedWord::from_bits(n));
+        h.number_bits(p)
+    })
+}
+
+/// Read an immediate `Int`'s payload (ADR-0073 §2). `Int` is an immediate (ADR-0064 §1), so `ctx` is
+/// unused — but every scalar accessor takes `PVContext*` for ABI uniformity (the whole `pv_*` surface is
+/// `ctx`-first; an immediate accessor simply ignores it).
+///
+/// # Safety
+/// `w` a value word denoting an `Int`.
+#[no_mangle]
+pub unsafe extern "C" fn pv_int_payload(_ctx: *mut Heap, w: u64) -> i32 {
+    guard(|| TaggedWord::from_bits(w).as_int())
+}
+
+/// Read an immediate `Boolean`'s payload as `0`/`1` (ADR-0073 §2). Immediate like [`pv_int_payload`]; `ctx`
+/// is ignored (uniformity). Returns a C `int`.
+///
+/// # Safety
+/// `w` a value word denoting a `Boolean`.
+#[no_mangle]
+pub unsafe extern "C" fn pv_bool_payload(_ctx: *mut Heap, w: u64) -> i32 {
+    guard(|| TaggedWord::from_bits(w).as_bool() as i32)
+}
+
 /// Allocate a mutable [`Ref`](crate::heap::Kind::Ref) cell holding `init` (ADR-0071 §6).
 ///
 /// # Safety
@@ -530,6 +567,23 @@ mod tests {
             let argv = [TaggedWord::int(3).to_bits(), TaggedWord::int(4).to_bits()];
             let r = pv_apply(ctx, clo, argv.as_ptr(), argv.len());
             assert_eq!(TaggedWord::from_bits(r).as_int(), 7);
+            pv_runtime_free(ctx);
+        }
+    }
+
+    /// The FFI scalar read side (ADR-0073 §2): `pv_number_bits` round-trips a boxed `Number`'s IEEE-754
+    /// bits (the value a `.c` `showNumberImpl` would format); the immediate `Int`/`Boolean` accessors read
+    /// their payloads and ignore `ctx`.
+    #[test]
+    fn scalar_accessors_read_payloads() {
+        let ctx = pv_runtime_new(1 << 12);
+        unsafe {
+            let bits = 3.5_f64.to_bits();
+            let n = pv_new_number(ctx, bits);
+            assert_eq!(pv_number_bits(ctx, n), bits);
+            assert_eq!(pv_int_payload(ctx, TaggedWord::int(-42).to_bits()), -42);
+            assert_eq!(pv_bool_payload(ctx, TaggedWord::bool(true).to_bits()), 1);
+            assert_eq!(pv_bool_payload(ctx, TaggedWord::bool(false).to_bits()), 0);
             pv_runtime_free(ctx);
         }
     }
