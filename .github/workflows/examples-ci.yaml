@@ -1,0 +1,108 @@
+name: Examples-CI
+
+# The cross-backend differential over the real demonstration programs: build every example from
+# the spago workspace and run it on the bytecode VM, the OCaml native backend, the LLVM native
+# backend, and the JS build, diffing stdout across all four (examples/run-examples.sh). This is
+# the one workflow that crosses every toolchain (OCaml + Rust + PureScript + clang), so it is
+# the layer where ulib overlay, `pvf_*` link resolution, and multi-module init actually compose.
+#
+# Same gate topology as ocaml-ci.yaml / purescript-ci.yaml (ADR-0057): the workflow always
+# triggers so the required `examples-ci-gate` status is always produced; the heavy build is
+# gated on whether any surface the differential crosses actually changed.
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+# Cancel a superseded run when new commits land on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # True iff something the differential crosses changed. Broader than the other workflows by
+  # design — the sweep exists to catch cross-toolchain composition breaks. `compiler/`/`cli/`
+  # (Level 2) are excluded: the sweep runs entirely on boot + runtime + ulib + examples.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'boot/**'
+              - 'runtime/**'
+              - 'ulib/**'
+              - 'ulib-tools/**'
+              - 'packages/**'
+              - 'examples/**'
+              - 'spago.yaml'
+              - 'spago.lock'
+              - 'flake.nix'
+              - 'flake.lock'
+              - '.github/workflows/examples-ci.yaml'
+
+  ci:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      # Setup Nix environment — identical to the sibling workflows so every toolchain (dune,
+      # cargo, clang/llvm, purs, spago, node) comes from flake.nix + flake.lock as the single
+      # source of truth.
+      - uses: actions/checkout@v5
+      # v30 ships Nix >= 2.18, required by the pinned nixos-25.11 nixpkgs.
+      - uses: cachix/install-nix-action@v30
+        with:
+          # No nixpkgs channel pin here: the toolchain comes from `nix develop`,
+          # so flake.nix + flake.lock are the single source of truth.
+          extra_nix_config: experimental-features = nix-command flakes
+      - uses: cachix/cachix-action@v17
+        with:
+          name: katsujukou-github
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+      # Loads the `nix develop` environment into PATH for every `run:` step below.
+      - uses: nicknovitski/nix-develop@v1
+
+      # The four prerequisites the sweep script documents, cheapest-signal first.
+      - name: Build boot (purvm)
+        run: dune build
+        working-directory: boot
+
+      - name: Build runtime staticlib
+        run: cargo build
+        working-directory: runtime
+
+      # One workspace build yields both the examples' CoreFn (for purvm) and the JS output
+      # (for the --with-js column), plus ulib-tools itself.
+      - name: Build spago workspace
+        run: spago build
+
+      # Stage the ulib overlay (patched corefn + native foreign manifest) to dist/ulib.
+      - name: Stage ulib
+        run: node ulib-tools/index.js build --prepare-release
+
+      - name: Run examples differential
+        run: ./examples/run-examples.sh --with-js
+
+  # The single required status check. Always runs; green when `ci` passed OR was skipped
+  # (no crossed surface touched), red when `ci` failed or was cancelled. Point branch
+  # protection at THIS job (`examples-ci-gate`), alongside `ci-gate`/`ps-ci-gate`/`rust-ci-gate`.
+  examples-ci-gate:
+    needs: [ci]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate on the ci result
+        run: |
+          result='${{ needs.ci.result }}'
+          if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+            echo "::error::Examples CI did not pass (result: $result)"
+            exit 1
+          fi
+          echo "Examples CI gate green (ci result: $result)"
