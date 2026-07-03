@@ -15,13 +15,13 @@ import Effect.Class.Console as Console
 
 data Enthusiasm = Passionate | Mild | None
 
-type Env = { enthusiasm :: Enthusiasm }
+type Env = { debug :: Boolean, enthusiasm :: Enthusiasm }
 
 type State = { energy :: Int }
 
 data Error = OutOfEnergy
 
-newtype AppM a = AppM (ReaderT Env (StateT State (ExceptT Error Effect)) a)
+newtype AppM a = AppM (ExceptT Error (ReaderT Env (StateT State Effect)) a)
 
 derive newtype instance Functor AppM
 derive newtype instance Apply AppM
@@ -34,26 +34,41 @@ derive newtype instance MonadState State AppM
 derive newtype instance MonadThrow Error AppM
 derive newtype instance MonadError Error AppM
 
-runAppM :: forall a. Env -> State -> AppM a -> Effect (Either Error (Tuple a State))
-runAppM env state (AppM m) = runExceptT (runStateT (runReaderT m env) state)
+runAppM :: forall a. Env -> State -> AppM a -> Effect (Tuple (Either Error a) State)
+runAppM env state (AppM m) = runStateT (runReaderT (runExceptT m) env) state
 
-speak :: String -> AppM Unit
-speak str = AppM do
-  { enthusiasm } <- ask
+consume :: AppM Unit 
+consume = AppM do
   s0 <- get
-  let
-    msg /\ s1 = case enthusiasm of
-      Passionate -> (str <> "!!") /\ (s0 { energy = s0.energy - 3 })
-      Mild -> (str <> "!") /\ (s0 { energy = s0.energy - 1 })
-      None -> (str <> ".") /\ s0
-
-  Console.log msg
+  { enthusiasm } <- ask 
+  let 
+    s1 = case enthusiasm of
+      Passionate -> s0 { energy = s0.energy - 3 }
+      Mild -> s0 { energy = s0.energy - 1 }
+      None -> s0
+  put s1
   when (s1.energy < 0) do
-    put { energy: 0 }
+    Console.log "I've exhausted. Please let me rest..."
     throwError OutOfEnergy
+  
+speak :: String -> AppM Unit
+speak str = do
+  env@{ enthusiasm } <- ask
+  s0 <- get
+  when (env.debug) $ Console.logShow s0
+  if s0.energy >= 0 then do 
+      Console.log $ str <> punctuaion enthusiasm
+      consume
+  else do
+      Console.log "(Cannot speak more...)"
+  where
+  punctuaion = case _ of
+    Passionate -> "!!"
+    Mild -> "!"
+    None -> "."
 
 sleep :: AppM Unit
 sleep = AppM do
+  Console.log "I'm going to sleep for a while..."
   s0 <- get
-  let s1 = s0 { energy = s0.energy + 5 }
-  put s1
+  put (s0 { energy = s0.energy + 5 })
