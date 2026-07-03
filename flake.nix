@@ -52,7 +52,13 @@
         ];
       in
         {
-          devShells.default = pkgs.mkShellNoCC {
+          # `mkShell`, not `mkShellNoCC`: `ocamlopt` shells out to the system C compiler to link
+          # every executable, and the linked-in OCaml runtime objects come from the Nix store —
+          # so the C toolchain must come from the same (Nix) libc world. Without it, a bare
+          # environment has no `gcc` at all, and a host with its own gcc (the GitHub ubuntu
+          # runner) silently mixes host glibc with Nix-built objects, producing binaries that
+          # abort at startup with "*** stack smashing detected ***".
+          devShells.default = pkgs.mkShell {
             # nixpkgs' stable `rustc` ships no stdlib *source*, so rust-analyzer can't find
             # `$sysroot/lib/rustlib/src/rust/library` ("try installing rust-src"). Point it at the
             # separately-packaged std source. rust-analyzer honours RUST_SRC_PATH.
