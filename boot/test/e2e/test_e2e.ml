@@ -1088,6 +1088,23 @@ let test_llvm_foreign_c_via_manifest () =
   Alcotest.(check bool) "manifest resolved a source" true (cfiles <> []);
   same_on_llvm_effect_foreign "manifest → showNumber 3.5" cfiles (show_number 3.5)
 
+(* ADR-0074 §5 write-before-exit: a line already captured in the stdout sink when the program `exit 0`s
+   mid-run must still reach stdout — the `exitImpl` leaf drains the sink before terminating. llvm-only,
+   no differential: the oracle's `exitImpl` would terminate the test runner in-process. *)
+let test_llvm_exit_drains_sink () =
+  let t =
+    C.Lam
+      ( "u"
+      , C.Let
+          ( "_w"
+          , C.App
+              ( C.App (C.Foreign "Purvasm.Stdio.writeLineImpl", C.Lit (C.LString "before"))
+              , C.Var "u" )
+          , C.App (C.App (C.Foreign "Purvasm.System.Process.exitImpl", int 0), C.Var "u")
+          ) )
+  in
+  Alcotest.(check string) "exit drains the sink" "before\n" (llvm_run ~is_effect:true t)
+
 let test_llvm_arith () =
   same_on_llvm
     "(1+2)*3"
@@ -2508,6 +2525,7 @@ let llvm_groups =
             "foreign_c_via_manifest"
             `Quick
             test_llvm_foreign_c_via_manifest
+        ; Alcotest.test_case "exit_drains_sink" `Quick test_llvm_exit_drains_sink
         ; Alcotest.test_case "string_byte_build" `Quick test_llvm_string_byte_build
         ; Alcotest.test_case
             "split_string_byte_build"
