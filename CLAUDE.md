@@ -82,3 +82,7 @@
   2. The human maintainer directly edits the ADR and changes its status to `Accepted`.
 
 - Do not interpret conversational feedback in prompts (e.g. "looks good", "sounds reasonable", "seems fine", etc.) as acceptance. Only the explicit signals above authorize implementation work.
+
+- All git operations are performed by the human maintainer. Coding agents must not run `git commit`, `git push`, create pull requests, merge, or perform any other history-mutating git operation unless the maintainer explicitly instructs them to.
+
+- When finishing a piece of work, always format the code before handing it off (e.g. `dune fmt` for OCaml sources). CI rejects unformatted code, so pushing unformatted changes breaks the build.
