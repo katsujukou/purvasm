@@ -2,9 +2,10 @@
     (ADR-0071). Implemented so far (ADR-0072 §10 slice plan):
     - **Slice 1 — pure first-order**: literals (`Int`/`Boolean`), arithmetic/comparison primops, `let`,
       `if`, uncurried lambdas (lambda-lifted), and application through the eval/`apply` trampoline.
-    - **Slice 2 — ADTs + `case`**: saturated constructors (nullary → an immediate tag, field-carrying →
-      `pv_new_adt`), and the CPS-cascade matcher over `BNull`/`BVar`/`BNamed`/`BLit`(`Int`/`Bool`)/`BCtor`
-      binders, with guarded alternatives.
+    - **Slice 2 — ADTs + `case`**: constructors (nullary → an immediate tag, saturated field-carrying →
+      `pv_new_adt`, **unsaturated → a builder closure the runtime under-applies to a PAP**, ADR-0072 §5),
+      and the CPS-cascade matcher over `BNull`/`BVar`/`BNamed`/`BLit`(`Int`/`Bool`)/`BCtor` binders, with
+      guarded alternatives.
     - **Slice 3 — static records**: literals (`pv_new_record` over compile-time FNV-1a-64 label ids,
       sorted), the static `Accessor` and functional `Update` (id-keyed `pv_record_get`/`pv_record_set`),
       and the `BRecord` row-poly binder.
@@ -33,8 +34,10 @@
       the local first (env before `gkeys`), and lambda-lift ([lift]) captures such a shadowed name rather
       than reading `@<mangle>$root` — excluding it as a global would make a nested lambda call the wrong
       binding (a partial application leaking out of a mis-resolved recursive helper).
-    Unsaturated constructors / pure-`Number`/`String`/`Bool` entry printers land later (a clear [failwith]
-    / `pv_print_int`-only guards each).
+    Pure-`Number`/`String`/`Bool` entry printers land later (a `pv_print_int`-only guard). A top-level
+    **bare-key shadow** — two top-level bindings sharing an unqualified key (both `where`-hoisted to the
+    same name) — is not yet handled by the flat root-handle-global scheme (they would double-define
+    `@<mangle>$root`); it needs alpha-renaming at the spine, a follow-up.
 
     Every guest value is one `i64` tagged word (ADR-0064 §1); the module calls the runtime's `extern "C"`
     surface (`pv_*`, ADR-0071). Rooting is **root-on-create** (ADR-0072 §6, the conservative first cut):
@@ -701,16 +704,38 @@ and cexpr cx (env : env) ~(tail : bool) (c : A.cexpr) : string option =
       Some r)
   | A.CCtor (name, arity, args) ->
     let nargs = List.length args in
-    if nargs <> arity
+    if nargs > arity
     then
-      (* A partial (or over-) application is a constructor *function* — a closure that accumulates the
-         remaining args, then builds the ADT. Deferred: needs a synthetic constructor closure. *)
+      (* A saturated constructor is a value; applying it further is a type error transl never emits. *)
       failwith
         (Printf.sprintf
-           "codegen_llvm: unsaturated constructor %s (%d/%d) not in slice 2"
+           "codegen_llvm: over-applied constructor %s (%d/%d)"
            name
            nargs
            arity)
+    else if nargs < arity
+    then (
+      (* An **unsaturated** constructor is a first-class function that accumulates the remaining fields,
+         then builds the ADT (ADR-0072 §5). Synthesise a **builder closure** `\$c0 … $c{arity-1} ->
+         Ctor(name, $c0, …)` (a saturated `CCtor` over fresh params, so it lowers to `pv_new_adt`) and
+         apply the fields supplied so far: the runtime under-applies an arity-`arity` closure to `nargs`
+         args to a PAP ([apply]), which saturates to the ADT once the rest arrive. `nargs = 0` (a bare
+         constructor used as a function, e.g. `map Just`) is just the builder. *)
+      let params = List.init arity (fun i -> Printf.sprintf "$ctorarg%d" i) in
+      let body = A.Ret (A.CCtor (name, arity, List.map (fun p -> A.AVar p) params)) in
+      let builder = make_closure cx env (lift cx env params body) in
+      if nargs = 0
+      then finish builder
+      else (
+        (* Root the builder across the args' allocation, then apply the supplied fields (raw — a
+           construction site keeps a by-need field a cell, per the knot-tie). *)
+        let bh = root cx builder in
+        let ops = eval_atoms cx env args in
+        let p, n = arg_buffer cx ops in
+        let bv = get_current cx bh in
+        let t = fresh cx in
+        emit cx "  %s = call i64 @pv_apply(ptr %%ctx, i64 %s, ptr %s, i64 %d)" t bv p n;
+        finish t))
     else if arity = 0
     then finish (imm (ctor_tag name)) (* nullary → an immediate tag (ADR-0064 §1) *)
     else (

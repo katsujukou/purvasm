@@ -1051,6 +1051,49 @@ let test_llvm_case_just () =
 let test_llvm_case_nothing () =
   same_on_llvm "case Nothing" (classify_term (C.Ctor ("Nothing", 0)))
 
+(* --- unsaturated constructors (ADR-0072 §5): a partially-applied ctor is a first-class function that
+   accumulates the remaining fields, then builds the ADT. ------------------------------------------------ *)
+
+(* A bare constructor used as a function (`0/1`): `let f = Just in case f 5 of Just x -> x+1` → 6. *)
+let test_llvm_unsat_ctor_nullary () =
+  same_on_llvm
+    "unsat ctor 0/1"
+    (C.Let ("f", C.Ctor ("Just", 1), classify_term (C.App (C.Var "f", int 5))))
+
+(* A partially-applied field-carrying ctor (`1/2`) — a PAP that saturates on the next arg:
+   `let g = Pair 3 in case g 4 of Pair a b -> a*10 + b` → 34. *)
+let test_llvm_unsat_ctor_partial () =
+  same_on_llvm
+    "unsat ctor 1/2"
+    (C.Let
+       ( "g"
+       , C.App (C.Ctor ("Pair", 2), int 3)
+       , C.Case
+           ( [ C.App (C.Var "g", int 4) ]
+           , [ { C.binders = [ C.BCtor ("Pair", [ C.BVar "a"; C.BVar "b" ]) ]
+               ; result =
+                   C.Unconditional
+                     (C.Prim
+                        (C.AddInt, [ C.Prim (C.MulInt, [ C.Var "a"; int 10 ]); C.Var "b" ]))
+               }
+             ] ) ))
+
+(* A bare constructor passed to a higher-order function (the `map Just` shape): `let ap = \h -> h 7 in
+   case ap Just of Just x -> x+1` → 8. *)
+let test_llvm_unsat_ctor_higher_order () =
+  same_on_llvm
+    "unsat ctor as arg"
+    (C.Let
+       ( "ap"
+       , C.Lam ("h", C.App (C.Var "h", int 7))
+       , classify_term (C.App (C.Var "ap", C.Ctor ("Just", 1))) ))
+
+(* Through the separate-compilation path: the builder closure + its PAP survive per-`.o` linking. *)
+let test_llvm_split_unsat_ctor () =
+  same_on_llvm_split
+    "split unsat ctor 0/1"
+    (C.Let ("f", C.Ctor ("Just", 1), classify_term (C.App (C.Var "f", int 5))))
+
 (* Nested constructor binder: `case Just (Just 3) of Just (Just y) -> y ; _ -> 0` → 3. *)
 let test_llvm_case_nested () =
   same_on_llvm
@@ -2245,6 +2288,13 @@ let llvm_groups =
         ; Alcotest.test_case "tailapp" `Quick test_llvm_tailapp
         ; Alcotest.test_case "case_just" `Quick test_llvm_case_just
         ; Alcotest.test_case "case_nothing" `Quick test_llvm_case_nothing
+        ; Alcotest.test_case "unsat_ctor_nullary" `Quick test_llvm_unsat_ctor_nullary
+        ; Alcotest.test_case "unsat_ctor_partial" `Quick test_llvm_unsat_ctor_partial
+        ; Alcotest.test_case
+            "unsat_ctor_higher_order"
+            `Quick
+            test_llvm_unsat_ctor_higher_order
+        ; Alcotest.test_case "split_unsat_ctor" `Quick test_llvm_split_unsat_ctor
         ; Alcotest.test_case "case_nested" `Quick test_llvm_case_nested
         ; Alcotest.test_case "case_guard" `Quick test_llvm_case_guard
         ; Alcotest.test_case "case_aspat" `Quick test_llvm_case_aspat
