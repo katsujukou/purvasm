@@ -47,7 +47,7 @@ main = do
   -- Native argv: element 0 is the executable, so drop 1 to get the user arguments.
   cliArgs <- Array.drop 1 <$> Sys.argv
   case Options.parse cliArgs of
-    Left err -> Console.error (ArgParser.printArgError err) *> Sys.exit 1
+    Left err -> Console.error (ArgParser.printArgError err) *> void (Sys.exit 1)
     Right cmd -> runPvm case cmd of
       Options.Compile opts -> Compile.cmd opts
       Options.Build opts -> Build.cmd opts
@@ -56,7 +56,7 @@ main = do
     res <- runPurvasmNative program
     case res of
       Right a -> pure a
-      Left err -> Console.error (Fmt.fmt @"purvasm: {err}" { err }) *> Sys.exit 1
+      Left err -> Console.error (Fmt.fmt @"purvasm: {err}" { err }) *> void (Sys.exit 1)
 
 -- | Run a CLI program against the purvasm-native backend: the same effect row as `runNode`, with
 -- | `ENV`/`FS`/`LOG` discharged to the host-system packages. `ENV` is read only to resolve

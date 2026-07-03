@@ -47,7 +47,7 @@ effect-ref       Example.EffectRef.Main
 record-meta      Example.RecordMeta.Main
 recursion-scheme Example.RecursionScheme.Main
 recursive-value  Example.RecursiveValue.Main
-transformer      Example.Transformer.Main      XFAIL:ADR-0074-effect-exception-pending
+transformer      Example.Transformer.Main
 "
 
 if [ ! -x "$PURVM" ]; then
