@@ -1,0 +1,13 @@
+{
+  "test": {
+    "repo": "https://github.com/purescript/purescript-unfoldable",
+    "ref": "v6.0.0",
+    "testMain": "Test.Main",
+    "testDeps": [
+      "assert",
+      "console"
+    ],
+    "fidelity": "js",
+    "xfail": []
+  }
+}

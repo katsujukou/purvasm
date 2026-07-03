@@ -1,6 +1,6 @@
 # 0065. `ulib` directory = one registry package: split `foldable-traversable`, testing `unfoldable` on its own
 
-- Status: Proposed
+- Status: ~~Proposed~~ **Accepted** _(2026-07-04: promoted — maintainer accepted the split; implemented, both suites green)_
 - Date: 2026-07-01
 
 ## Context
@@ -79,3 +79,8 @@ directory, and `test` already treats each directory as one package. `foldable-tr
 - **Test only `foldable-traversable`, leave `unfoldable` overlaid-but-untested.** Rejected: it is
   silent omission of a package that has a perfectly runnable suite
   ([0048](0048-ulib-tools-test-upstream-suite-execution.md)'s no-silent-omission principle).
+
+> **Progress (2026-07-04):** Implemented. `Data.Unfoldable.purs`/`Data.Unfoldable1.purs` moved to
+> `ulib/unfoldable/`; both directories carry their `test` block; no `ulib-tools` change. `test` now
+> runs five green suites — `arrays`, `console`, `enums`, `foldable-traversable`, `unfoldable`
+> (`5 suite(s) passed`). Every `ulib` directory maps to exactly one registry package.
