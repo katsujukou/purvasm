@@ -11,6 +11,7 @@
   pvm
   ocaml_backend
   llvm_backend
+  native_link
   alcotest
   unix)
  (deps

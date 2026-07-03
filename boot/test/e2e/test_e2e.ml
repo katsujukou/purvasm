@@ -806,15 +806,47 @@ let rt_staticlib : string option =
 let has_clang : bool = Sys.command "clang --version >/dev/null 2>&1" = 0
 let llvm_available : bool = rt_staticlib <> None && has_clang
 
+(* The co-distributed C header directory (`purvasm.h`, ADR-0073 §2) a ulib native `foreign` `.c` compiles
+   against — `runtime/include` under the repo root. *)
+let rt_include : string option =
+  Option.map (fun root -> Filename.concat root "runtime/include") repo_root
+
+(* Compile a ulib native-foreign `.c` (ADR-0073) to a `.o` in [dir], against `purvasm.h`. Returns the `.o`
+   path to add to the link, so a `pvf_*` leaf symbol resolves from this object. *)
+let compile_foreign_c ~(dir : string) (csrc : string) : string =
+  let inc = Option.get rt_include in
+  let obj =
+    Filename.concat dir (Filename.remove_extension (Filename.basename csrc) ^ ".o")
+  in
+  let err = Filename.concat dir "foreign.err" in
+  if
+    Sys.command
+      (Printf.sprintf
+         "clang -c -I%s %s -o %s 2>%s"
+         (Filename.quote inc)
+         (Filename.quote csrc)
+         (Filename.quote obj)
+         (Filename.quote err))
+    <> 0
+  then Alcotest.failf "clang -c (foreign) failed; see %s and %s" err csrc;
+  obj
+
 (* Compile a term through the LLVM backend to a native executable and run it: ANF (ADR-0025) → LLVM IR
    → `clang` (link the runtime `staticlib`) → run → its output. The **fourth** differential
    implementation (ADR-0064 §7), held to the CESK oracle's value / `Effect`-order. *)
-let llvm_run ?(is_effect = false) ?(modular = false) ?heap_words (t : C.term) : string =
+let llvm_run
+      ?(is_effect = false)
+      ?(modular = false)
+      ?(foreign_c = [])
+      ?heap_words
+      (t : C.term)
+  : string
+  =
   let rt = Option.get rt_staticlib in
   let dir =
     Filename.concat
       (Filename.get_temp_dir_name ())
-      (Printf.sprintf "purvasm_ll_%x" (Hashtbl.hash (t, heap_words, modular)))
+      (Printf.sprintf "purvasm_ll_%x" (Hashtbl.hash (t, heap_words, modular, foreign_c)))
   in
   (try Sys.mkdir dir 0o755 with
    | Sys_error _ -> ());
@@ -832,11 +864,16 @@ let llvm_run ?(is_effect = false) ?(modular = false) ?heap_words (t : C.term) : 
   let oc = open_out genll in
   output_string oc src;
   close_out oc;
+  (* A ulib native `foreign` `.c` (ADR-0073) is compiled to a `.o` and linked, so its `pvf_*` leaf symbol
+     resolves from exactly one provider (this object) alongside the runtime staticlib. *)
+  let foreign_objs = List.map (compile_foreign_c ~dir) foreign_c in
   if
     Sys.command
+      (* `-lm` resolves a native `foreign` `.c`'s libm calls on Linux (macOS folds libm into libSystem). *)
       (Printf.sprintf
-         "clang -Wl,-dead_strip %s %s -o %s 2>%s"
+         "clang -Wl,-dead_strip %s %s %s -lm -o %s 2>%s"
          (Filename.quote genll)
+         (String.concat " " (List.map Filename.quote foreign_objs))
          (Filename.quote rt)
          (Filename.quote genexe)
          (Filename.quote err))
@@ -898,8 +935,9 @@ let build_split_exe ?(is_effect = false) ?heap_words ~(dir : string) (t : C.term
   let err = Filename.concat dir "link.err" in
   if
     Sys.command
+      (* `-lm` for parity with the single-object link (a `.c` foreign's libm calls, Linux). *)
       (Printf.sprintf
-         "clang -Wl,-dead_strip %s %s -o %s 2>%s"
+         "clang -Wl,-dead_strip %s %s -lm -o %s 2>%s"
          (String.concat " " (List.map Filename.quote objs))
          (Filename.quote rt)
          (Filename.quote genexe)
@@ -970,6 +1008,80 @@ let same_on_llvm_split_effect (label : string) (t : C.term) =
     with_captured_stdout (fun () -> ignore (Cesk.Machine.run_effect ~host:Ffi.host t))
   in
   Alcotest.(check string) label out (llvm_run_split ~is_effect:true t)
+
+(* The prelude ulib's native `foreign` in `.c` (ADR-0073): `showNumberImpl` shipped as C over the `pv_*`
+   C-ABI, resolved by its `pvf_*` symbol from the compiled `Data.Show.foreign.c`. *)
+let dshow_foreign_c : string option =
+  Option.map
+    (fun root -> Filename.concat root "ulib/prelude/Data.Show.foreign.c")
+    repo_root
+
+(* An Effect differential whose leaf `pvf_*` symbol is provided by a ulib-shipped `.c` (ADR-0073), not the
+   runtime. The oracle runs the same first-order host leaf (`Ffi.host`'s `show_number`), so the outputs
+   must match — this is the differential proof that a ulib native foreign compiles, links, and runs. *)
+let same_on_llvm_effect_foreign (label : string) (cfiles : string list) (t : C.term) =
+  let out =
+    with_captured_stdout (fun () -> ignore (Cesk.Machine.run_effect ~host:Ffi.host t))
+  in
+  Alcotest.(check string) label out (llvm_run ~is_effect:true ~foreign_c:cfiles t)
+
+let show_number (f : float) : C.term =
+  C.App
+    ( C.Foreign "Purvasm.Stdio.writeLineImpl"
+    , C.App (C.Foreign "Data.Show.showNumberImpl", C.Lit (C.LNumber f)) )
+
+(* `writeLine (showNumber 3.5)` — a fractional value through the shortest-round-trip branch. *)
+let test_llvm_foreign_c_show_number_fraction () =
+  same_on_llvm_effect_foreign
+    "writeLine (showNumber 3.5)"
+    [ Option.get dshow_foreign_c ]
+    (show_number 3.5)
+
+(* `writeLine (showNumber 3.0)` — an integral value through the distinctive `"x.0"` branch. *)
+let test_llvm_foreign_c_show_number_integral () =
+  same_on_llvm_effect_foreign
+    "writeLine (showNumber 3.0)"
+    [ Option.get dshow_foreign_c ]
+    (show_number 3.0)
+
+(* Stage a synthetic `ulib` corefn dir carrying a native-foreign manifest + the `.c`, as `ulib-tools`
+   staging produces it (ADR-0073 §3), then resolve the `.c` through the *real* manifest reader
+   ([Native_link.foreign_c_files]) — the CLI's exact key → source path — and link it. This exercises the
+   manifest → compile → link → run path end to end (not just a direct `.c` hand-off). *)
+let staged_ulib_with_show_number () : string =
+  let d =
+    let f = Filename.temp_file "ulibstage_" "" in
+    Sys.remove f;
+    Sys.mkdir f 0o755;
+    f
+  in
+  (* the `native/<pkg>/…` layout `ulib-tools build` produces (ADR-0073 §3). *)
+  let nd = Filename.concat (Filename.concat d "native") "prelude" in
+  Sys.mkdir (Filename.concat d "native") 0o755;
+  Sys.mkdir nd 0o755;
+  let contents =
+    let ic = open_in_bin (Option.get dshow_foreign_c) in
+    let s = In_channel.input_all ic in
+    close_in ic;
+    s
+  in
+  let oc = open_out_bin (Filename.concat nd "Data.Show.foreign.c") in
+  output_string oc contents;
+  close_out oc;
+  let oc = open_out (Filename.concat d "ulib.json") in
+  output_string
+    oc
+    {|{ "foreign": { "Data.Show.showNumberImpl": "native/prelude/Data.Show.foreign.c" } }|};
+  close_out oc;
+  d
+
+let test_llvm_foreign_c_via_manifest () =
+  let ulib_dir = staged_ulib_with_show_number () in
+  let cfiles =
+    Native_link.foreign_c_files ~ulib_dir ~keys:[ "Data.Show.showNumberImpl" ]
+  in
+  Alcotest.(check bool) "manifest resolved a source" true (cfiles <> []);
+  same_on_llvm_effect_foreign "manifest → showNumber 3.5" cfiles (show_number 3.5)
 
 let test_llvm_arith () =
   same_on_llvm
@@ -2378,6 +2490,18 @@ let llvm_groups =
         ; Alcotest.test_case "record_union" `Quick test_llvm_record_union
         ; Alcotest.test_case "split_record_union" `Quick test_llvm_split_record_union
         ; Alcotest.test_case "effect_show" `Quick test_llvm_effect_show
+        ; Alcotest.test_case
+            "foreign_c_show_number_fraction"
+            `Quick
+            test_llvm_foreign_c_show_number_fraction
+        ; Alcotest.test_case
+            "foreign_c_show_number_integral"
+            `Quick
+            test_llvm_foreign_c_show_number_integral
+        ; Alcotest.test_case
+            "foreign_c_via_manifest"
+            `Quick
+            test_llvm_foreign_c_via_manifest
         ; Alcotest.test_case "string_byte_build" `Quick test_llvm_string_byte_build
         ; Alcotest.test_case
             "split_string_byte_build"

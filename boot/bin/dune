@@ -12,5 +12,6 @@
   purvasm.ocaml_backend
   purvasm.llvm_backend
   purvasm.ffi
+  purvasm.native_link
   cmdliner
   unix))

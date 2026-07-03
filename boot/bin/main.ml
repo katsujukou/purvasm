@@ -272,10 +272,27 @@ let resolve_runtime_lib runtime_lib =
        set $PURVASM_RT_A, or `cargo build` in runtime/.";
     Stdlib.exit 1
 
+(* Locate the co-distributed C header directory (`purvasm.h`) a ulib native `foreign` `.c` is compiled
+   against (ADR-0073 §2): `$PURVASM_INCLUDE`, else `runtime/include` under a repo root. Like the staticlib,
+   the header is a co-distributed artifact the compiler only locates. *)
+let resolve_runtime_include () =
+  match Sys.getenv_opt "PURVASM_INCLUDE" with
+  | Some p when Sys.file_exists (Filename.concat p "purvasm.h") -> Some p
+  | _ ->
+    let rec up d =
+      if Sys.file_exists (Filename.concat d "runtime/Cargo.toml")
+      then Some d
+      else (
+        let p = Filename.dirname d in
+        if p = d then None else up p)
+    in
+    Option.map (fun root -> Filename.concat root "runtime/include") (up (Sys.getcwd ()))
+
 (* The LLVM native backend (ADR-0071/0072): lower optimised ANF to per-module `.ll` objects + an
-   init/entry object (ADR-0072 §2/§3), compile each with `clang -c`, and dead-strip-link them with the
-   runtime staticlib into a native executable — the CLI form of the e2e differential harness. *)
-let emit_native_llvm ~bdir ~output ~is_effect ~runtime_lib anf =
+   init/entry object (ADR-0072 §2/§3), compile each with `clang -c`, compile any ulib-shipped native
+   `foreign` `.c` the program references (ADR-0073), and dead-strip-link them all with the runtime
+   staticlib into a native executable — the CLI form of the e2e differential harness. *)
+let emit_native_llvm ~bdir ~output ~is_effect ~runtime_lib ~ulib anf =
   let rt = resolve_runtime_lib runtime_lib in
   let split = Llvm_backend.Codegen_llvm.program_split ~is_effect anf in
   let sh label cmd =
@@ -297,17 +314,59 @@ let emit_native_llvm ~bdir ~output ~is_effect ~runtime_lib anf =
          (Filename.quote (Filename.concat bdir (tag ^ ".clang.log"))));
     obj
   in
+  (* Compile the ulib `.c` for each referenced foreign the manifest maps (ADR-0073 §3). The linker then
+     resolves each `pvf_*` symbol from exactly one provider — this `.o` or the runtime staticlib — so a
+     duplicate or missing provider is a link error, not a silent fallback. *)
+  let foreign_objs =
+    match ulib with
+    | None -> []
+    | Some ud ->
+      let cfiles =
+        Native_link.foreign_c_files
+          ~ulib_dir:ud
+          ~keys:(Llvm_backend.Codegen_llvm.foreign_keys_of split)
+      in
+      if cfiles = []
+      then []
+      else (
+        let inc =
+          match resolve_runtime_include () with
+          | Some p -> p
+          | None ->
+            Stdlib.prerr_endline
+              "error: purvasm.h not found for ulib native foreign. Set $PURVASM_INCLUDE \
+               or build runtime/.";
+            Stdlib.exit 1
+        in
+        List.mapi
+          (fun i src ->
+             let obj = Filename.concat bdir (Stdlib.Printf.sprintf "foreign_%d.o" i) in
+             sh
+               "clang -c foreign"
+               (Stdlib.Printf.sprintf
+                  "clang -c -I%s %s -o %s 2>%s"
+                  (Filename.quote inc)
+                  (Filename.quote src)
+                  (Filename.quote obj)
+                  (Filename.quote
+                     (Filename.concat bdir (Stdlib.Printf.sprintf "foreign_%d.log" i))));
+             obj)
+          cfiles)
+  in
   let objs =
     List.mapi
       (fun i (_, src) -> compile_obj (Stdlib.Printf.sprintf "mod_%d" i) src)
       split.modules
     @ [ compile_obj "entry" split.entry ]
+    @ foreign_objs
   in
   let exe = abspath (Filename.concat output "app") in
+  (* `-lm` for a native `foreign` `.c`'s libm calls (`floor`/`fabs`/… in `showNumberImpl`) — unresolved on
+     Linux otherwise (macOS folds libm into libSystem). Harmless when no `.c` needs it. *)
   sh
     "link"
     (Stdlib.Printf.sprintf
-       "clang -Wl,-dead_strip %s %s -o %s 2>%s"
+       "clang -Wl,-dead_strip %s %s -lm -o %s 2>%s"
        (String.concat " " (List.map Filename.quote objs))
        (Filename.quote rt)
        (Filename.quote exe)
@@ -345,7 +404,7 @@ let native_action backend runtime_lib corefn_dir output entry_module entry arg v
   in
   let bdir = build_dir output in
   match backend with
-  | "llvm" -> emit_native_llvm ~bdir ~output ~is_effect ~runtime_lib anf
+  | "llvm" -> emit_native_llvm ~bdir ~output ~is_effect ~runtime_lib ~ulib anf
   | "ocaml" ->
     write_file
       (Filename.concat bdir "app.ml")

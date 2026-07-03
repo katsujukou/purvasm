@@ -1,4 +1,4 @@
 (library
  (name llvm_backend)
  (public_name purvasm.llvm_backend)
- (libraries cesk middle_end))
+ (libraries cesk middle_end ffi))

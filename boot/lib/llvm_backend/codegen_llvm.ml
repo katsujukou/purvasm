@@ -11,7 +11,7 @@
       and the `BRecord` row-poly binder.
     - **Slice 4 — strings, numbers, arrays, leaves, `Effect`**: `String`/`Number` literals
       (`pv_new_str`/`pv_new_number`), `Array` literals, the full primop set (Number/String/Array + the
-      dynamic `String`-keyed record ops), `foreign` leaves (`pv_foreign`), and the `Effect` entry
+      dynamic `String`-keyed record ops), `foreign` leaves (link-time `pvf_*` symbols, ADR-0073 §3), and the `Effect` entry
       (`pv_run_effect` + drain to `stdout`). Multi-atom sites are `eval_atoms`-protected (root-on-collect,
       since literals now allocate); a small-heap fixture exercises the rooting under a forced collection.
     - **Slice 5a — recursive groups (`letrec`)**: a group is all-by-need `ByNeed` cells over one shared
@@ -95,9 +95,11 @@ let ctor_tag (name : string) : int =
    root-handle global `@<mangle>$root`, its init function `@<mangle>$init` (`$` is a legal LLVM identifier
    char). ------------------------------------------------------------------------------------------------ *)
 
-let mangle (key : string) : string =
+(* The injective identifier escape (ADR-0072 §2): alphanumerics pass through, every other byte (including
+   `_` itself) becomes `_HH`, so distinct keys never collide. Shared by the global mangle (`pv_g_` prefix)
+   and the foreign-symbol mangle (`pvf_` prefix, ADR-0073 §3). *)
+let escape_ident (key : string) : string =
   let b = Buffer.create (String.length key + 8) in
-  Buffer.add_string b "pv_g_";
   String.iter
     (fun c ->
        match c with
@@ -105,6 +107,14 @@ let mangle (key : string) : string =
        | _ -> Buffer.add_string b (Printf.sprintf "_%02x" (Char.code c)))
     key;
   Buffer.contents b
+
+(* A top-level binding's linker symbol base: `pv_g_<escape key>` (ADR-0072 §2). *)
+let mangle (key : string) : string = "pv_g_" ^ escape_ident key
+
+(* A native foreign leaf's `AbiCodeFn` linker symbol: `pvf_<escape key>` (ADR-0073 §3). The runtime (and,
+   later, a ulib's compiled `.c`) exports the leaf under exactly this name; codegen references it directly,
+   so foreign resolution is by the linker, not a runtime string dispatch. *)
+let mangle_foreign (key : string) : string = "pvf_" ^ escape_ident key
 
 (* --- free variables of an ANF term (for lambda-lifting, ADR-0072 §4) ------------------------------- *)
 
@@ -158,6 +168,49 @@ and fv_alt (bound : SS.t) (alt : A.alt) : SS.t =
   | A.Guarded gs ->
     List.fold_left
       (fun acc (g, e) -> SS.union acc (SS.union (fv_expr bound g) (fv_expr bound e)))
+      SS.empty
+      gs
+
+(* --- referenced native foreign keys (ADR-0073 §3) -------------------------------------------------- *)
+
+(* Every native foreign key an expression references. The native build compiles the ulib `.c` implementing
+   each reachable key and links it (ADR-0073 §2/§3); a superset (a key in a dead binding) is harmless — the
+   dead-strip link drops an unreferenced leaf's object. Keys with no ulib `.c` are left to the linker to
+   resolve from the runtime staticlib (a truly unbound key becomes a link error). *)
+let rec cf_expr (e : A.expr) : SS.t =
+  match e with
+  | A.Ret c -> cf_cexpr c
+  | A.Let (_, c, body) -> SS.union (cf_cexpr c) (cf_expr body)
+  | A.LetRec (binds, body) ->
+    List.fold_left (fun a (_, r) -> SS.union a (cf_expr r)) (cf_expr body) binds
+
+and cf_cexpr (c : A.cexpr) : SS.t =
+  match c with
+  | A.CAtom a -> cf_atom a
+  | A.CLam (_, b) -> cf_expr b
+  | A.CApp (f, args) ->
+    List.fold_left (fun s a -> SS.union s (cf_atom a)) (cf_atom f) args
+  | A.CPrim (_, args) | A.CArray args | A.CCtor (_, _, args) -> cf_atoms args
+  | A.CRecord fs -> List.fold_left (fun s (_, a) -> SS.union s (cf_atom a)) SS.empty fs
+  | A.CUpdate (a0, fs) ->
+    List.fold_left (fun s (_, a) -> SS.union s (cf_atom a)) (cf_atom a0) fs
+  | A.CAccessor (a, _) -> cf_atom a
+  | A.CIf (a, t, e) -> SS.union (cf_atom a) (SS.union (cf_expr t) (cf_expr e))
+  | A.CCase (scruts, alts) ->
+    List.fold_left (fun s alt -> SS.union s (cf_alt alt)) (cf_atoms scruts) alts
+
+and cf_atom : A.atom -> SS.t = function
+  | A.AForeign k -> SS.singleton k
+  | A.AVar _ | A.ALit _ -> SS.empty
+
+and cf_atoms xs = List.fold_left (fun s a -> SS.union s (cf_atom a)) SS.empty xs
+
+and cf_alt (alt : A.alt) : SS.t =
+  match alt.result with
+  | A.Uncond e -> cf_expr e
+  | A.Guarded gs ->
+    List.fold_left
+      (fun s (g, e) -> SS.union s (SS.union (cf_expr g) (cf_expr e)))
       SS.empty
       gs
 
@@ -230,6 +283,8 @@ type ctx =
     (* top-level qualified keys → referenced as `@<mangle>$root` globals (ADR-0072 §2) *)
   ; mutable externs :
       SS.t (* referenced globals not defined here → emitted as `external` decls *)
+  ; mutable foreigns : SS.t
+    (* referenced native foreign keys → declared as `pvf_<mangle>` externals (ADR-0073 §3) *)
   }
 
 let fresh cx : string =
@@ -278,8 +333,8 @@ let read_var cx (env : env) (x : string) : string =
     failwith (Printf.sprintf "codegen_llvm: unbound variable %s (unresolved foreign?)" x)
 
 (* Emit a module-level byte constant for [s] and return `(ptr-to-first-byte, len)`. Used for `String`
-   literals (`pv_new_str`) and foreign keys (`pv_foreign`). The empty string needs no global — a null
-   pointer with length 0 is the runtime's empty-buffer convention. *)
+   literals (`pv_new_str`). The empty string needs no global — a null pointer with length 0 is the
+   runtime's empty-buffer convention. *)
 let string_constant cx (s : string) : string * int =
   let len = String.length s in
   if len = 0
@@ -325,11 +380,21 @@ let atom cx (env : env) : A.atom -> string = function
     emit cx "  %s = call i64 @pv_new_str(ptr %%ctx, ptr %s, i64 %d)" t p len;
     t
   | A.AForeign k ->
-    (* An unresolved foreign leaf → the runtime resolver returns it as a closure (ADR-0072 §9). *)
-    let p, len = string_constant cx k in
-    let t = fresh cx in
-    emit cx "  %s = call i64 @pv_foreign(ptr %%ctx, ptr %s, i64 %d)" t p len;
-    t
+    (* A native foreign leaf resolves by **link-time symbol** (ADR-0073 §3): reference its `AbiCodeFn`
+       `@pvf_<mangle key>` and wrap it in a no-capture closure of the leaf's arity (from the `Ffi`
+       registry — boot's metadata source, ADR-0073 §3). Its arity is fixed here at the reference. *)
+    cx.foreigns <- SS.add k cx.foreigns;
+    let addr = fresh cx in
+    emit cx "  %s = ptrtoint ptr @%s to i64" addr (mangle_foreign k);
+    let clo = fresh cx in
+    emit
+      cx
+      "  %s = call i64 @pv_make_closure(ptr %%ctx, i64 %s, i32 %d, i64 %s)"
+      clo
+      addr
+      (Ffi.foreign_arity k)
+      imm_unit;
+    clo
 
 (* An atom evaluated at a **value-dereference** site (ADR-0070 §3): a dictionary read for a method, a
    `case` scrutinee, a primop operand. A variable might hold a by-need cell (a recursive member, or one
@@ -962,7 +1027,6 @@ let declarations : string =
     ; "declare i64 @pv_new_record(ptr, ptr, ptr, i64)"
     ; "declare i64 @pv_new_str(ptr, ptr, i64)"
     ; "declare i64 @pv_new_number(ptr, i64)"
-    ; "declare i64 @pv_foreign(ptr, ptr, i64)"
     ; "declare i64 @pv_record_get(ptr, i64, i64)"
     ; "declare i64 @pv_record_set(ptr, i64, i64, i64)"
     ; "declare i64 @pv_read_field(ptr, i64, i64)"
@@ -1039,7 +1103,18 @@ let make_cx ?(gkeys = SS.empty) () : ctx =
   ; frame = "%frame"
   ; gkeys
   ; externs = SS.empty
+  ; foreigns = SS.empty
   }
+
+(* `declare` lines for the native foreign `AbiCodeFn` symbols this object references (ADR-0073 §3). Each has
+   the leaf ABI `i64 (ptr ctx, i64 clo, ptr args, i64 nargs)`; the symbol is resolved at link from the
+   runtime (or, later, a ulib's compiled `.c`). A `declare` of a symbol referenced nowhere in the object is
+   inert, so emitting these per-object is safe. *)
+let foreign_decls cx : string =
+  SS.elements cx.foreigns
+  |> List.map (fun k ->
+    Printf.sprintf "declare i64 @%s(ptr, i64, ptr, i64)" (mangle_foreign k))
+  |> String.concat "\n"
 
 let program ?(is_effect = false) ?(heap_words = default_heap_words) (e : A.expr) : string =
   let cx = make_cx () in
@@ -1065,8 +1140,9 @@ let program ?(is_effect = false) ?(heap_words = default_heap_words) (e : A.expr)
   (* emit the lifted functions the entry (and transitively) queued *)
   emit_pending cx;
   Printf.sprintf
-    "; ModuleID = 'purvasm'\n\n%s\n\n%s\n%s\ndefine i32 @main() {\nentry:\n%s}\n"
+    "; ModuleID = 'purvasm'\n\n%s\n%s\n\n%s\n%s\ndefine i32 @main() {\nentry:\n%s}\n"
     declarations
+    (foreign_decls cx)
     (Buffer.contents cx.globals)
     (Buffer.contents cx.md)
     entry_body
@@ -1384,9 +1460,10 @@ let program_modular ?(is_effect = false) ?(heap_words = default_heap_words) (e :
   let entry_body = emit_entry_stub cx ~is_effect ~heap_words entry in
   emit_pending cx;
   Printf.sprintf
-    "; ModuleID = 'purvasm'\n\n%s\n%s\n\n%s\n%s\ndefine i32 @main() {\nentry:\n%s}\n"
+    "; ModuleID = 'purvasm'\n\n%s\n%s\n%s\n\n%s\n%s\ndefine i32 @main() {\nentry:\n%s}\n"
     declarations
     (extern_global_decls cx ~defined:gkeys)
+    (foreign_decls cx)
     (Buffer.contents cx.globals)
     (Buffer.contents cx.md)
     entry_body
@@ -1415,9 +1492,10 @@ let module_ll ~(gkeys : SS.t) ~(defined : SS.t) (gdefs : gdef list) : string =
   emit_gdefs cx gdefs;
   emit_pending cx;
   Printf.sprintf
-    "; ModuleID = 'purvasm.module'\n\n%s\n%s\n\n%s\n%s"
+    "; ModuleID = 'purvasm.module'\n\n%s\n%s\n%s\n\n%s\n%s"
     declarations
     (extern_global_decls cx ~defined)
+    (foreign_decls cx)
     (Buffer.contents cx.globals)
     (Buffer.contents cx.md)
 
@@ -1450,6 +1528,7 @@ let entry_ll
     "; ModuleID = 'purvasm.init'\n\n\
      %s\n\
      %s\n\
+     %s\n\
      %s\n\n\
      %s\n\
      %s\n\
@@ -1459,6 +1538,7 @@ let entry_ll
     declarations
     init_decls
     (extern_global_decls cx ~defined:SS.empty)
+    (foreign_decls cx)
     (Buffer.contents cx.globals)
     (Buffer.contents cx.md)
     entry_body
@@ -1466,6 +1546,7 @@ let entry_ll
 type split_output =
   { modules : (string * string) list (* (module name, its `.ll`) *)
   ; entry : string (* the init/entry object `.ll` *)
+  ; foreigns : SS.t (* native foreign keys the program references (ADR-0073 §3) *)
   }
 
 (** Lower a linked program to **separate module objects + one init/entry object** (ADR-0072 §1/§3). Top-level
@@ -1502,4 +1583,11 @@ let program_split ?(is_effect = false) ?(heap_words = default_heap_words) (e : A
       let defined = SS.of_list (List.concat_map gdef_keys gs) in
       m, module_ll ~gkeys ~defined gs)
   in
-  { modules; entry = entry_ll ~is_effect ~heap_words ~gkeys gdefs entry }
+  { modules
+  ; entry = entry_ll ~is_effect ~heap_words ~gkeys gdefs entry
+  ; foreigns = cf_expr e
+  }
+
+(** The native foreign keys a [split_output] references, as a sorted list — the native build resolves each
+    to a ulib `.c` (compiled and linked) or leaves it to the linker (ADR-0073 §3). *)
+let foreign_keys_of (o : split_output) : string list = SS.elements o.foreigns
