@@ -459,6 +459,20 @@ pub unsafe extern "C" fn pv_prim_record_delete(ctx: *mut Heap, label: u64, rec: 
     })
 }
 
+/// `Record.Unsafe.Union.unsafeUnionFn r1 r2` — the left-biased record merge (ADR-0069 revision). Takes two
+/// records directly (no label), so unlike the other record primops there is no `String`-key hashing.
+///
+/// # Safety
+/// `ctx` live; `r1`/`r2` are `Record`s.
+#[no_mangle]
+pub unsafe extern "C" fn pv_prim_record_union(ctx: *mut Heap, r1: u64, r2: u64) -> u64 {
+    guard(|| {
+        heap(ctx)
+            .record_union(TaggedWord::from_bits(r1), TaggedWord::from_bits(r2))
+            .to_bits()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

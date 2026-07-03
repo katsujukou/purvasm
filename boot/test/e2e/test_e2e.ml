@@ -1261,6 +1261,26 @@ let test_llvm_record_dynamic () =
     "dynamic record get"
     (C.Prim (C.RecordGet, [ C.Lit (C.LString "a"); C.Record [ "a", int 5; "b", int 6 ] ]))
 
+(* Record union (ADR-0069 revision): `union {a:1,b:2} {b:99,c:3}` = `{a:1,b:2,c:3}` — **left-biased** (r1's
+   `b=2` wins over r2's `b=99`). Read `a + b + c` = 1 + 2 + 3 = 6 (a right-biased merge would give 103). *)
+let record_union_term =
+  C.Let
+    ( "u"
+    , C.Prim
+        ( C.RecordUnion
+        , [ C.Record [ "a", int 1; "b", int 2 ]; C.Record [ "b", int 99; "c", int 3 ] ] )
+    , C.Prim
+        ( C.AddInt
+        , [ C.Prim (C.AddInt, [ C.Accessor (C.Var "u", "a"); C.Accessor (C.Var "u", "b") ])
+          ; C.Accessor (C.Var "u", "c")
+          ] ) )
+
+let test_llvm_record_union () =
+  same_on_llvm "record union (left-biased)" record_union_term
+
+let test_llvm_split_record_union () =
+  same_on_llvm_split "split record union" record_union_term
+
 (* A foreign `show` leaf feeding a `writeLine`: `writeLine (showInt 42)` → "42\n". *)
 let test_llvm_effect_show () =
   same_on_llvm_effect
@@ -2355,6 +2375,8 @@ let llvm_groups =
         ; Alcotest.test_case "array_index" `Quick test_llvm_array_index
         ; Alcotest.test_case "array_length" `Quick test_llvm_array_length
         ; Alcotest.test_case "record_dynamic" `Quick test_llvm_record_dynamic
+        ; Alcotest.test_case "record_union" `Quick test_llvm_record_union
+        ; Alcotest.test_case "split_record_union" `Quick test_llvm_split_record_union
         ; Alcotest.test_case "effect_show" `Quick test_llvm_effect_show
         ; Alcotest.test_case "string_byte_build" `Quick test_llvm_string_byte_build
         ; Alcotest.test_case

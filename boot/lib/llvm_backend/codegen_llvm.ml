@@ -203,6 +203,7 @@ let prim_sym : C.primop -> string * bool = function
   | C.RecordSet -> "pv_prim_record_set", true
   | C.RecordHas -> "pv_prim_record_has", true
   | C.RecordDelete -> "pv_prim_record_delete", true
+  | C.RecordUnion -> "pv_prim_record_union", true
 
 (* --- the emitter ----------------------------------------------------------------------------------- *)
 
@@ -1008,6 +1009,7 @@ let declarations : string =
     ; "declare i64 @pv_prim_record_set(ptr, i64, i64, i64)"
     ; "declare i64 @pv_prim_record_has(ptr, i64, i64)"
     ; "declare i64 @pv_prim_record_delete(ptr, i64, i64)"
+    ; "declare i64 @pv_prim_record_union(ptr, i64, i64)"
     ; "declare i64 @pv_empty_array()"
     ; "declare i64 @pv_new_byneed_placeholder(ptr)"
     ; "declare void @pv_byneed_set_suspension(ptr, i64, i64)"

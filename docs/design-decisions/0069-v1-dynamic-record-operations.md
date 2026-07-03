@@ -3,6 +3,30 @@
 - Status: Accepted
 - Date: 2026-07-02
 
+> **Revision (2026-07-03, accepted).** Two additions surfaced by the
+> Record-metaprogramming example:
+>
+> **(a) `record_union` (a new §3 operation).** `Record.Unsafe.Union.unsafeUnionFn :: Record r1 -> Record
+> r2 -> Record r3` merges two records — all of `r2`'s fields, overwritten by `r1`'s on a shared id
+> (left-biased, matching `Object.assign({}, r2, r1)`). It is a straight **id-keyed merge on the opaque
+> representation**: read both `checked_record` views, combine their `(id, value)` pairs (r1 wins), emit one
+> `new_record` with sorted ids — no new value form, no label strings, self-rooting `r1`/`r2` across the
+> allocation (ADR-0066 §3). Added as a runtime op + a `RecordUnion` primop + the `ffi.ml` mapping (the
+> oracle side), so the VM/CESK and LLVM backends stay differential-equal.
+>
+> **(b) Representation-opacity restriction (a non-goal, making §2/§4/§5 explicit).** The id-keyed layout
+> **discards the label strings** (§4 stores only `fnv1a_64` ids). This fixes a deliberate boundary,
+> matching Wasm-backend PureScript: the record representation is **opaque**, and any code/FFI that depends
+> on its concrete form — reading a *typed* record's field-name **strings** at runtime (`Object.keys`), or
+> touching a record as a raw host object (a representation-equality trick in `foreign.js`) — is **out of
+> scope and non-portable** to purvasm. Rationale: idiomatic PureScript obtains a record's field names from
+> the **type-level row** at compile time (`IsSymbol`/`reflectSymbol`, as `showRecordFields` does), never
+> from the runtime value; and every *typed* record operation (`get`/`set`/`insert`/`delete`/`modify`/
+> `union`) is expressible on the opaque id→value core. A genuine dynamic string-keyed map is a **distinct
+> type** (`Foreign.Object`, §5), represented with real string keys — not by exposing record internals.
+> Consequently enumerating the stored ids to PureScript is **not** provided: an id is an opaque hash (no
+> string recovery), so it would let a consumer do nothing the type does not already know.
+
 ## Context
 
 PureScript records are first-class and support **dynamic** field operations — `Record.get` / `set` /

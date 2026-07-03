@@ -120,6 +120,7 @@ let intrinsics : (string * C.term) list =
   ; p "Record.Unsafe.unsafeSet" C.RecordSet 3
   ; p "Record.Unsafe.unsafeHas" C.RecordHas 2
   ; p "Record.Unsafe.unsafeDelete" C.RecordDelete 2
+  ; p "Record.Unsafe.Union.unsafeUnionFn" C.RecordUnion 2
     (* `Record.Builder` over the same record primops: `copyRecord` is the identity (records are
        persistent — no defensive copy needed); insert/delete reuse the record primops.
        `unsafeModify`/`unsafeRename` are structural guest terms (below). *)

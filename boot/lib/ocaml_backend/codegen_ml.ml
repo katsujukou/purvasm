@@ -106,6 +106,10 @@ let p_record_get l r = (match r with VRecord m ->
 let p_record_set l v r = (match r with VRecord m -> VRecord (SMap.add (as_str l) v m) | _ -> stuck "recordSet")
 let p_record_has l r = (match r with VRecord m -> VBool (SMap.mem (as_str l) m) | _ -> stuck "recordHas")
 let p_record_delete l r = (match r with VRecord m -> VRecord (SMap.remove (as_str l) m) | _ -> stuck "recordDelete")
+(* Left-biased merge (ADR-0069 revision): `r1`'s fields override `r2`'s on a shared label. *)
+let p_record_union r1 r2 = (match r1, r2 with
+  | VRecord m1, VRecord m2 -> VRecord (SMap.union (fun _ v1 _v2 -> Some v1) m1 m2)
+  | _ -> stuck "recordUnion")
 
 (* Native foreign leaves, re-implemented over [value]. The generated program is a
    standalone executable and cannot link Cesk's host registry, so the leaves live here;
@@ -342,6 +346,7 @@ let prim_fn : C.primop -> string = function
   | C.RecordSet -> "p_record_set"
   | C.RecordHas -> "p_record_has"
   | C.RecordDelete -> "p_record_delete"
+  | C.RecordUnion -> "p_record_union"
 
 let prim (lz : SS.t) (op : C.primop) (args : A.atom list) : string =
   Printf.sprintf

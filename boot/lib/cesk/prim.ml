@@ -112,4 +112,8 @@ let eval (op : primop) (args : Value.t list) : Value.t =
     Value.VBool (Base.Map.mem m label)
   | RecordDelete, [ Value.VString label; Value.VRecord m ] ->
     Value.VRecord (Base.Map.remove m label)
+  (* Left-biased merge (ADR-0069 revision): all of `m2`'s fields, overwritten by `m1`'s on a shared
+     label — `Object.assign({}, r2, r1)`. *)
+  | RecordUnion, [ Value.VRecord m1; Value.VRecord m2 ] ->
+    Value.VRecord (Base.Map.merge_skewed m1 m2 ~combine:(fun ~key:_ v1 _v2 -> v1))
   | _ -> Errors.stuck ("primop " ^ primop_to_string op ^ ": ill-typed arguments")

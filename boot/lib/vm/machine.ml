@@ -138,6 +138,9 @@ let eval_prim (op : C.primop) (args : V.t list) : V.t =
   | C.RecordSet, [ V.Vstring label; v; V.Vrecord m ] -> V.Vrecord (SMap.add label v m)
   | C.RecordHas, [ V.Vstring label; V.Vrecord m ] -> V.Vbool (SMap.mem label m)
   | C.RecordDelete, [ V.Vstring label; V.Vrecord m ] -> V.Vrecord (SMap.remove label m)
+  (* Left-biased merge (ADR-0069 revision): `m1`'s fields override `m2`'s on a shared label. *)
+  | C.RecordUnion, [ V.Vrecord m1; V.Vrecord m2 ] ->
+    V.Vrecord (SMap.union (fun _ v1 _v2 -> Some v1) m1 m2)
   | _ -> stuck ("primop " ^ C.primop_to_string op ^ ": ill-typed arguments")
 
 (** Take/drop helpers for the eval/apply over-application split. *)

@@ -55,6 +55,9 @@ type primop =
   | RecordSet
   | RecordHas
   | RecordDelete
+  (* Merge two records (ADR-0069 revision): all of the right record's fields, overwritten by the left's
+     on a shared label (left-biased). The `Record.Unsafe.Union.unsafeUnionFn` foreign. *)
+  | RecordUnion
 
 (* A pattern, matched structurally against an already-evaluated value (ADR-0011,
    ADR-0012). Covers all of CoreFn's binders: wildcard, variable, scalar literal,
@@ -163,6 +166,7 @@ let primop_to_string : primop -> string = function
   | RecordSet -> "rec.set"
   | RecordHas -> "rec.has"
   | RecordDelete -> "rec.del"
+  | RecordUnion -> "rec.union"
 
 let lit_to_string : lit -> string = function
   | LInt n -> Int.to_string n

@@ -144,6 +144,56 @@ impl Heap {
         out.as_word()
     }
 
+    /// `Record.union` (ADR-0069 revision): a new record with all of `r2`'s fields, **overwritten by
+    /// `r1`'s** on a shared id (left-biased — `Object.assign({}, r2, r1)`). A two-pointer merge of the two
+    /// already-ascending id runs into strictly-ascending merged ids, then one `new_record`. Both records
+    /// are rooted across that allocation; the reads happen with no intervening allocation, so their field
+    /// pointers stay valid, and `new_record` roots the collected values (ADR-0066 §3).
+    pub fn record_union(&mut self, r1: Value, r2: Value) -> Value {
+        let frame = self.frame();
+        let rr1 = self.root(r1);
+        let rr2 = self.root(r2);
+        let v1 = self.checked_record(self.get(rr1));
+        let v2 = self.checked_record(self.get(rr2));
+        let cap = v1.count + v2.count;
+        let mut ids: Vec<u64> = Vec::with_capacity(cap);
+        let mut vals: Vec<Value> = Vec::with_capacity(cap);
+        let (mut i, mut j) = (0usize, 0usize);
+        // No allocation in this loop, so `v1`/`v2`'s field pointers stay live (ADR-0069 §3).
+        while i < v1.count && j < v2.count {
+            let id1 = self.rawids_id(v1.ids.unwrap(), i);
+            let id2 = self.rawids_id(v2.ids.unwrap(), j);
+            if id1 < id2 {
+                ids.push(id1);
+                vals.push(self.read_field_unchecked(v1.vals.unwrap(), i as u64));
+                i += 1;
+            } else if id2 < id1 {
+                ids.push(id2);
+                vals.push(self.read_field_unchecked(v2.vals.unwrap(), j as u64));
+                j += 1;
+            } else {
+                // shared id → `r1` wins
+                ids.push(id1);
+                vals.push(self.read_field_unchecked(v1.vals.unwrap(), i as u64));
+                i += 1;
+                j += 1;
+            }
+        }
+        while i < v1.count {
+            ids.push(self.rawids_id(v1.ids.unwrap(), i));
+            vals.push(self.read_field_unchecked(v1.vals.unwrap(), i as u64));
+            i += 1;
+        }
+        while j < v2.count {
+            ids.push(self.rawids_id(v2.ids.unwrap(), j));
+            vals.push(self.read_field_unchecked(v2.vals.unwrap(), j as u64));
+            j += 1;
+        }
+        let out = self.new_record(&ids, &vals);
+        self.pop_frame(frame);
+        out.as_word()
+    }
+
     /// `Record.modify`: `set(rec, id, f (get rec id))`. `apply f` is a safepoint, so `rec` is rooted
     /// across it and reloaded before the `set` (ADR-0066 §3).
     pub fn record_modify(&mut self, rec: Value, id: u64, f: Value) -> Value {
@@ -339,6 +389,24 @@ mod tests {
         let kb3 = h.new_str(b"beta").as_word();
         let r4 = h.record_unsafe_delete(kb3, r3);
         assert_eq!(h.checked_record(r4).count, 1);
+    }
+
+    #[test]
+    fn record_union_is_left_biased() {
+        let mut h = Heap::new(256);
+        let r1 = rec_of(&mut h, &[10, 20], &[1, 2]);
+        let r2 = rec_of(&mut h, &[20, 30], &[99, 3]);
+        let u = h.record_union(r1, r2);
+        assert_eq!(h.checked_record(u).count, 3);
+        assert_eq!(get_int(&h, u, 10), 1); // only in r1
+        assert_eq!(get_int(&h, u, 20), 2); // shared id → r1 wins (not r2's 99)
+        assert_eq!(get_int(&h, u, 30), 3); // only in r2
+                                           // union with the empty record is identity (both directions)
+        let e = h.new_record(&[], &[]).as_word();
+        let u2 = h.record_union(r1, e);
+        assert_eq!((get_int(&h, u2, 10), get_int(&h, u2, 20)), (1, 2));
+        let u3 = h.record_union(e, r1);
+        assert_eq!((get_int(&h, u3, 10), get_int(&h, u3, 20)), (1, 2));
     }
 
     /// A `+1` leaf that forces a collection before returning (garbage → GC in a small heap).
