@@ -1,0 +1,20 @@
+{
+  "dependencies": ["foldable-traversable"],
+  "test": {
+    "repo": "https://github.com/rowtype-yoga/purescript-record-studio",
+    "ref": "v1.0.4",
+    "testMain": "Test.Main",
+    "testDeps": [
+      "aff",
+      "effect",
+      "spec",
+      "spec-discovery",
+      "either",
+      "maybe",
+      "foreign-object",
+      "unsafe-coerce"
+    ],
+    "fidelity": "js",
+    "xfail": []
+  }
+}
