@@ -101,6 +101,15 @@ escape. What remains unproven is only what `unsafe` opts into (a leaf can still 
 word via the `sys` floor); the paved path makes the contract the default instead of the author's
 memory.
 
+> **Progress (2026-07-05):** Accepted, and the maintainer fixed the crate homes ahead of
+> implementation. The three layer crates live under a new top-level `crates/` directory —
+> `crates/purvasm-sys/`, `crates/purvasm-foreign/`, `crates/purvasm-foreign-macros/` (the §3 names
+> stand). The runtime **stays at `runtime/` for now**: moving it to `crates/purvasm-rt/` is the
+> desired end state but is deferred until the CI wiring can move with it. All crates remain
+> monorepo-internal with `publish = false` at least until, post-v1.0: external users are writing
+> purvasm foreign crates, an ABI-compatibility policy can be stated, and a crates.io publishing
+> process is actually needed.
+
 ### 4. Panic containment at the `pvf_*` boundary
 
 A Rust panic must never unwind across the `extern "C"` boundary into the runtime's `apply` (UB, and
@@ -160,6 +169,38 @@ Linking is where Rust differs from C, and it needs two pinned decisions:
 
 When no Rust foreign is reachable, the build uses the prebuilt plain runtime staticlib exactly as
 today — the cargo/rustc dependency and the bundle step cost nothing unless a Rust foreign is present.
+
+> **Progress (2026-07-05):** build-orchestration clarifications agreed with the maintainer ahead of
+> implementation — `purvasm build` owns the whole flow first-class:
+>
+> 1. provider map over the reachable keys (the §5 exactly-one validation, C/Rust/intrinsics
+>    together, crate-level dedup);
+> 2. C providers compile via `clang -c` exactly as today;
+> 3. only when a Rust provider is present, the driver synthesizes the bundle crate in the build
+>    directory and drives the **user's** cargo
+>    (`cargo build --release --target-dir <bdir>/cargo`), then runs the `nm`-class audit on the
+>    produced archive;
+> 4. the final `clang` link is unchanged except that the bundle `.a` stands in for the plain
+>    runtime staticlib.
+>
+> Two consequences made explicit:
+>
+> - **A Rust-foreign build recompiles the runtime with the user's toolchain.** rlibs are not
+>   stable across rustc versions, so the bundle cannot link a prebuilt `purvasm-rt` rlib: the
+>   distribution ships the `purvasm-rt` / `purvasm-sys` / `purvasm-foreign` *sources*, and the
+>   bundle builds them all with the user's rustc. The prebuilt runtime staticlib serves only the
+>   no-Rust path. Cargo's target-dir cache confines this to a first-build cost.
+> - **Cargo invocation defaults**: `--locked --offline` (a foreign crate depends only on the local
+>   path crates by default; third-party dependencies are an explicit opt-in flag), an MSRV floor
+>   pinned via `rust-version` in lockstep with the runtime crate, and cargo failures surfaced with
+>   a log path exactly as the existing `clang` logs are.
+> - **The driver checks `purvasm-sys` ↔ `purvasm.h` version agreement at bundle-build time.** The
+>   Consequences already pin lockstep versioning of the layer crates with the header; this makes
+>   the check active rather than a convention: before invoking cargo, the driver verifies that the
+>   `purvasm-sys` version the bundle resolves matches the header/runtime-staticlib version the rest
+>   of the build uses, and fails with an error naming both versions on mismatch. This is the
+>   wasm-bindgen lesson (its library↔CLI version-match failures are a recurring operational trap)
+>   applied preemptively, as a natural extension of the provider-map validation step.
 
 ### Non-goals (unchanged invariants)
 
