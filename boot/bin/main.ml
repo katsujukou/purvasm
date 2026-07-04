@@ -299,9 +299,21 @@ let resolve_runtime_include () =
    init/entry object (ADR-0072 §2/§3), compile each with `clang -c`, compile any ulib-shipped native
    `foreign` `.c` the program references (ADR-0073), and dead-strip-link them all with the runtime
    staticlib into a native executable — the CLI form of the e2e differential harness. *)
-let emit_native_llvm ~bdir ~output ~is_effect ~runtime_lib ~debug ~ulib ~heap_words anf =
+let emit_native_llvm
+      ~bdir
+      ~output
+      ~is_effect
+      ~runtime_lib
+      ~debug
+      ~ulib
+      ~heap_words
+      ~surface
+      anf
+  =
   let rt = resolve_runtime_lib ~debug runtime_lib in
-  let split = Llvm_backend.Codegen_llvm.program_split ~is_effect ?heap_words anf in
+  let split =
+    Llvm_backend.Codegen_llvm.program_split ~is_effect ?heap_words ~surface anf
+  in
   let sh label cmd =
     if Sys.command cmd <> 0
     then (
@@ -402,14 +414,28 @@ let native_action
   =
   mkdir_p (build_dir output);
   let em = split_module entry_module in
-  let term0 =
-    Link.link_program
-      ~resolver:Ffi.resolver
-      ?ulib_dir:ulib
-      ~outdir:corefn_dir
-      ~entry_module:em
-      ~entry
-      ()
+  let modules = Link.load ?ulib_dir:ulib ~outdir:corefn_dir ~entry_module:em () in
+  let term0 = Link.link ~resolver:Ffi.resolver modules ~entry_module:em ~entry in
+  (* The program's export surface, key → call fact (ADR-0077 §2): derived from the SAME code
+     that writes each module's `.pmi` (`compile_module` → `interface_of`), so what native
+     codegen bakes into a caller's `.o` is exactly the fact the `.pmi` hash cascade guards —
+     one contract, two consumers. The future artifact-driven driver reads the `.pmi` files
+     instead, with no behavioural change. *)
+  let surface =
+    let module CG = Llvm_backend.Codegen_llvm in
+    List.fold_left
+      (fun acc (m : Corefn.Module.t) ->
+         let iface = Pvm.Artifact.interface_of (Pvm.Compile.compile_module m) in
+         List.fold_left
+           (fun acc (k, kd) ->
+              match kd with
+              | Pvm.Artifact.Efn n -> CG.SM.add k (CG.Cfn n) acc
+              | Pvm.Artifact.Erecfn n -> CG.SM.add k (CG.Crecfn n) acc
+              | Pvm.Artifact.Ecaf | Pvm.Artifact.Erec -> acc)
+           acc
+           iface.Pvm.Artifact.exports)
+      CG.SM.empty
+      modules
   in
   let main_term, is_effect =
     match value, arg with
@@ -427,7 +453,16 @@ let native_action
   let bdir = build_dir output in
   match backend with
   | "llvm" ->
-    emit_native_llvm ~bdir ~output ~is_effect ~runtime_lib ~debug ~ulib ~heap_words anf
+    emit_native_llvm
+      ~bdir
+      ~output
+      ~is_effect
+      ~runtime_lib
+      ~debug
+      ~ulib
+      ~heap_words
+      ~surface
+      anf
   | "ocaml" ->
     write_file
       (Filename.concat bdir "app.ml")

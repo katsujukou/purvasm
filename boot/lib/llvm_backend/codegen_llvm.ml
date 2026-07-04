@@ -292,6 +292,10 @@ type lifted =
   ; capture_fns : (string * fn_info) list
     (* direct-call info for captures that are known recursive-group function members (the
        mutual-recursion case: a sibling reached through the shared env, ADR-0076 §2) *)
+  ; exported : bool
+    (* the direct entry `$d` is part of the module's export surface (ADR-0077 §3): external
+       linkage, so other modules' objects can call it by symbol. Lifted internals and all
+       wrappers stay [internal]. *)
   }
 
 (* [LBody] is an ordinary lambda body. [LClosure lm] is a `Grec` function member's suspension body:
@@ -319,7 +323,14 @@ type ctx =
     (* referenced native foreign keys → declared as `pvf_<mangle>` externals (ADR-0073 §3) *)
   ; mutable gfns : fn_info SM.t
     (* this module's own top-level function bindings, callable directly when saturated
-       (ADR-0076 §2 — never cross-module: each per-module [cx] registers only its own gdefs) *)
+       (ADR-0076 §2 — each per-module [cx] registers only its own gdefs; checked first) *)
+  ; xfns : fn_info SM.t
+    (* the program's cross-module export surface (ADR-0077 §2): exported top-level function
+       key → direct-entry info, exactly what the dependency's `.pmi` publishes (`Efn` →
+       [SSentinel], `Erecfn` → [SForceCell]) — spine-derived today, file-read tomorrow *)
+  ; mutable xdecls : int SM.t
+    (* referenced cross-module direct entries (`$d` symbol → arity) → emitted as
+       per-signature `declare tailcc` externs (ADR-0077 §3) *)
   ; mutable self_ctx : (string * string option * string * fn_info) option
     (* the binding whose lambda is being emitted: (name, its entry-time capture handle if the
        name is captured — [None] when it resolves as a global —, the rooted handle of this
@@ -542,6 +553,7 @@ let lift cx (env : env) (params : string list) (body : A.expr) : lifted =
     ; body = LBody body
     ; self_name = None
     ; capture_fns = []
+    ; exported = false
     }
   in
   cx.pending <- l :: cx.pending;
@@ -765,12 +777,12 @@ let build_grec
       (fun (m, rhs) ->
          match rhs with
          | A.Ret (A.CLam (ps, b)) ->
-           let name =
+           let name, top =
              match named m with
-             | Some n -> n
+             | Some n -> n, true
              | None ->
                cx.fns <- cx.fns + 1;
-               Printf.sprintf "recfn_%d" cx.fns
+               Printf.sprintf "recfn_%d" cx.fns, false
            in
            let bound = List.fold_left (fun s p -> SS.add p s) SS.empty ps in
            let globals_unshadowed = SS.diff cx.gkeys shared_names in
@@ -783,7 +795,11 @@ let build_grec
                ; captures
                ; body = LBody b
                ; self_name = Some m
-               ; capture_fns = []
+               ; capture_fns =
+                   []
+                   (* an exported `Erecfn` member's `$d` is the cross-module force-cell
+                    target (ADR-0077 §2/§3) *)
+               ; exported = top && SM.mem m cx.xfns
                }
              , info )
          | _ -> None)
@@ -816,6 +832,7 @@ let build_grec
             ; body
             ; self_name = None
             ; capture_fns = []
+            ; exported = false
             }
             :: cx.pending;
          name)
@@ -868,11 +885,15 @@ let build_grec
     members
     cell_hs
 
-(* Resolve a saturated call's statically-known direct target (ADR-0076 §2): a self-call, a
-   let-bound lambda / recursive-group member, or a same-module top-level function. [None] falls
-   back to the generic `pv_apply` / trampoline path. Resolution mirrors [read_var]'s order —
-   local scope first, then the enclosing self binding, then this module's own globals — so a
-   local rebinding of a function's name is never mistaken for the function. *)
+(* Resolve a saturated call's statically-known direct target (ADR-0076 §2, extended
+   cross-module by ADR-0077 §2): a self-call, a let-bound lambda / recursive-group member, a
+   same-module top-level function, or another module's *exported* function ([cx.xfns] — the
+   dependency's `.pmi` export surface). [None] falls back to the generic `pv_apply` /
+   trampoline path. Resolution mirrors [read_var]'s order — local scope first, then the
+   enclosing self binding, then this module's own globals, then the export surface — so a
+   local rebinding of a function's name is never mistaken for the function, and same-module
+   facts win over the interface. A cross-module hit is recorded in [cx.xdecls] for its
+   per-signature `declare tailcc` extern (ADR-0077 §3). *)
 let direct_target cx (env : env) (f : A.atom) (nargs : int) : fn_info option =
   match f with
   | A.AVar x ->
@@ -891,7 +912,14 @@ let direct_target cx (env : env) (f : A.atom) (nargs : int) : fn_info option =
         | _ ->
           (match SM.find_opt x cx.gfns with
            | Some info when info.arity = nargs -> Some info
-           | _ -> None))
+           | Some _ ->
+             None (* own-module fact says unsaturated: never fall to the surface *)
+           | None ->
+             (match SM.find_opt x cx.xfns with
+              | Some info when info.arity = nargs ->
+                cx.xdecls <- SM.add info.dsym info.arity cx.xdecls;
+                Some info
+              | _ -> None)))
      | None -> None)
   | A.ALit _ | A.AForeign _ -> None
 
@@ -1339,17 +1367,20 @@ let emit_function cx (l : lifted) : unit =
      emit_ret cx clo);
   cx.self_ctx <- saved_self;
   cx.in_direct <- saved_direct;
-  (* `internal` linkage: a lifted function is referenced only by address within its own module (never by
-     symbol name cross-module), so it must not clash with an equally-named lifted function in another
-     per-module `.o` (ADR-0072 §1). `tailcc` guarantees the `musttail` TCO on direct→direct tail edges
-     (ADR-0076 §3) — legal because direct entries are module-internal, never an ABI surface. *)
+  (* Linkage: a lifted internal (`fn_*`/`susp_*`/local `recfn_*`) is referenced only by address
+     within its own module, so `internal` keeps it from clashing with an equally-named lifted
+     function in another per-module `.o` (ADR-0072 §1). An **exported top-level** binding's `$d`
+     is external (ADR-0077 §3): it is the cross-module direct-call target, and the injective
+     mangle already guarantees cross-`.o` uniqueness. `tailcc` guarantees the `musttail` TCO on
+     direct→direct tail edges (ADR-0076 §3; prototype matching is not required for `tailcc`). *)
   let dparams =
     String.concat "" (List.init arity (fun i -> Printf.sprintf ", i64 %%p%d" i))
   in
   Buffer.add_string
     cx.md
     (Printf.sprintf
-       "define internal tailcc i64 @%s$d(ptr %%ctx, i64 %%env%s) {\nentry:\n%s}\n\n"
+       "define %stailcc i64 @%s$d(ptr %%ctx, i64 %%env%s) {\nentry:\n%s}\n\n"
+       (if l.exported then "" else "internal ")
        l.name
        dparams
        (Buffer.contents cx.fn));
@@ -1481,7 +1512,7 @@ let default_heap_words = 1 lsl 20
     false`) computes its `Int` value and prints it (`pv_print_int`, matching the oracle's `to_string`); an
     **`Effect`** entry runs `pv_run_effect` then drains the output sink (ADR-0072 §8). The entry body is
     compiled in non-tail (value) position, then the stub prints/runs, frees the runtime, and returns. *)
-let make_cx ?(gkeys = SS.empty) () : ctx =
+let make_cx ?(gkeys = SS.empty) ?(xfns = SM.empty) () : ctx =
   { md = Buffer.create 4096
   ; globals = Buffer.create 256
   ; fn = Buffer.create 256
@@ -1495,6 +1526,8 @@ let make_cx ?(gkeys = SS.empty) () : ctx =
   ; externs = SS.empty
   ; foreigns = SS.empty
   ; gfns = SM.empty
+  ; xfns
+  ; xdecls = SM.empty
   ; self_ctx = None
   ; in_direct = false
   }
@@ -1507,6 +1540,18 @@ let foreign_decls cx : string =
   SS.elements cx.foreigns
   |> List.map (fun k ->
     Printf.sprintf "declare i64 @%s(ptr, i64, ptr, i64)" (mangle_foreign k))
+  |> String.concat "\n"
+
+(* `declare tailcc` lines for the cross-module direct entries this object calls (ADR-0077 §3):
+   one per referenced `$d` symbol, with the interface-exact signature (the callee's arity). A
+   stale declare is an ABI break — guarding it is the `.pmi` hash cascade's job (ADR-0077 §4). *)
+let xfn_decls cx : string =
+  SM.bindings cx.xdecls
+  |> List.map (fun (dsym, arity) ->
+    Printf.sprintf
+      "declare tailcc i64 @%s(ptr, i64%s)"
+      dsym
+      (String.concat "" (List.init arity (fun _ -> ", i64"))))
   |> String.concat "\n"
 
 let program ?(is_effect = false) ?(heap_words = default_heap_words) (e : A.expr) : string =
@@ -1545,6 +1590,15 @@ let program ?(is_effect = false) ?(heap_words = default_heap_words) (e : A.expr)
    function, so modules compile to independent `.o` files linked by symbol. B1 emits one module's `.ll`
    (its globals + init functions + code); the whole-program `Grec`/by-need machinery above is reused. *)
 (* ==================================================================================================== *)
+
+(** A dependency export's call-relevant fact as its `.pmi` publishes it (ADR-0077 §2): a
+    non-recursive function of an arity ([Cfn] = `Efn`, the sentinel-env direct entry) or a
+    recursive-group function member of an arity ([Crecfn] = `Erecfn`, the force-cell direct
+    entry). Value exports (`Ecaf`/`Erec`) carry no call fact. Mirrors
+    [Pvm.Artifact.export_kind] without depending on it — the driver translates. *)
+type call_fact =
+  | Cfn of int
+  | Crecfn of int
 
 (** A classified top-level binding (ADR-0072 §3), the `gdef` rule at the ANF level: a syntactic lambda is a
     [Gfun] (a closed global closure); any other non-recursive value is a strict [Gcaf]; a recursive group is
@@ -1734,7 +1788,8 @@ let emit_init_fn cx ~(name : string) (emit_body : unit -> unit) : unit =
    globals (so intermediates are not leaked; only the CAF value stays rooted — ADR-0072 §3). *)
 let emit_gdef cx : gdef -> unit = function
   | Gfun (key, ps, body) ->
-    (* the code symbol (a closed top-level function, no captures) is hoisted like any lambda *)
+    (* the code symbol (a closed top-level function, no captures) is hoisted like any lambda;
+       an exported one's `$d` is the cross-module sentinel-env direct target (ADR-0077 §2/§3) *)
     cx.pending
     <- { name = mangle key
        ; params = ps
@@ -1742,6 +1797,7 @@ let emit_gdef cx : gdef -> unit = function
        ; body = LBody body
        ; self_name = None
        ; capture_fns = []
+       ; exported = SM.mem key cx.xfns
        }
        :: cx.pending;
     emit_init_fn cx ~name:key (fun () ->
@@ -1789,9 +1845,11 @@ let emit_gdef cx : gdef -> unit = function
     locally); B2 splits this across `.o` files with a link-synthesised `pv_init_all`. *)
 let emit_gdefs cx (gdefs : gdef list) : unit =
   (* Register this compilation unit's OWN function bindings for direct calls (ADR-0076 §2) —
-     never a neighbour's: each per-module [cx] sees only its own gdefs, so the cross-module
-     boundary stays generic (ADR-0072 §2's no-metadata pin). The names are deterministic
-     (`mangle key`), matching [emit_gdef]/[build_grec ~named]'s emissions. *)
+     never a neighbour's: each per-module [cx] sees only its own gdefs here, and these
+     same-module facts win before the export surface. What crosses the module boundary is
+     only [cx.xfns] — the dependency's `.pmi` call facts (ADR-0077 §2, superseding ADR-0072
+     §2's no-metadata pin). The names are deterministic (`mangle key`), matching
+     [emit_gdef]/[build_grec ~named]'s emissions. *)
   List.iter
     (fun g ->
        match g with
@@ -1914,17 +1972,21 @@ let module_of_key (k : string) : string =
   | None -> k
 
 (** Emit one module object's `.ll`: its own root-handle global definitions + init functions + internal
-    code, plus `external` decls for referenced globals owned by *other* modules. No `pv_init_all`, no
+    code, plus `external` decls for referenced globals owned by *other* modules and `declare tailcc`
+    externs for the cross-module direct entries it calls (ADR-0077 §3). No `pv_init_all`, no
     `@main` — those live in the init/entry object ([entry_ll]). *)
-let module_ll ~(gkeys : SS.t) ~(defined : SS.t) (gdefs : gdef list) : string =
-  let cx = make_cx ~gkeys () in
+let module_ll ~(gkeys : SS.t) ~(xfns : fn_info SM.t) ~(defined : SS.t) (gdefs : gdef list)
+  : string
+  =
+  let cx = make_cx ~gkeys ~xfns () in
   emit_gdefs cx gdefs;
   emit_pending cx;
   Printf.sprintf
-    "; ModuleID = 'purvasm.module'\n\n%s\n%s\n%s\n\n%s\n%s"
+    "; ModuleID = 'purvasm.module'\n\n%s\n%s\n%s\n%s\n\n%s\n%s"
     declarations
     (extern_global_decls cx ~defined)
     (foreign_decls cx)
+    (xfn_decls cx)
     (Buffer.contents cx.globals)
     (Buffer.contents cx.md)
 
@@ -1935,11 +1997,12 @@ let entry_ll
       ?(is_effect = false)
       ?(heap_words = default_heap_words)
       ~(gkeys : SS.t)
+      ~(xfns : fn_info SM.t)
       (gdefs : gdef list)
       (entry : A.expr)
   : string
   =
-  let cx = make_cx ~gkeys () in
+  let cx = make_cx ~gkeys ~xfns () in
   (* initialise only the bindings reachable from the entry (ADR-0072 §3); the unreachable module objects'
      code/globals are dropped by the dead-strip link. *)
   let reach = reachable_gdefs ~gkeys entry gdefs in
@@ -1958,6 +2021,7 @@ let entry_ll
      %s\n\
      %s\n\
      %s\n\
+     %s\n\
      %s\n\n\
      %s\n\
      %s\n\
@@ -1968,6 +2032,7 @@ let entry_ll
     init_decls
     (extern_global_decls cx ~defined:SS.empty)
     (foreign_decls cx)
+    (xfn_decls cx)
     (Buffer.contents cx.globals)
     (Buffer.contents cx.md)
     entry_body
@@ -1982,12 +2047,48 @@ type split_output =
     bindings are partitioned by their owning module (via [module_of_key]); each partition is an independent
     `.ll`. `pv_init_all` runs the **reachable** bindings ([reachable_gdefs]) in linked-spine order restricted
     to that set — a valid topological order ([Link] already spine-orders the DAG); modules still emit their
-    unreachable bindings, whose symbols the dead-strip link removes. *)
-let program_split ?(is_effect = false) ?(heap_words = default_heap_words) (e : A.expr)
+    unreachable bindings, whose symbols the dead-strip link removes.
+
+    [surface] maps key → [call_fact], exactly as each dependency's `.pmi` publishes it
+    (ADR-0077 §2 — the interface is the contract; the driver derives it from the same code
+    that writes the `.pmi`, and the future artifact-driven driver reads the files). A key
+    becomes direct-callable only where the natively-lowered shape **agrees** with the
+    published fact (same kind, same arity): the optimised native ANF may reshape a binding
+    the bytecode path did not, and on a disagreement the boundary stays generic rather than
+    baking a wrong ABI. The exported-`$d` emission keys off the same intersection ([xfns]),
+    so every emitted `declare` resolves at link. An empty [surface] disables cross-module
+    direct calls (the pre-0077 behaviour). *)
+let program_split
+      ?(is_effect = false)
+      ?(heap_words = default_heap_words)
+      ?(surface = SM.empty)
+      (e : A.expr)
   : split_output
   =
   let gdefs, entry = split_spine (uniquify_toplevel e) in
   let gkeys = SS.of_list (List.concat_map gdef_keys gdefs) in
+  let xfns =
+    List.fold_left
+      (fun acc g ->
+         match g with
+         | Gfun (k, ps, _) ->
+           (match SM.find_opt k surface with
+            | Some (Cfn n) when n = List.length ps ->
+              SM.add k { dsym = mangle k ^ "$d"; arity = n; src = SSentinel } acc
+            | _ -> acc)
+         | Gcaf _ -> acc
+         | Grec ms ->
+           List.fold_left
+             (fun acc (m, rhs) ->
+                match rhs, SM.find_opt m surface with
+                | A.Ret (A.CLam (ps, _)), Some (Crecfn n) when n = List.length ps ->
+                  SM.add m { dsym = mangle m ^ "$d"; arity = n; src = SForceCell } acc
+                | _ -> acc)
+             acc
+             ms)
+      SM.empty
+      gdefs
+  in
   (* partition gdefs by module, preserving first-appearance module order and per-module spine order *)
   let order = ref [] in
   let tbl : (string, gdef list ref) Hashtbl.t = Hashtbl.create 16 in
@@ -2010,10 +2111,10 @@ let program_split ?(is_effect = false) ?(heap_words = default_heap_words) (e : A
     |> List.map (fun m ->
       let gs = List.rev !(Hashtbl.find tbl m) in
       let defined = SS.of_list (List.concat_map gdef_keys gs) in
-      m, module_ll ~gkeys ~defined gs)
+      m, module_ll ~gkeys ~xfns ~defined gs)
   in
   { modules
-  ; entry = entry_ll ~is_effect ~heap_words ~gkeys gdefs entry
+  ; entry = entry_ll ~is_effect ~heap_words ~gkeys ~xfns gdefs entry
   ; foreigns = cf_expr e
   }
 
