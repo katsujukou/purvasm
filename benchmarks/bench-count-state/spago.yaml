@@ -1,0 +1,9 @@
+package:
+  name: bench-count-state
+  dependencies:
+    - bench-common
+    - console
+    - effect
+    - prelude
+    - tailrec
+    - transformers

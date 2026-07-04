@@ -1,0 +1,13 @@
+package:
+  name: bench-quicksort
+  dependencies:
+    - arrays
+    - bench-common
+    - console
+    - effect
+    - foldable-traversable
+    - integers
+    - maybe
+    - prelude
+    - tuples
+    - unfoldable

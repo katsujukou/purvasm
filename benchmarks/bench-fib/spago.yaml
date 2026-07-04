@@ -1,0 +1,7 @@
+package:
+  name: bench-fib
+  dependencies:
+    - bench-common
+    - console
+    - effect
+    - prelude

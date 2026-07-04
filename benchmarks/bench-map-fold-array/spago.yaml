@@ -1,0 +1,9 @@
+package:
+  name: bench-map-fold-array
+  dependencies:
+    - arrays
+    - bench-common
+    - console
+    - effect
+    - foldable-traversable
+    - prelude

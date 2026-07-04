@@ -1,0 +1,9 @@
+package:
+  name: bench-common
+  dependencies:
+    - arrays
+    - effect
+    - integers
+    - maybe
+    - prelude
+    - purvasm-system

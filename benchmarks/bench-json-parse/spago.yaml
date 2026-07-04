@@ -1,0 +1,12 @@
+package:
+  name: bench-json-parse
+  dependencies:
+    - argonaut-core
+    - arrays
+    - bench-common
+    - console
+    - effect
+    - either
+    - maybe
+    - prelude
+    - strings
