@@ -1,0 +1,12 @@
+{
+  "foreign": {
+    "Data.Number.abs": "Data.Number.c",
+    "Data.Number.ceil": "Data.Number.c",
+    "Data.Number.floor": "Data.Number.c",
+    "Data.Number.isFinite": "Data.Number.c",
+    "Data.Number.isNaN": "Data.Number.c",
+    "Data.Number.parseFloatImpl": "Data.Number.c",
+    "Data.Number.round": "Data.Number.c",
+    "Data.Number.sin": "Data.Number.c"
+  }
+}

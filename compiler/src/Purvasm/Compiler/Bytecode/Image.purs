@@ -22,6 +22,8 @@ import Purvasm.Compiler.Bytecode.Codegen (Gdef(..))
 import Purvasm.Compiler.Bytecode.Instruction (CodeBlock, Instruction(..))
 import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.Primitive (PrimOp(..))
+import Purvasm.Compiler.Util.Int64Decimal (int64BitsDecimal)
+import Purvasm.Number (floatBitsHi, floatBitsLo)
 
 -- | Artifact-compatibility version, stamped into every `.pmo`/`.pmi` (boot's
 -- | `Image.format_version`). Bump on any codegen change so a stale object is rejected.
@@ -91,11 +93,10 @@ strs = JArr <<< map JStr
 -- --- literals / primitives ----------------------------------------------------------
 
 -- | A `Number` literal is stored as its exact IEEE-754 bits in a decimal string (boot's
--- | `float_to_json`), so it round-trips bit-for-bit through the text format.
-foreign import floatBitsDecimalImpl :: Number -> String
-
+-- | `float_to_json`), so it round-trips bit-for-bit through the text format. The bits come from
+-- | the `purvasm-base` float-bits read; the 64-bit decimal spelling is ordinary PureScript.
 floatToJson :: Number -> Json
-floatToJson f = JStr (floatBitsDecimalImpl f)
+floatToJson f = JStr (int64BitsDecimal { hi: floatBitsHi f, lo: floatBitsLo f })
 
 litToJson :: Literal -> Json
 litToJson = case _ of

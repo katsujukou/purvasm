@@ -9,6 +9,7 @@ package:
     - foreign-object
     - lists
     - prelude
+    - purvasm-base
   test:
     main: Test.Unit.Purvasm.Compiler
     dependencies: 
