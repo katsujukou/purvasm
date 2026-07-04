@@ -237,9 +237,12 @@ let abspath p = if Filename.is_relative p then Filename.concat (Sys.getcwd ()) p
 
 (* Locate the runtime staticlib (ADR-0071 §1) the LLVM backend links against: `--runtime-lib`, else
    `$PURVASM_RT_A`, else the conventional built path under a repo root (walked up for `runtime/Cargo.toml`).
-   The compiler only *locates* it — the staticlib is a co-distributed, separately `cargo build`t artifact,
-   not something the compiler builds. *)
-let resolve_runtime_lib runtime_lib =
+   The repo lookup prefers the **release** build — a debug-linked binary carries the runtime's
+   precondition checks on every `pv_*` call and is not perf-representative — unless [debug] (the
+   `--debug` flag) flips the preference for a runtime-assertions build. The compiler only *locates* the
+   staticlib — it is a co-distributed, separately `cargo build`t artifact, not something the compiler
+   builds. *)
+let resolve_runtime_lib ~debug runtime_lib =
   let exists p = if Sys.file_exists p then Some p else None in
   let from_repo () =
     let rec up d =
@@ -249,12 +252,16 @@ let resolve_runtime_lib runtime_lib =
         let p = Filename.dirname d in
         if p = d then None else up p)
     in
+    let first, second = if debug then "debug", "release" else "release", "debug" in
+    let lib profile =
+      Filename.concat "runtime/target" (Filename.concat profile "libpurvasm_rt.a")
+    in
     Option.bind
       (up (Sys.getcwd ()))
       (fun root ->
-         match exists (Filename.concat root "runtime/target/debug/libpurvasm_rt.a") with
+         match exists (Filename.concat root (lib first)) with
          | Some p -> Some p
-         | None -> exists (Filename.concat root "runtime/target/release/libpurvasm_rt.a"))
+         | None -> exists (Filename.concat root (lib second)))
   in
   let found =
     match runtime_lib with
@@ -292,8 +299,8 @@ let resolve_runtime_include () =
    init/entry object (ADR-0072 §2/§3), compile each with `clang -c`, compile any ulib-shipped native
    `foreign` `.c` the program references (ADR-0073), and dead-strip-link them all with the runtime
    staticlib into a native executable — the CLI form of the e2e differential harness. *)
-let emit_native_llvm ~bdir ~output ~is_effect ~runtime_lib ~ulib ~heap_words anf =
-  let rt = resolve_runtime_lib runtime_lib in
+let emit_native_llvm ~bdir ~output ~is_effect ~runtime_lib ~debug ~ulib ~heap_words anf =
+  let rt = resolve_runtime_lib ~debug runtime_lib in
   let split = Llvm_backend.Codegen_llvm.program_split ~is_effect ?heap_words anf in
   let sh label cmd =
     if Sys.command cmd <> 0
@@ -383,6 +390,7 @@ let emit_native_llvm ~bdir ~output ~is_effect ~runtime_lib ~ulib ~heap_words anf
 let native_action
       backend
       runtime_lib
+      debug
       heap_words
       corefn_dir
       output
@@ -418,7 +426,8 @@ let native_action
   in
   let bdir = build_dir output in
   match backend with
-  | "llvm" -> emit_native_llvm ~bdir ~output ~is_effect ~runtime_lib ~ulib ~heap_words anf
+  | "llvm" ->
+    emit_native_llvm ~bdir ~output ~is_effect ~runtime_lib ~debug ~ulib ~heap_words anf
   | "ocaml" ->
     write_file
       (Filename.concat bdir "app.ml")
@@ -579,6 +588,18 @@ let native_cmd =
             "Path to the runtime staticlib libpurvasm_rt.a ($(b,llvm) backend). Defaults \
              to $(b,\\$PURVASM_RT_A) or runtime/target/{debug,release}.")
   in
+  let debug =
+    Arg.(
+      value
+      & flag
+      & info
+          [ "debug" ]
+          ~doc:
+            "Prefer the DEBUG runtime staticlib (runtime/target/debug — runtime \
+             assertions on, not perf-representative) over release in the repo lookup \
+             ($(b,llvm) backend). Default prefers release; $(b,--runtime-lib) / \
+             $(b,\\$PURVASM_RT_A) always win.")
+  in
   let heap_words =
     Arg.(
       value
@@ -602,6 +623,7 @@ let native_cmd =
       const native_action
       $ backend
       $ runtime_lib
+      $ debug
       $ heap_words
       $ corefn_dir_arg
       $ output_arg
