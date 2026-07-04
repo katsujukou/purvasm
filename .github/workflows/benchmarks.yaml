@@ -1,0 +1,103 @@
+name: Benchmarks
+
+# The wall-4 cross-backend wall-clock sweep (ADR-0075, benchmarks/run-benchmarks.sh) on a
+# hosted runner: a thermally boring environment for RATIO tracking (llvm/ml, vs-js, scaling
+# exponents) over time. Shared-runner caveat, by design: absolute times are NOT comparable
+# across runs (neighbour noise, hardware generations) — the trustworthy outputs are the
+# within-run ratios and the shape of the per-run summary. A/B verdicts on a single change
+# still belong to paired interleaved runs on one quiet machine; this workflow is the trend
+# line, not the referee.
+#
+# Deliberately NOT wired to push/pull_request: a full sweep is minutes of hot loops per leg
+# and would be noise-gated anyway. Trigger it by hand, or let the weekly schedule collect a
+# trend point.
+on:
+  workflow_dispatch:
+    inputs:
+      budget:
+        description: "Per-point time budget in seconds (ADR-0075 sweep stop rule)"
+        required: false
+        default: "5"
+      legs:
+        description: "Comma-separated legs to run (vm,ml,llvm,js)"
+        required: false
+        default: "vm,ml,llvm,js"
+      programs:
+        description: "Comma-separated benchmark names (empty = all)"
+        required: false
+        default: ""
+  schedule:
+    # Weekly trend point (Monday 02:17 UTC — an off-peak slot for slightly quieter runners).
+    - cron: "17 2 * * 1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
+      - uses: cachix/cachix-action@v17
+        with:
+          name: katsujukou-github
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+      - uses: nicknovitski/nix-develop@v1
+
+      - name: Build boot (purvm)
+        run: dune build
+        working-directory: boot
+
+      # The bench must link the RELEASE staticlib (the debug build's assertions are not
+      # perf-representative; `purvm native` resolves release-first).
+      - name: Build runtime staticlib (release)
+        run: cargo build --release
+        working-directory: runtime
+
+      - name: Build spago workspace
+        run: spago build
+
+      - name: Stage ulib
+        run: node ulib-tools/index.js build --prepare-release
+
+      - name: Run the sweep
+        run: |
+          args="--budget ${{ github.event.inputs.budget || '5' }}"
+          legs="${{ github.event.inputs.legs || 'vm,ml,llvm,js' }}"
+          args="$args --legs $legs"
+          progs="${{ github.event.inputs.programs || '' }}"
+          [ -n "$progs" ] && args="$args --programs $progs"
+          ./benchmarks/run-benchmarks.sh $args
+
+      # The summary is the run's headline; the CSVs are the trend data an offline comparison
+      # (or a future dashboard) consumes.
+      - name: Publish summary
+        if: always()
+        run: |
+          if [ -f benchmarks/out/summary.txt ]; then
+            {
+              echo '## Benchmark sweep summary'
+              echo
+              echo '> Shared-runner run: compare ratios within this run, not absolute times across runs.'
+              echo
+              echo '```'
+              cat benchmarks/out/summary.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-${{ github.run_number }}
+          path: |
+            benchmarks/out/*.csv
+            benchmarks/out/*.png
+            benchmarks/out/summary.txt
+          if-no-files-found: warn
+          retention-days: 90
