@@ -95,21 +95,26 @@ time_min() {
 }
 
 # Build one (program, leg) once; echo the run-command prefix (the size is appended per point).
+# An artifact older than $PURVM is STALE, not a cache hit: a toolchain rebuild must rebuild the
+# legs, or the sweep silently times binaries of the previous compiler (and the vm leg trips the
+# artifact version check instead of running).
+fresh() { [ -e "$1" ] && [ ! "$PURVM" -nt "$1" ]; }
+
 build_leg() {
   local name=$1 module=$2 heap=$3 leg=$4
   local bdir="$OUT/build/$name/$leg"
   mkdir -p "$bdir"
   case "$leg" in
     vm)
-      [ -f "$bdir/app.pvm" ] || "$PURVM" build --corefn-dir output --ulib dist/ulib -m "$module" -o "$bdir" >"$bdir/build.log" 2>&1 || return 1
+      fresh "$bdir/app.pvm" || "$PURVM" build --corefn-dir output --ulib dist/ulib -m "$module" -o "$bdir" >"$bdir/build.log" 2>&1 || return 1
       echo "$PURVM run $bdir/app.pvm"
       ;;
     ml)
-      [ -x "$bdir/app" ] || "$PURVM" native --backend ocaml --corefn-dir output --ulib dist/ulib -m "$module" -o "$bdir" >"$bdir/build.log" 2>&1 || return 1
+      fresh "$bdir/app" || "$PURVM" native --backend ocaml --corefn-dir output --ulib dist/ulib -m "$module" -o "$bdir" >"$bdir/build.log" 2>&1 || return 1
       echo "$bdir/app"
       ;;
     llvm)
-      [ -x "$bdir/app" ] || "$PURVM" native --backend llvm --heap-words "$heap" --corefn-dir output --ulib dist/ulib -m "$module" -o "$bdir" >"$bdir/build.log" 2>&1 || return 1
+      fresh "$bdir/app" || "$PURVM" native --backend llvm --heap-words "$heap" --corefn-dir output --ulib dist/ulib -m "$module" -o "$bdir" >"$bdir/build.log" 2>&1 || return 1
       echo "$bdir/app"
       ;;
     js)
