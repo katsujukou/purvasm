@@ -113,6 +113,27 @@ pub unsafe extern "C" fn pv_tailcall(ctx: *mut Heap, f: u64, args: *const u64, n
     })
 }
 
+/// Resolve a pending trampoline bounce for a **direct** caller (ADR-0076 §3): a directly-entered
+/// body's generic tail call stashes `(f, args)` ([`pv_tailcall`]) and returns a dummy — and a direct
+/// call has no enclosing [`pv_apply`] loop to take the stash. Every non-`musttail` direct call site
+/// therefore settles its result: a stashed tail is run to a real value here (`apply` resolves the
+/// whole chain flat, ADR-0071 §4), and a real value passes through untouched. A `musttail` edge
+/// propagates the dummy+stash to *its* caller's settle. Wrappers do not settle — under the
+/// [`pv_apply`] loop the stash belongs to the loop, exactly as before.
+///
+/// # Safety
+/// As [`pv_apply`].
+#[no_mangle]
+pub unsafe extern "C" fn pv_settle(ctx: *mut Heap, r: u64) -> u64 {
+    guard(|| {
+        let h = heap(ctx);
+        match h.take_pending_tail() {
+            None => r,
+            Some((f, args)) => h.apply(f, &args).to_bits(),
+        }
+    })
+}
+
 /// Build a [`Closure`](crate::heap::Kind::Closure) whose `code` word is the real `extern "C"` fn address
 /// `code_addr` (ADR-0071 §3), with `arity` and captured env word `env` (a shared env-block pointer, or
 /// an immediate sentinel for a no-capture closure). Returns the closure value word.

@@ -260,14 +260,46 @@ let prim_sym : C.primop -> string * bool = function
 
 (* --- the emitter ----------------------------------------------------------------------------------- *)
 
+(* How a direct call site obtains the callee's env word (ADR-0076 §2). *)
+type env_src =
+  | SSelf (* the enclosing direct entry's own `%env` (a self-call) *)
+  | SSentinel
+    (* the no-capture immediate sentinel (top-level `Gfun`, no-capture lambdas) *)
+  | SClosureEnv (* read the closure value's env slot (a capturing let-bound lambda) *)
+  | SForceCell
+(* force the `ByNeed` cell, then read the forced closure's env slot (a `Grec` member) *)
+
+(* A statically-known function a saturated call can enter directly: its direct-entry symbol, its
+   arity, and how to obtain the env operand. *)
+type fn_info =
+  { dsym : string
+  ; arity : int
+  ; src : env_src
+  }
+
 (* A lifted lambda awaiting emission: its global name, params, captured free vars (in a fixed order),
-   and body. *)
+   and body. Every lifted function is emitted as **two entries** (ADR-0076 §1): the `tailcc` direct
+   entry `@<name>$d(ctx, env, a0…)` holding the body, and the generic `AbiCodeFn` `@<name>` as a thin
+   unpack-and-call wrapper (the closure's `code` word keeps pointing at the wrapper, so every dynamic
+   path is unchanged). [self_name] is the source binding this lambda is the RHS of (a recursive-group
+   function member), enabling the self-call shortcut (own `$d` + own `%env`, ADR-0076 §2). *)
 type lifted =
   { name : string
   ; params : string list
   ; captures : string list
-  ; body : A.expr
+  ; body : lifted_body
+  ; self_name : string option
+  ; capture_fns : (string * fn_info) list
+    (* direct-call info for captures that are known recursive-group function members (the
+       mutual-recursion case: a sibling reached through the shared env, ADR-0076 §2) *)
   }
+
+(* [LBody] is an ordinary lambda body. [LClosure lm] is a `Grec` function member's suspension body:
+   forcing the member's cell builds `lm`'s closure — pre-lifting `lm` under a stable name is what
+   lets call sites target its direct entry (ADR-0076 §2). *)
+and lifted_body =
+  | LBody of A.expr
+  | LClosure of lifted
 
 type ctx =
   { md : Buffer.t (* the whole module *)
@@ -285,6 +317,16 @@ type ctx =
       SS.t (* referenced globals not defined here → emitted as `external` decls *)
   ; mutable foreigns : SS.t
     (* referenced native foreign keys → declared as `pvf_<mangle>` externals (ADR-0073 §3) *)
+  ; mutable gfns : fn_info SM.t
+    (* this module's own top-level function bindings, callable directly when saturated
+       (ADR-0076 §2 — never cross-module: each per-module [cx] registers only its own gdefs) *)
+  ; mutable self_ctx : (string * string option * string * fn_info) option
+    (* the binding whose lambda is being emitted: (name, its entry-time capture handle if the
+       name is captured — [None] when it resolves as a global —, the rooted handle of this
+       activation's `%env` word — reloaded at self-calls, since the raw `%env` SSA value is
+       stale after any safepoint —, its own direct-entry info) *)
+  ; mutable in_direct : bool
+    (* emitting a `tailcc` direct entry (so `%env` exists and `musttail` is legal) *)
   }
 
 let fresh cx : string =
@@ -302,13 +344,24 @@ let emit cx fmt =
        Buffer.add_char cx.fn '\n')
     fmt
 
-(* env: a guest variable → the SSA operand holding its **root handle** (root-on-create). A reference
-   reloads the current value via [pv_get]. A by-need cell may reach a value-dereference site through any
-   binding (a member, a function argument, a data field), so forcing is a *runtime* check at the site
-   ([force_atom] → `pv_force_if_byneed`), not a static per-binding flag. *)
-type env = (string * string) list
+(* env: a guest variable → the SSA operand holding its **root handle** (root-on-create), plus the
+   static function info when the binding is a known lambda (ADR-0076 §2 — a direct-call candidate).
+   A reference reloads the current value via [pv_get]. A by-need cell may reach a value-dereference
+   site through any binding (a member, a function argument, a data field), so forcing is a *runtime*
+   check at the site ([force_atom] → `pv_force_if_byneed`), not a static per-binding flag. *)
+type env_entry =
+  { handle : string
+  ; known_fn : fn_info option
+  }
 
-let bind (env : env) (x : string) (handle : string) : env = (x, handle) :: env
+type env = (string * env_entry) list
+
+let bind (env : env) (x : string) (handle : string) : env =
+  (x, { handle; known_fn = None }) :: env
+
+(* Bind a variable that is statically a known lambda (its saturated calls may go direct). *)
+let bind_fn (env : env) (x : string) (handle : string) (fn : fn_info) : env =
+  (x, { handle; known_fn = Some fn }) :: env
 
 (* Read a variable's current value (post-safepoint). A **local** reloads its value through its root handle
    ([pv_get]); a **top-level global** (a qualified key in [gkeys], ADR-0072 §2) loads its persistent
@@ -318,9 +371,9 @@ let bind (env : env) (x : string) (handle : string) : env = (x, handle) :: env
    the local lookup is tried first regardless. *)
 let read_var cx (env : env) (x : string) : string =
   match List.assoc_opt x env with
-  | Some h ->
+  | Some { handle; _ } ->
     let t = fresh cx in
-    emit cx "  %s = call i64 @pv_get(ptr %%ctx, i64 %s)" t h;
+    emit cx "  %s = call i64 @pv_get(ptr %%ctx, i64 %s)" t handle;
     t
   | None when SS.mem x cx.gkeys ->
     cx.externs <- SS.add x cx.externs;
@@ -482,7 +535,15 @@ let lift cx (env : env) (params : string list) (body : A.expr) : lifted =
   let local_names = List.fold_left (fun s (x, _) -> SS.add x s) SS.empty env in
   let globals_unshadowed = SS.diff cx.gkeys local_names in
   let captures = SS.elements (SS.diff (fv_expr bound body) globals_unshadowed) in
-  let l = { name = Printf.sprintf "fn_%d" cx.fns; params; captures; body } in
+  let l =
+    { name = Printf.sprintf "fn_%d" cx.fns
+    ; params
+    ; captures
+    ; body = LBody body
+    ; self_name = None
+    ; capture_fns = []
+    }
+  in
   cx.pending <- l :: cx.pending;
   l
 
@@ -673,7 +734,13 @@ let rec match_binder
    closure on first use; `apply` auto-forces a by-need callee, ADR-0070 §3). Distinguishing function
    members as back-patched closures (ADR-0059 §1) is a deferred optimisation. Shared by the in-function
    [A.LetRec] and the top-level `Grec` init unit (ADR-0072 §3). *)
-let build_grec cx (env : env) (binds : (string * A.expr) list) : env =
+let build_grec
+      ?(named = fun (_ : string) -> None)
+      cx
+      (env : env)
+      (binds : (string * A.expr) list)
+  : env
+  =
   let members = List.map fst binds in
   let k = List.length members in
   let member_set = List.fold_left (fun s m -> SS.add m s) SS.empty members in
@@ -687,14 +754,69 @@ let build_grec cx (env : env) (binds : (string * A.expr) list) : env =
   in
   (* the shared env layout: the k member cells, then the outside captures *)
   let shared_layout = members @ outside in
-  (* one suspension per member: `\$u -> rhs_i` over the shared env (registered for hoisting) *)
+  (* Pre-lift each **function** member under a stable name (ADR-0076 §2): its suspension then just
+     builds that closure when forced ([LClosure]), so call sites — self, siblings, and (for a
+     top-level group) other bindings via [cx.gfns] — can enter the member's direct entry. The
+     capture set is computed exactly as [lift] would at the CLam site inside the suspension, whose
+     scope is [shared_layout] (a shared name shadows an equally-named global, so it is captured). *)
+  let shared_names = SS.of_list shared_layout in
+  let member_fns =
+    List.filter_map
+      (fun (m, rhs) ->
+         match rhs with
+         | A.Ret (A.CLam (ps, b)) ->
+           let name =
+             match named m with
+             | Some n -> n
+             | None ->
+               cx.fns <- cx.fns + 1;
+               Printf.sprintf "recfn_%d" cx.fns
+           in
+           let bound = List.fold_left (fun s p -> SS.add p s) SS.empty ps in
+           let globals_unshadowed = SS.diff cx.gkeys shared_names in
+           let captures = SS.elements (SS.diff (fv_expr bound b) globals_unshadowed) in
+           let info = { dsym = name ^ "$d"; arity = List.length ps; src = SForceCell } in
+           Some
+             ( m
+             , { name
+               ; params = ps
+               ; captures
+               ; body = LBody b
+               ; self_name = Some m
+               ; capture_fns = []
+               }
+             , info )
+         | _ -> None)
+      binds
+  in
+  (* every member lambda may reach its siblings through its captures — give each the group's info *)
+  let group_infos = List.map (fun (m, _, info) -> m, info) member_fns in
+  let member_fns =
+    List.map
+      (fun (m, lm, info) -> m, { lm with capture_fns = group_infos }, info)
+      member_fns
+  in
+  List.iter (fun (_, lm, _) -> cx.pending <- lm :: cx.pending) member_fns;
+  (* one suspension per member over the shared env: a function member's suspension builds its
+     pre-lifted closure; any other member's suspension evaluates its RHS as before *)
   let susp_names =
     List.map
-      (fun (_, rhs) ->
+      (fun (m, rhs) ->
          cx.fns <- cx.fns + 1;
          let name = Printf.sprintf "susp_%d" cx.fns in
+         let body =
+           match List.find_opt (fun (m', _, _) -> m' = m) member_fns with
+           | Some (_, lm, _) -> LClosure lm
+           | None -> LBody rhs
+         in
          cx.pending
-         <- { name; params = [ "$u" ]; captures = shared_layout; body = rhs }
+         <- { name
+            ; params = [ "$u" ]
+            ; captures = shared_layout
+            ; body
+            ; self_name = None
+            ; capture_fns = []
+            }
             :: cx.pending;
          name)
       binds
@@ -736,14 +858,61 @@ let build_grec cx (env : env) (binds : (string * A.expr) list) : env =
          cellp
          susp)
     susp_names;
-  (* 4. bind each member to its cell. *)
-  List.fold_left2 bind env members cell_hs
+  (* 4. bind each member to its cell — function members carry their direct-call info. *)
+  List.fold_left2
+    (fun env m ch ->
+       match List.find_opt (fun (m', _, _) -> m' = m) member_fns with
+       | Some (_, _, info) -> bind_fn env m ch info
+       | None -> bind env m ch)
+    env
+    members
+    cell_hs
+
+(* Resolve a saturated call's statically-known direct target (ADR-0076 §2): a self-call, a
+   let-bound lambda / recursive-group member, or a same-module top-level function. [None] falls
+   back to the generic `pv_apply` / trampoline path. Resolution mirrors [read_var]'s order —
+   local scope first, then the enclosing self binding, then this module's own globals — so a
+   local rebinding of a function's name is never mistaken for the function. *)
+let direct_target cx (env : env) (f : A.atom) (nargs : int) : fn_info option =
+  match f with
+  | A.AVar x ->
+    (match List.assoc_opt x env with
+     | Some entry ->
+       (match cx.self_ctx with
+        | Some (nm, Some h0, _, info)
+          when nm = x && entry.handle = h0 && info.arity = nargs -> Some info
+        | _ ->
+          (match entry.known_fn with
+           | Some info when info.arity = nargs -> Some info
+           | _ -> None))
+     | None when SS.mem x cx.gkeys ->
+       (match cx.self_ctx with
+        | Some (nm, None, _, info) when nm = x && info.arity = nargs -> Some info
+        | _ ->
+          (match SM.find_opt x cx.gfns with
+           | Some info when info.arity = nargs -> Some info
+           | _ -> None))
+     | None -> None)
+  | A.ALit _ | A.AForeign _ -> None
 
 (* Compile [e]; [tail] = it is in the enclosing function's tail position. Returns [Some operand] when
    not tail (the produced value), [None] when tail (a `ret`/tail-call was emitted). *)
 let rec expr cx (env : env) ~(tail : bool) (e : A.expr) : string option =
   match e with
   | A.Ret c -> cexpr cx env ~tail c
+  | A.Let (x, A.CLam (ps, lbody), body) ->
+    (* A let-bound lambda is a direct-call candidate (ADR-0076 §2): keep its lifted identity on
+       the binding so saturated calls skip the generic dispatch. Non-recursive, so no self. *)
+    let l = lift cx env ps lbody in
+    let v = make_closure cx env l in
+    let h = root cx v in
+    let info =
+      { dsym = l.name ^ "$d"
+      ; arity = List.length ps
+      ; src = (if l.captures = [] then SSentinel else SClosureEnv)
+      }
+    in
+    expr cx (bind_fn env x h info) ~tail body
   | A.Let (x, c, body) ->
     let v = Option.get (cexpr cx env ~tail:false c) in
     let h = root cx v in
@@ -784,23 +953,100 @@ and cexpr cx (env : env) ~(tail : bool) (c : A.cexpr) : string option =
     finish t
   | A.CLam (ps, body) -> finish (make_closure cx env (lift cx env ps body))
   | A.CApp (f, args) ->
-    (* `f` and the args are mutually protected: a `foreign` callee or a `String` arg may allocate. *)
-    let all = eval_atoms cx env (f :: args) in
-    let fv = List.hd all
-    and ops = List.tl all in
-    if tail
-    then (
-      (* Trampoline tail call (ADR-0071 §4): stash the pending tail, pop this frame, return (ignored). *)
-      let p, n = arg_buffer cx ops in
-      emit cx "  call void @pv_tailcall(ptr %%ctx, i64 %s, ptr %s, i64 %d)" fv p n;
-      emit cx "  call void @pv_pop_frame(ptr %%ctx, i64 %s)" cx.frame;
-      emit cx "  ret i64 %s" imm_unit;
-      None)
-    else (
-      let p, n = arg_buffer cx ops in
-      let t = fresh cx in
-      emit cx "  %s = call i64 @pv_apply(ptr %%ctx, i64 %s, ptr %s, i64 %d)" t fv p n;
-      Some t)
+    (match direct_target cx env f (List.length args) with
+     | Some info ->
+       (* Direct known-arity call (ADR-0076 §2/§3): skip the generic dispatch entirely. The env
+          word is derived per the callee's shape; a cell force is a safepoint (the suspension may
+          run guest code), so the argument values are re-read from their roots after it. *)
+       let env_op, ops =
+         match info.src with
+         | SSelf ->
+           let env_h =
+             match cx.self_ctx with
+             | Some (_, _, h, _) -> h
+             | None -> failwith "codegen_llvm: self-call outside a self context"
+           in
+           let ops = eval_atoms cx env args in
+           get_current cx env_h, ops
+         | SSentinel -> imm_unit, eval_atoms cx env args
+         | SClosureEnv ->
+           let all = eval_atoms cx env (f :: args) in
+           let e = fresh cx in
+           emit
+             cx
+             "  %s = call i64 @pv_read_field(ptr %%ctx, i64 %s, i64 2)"
+             e
+             (List.hd all);
+           e, List.tl all
+         | SForceCell ->
+           let fh = root cx (atom cx env f) in
+           let arg_hs = List.map (fun a -> root cx (atom cx env a)) args in
+           let forced = fresh cx in
+           emit
+             cx
+             "  %s = call i64 @pv_force_if_byneed(ptr %%ctx, i64 %s)"
+             forced
+             (get_current cx fh);
+           let e = fresh cx in
+           emit cx "  %s = call i64 @pv_read_field(ptr %%ctx, i64 %s, i64 2)" e forced;
+           e, List.map (get_current cx) arg_hs
+       in
+       let arglist = String.concat "" (List.map (fun o -> ", i64 " ^ o) ops) in
+       if tail && cx.in_direct
+       then (
+         (* musttail (ADR-0076 §3): pop this frame first — the callee opens its own — with every
+            operand (env word included) computed before the pop; no safepoint in between. *)
+         emit cx "  call void @pv_pop_frame(ptr %%ctx, i64 %s)" cx.frame;
+         let r = fresh cx in
+         emit
+           cx
+           "  %s = musttail call tailcc i64 @%s(ptr %%ctx, i64 %s%s)"
+           r
+           info.dsym
+           env_op
+           arglist;
+         emit cx "  ret i64 %s" r;
+         None)
+       else (
+         let r = fresh cx in
+         emit
+           cx
+           "  %s = call tailcc i64 @%s(ptr %%ctx, i64 %s%s)"
+           r
+           info.dsym
+           env_op
+           arglist;
+         (* Settle (ADR-0076 §3): the callee's body may have stashed a generic tail bounce
+            (`pv_tailcall`) that no enclosing `pv_apply` loop will take on this direct path —
+            run it to a real value; a real value passes through. *)
+         let r' = fresh cx in
+         emit cx "  %s = call i64 @pv_settle(ptr %%ctx, i64 %s)" r' r;
+         if tail
+         then (
+           (* tail position inside a non-`tailcc` context (an init fn / entry stub): an ordinary
+              call + return — correct, just without the guaranteed jump. *)
+           emit_ret cx r';
+           None)
+         else Some r')
+     | None ->
+       (* `f` and the args are mutually protected: a `foreign` callee or a `String` arg may allocate. *)
+       let all = eval_atoms cx env (f :: args) in
+       let fv = List.hd all
+       and ops = List.tl all in
+       if tail
+       then (
+         (* Trampoline tail call (ADR-0071 §4): stash the pending tail, pop this frame, return
+            (ignored). *)
+         let p, n = arg_buffer cx ops in
+         emit cx "  call void @pv_tailcall(ptr %%ctx, i64 %s, ptr %s, i64 %d)" fv p n;
+         emit cx "  call void @pv_pop_frame(ptr %%ctx, i64 %s)" cx.frame;
+         emit cx "  ret i64 %s" imm_unit;
+         None)
+       else (
+         let p, n = arg_buffer cx ops in
+         let t = fresh cx in
+         emit cx "  %s = call i64 @pv_apply(ptr %%ctx, i64 %s, ptr %s, i64 %d)" t fv p n;
+         Some t))
   | A.CIf (a, t, e) ->
     (* A Boolean demand site: a by-need cell reaching the condition (e.g. `letrec b = false in
        if b …`) must be forced before its payload bit is read (mirroring the VM's `Jump_unless`). *)
@@ -1034,42 +1280,107 @@ and cexpr cx (env : env) ~(tail : bool) (c : A.cexpr) : string option =
 (* Emit one lifted function: open a frame, root the params (from the arg buffer) and the captured free
    vars (from the closure env block), then compile the body in tail position. *)
 let emit_function cx (l : lifted) : unit =
+  let arity = List.length l.params in
+  (* --- the direct entry `@<name>$d` (ADR-0076 §1): body under `tailcc`, args as parameters ------- *)
   cx.fn <- Buffer.create 256;
   cx.ssa <- 0;
   let frame = "%frame" in
   cx.frame <- frame;
   emit cx "  %s = call i64 @pv_frame(ptr %%ctx)" frame;
-  (* params: arg i ↦ a rooted slot *)
+  (* params: parameter i ↦ a rooted slot *)
   let env =
     List.mapi (fun i p -> p, i) l.params
     |> List.fold_left
-         (fun env (p, i) ->
-            let ptr = fresh cx in
-            emit cx "  %s = getelementptr i64, ptr %%args, i64 %d" ptr i;
-            let v = fresh cx in
-            emit cx "  %s = load i64, ptr %s" v ptr;
-            bind env p (root cx v))
+         (fun env (p, i) -> bind env p (root cx (Printf.sprintf "%%p%d" i)))
          []
   in
-  (* captures: closure env block (slot 2) then positional reads *)
-  let env =
+  (* captures: positional reads from the env word `%env` (the shared/captured array) *)
+  let env, self_handle =
     if l.captures = []
-    then env
+    then env, None
     else (
-      let envb = fresh cx in
-      emit cx "  %s = call i64 @pv_read_field(ptr %%ctx, i64 %%clo, i64 2)" envb;
-      List.mapi (fun i c -> c, i) l.captures
-      |> List.fold_left
-           (fun env (c, i) ->
-              let v = fresh cx in
-              emit cx "  %s = call i64 @pv_read_field(ptr %%ctx, i64 %s, i64 %d)" v envb i;
-              bind env c (root cx v))
-           env)
+      let env, sh =
+        List.mapi (fun i c -> c, i) l.captures
+        |> List.fold_left
+             (fun (env, sh) (c, i) ->
+                let v = fresh cx in
+                emit cx "  %s = call i64 @pv_read_field(ptr %%ctx, i64 %%env, i64 %d)" v i;
+                let h = root cx v in
+                let sh = if Some c = l.self_name then Some h else sh in
+                let env =
+                  match List.assoc_opt c l.capture_fns with
+                  | Some info -> bind_fn env c h info
+                  | None -> bind env c h
+                in
+                env, sh)
+             (env, None)
+      in
+      env, sh)
   in
-  ignore (expr cx env ~tail:true l.body);
+  (* the self-call shortcut (ADR-0076 §2): while this body runs, a saturated call to [self_name]
+     re-enters this very function with this very `%env` — record the entry-time handle so a local
+     rebinding of the name is not mistaken for self. *)
+  let saved_self = cx.self_ctx
+  and saved_direct = cx.in_direct in
+  (match l.self_name with
+   | Some nm ->
+     (* Root the env word itself: a self-call re-supplies it, and the raw `%env` SSA value is
+        stale after the first safepoint in the body (the env array moves with the heap). *)
+     let env_h = root cx "%env" in
+     cx.self_ctx
+     <- Some (nm, self_handle, env_h, { dsym = l.name ^ "$d"; arity; src = SSelf })
+   | None -> cx.self_ctx <- None);
+  cx.in_direct <- true;
+  (match l.body with
+   | LBody e -> ignore (expr cx env ~tail:true e)
+   | LClosure lm ->
+     (* a `Grec` function member's suspension: forcing builds the pre-lifted member closure *)
+     let clo = make_closure cx env lm in
+     emit_ret cx clo);
+  cx.self_ctx <- saved_self;
+  cx.in_direct <- saved_direct;
   (* `internal` linkage: a lifted function is referenced only by address within its own module (never by
      symbol name cross-module), so it must not clash with an equally-named lifted function in another
-     per-module `.o` (ADR-0072 §1). *)
+     per-module `.o` (ADR-0072 §1). `tailcc` guarantees the `musttail` TCO on direct→direct tail edges
+     (ADR-0076 §3) — legal because direct entries are module-internal, never an ABI surface. *)
+  let dparams =
+    String.concat "" (List.init arity (fun i -> Printf.sprintf ", i64 %%p%d" i))
+  in
+  Buffer.add_string
+    cx.md
+    (Printf.sprintf
+       "define internal tailcc i64 @%s$d(ptr %%ctx, i64 %%env%s) {\nentry:\n%s}\n\n"
+       l.name
+       dparams
+       (Buffer.contents cx.fn));
+  (* --- the generic wrapper `@<name>` (the `AbiCodeFn` the closure's code word points at) ---------- *)
+  cx.fn <- Buffer.create 256;
+  cx.ssa <- 0;
+  let envw =
+    if l.captures = []
+    then imm_unit
+    else (
+      let e = fresh cx in
+      emit cx "  %s = call i64 @pv_read_field(ptr %%ctx, i64 %%clo, i64 2)" e;
+      e)
+  in
+  let args =
+    List.init arity (fun i ->
+      let ptr = fresh cx in
+      emit cx "  %s = getelementptr i64, ptr %%args, i64 %d" ptr i;
+      let v = fresh cx in
+      emit cx "  %s = load i64, ptr %s" v ptr;
+      v)
+  in
+  let r = fresh cx in
+  emit
+    cx
+    "  %s = call tailcc i64 @%s$d(ptr %%ctx, i64 %s%s)"
+    r
+    l.name
+    envw
+    (String.concat "" (List.map (fun a -> ", i64 " ^ a) args));
+  emit cx "  ret i64 %s" r;
   Buffer.add_string
     cx.md
     (Printf.sprintf
@@ -1095,6 +1406,7 @@ let declarations : string =
     ; "declare void @pv_runtime_free(ptr)"
     ; "declare i64 @pv_apply(ptr, i64, ptr, i64)"
     ; "declare void @pv_tailcall(ptr, i64, ptr, i64)"
+    ; "declare i64 @pv_settle(ptr, i64)"
     ; "declare i64 @pv_make_closure(ptr, i64, i32, i64)"
     ; "declare i64 @pv_frame(ptr)"
     ; "declare i64 @pv_root(ptr, i64)"
@@ -1182,6 +1494,9 @@ let make_cx ?(gkeys = SS.empty) () : ctx =
   ; gkeys
   ; externs = SS.empty
   ; foreigns = SS.empty
+  ; gfns = SM.empty
+  ; self_ctx = None
+  ; in_direct = false
   }
 
 (* `declare` lines for the native foreign `AbiCodeFn` symbols this object references (ADR-0073 §3). Each has
@@ -1420,7 +1735,15 @@ let emit_init_fn cx ~(name : string) (emit_body : unit -> unit) : unit =
 let emit_gdef cx : gdef -> unit = function
   | Gfun (key, ps, body) ->
     (* the code symbol (a closed top-level function, no captures) is hoisted like any lambda *)
-    cx.pending <- { name = mangle key; params = ps; captures = []; body } :: cx.pending;
+    cx.pending
+    <- { name = mangle key
+       ; params = ps
+       ; captures = []
+       ; body = LBody body
+       ; self_name = None
+       ; capture_fns = []
+       }
+       :: cx.pending;
     emit_init_fn cx ~name:key (fun () ->
       let addr = fresh cx in
       emit cx "  %s = ptrtoint ptr @%s to i64" addr (mangle key);
@@ -1449,7 +1772,8 @@ let emit_gdef cx : gdef -> unit = function
          let frame = "%frame" in
          cx.frame <- frame;
          emit cx "  %s = call i64 @pv_frame(ptr %%ctx)" frame;
-         let env' = build_grec cx [] binds in
+         (* stable member code symbols, so [cx.gfns]'s pre-registered `$d` names line up *)
+         let env' = build_grec ~named:(fun m -> Some (mangle m)) cx [] binds in
          (* read each member's current cell value *before* popping the transient roots *)
          let vals = List.map (fun (m, _) -> m, read_var cx env' m) binds in
          emit cx "  call void @pv_pop_frame(ptr %%ctx, i64 %s)" frame;
@@ -1464,6 +1788,33 @@ let emit_gdef cx : gdef -> unit = function
     entry (reading globals via `pv_get`). B1 emits a single self-contained module (all globals defined
     locally); B2 splits this across `.o` files with a link-synthesised `pv_init_all`. *)
 let emit_gdefs cx (gdefs : gdef list) : unit =
+  (* Register this compilation unit's OWN function bindings for direct calls (ADR-0076 §2) —
+     never a neighbour's: each per-module [cx] sees only its own gdefs, so the cross-module
+     boundary stays generic (ADR-0072 §2's no-metadata pin). The names are deterministic
+     (`mangle key`), matching [emit_gdef]/[build_grec ~named]'s emissions. *)
+  List.iter
+    (fun g ->
+       match g with
+       | Gfun (k, ps, _) ->
+         cx.gfns
+         <- SM.add
+              k
+              { dsym = mangle k ^ "$d"; arity = List.length ps; src = SSentinel }
+              cx.gfns
+       | Grec ms ->
+         List.iter
+           (fun (m, rhs) ->
+              match rhs with
+              | A.Ret (A.CLam (ps, _)) ->
+                cx.gfns
+                <- SM.add
+                     m
+                     { dsym = mangle m ^ "$d"; arity = List.length ps; src = SForceCell }
+                     cx.gfns
+              | _ -> ())
+           ms
+       | Gcaf _ -> ())
+    gdefs;
   List.iter
     (fun g ->
        List.iter
