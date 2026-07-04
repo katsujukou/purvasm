@@ -79,9 +79,15 @@ cells), and every call made *by the runtime* (`apply`, `force`, leaves).
   [0064](0064-v1-single-capability-native-abi-codegen-contract.md) §4 discipline: the callee opens
   its own frame; leaving the caller's frame open would leak roots on every iteration). LLVM
   guarantees the jump for matching signatures on the supported 64-bit targets.
+  > **Correction (2026-07-05, from the 0077 review):** the "matching signatures" phrasing here
+  > understates what shipped. `tailcc` is exempt from `musttail`'s prototype-matching
+  > requirement (LLVM LangRef), so the implementation emits `musttail` on **every**
+  > direct→direct tail edge — mismatched arities included — and the standing differential
+  > exercises such edges. Matching arity is neither required nor checked.
   Arguments must be computed (and any needed `pv_get` reloads done) **before** the pop; between
   the pop and the `musttail` no safepoint occurs (argument words stay valid).
-- A **tail call that does not qualify** (generic callee, cross-module, arity mismatch) keeps the
+- A **tail call that does not qualify** — anything not statically direct per §2: a generic
+  callee, or a cross-module reference (until the `.pmi`-publication record) — keeps the
   [0071](0071-codegen-runtime-c-abi.md) §4 trampoline unchanged.
 - The generic wrapper's call into its own direct entry is a tail call by construction, so a
   dynamic call costs one extra jump, not a second frame.

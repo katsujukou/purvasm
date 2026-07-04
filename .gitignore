@@ -12,6 +12,7 @@ _build
 /target
 /.ulib-test-cache
 /cli/bin
+/.bin
 purvasm_lib
 .psc-ide-port
 .purs-repl
