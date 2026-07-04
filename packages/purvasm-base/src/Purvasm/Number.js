@@ -6,3 +6,14 @@ export const mul = (a) => (b) => a * b;
 export const div = (a) => (b) => a / b;
 export const eq = (a) => (b) => a === b;
 export const lt = (a) => (b) => a < b;
+
+// float-bits reads: DataView defaults to big-endian, so offset 0 is the high word.
+const floatBitsView = new DataView(new ArrayBuffer(8));
+export const floatBitsHi = (f) => {
+  floatBitsView.setFloat64(0, f);
+  return floatBitsView.getInt32(0);
+};
+export const floatBitsLo = (f) => {
+  floatBitsView.setFloat64(0, f);
+  return floatBitsView.getInt32(4);
+};
