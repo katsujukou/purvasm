@@ -17,7 +17,7 @@ module J = Yojson.Safe
    checked on load. Bump it on ANY change to the JSON encoding *or* the emitted
    bytecode (codegen), so a toolchain update invalidates stale artifacts — the
    incremental builder reuses an object only if it still loads at this version. *)
-let format_version = 2
+let format_version = 3
 
 exception Bad_image of string
 

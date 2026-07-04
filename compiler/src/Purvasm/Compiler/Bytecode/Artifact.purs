@@ -22,10 +22,14 @@ import Purvasm.Compiler.Util.MD5 (md5Hex)
 
 -- | A linkable binding group: the keys it defines, the keys it references (deps, for
 -- | reachability), and its members as bytecode definitions. A recursive group is atomic.
+-- | `recursive` is carried from the bind site (ADR-0077): a recursive lambda member is
+-- | still a `Gfun`, and a singleton self-recursive group is indistinguishable from a
+-- | plain one, so rec-membership cannot be re-derived from the members.
 type Group =
   { keys :: Array String
   , deps :: Array String
   , members :: Array (String /\ Gdef)
+  , recursive :: Boolean
   }
 
 type ModuleArtifact =
@@ -35,9 +39,11 @@ type ModuleArtifact =
   , groups :: Array Group
   }
 
--- | An exported value's link/optimisation-relevant shape: a function of an arity, a
--- | strict CAF, or a recursive-group value.
-data ExportKind = Efn Int | Ecaf | Erec
+-- | An exported value's link/optimisation-relevant shape: a non-recursive function of an
+-- | arity, a recursive-group function member of an arity (ADR-0077 — a native caller
+-- | enters it through the force-cell path, not with the env sentinel), a strict CAF, or
+-- | a recursive-group value.
+data ExportKind = Efn Int | Erecfn Int | Ecaf | Erec
 
 type Interface =
   { ifaceName :: String
@@ -46,15 +52,16 @@ type Interface =
   , hash :: String
   }
 
-kindOfGdef :: Gdef -> ExportKind
-kindOfGdef = case _ of
-  Gfun ps _ -> Efn (length ps)
+kindOfGdef :: Boolean -> Gdef -> ExportKind
+kindOfGdef recursive = case _ of
+  Gfun ps _ -> if recursive then Erecfn (length ps) else Efn (length ps)
   Gcaf _ -> Ecaf
   Grec _ -> Erec
 
 kindToTag :: ExportKind -> String
 kindToTag = case _ of
   Efn n -> "fn" <> show n
+  Erecfn n -> "recfn" <> show n
   Ecaf -> "caf"
   Erec -> "rec"
 
@@ -64,9 +71,12 @@ kindToTag = case _ of
 interfaceOf :: ModuleArtifact -> Interface
 interfaceOf a =
   let
-    defs = Map.fromFoldable (concatMap _.members a.groups)
+    defs = Map.fromFoldable
+      (concatMap (\g -> map (\(k /\ gd) -> k /\ (g.recursive /\ gd)) g.members) a.groups)
     exports = sortWith (\(k /\ _) -> k)
-      (mapMaybe (\k -> map (\gd -> k /\ kindOfGdef gd) (Map.lookup k defs)) a.exports)
+      ( mapMaybe (\k -> map (\(r /\ gd) -> k /\ kindOfGdef r gd) (Map.lookup k defs))
+          a.exports
+      )
     surface = map (\(k /\ kd) -> k <> ":" <> kindToTag kd) exports
   in
     { ifaceName: a.name
@@ -81,6 +91,7 @@ groupToJson :: Group -> Json
 groupToJson g = JObj
   [ "keys" /\ strs g.keys
   , "deps" /\ strs g.deps
+  , "recursive" /\ JBool g.recursive
   , "members" /\ JArr (map (\(n /\ gd) -> JArr [ JStr n, gdefToJson gd ]) g.members)
   ]
 
@@ -96,6 +107,7 @@ moduleToJson a = JObj
 kindToJson :: ExportKind -> Json
 kindToJson = case _ of
   Efn n -> JArr [ JStr "fn", JInt n ]
+  Erecfn n -> JArr [ JStr "recfn", JInt n ]
   Ecaf -> JStr "caf"
   Erec -> JStr "rec"
 

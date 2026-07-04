@@ -23,7 +23,7 @@ diaD =
   { name: "DiaD"
   , imports: [ "Prim" ]
   , exports: [ "DiaD.d" ]
-  , groups: [ { keys: [ "DiaD.d" ], deps: [], members: [ "DiaD.d" /\ Gcaf [ PushInt 7, Return ] ] } ]
+  , groups: [ { keys: [ "DiaD.d" ], deps: [], members: [ "DiaD.d" /\ Gcaf [ PushInt 7, Return ] ], recursive: false } ]
   }
 
 diaB :: ModuleArtifact
@@ -31,7 +31,7 @@ diaB =
   { name: "DiaB"
   , imports: [ "DiaB", "DiaD", "Prim" ]
   , exports: [ "DiaB.b" ]
-  , groups: [ { keys: [ "DiaB.b" ], deps: [ "DiaD.d" ], members: [ "DiaB.b" /\ Gcaf [ Load "DiaD.d", Return ] ] } ]
+  , groups: [ { keys: [ "DiaB.b" ], deps: [ "DiaD.d" ], members: [ "DiaB.b" /\ Gcaf [ Load "DiaD.d", Return ] ], recursive: false } ]
   }
 
 diaC :: ModuleArtifact
@@ -39,7 +39,7 @@ diaC =
   { name: "DiaC"
   , imports: [ "DiaC", "DiaD", "Prim" ]
   , exports: [ "DiaC.c" ]
-  , groups: [ { keys: [ "DiaC.c" ], deps: [ "DiaD.d" ], members: [ "DiaC.c" /\ Gcaf [ Load "DiaD.d", Return ] ] } ]
+  , groups: [ { keys: [ "DiaC.c" ], deps: [ "DiaD.d" ], members: [ "DiaC.c" /\ Gcaf [ Load "DiaD.d", Return ] ], recursive: false } ]
   }
 
 diaA :: ModuleArtifact
@@ -48,20 +48,21 @@ diaA =
   , imports: [ "DiaA", "DiaB", "DiaC", "Prim" ]
   , exports: [ "DiaA.Two", "DiaA.both" ]
   , groups:
-      [ { keys: [ "DiaA.Two" ], deps: [], members: [ "DiaA.Two" /\ Gcaf [ Ctor "Two" 2 0, Return ] ] }
+      [ { keys: [ "DiaA.Two" ], deps: [], members: [ "DiaA.Two" /\ Gcaf [ Ctor "Two" 2 0, Return ] ], recursive: false }
       , { keys: [ "DiaA.both" ]
         , deps: [ "DiaA.Two", "DiaB.b", "DiaC.c" ]
         , members: [ "DiaA.both" /\ Gcaf [ Load "DiaA.Two", Load "DiaB.b", Load "DiaC.c", TailCall 2 ] ]
+        , recursive: false
         }
       ]
   }
 
 refAppPvm :: String
-refAppPvm = """{"version":2,"gdefs":[["DiaD.d",["caf",[["pi",7],["rt"]]]],["DiaB.b",["caf",[["ld","DiaD.d"],["rt"]]]],["DiaC.c",["caf",[["ld","DiaD.d"],["rt"]]]],["DiaA.Two",["caf",[["ct","Two",2,0],["rt"]]]],["DiaA.both",["caf",[["ld","DiaA.Two"],["ld","DiaB.b"],["ld","DiaC.c"],["tc",2]]]]],"main":[["ld","DiaA.both"],["rt"]],"effect":false}"""
+refAppPvm = """{"version":3,"gdefs":[["DiaD.d",["caf",[["pi",7],["rt"]]]],["DiaB.b",["caf",[["ld","DiaD.d"],["rt"]]]],["DiaC.c",["caf",[["ld","DiaD.d"],["rt"]]]],["DiaA.Two",["caf",[["ct","Two",2,0],["rt"]]]],["DiaA.both",["caf",[["ld","DiaA.Two"],["ld","DiaB.b"],["ld","DiaC.c"],["tc",2]]]]],"main":[["ld","DiaA.both"],["rt"]],"effect":false}"""
 
 -- Entry `DiaB.b` reaches only `DiaB.b → DiaD.d`; `DiaA.*` and `DiaC.c` are dropped.
 refDce :: String
-refDce = """{"version":2,"gdefs":[["DiaD.d",["caf",[["pi",7],["rt"]]]],["DiaB.b",["caf",[["ld","DiaD.d"],["rt"]]]]],"main":[["ld","DiaB.b"],["rt"]],"effect":false}"""
+refDce = """{"version":3,"gdefs":[["DiaD.d",["caf",[["pi",7],["rt"]]]],["DiaB.b",["caf",[["ld","DiaD.d"],["rt"]]]]],"main":[["ld","DiaB.b"],["rt"]],"effect":false}"""
 
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.Link" do

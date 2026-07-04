@@ -23,6 +23,7 @@ let group_of_bind (key : Corefn.Names.ident -> string) (b : E.bind) : Artifact.g
     { Artifact.keys = [ k ]
     ; deps = SSet.elements (Link.free_vars t)
     ; members = [ k, gdef ~recursive:false t ]
+    ; recursive = false
     }
   | E.Rec rbs ->
     let pairs =
@@ -37,6 +38,7 @@ let group_of_bind (key : Corefn.Names.ident -> string) (b : E.bind) : Artifact.g
     { Artifact.keys = List.map fst pairs
     ; deps = SSet.elements deps
     ; members = List.map (fun (k, t) -> k, gdef ~recursive:true t) pairs
+    ; recursive = true
     }
 
 (** Compile a module to its `.pvmo` artifact. The interface's [exports] are the

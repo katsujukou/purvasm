@@ -81,6 +81,7 @@ let link
                     { A.keys = [ k ]
                     ; deps = SSet.elements (Link.free_vars t)
                     ; members = [ k, gd ]
+                    ; recursive = false
                     }
                   in
                   Hashtbl.replace runtime k g;

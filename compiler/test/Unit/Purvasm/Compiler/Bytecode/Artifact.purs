@@ -22,20 +22,22 @@ diaA =
       [ { keys: [ "DiaA.Two" ]
         , deps: []
         , members: [ "DiaA.Two" /\ Gcaf [ Ctor "Two" 2 0, Return ] ]
+        , recursive: false
         }
       , { keys: [ "DiaA.both" ]
         , deps: [ "DiaA.Two", "DiaB.b", "DiaC.c" ]
         , members:
             [ "DiaA.both" /\ Gcaf [ Load "DiaA.Two", Load "DiaB.b", Load "DiaC.c", TailCall 2 ] ]
+        , recursive: false
         }
       ]
   }
 
 refPmo :: String
-refPmo = """{"version":2,"name":"DiaA","imports":["DiaA","DiaB","DiaC","Prim"],"exports":["DiaA.Two","DiaA.both"],"groups":[{"keys":["DiaA.Two"],"deps":[],"members":[["DiaA.Two",["caf",[["ct","Two",2,0],["rt"]]]]]},{"keys":["DiaA.both"],"deps":["DiaA.Two","DiaB.b","DiaC.c"],"members":[["DiaA.both",["caf",[["ld","DiaA.Two"],["ld","DiaB.b"],["ld","DiaC.c"],["tc",2]]]]]}]}"""
+refPmo = """{"version":3,"name":"DiaA","imports":["DiaA","DiaB","DiaC","Prim"],"exports":["DiaA.Two","DiaA.both"],"groups":[{"keys":["DiaA.Two"],"deps":[],"recursive":false,"members":[["DiaA.Two",["caf",[["ct","Two",2,0],["rt"]]]]]},{"keys":["DiaA.both"],"deps":["DiaA.Two","DiaB.b","DiaC.c"],"recursive":false,"members":[["DiaA.both",["caf",[["ld","DiaA.Two"],["ld","DiaB.b"],["ld","DiaC.c"],["tc",2]]]]]}]}"""
 
 refPmi :: String
-refPmi = """{"version":2,"name":"DiaA","exports":[["DiaA.Two","caf"],["DiaA.both","caf"]],"imports":["DiaA","DiaB","DiaC","Prim"],"hash":"abfec547bb4356605e4c57f967084fce"}"""
+refPmi = """{"version":3,"name":"DiaA","exports":[["DiaA.Two","caf"],["DiaA.both","caf"]],"imports":["DiaA","DiaB","DiaC","Prim"],"hash":"abfec547bb4356605e4c57f967084fce"}"""
 
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.Bytecode.Artifact" do

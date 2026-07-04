@@ -6,6 +6,7 @@
 
 module C = Cesk.Ast
 module V = Cesk.Value
+module SS = Set.Make (String)
 
 let fixture : Corefn.Module.t =
   Corefn.Decode.module_of_file "../fixtures/fixture.corefn.json"
@@ -901,7 +902,8 @@ let llvm_run
    (`-dead_strip` on ld64, `--gc-sections` + per-function sections on GNU ld/lld — [Native_link])
    so unreferenced symbols — a pruned dead binding's code/globals — are removed (ADR-0072 §3
    tree-shaking). *)
-let build_split_exe ?(is_effect = false) ?heap_words ~(dir : string) (t : C.term) : string
+let build_split_exe ?(is_effect = false) ?heap_words ?surface ~(dir : string) (t : C.term)
+  : string
   =
   let rt = Option.get rt_staticlib in
   (try Sys.mkdir dir 0o755 with
@@ -910,6 +912,7 @@ let build_split_exe ?(is_effect = false) ?heap_words ~(dir : string) (t : C.term
     Llvm_backend.Codegen_llvm.program_split
       ~is_effect
       ?heap_words
+      ?surface
       (Middle_end.Transl.transl t)
   in
   (* one `.ll` → `.o` (`clang -c`), quoting every path; return the `.o` path *)
@@ -953,13 +956,13 @@ let build_split_exe ?(is_effect = false) ?heap_words ~(dir : string) (t : C.term
   then Alcotest.failf "link failed; see %s" err;
   genexe
 
-let llvm_run_split ?(is_effect = false) ?heap_words (t : C.term) : string =
+let llvm_run_split ?(is_effect = false) ?heap_words ?surface (t : C.term) : string =
   let dir =
     Filename.concat
       (Filename.get_temp_dir_name ())
-      (Printf.sprintf "purvasm_lls_%x" (Hashtbl.hash (t, heap_words)))
+      (Printf.sprintf "purvasm_lls_%x" (Hashtbl.hash (t, heap_words, surface <> None)))
   in
-  let genexe = build_split_exe ~is_effect ?heap_words ~dir t in
+  let genexe = build_split_exe ~is_effect ?heap_words ?surface ~dir t in
   let outf = Filename.concat dir "out" in
   if
     Sys.command (Printf.sprintf "%s > %s" (Filename.quote genexe) (Filename.quote outf))
@@ -1004,17 +1007,39 @@ let same_on_llvm_modular_effect (label : string) (t : C.term) =
 
 (* The **separate-compilation** path (ADR-0072 §1/§3, Part B2): each module compiled to its own `.o`, all
    linked with the runtime. Same differential contract against the CESK oracle. *)
-let same_on_llvm_split ?heap_words (label : string) (t : C.term) =
+let same_on_llvm_split ?heap_words ?surface (label : string) (t : C.term) =
   Alcotest.(check string)
     label
     (V.to_string (Cesk.Machine.eval ~host:Ffi.host t))
-    (llvm_run_split ?heap_words t)
+    (llvm_run_split ?heap_words ?surface t)
 
-let same_on_llvm_split_effect (label : string) (t : C.term) =
+let same_on_llvm_split_effect ?surface (label : string) (t : C.term) =
   let out =
     with_captured_stdout (fun () -> ignore (Cesk.Machine.run_effect ~host:Ffi.host t))
   in
-  Alcotest.(check string) label out (llvm_run_split ~is_effect:true t)
+  Alcotest.(check string) label out (llvm_run_split ~is_effect:true ?surface t)
+
+(* A fixture program's export surface, key → call fact (ADR-0077 §2): derived from the SAME
+   code that writes each module's `.pmi` (`compile_module` → `interface_of`) — exactly what
+   `purvm native` supplies. Passing it turns the split differential into the cross-module
+   direct-call differential. *)
+let fixture_surface ~(outdir : string) ~(entry_module : string list)
+  : Llvm_backend.Codegen_llvm.call_fact Llvm_backend.Codegen_llvm.SM.t
+  =
+  let module CG = Llvm_backend.Codegen_llvm in
+  Link.load ~outdir ~entry_module ()
+  |> List.fold_left
+       (fun acc (m : Corefn.Module.t) ->
+          let iface = Pvm.Artifact.interface_of (Pvm.Compile.compile_module m) in
+          List.fold_left
+            (fun acc (k, kd) ->
+               match kd with
+               | Pvm.Artifact.Efn n -> CG.SM.add k (CG.Cfn n) acc
+               | Pvm.Artifact.Erecfn n -> CG.SM.add k (CG.Crecfn n) acc
+               | Pvm.Artifact.Ecaf | Pvm.Artifact.Erec -> acc)
+            acc
+            iface.Pvm.Artifact.exports)
+       CG.SM.empty
 
 (* The prelude ulib's native `foreign` in `.c` (ADR-0073): `showNumberImpl` shipped as C over the `pv_*`
    C-ABI, resolved by its `pvf_*` symbol from the compiled `Data.Show.c`. *)
@@ -1851,8 +1876,52 @@ let test_llvm_split_prelude_answer () =
 let test_llvm_split_prelude_quotient () =
   same_on_llvm_split "split prelude quotient" (prelude_term "quotient")
 
+(* The same real multi-module programs with the export surface supplied (ADR-0077 §2): exported
+   `Efn`s are entered by bare symbol with the sentinel env, exported `Erecfn`s (e.g. `gcd`)
+   through the force-cell path — the cross-module direct-call differential. *)
+let test_llvm_split_prelude_answer_xmod () =
+  same_on_llvm_split
+    ~surface:(fixture_surface ~outdir:"../fixtures/prelude" ~entry_module:[ "Main" ])
+    "split prelude answer (cross-module direct)"
+    (prelude_term "answer")
+
+let test_llvm_split_prelude_quotient_xmod () =
+  same_on_llvm_split
+    ~surface:(fixture_surface ~outdir:"../fixtures/prelude" ~entry_module:[ "Main" ])
+    "split prelude quotient (cross-module direct)"
+    (prelude_term "quotient")
+
+let str_contains ~(needle : string) (hay : string) : bool =
+  let nl = String.length needle
+  and hl = String.length hay in
+  let rec go i = i + nl <= hl && (String.sub hay i nl = needle || go (i + 1)) in
+  nl = 0 || go 0
+
+(* Structural pin for ADR-0077 §3: with the surface supplied, some module object must declare a
+   neighbour's external `$d` (`declare tailcc`), and a defined exported `$d` loses `internal`. *)
+let test_llvm_split_xmod_declares () =
+  let surface = fixture_surface ~outdir:"../fixtures/prelude" ~entry_module:[ "Main" ] in
+  let out =
+    Llvm_backend.Codegen_llvm.program_split
+      ~surface
+      (Middle_end.Transl.transl (prelude_term "answer"))
+  in
+  let alls = String.concat "\n" (List.map snd out.modules) in
+  Alcotest.(check bool)
+    "a cross-module direct entry is declared"
+    true
+    (str_contains ~needle:"declare tailcc i64 @pv_g_" alls);
+  Alcotest.(check bool)
+    "an exported direct entry is external"
+    true
+    (str_contains ~needle:"\ndefine tailcc i64 @pv_g_" alls)
+
 let test_llvm_split_effect_console () =
   same_on_llvm_split_effect
+    ~surface:
+      (fixture_surface
+         ~outdir:"../fixtures/effect_console"
+         ~entry_module:[ "ConsoleMain" ])
     "split effect_console"
     (Link.link_program
        ~resolver:Ffi.resolver
@@ -1862,12 +1931,6 @@ let test_llvm_split_effect_console () =
        ())
 
 (* --- Reachability pruning + system-linker dead-strip (ADR-0072 §3). ---------------------------------- *)
-
-let str_contains ~(needle : string) (hay : string) : bool =
-  let nl = String.length needle
-  and hl = String.length hay in
-  let rec go i = i + nl <= hl && (String.sub hay i nl = needle || go (i + 1)) in
-  nl = 0 || go 0
 
 (* A binding unreachable from the entry (`dead`) is still emitted in its module object but **pruned from
    `pv_init_all`** (ADR-0072 §3). A pure dead binding is observationally invisible, so this proves the
@@ -2462,9 +2525,34 @@ let test_sc_interface () =
     "interface hash stable through serde"
     i.Pvm.Artifact.hash
     i2.Pvm.Artifact.hash;
-  match List.assoc_opt "FibAnd.fib" i.Pvm.Artifact.exports with
-  | Some (Pvm.Artifact.Efn 1) -> ()
-  | _ -> Alcotest.fail "FibAnd.fib should be exported as a fn/1"
+  (match List.assoc_opt "FibAnd.fib" i.Pvm.Artifact.exports with
+   | Some (Pvm.Artifact.Efn 1) -> ()
+   | _ -> Alcotest.fail "FibAnd.fib should be exported as a fn/1");
+  (* ADR-0077 classification, both sides. [fibAnd]'s ANF is not a bare lambda (lets
+     precede it), so it stays a by-need value member ([Erec]); a bare recursive lambda
+     like [gcd] publishes its recursiveness ([Erecfn]) — a native caller must enter it
+     through the force-cell path, not with the env sentinel. *)
+  (match List.assoc_opt "FibAnd.fibAnd" i.Pvm.Artifact.exports with
+   | Some Pvm.Artifact.Erec -> ()
+   | Some kd ->
+     Alcotest.fail
+       ("FibAnd.fibAnd should be exported as rec, got " ^ Pvm.Artifact.kind_to_tag kd)
+   | None -> Alcotest.fail "FibAnd.fibAnd missing from interface");
+  let prelude = Link.load ~outdir:"../fixtures/prelude" ~entry_module:[ "Main" ] () in
+  let er =
+    List.find
+      (fun (mm : Corefn.Module.t) ->
+         String.equal (Link.name_key mm.name) "Data.EuclideanRing")
+      prelude
+  in
+  let ier = Pvm.Artifact.interface_of (Pvm.Compile.compile_module er) in
+  match List.assoc_opt "Data.EuclideanRing.gcd" ier.Pvm.Artifact.exports with
+  | Some (Pvm.Artifact.Erecfn _) -> ()
+  | Some kd ->
+    Alcotest.fail
+      ("Data.EuclideanRing.gcd should be exported as recfn (ADR-0077), got "
+       ^ Pvm.Artifact.kind_to_tag kd)
+  | None -> Alcotest.fail "Data.EuclideanRing.gcd missing from interface"
 
 let test_sc_effect_console () =
   let t =
@@ -2653,6 +2741,15 @@ let llvm_groups =
             "split_prelude_quotient"
             `Quick
             test_llvm_split_prelude_quotient
+        ; Alcotest.test_case
+            "split_prelude_answer_xmod"
+            `Quick
+            test_llvm_split_prelude_answer_xmod
+        ; Alcotest.test_case
+            "split_prelude_quotient_xmod"
+            `Quick
+            test_llvm_split_prelude_quotient_xmod
+        ; Alcotest.test_case "split_xmod_declares" `Quick test_llvm_split_xmod_declares
         ; Alcotest.test_case "split_effect_console" `Quick test_llvm_split_effect_console
         ; Alcotest.test_case "prune_omits_dead" `Quick test_llvm_prune_omits_dead
         ; Alcotest.test_case "split_dead_binding" `Quick test_llvm_split_dead_binding

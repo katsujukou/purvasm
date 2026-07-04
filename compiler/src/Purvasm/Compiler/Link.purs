@@ -105,6 +105,7 @@ link artifacts resolver mainTerm =
                 { keys: [ k ]
                 , deps: freeVars t
                 , members: [ k /\ gdefOfExpr false (normalize t) ] :: Array (String /\ Gdef)
+                , recursive: false
                 }
             modify_ \s -> s { runtime = Map.insert k g s.runtime }
             pure (Just g)

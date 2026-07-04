@@ -28,7 +28,7 @@ import Purvasm.Number (floatBitsHi, floatBitsLo)
 -- | Artifact-compatibility version, stamped into every `.pmo`/`.pmi` (boot's
 -- | `Image.format_version`). Bump on any codegen change so a stale object is rejected.
 formatVersion :: Int
-formatVersion = 2
+formatVersion = 3
 
 -- --- a JSON tree with a Yojson-faithful compact serialiser --------------------------
 

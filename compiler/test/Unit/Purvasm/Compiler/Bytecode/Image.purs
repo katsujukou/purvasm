@@ -43,4 +43,4 @@ spec = describe "Purvasm.Compiler.Bytecode.Image" do
         , isEffect: false
         }
         `shouldEqual`
-          """{"version":2,"gdefs":[["M.x",["caf",[["pi",1],["rt"]]]]],"main":[["ld","M.x"],["rt"]],"effect":false}"""
+          """{"version":3,"gdefs":[["M.x",["caf",[["pi",1],["rt"]]]]],"main":[["ld","M.x"],["rt"]],"effect":false}"""

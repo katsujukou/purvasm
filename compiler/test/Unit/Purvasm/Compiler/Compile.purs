@@ -45,10 +45,38 @@ diaA =
   imp mn = { ann: nullAnn, moduleName: mn }
 
 refPmo :: String
-refPmo = """{"version":2,"name":"DiaA","imports":["DiaA","DiaB","DiaC","Prim"],"exports":["DiaA.Two","DiaA.both"],"groups":[{"keys":["DiaA.Two"],"deps":[],"members":[["DiaA.Two",["caf",[["ct","Two",2,0],["rt"]]]]]},{"keys":["DiaA.both"],"deps":["DiaA.Two","DiaB.b","DiaC.c"],"members":[["DiaA.both",["caf",[["ld","DiaA.Two"],["ld","DiaB.b"],["ld","DiaC.c"],["tc",2]]]]]}]}"""
+refPmo = """{"version":3,"name":"DiaA","imports":["DiaA","DiaB","DiaC","Prim"],"exports":["DiaA.Two","DiaA.both"],"groups":[{"keys":["DiaA.Two"],"deps":[],"recursive":false,"members":[["DiaA.Two",["caf",[["ct","Two",2,0],["rt"]]]]]},{"keys":["DiaA.both"],"deps":["DiaA.Two","DiaB.b","DiaC.c"],"recursive":false,"members":[["DiaA.both",["caf",[["ld","DiaA.Two"],["ld","DiaB.b"],["ld","DiaC.c"],["tc",2]]]]]}]}"""
 
 refPmi :: String
-refPmi = """{"version":2,"name":"DiaA","exports":[["DiaA.Two","caf"],["DiaA.both","caf"]],"imports":["DiaA","DiaB","DiaC","Prim"],"hash":"abfec547bb4356605e4c57f967084fce"}"""
+refPmi = """{"version":3,"name":"DiaA","exports":[["DiaA.Two","caf"],["DiaA.both","caf"]],"imports":["DiaA","DiaB","DiaC","Prim"],"hash":"abfec547bb4356605e4c57f967084fce"}"""
+
+-- A self-recursive lambda (`loop = \x -> loop x`): its group must carry `recursive:true`
+-- and its interface must publish `["recfn", 1]`, not `["fn", 1]` (ADR-0077) — the fact a
+-- native caller needs to pick the force-cell path over the sentinel path.
+recMod :: CF.Module
+recMod =
+  { name: [ "RecMod" ]
+  , path: ""
+  , builtWith: ""
+  , imports: [ { ann: nullAnn, moduleName: [ "Prim" ] } ]
+  , exports: [ "loop" ]
+  , reExports: Object.empty
+  , foreignNames: []
+  , decls:
+      [ CF.Rec
+          [ { ann: nullAnn
+            , ident: "loop"
+            , expr: CF.Abs nullAnn "x" (CF.App nullAnn (qvar [ "RecMod" ] "loop") (CF.Var nullAnn (CF.Qualified Nothing "x")))
+            }
+          ]
+      ]
+  }
+
+refRecPmo :: String
+refRecPmo = """{"version":3,"name":"RecMod","imports":["Prim"],"exports":["RecMod.loop"],"groups":[{"keys":["RecMod.loop"],"deps":["RecMod.loop"],"recursive":true,"members":[["RecMod.loop",["fn",["x"],[["ld","RecMod.loop"],["ld","x"],["tc",1]]]]]}]}"""
+
+refRecPmi :: String
+refRecPmi = """{"version":3,"name":"RecMod","exports":[["RecMod.loop",["recfn",1]]],"imports":["Prim"],"hash":"c98b98efe3f5ac8b6b5644a654c18ebb"}"""
 
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.Compile" do
@@ -57,3 +85,9 @@ spec = describe "Purvasm.Compiler.Compile" do
 
   it "derives a byte-identical .pmi (== boot's .pvmi)" do
     interfaceToString (interfaceOf (compileModule diaA)) `shouldEqual` refPmi
+
+  it "marks a recursive lambda group recursive:true in the .pmo (== boot, ADR-0077)" do
+    moduleToString (compileModule recMod) `shouldEqual` refRecPmo
+
+  it "publishes a recursive lambda as [\"recfn\", n] in the .pmi (== boot, ADR-0077)" do
+    interfaceToString (interfaceOf (compileModule recMod)) `shouldEqual` refRecPmi

@@ -18,11 +18,15 @@ let err = I.err
 
 (* A linkable binding group: the keys it defines, the keys it references (deps, for
    reachability), and its members as bytecode definitions. A [Rec] group is atomic —
-   reaching any member links them all (ADR-0021). *)
+   reaching any member links them all (ADR-0021). [recursive] is carried from the bind
+   site (ADR-0077): a recursive lambda member is still a [Gfun] (the global table closes
+   it), and a singleton self-recursive group is indistinguishable from a plain one, so
+   rec-membership cannot be re-derived from the members. *)
 type group =
   { keys : string list
   ; deps : string list
   ; members : (string * G.gdef) list
+  ; recursive : bool
   }
 
 type module_artifact =
@@ -33,9 +37,12 @@ type module_artifact =
   }
 
 (* An exported value's link/optimisation-relevant shape (ADR-0033's "name →
-   arity/kind"): a function of an arity, a strict CAF, or a recursive-group value. *)
+   arity/kind"): a non-recursive function of an arity, a recursive-group function
+   member of an arity (ADR-0077 — a native caller enters it through the force-cell
+   path, not with the env sentinel), a strict CAF, or a recursive-group value. *)
 type export_kind =
   | Efn of int
+  | Erecfn of int
   | Ecaf
   | Erec
 
@@ -48,13 +55,14 @@ type interface =
 
 (* --- the interface (.pvmi) ------------------------------------------------- *)
 
-let kind_of_gdef : G.gdef -> export_kind = function
-  | G.Gfun (ps, _) -> Efn (List.length ps)
+let kind_of_gdef ~(recursive : bool) : G.gdef -> export_kind = function
+  | G.Gfun (ps, _) -> if recursive then Erecfn (List.length ps) else Efn (List.length ps)
   | G.Gcaf _ -> Ecaf
   | G.Grec _ -> Erec
 
 let kind_to_tag = function
   | Efn n -> "fn" ^ string_of_int n
+  | Erecfn n -> "recfn" ^ string_of_int n
   | Ecaf -> "caf"
   | Erec -> "rec"
 
@@ -65,14 +73,17 @@ let kind_to_tag = function
     an exported function's arity) moves it while a private edit does not — ADR-0033's
     hash-stability + interface-completeness. *)
 let interface_of (a : module_artifact) : interface =
-  let defs : (string, G.gdef) Hashtbl.t = Hashtbl.create 64 in
+  let defs : (string, G.gdef * bool) Hashtbl.t = Hashtbl.create 64 in
   List.iter
-    (fun g -> List.iter (fun (k, gd) -> Hashtbl.replace defs k gd) g.members)
+    (fun g ->
+       List.iter (fun (k, gd) -> Hashtbl.replace defs k (gd, g.recursive)) g.members)
     a.groups;
   let exports =
     a.exports
     |> List.filter_map (fun k ->
-      Option.map (fun gd -> k, kind_of_gdef gd) (Hashtbl.find_opt defs k))
+      Option.map
+        (fun (gd, recursive) -> k, kind_of_gdef ~recursive gd)
+        (Hashtbl.find_opt defs k))
     |> List.sort (fun (a, _) (b, _) -> String.compare a b)
   in
   let surface = List.map (fun (k, kd) -> k ^ ":" ^ kind_to_tag kd) exports in
@@ -88,6 +99,7 @@ let group_to_json (g : group) : J.t =
   `Assoc
     [ "keys", I.strs g.keys
     ; "deps", I.strs g.deps
+    ; "recursive", `Bool g.recursive
     ; ( "members"
       , `List (List.map (fun (n, gd) -> `List [ `String n; I.gdef_to_json gd ]) g.members)
       )
@@ -102,6 +114,10 @@ let group_of_json : J.t -> group = function
     in
     { keys = I.strs_of (get "keys")
     ; deps = I.strs_of (get "deps")
+    ; recursive =
+        (match get "recursive" with
+         | `Bool b -> b
+         | _ -> err "group: recursive expected bool")
     ; members =
         (match get "members" with
          | `List xs ->
@@ -148,11 +164,13 @@ let module_of_json : J.t -> module_artifact = function
 
 let kind_to_json : export_kind -> J.t = function
   | Efn n -> `List [ `String "fn"; `Int n ]
+  | Erecfn n -> `List [ `String "recfn"; `Int n ]
   | Ecaf -> `String "caf"
   | Erec -> `String "rec"
 
 let kind_of_json : J.t -> export_kind = function
   | `List [ `String "fn"; `Int n ] -> Efn n
+  | `List [ `String "recfn"; `Int n ] -> Erecfn n
   | `String "caf" -> Ecaf
   | `String "rec" -> Erec
   | _ -> err "export kind"

@@ -34,6 +34,7 @@ groupOfBind key = case _ of
       { keys: [ k ]
       , deps: Set.toUnfoldable (freeVarsSet t)
       , members: [ k /\ gdefOfExpr false (normalize t) ]
+      , recursive: false
       }
   CF.Rec rbs ->
     let
@@ -43,6 +44,7 @@ groupOfBind key = case _ of
       { keys: map (\(k /\ _) -> k) pairs
       , deps
       , members: pairs <#> \(k /\ t) -> k /\ gdefOfExpr true (normalize t)
+      , recursive: true
       }
 
 -- | Compile a module to its `.pmo` artifact. The `exports` are its *public* value exports
