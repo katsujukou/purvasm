@@ -823,7 +823,8 @@ let compile_foreign_c ~(dir : string) (csrc : string) : string =
   if
     Sys.command
       (Printf.sprintf
-         "clang -c %s -I%s %s -o %s 2>%s"
+         "clang -c %s %s -I%s %s -o %s 2>%s"
+         (Native_link.opt_cflags ())
          (Native_link.section_cflags ())
          (Filename.quote inc)
          (Filename.quote csrc)
@@ -873,7 +874,8 @@ let llvm_run
     Sys.command
       (* `-lm` resolves a native `foreign` `.c`'s libm calls on Linux (macOS folds libm into libSystem). *)
       (Printf.sprintf
-         "clang %s %s %s %s %s -lm -o %s 2>%s"
+         "clang %s %s %s %s %s %s -lm -o %s 2>%s"
+         (Native_link.opt_cflags ())
          (Native_link.section_cflags ())
          (Native_link.dead_strip_link_flag ())
          (Filename.quote genll)
@@ -926,7 +928,8 @@ let build_split_exe ?(is_effect = false) ?heap_words ?surface ~(dir : string) (t
     if
       Sys.command
         (Printf.sprintf
-           "clang -c %s %s -o %s 2>%s"
+           "clang -c %s %s %s -o %s 2>%s"
+           (Native_link.opt_cflags ())
            (Native_link.section_cflags ())
            (Filename.quote ll)
            (Filename.quote obj)

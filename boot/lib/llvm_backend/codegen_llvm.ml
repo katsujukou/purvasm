@@ -582,6 +582,116 @@ let eval_atoms cx ?(force = false) (env : env) (atoms : A.atom list) : string li
   let handles = List.fold_left (fun acc a -> root cx (one cx env a) :: acc) [] atoms in
   List.rev_map (get_current cx) handles
 
+(* Inline the trivially-transcribable scalar primops (ADR-0072 §7) instead of an extern
+   `pv_prim_*` call per operation: exactly the ops whose runtime semantics (prim.rs) are a
+   handful of instructions on immediate words — 32-bit wrapping arithmetic/bit-ops, the
+   JS-masked shifts, and payload compares. `div`/`mod` (the Euclidean/zero-divisor rules,
+   ADR-0041) and every ctx-taking op stay runtime helpers. The IR mirrors the runtime's
+   reads *exactly*: the tagged encoding is `(payload << 1) | 1` (word.rs), an `Int` is read
+   as the payload's low 32 bits (`ii` = `as_int`), a `Boolean` as `payload != 0`
+   (`as_bool`) — so a hypothetical non-canonical word behaves identically on both paths.
+   Returns [None] for every other op (the caller falls back to the call). *)
+let inline_prim cx (op : C.primop) (ops : string list) : string option =
+  let payload w =
+    let p = fresh cx in
+    emit cx "  %s = ashr i64 %s, 1" p w;
+    p
+  in
+  let to_i32 w =
+    let v = fresh cx in
+    emit cx "  %s = trunc i64 %s to i32" v (payload w);
+    v
+  in
+  let of_i32 v =
+    let s = fresh cx in
+    emit cx "  %s = sext i32 %s to i64" s v;
+    let sh = fresh cx in
+    emit cx "  %s = shl i64 %s, 1" sh s;
+    let t = fresh cx in
+    emit cx "  %s = or i64 %s, 1" t sh;
+    t
+  in
+  let of_i1 b =
+    let z = fresh cx in
+    emit cx "  %s = zext i1 %s to i64" z b;
+    let sh = fresh cx in
+    emit cx "  %s = shl i64 %s, 1" sh z;
+    let t = fresh cx in
+    emit cx "  %s = or i64 %s, 1" t sh;
+    t
+  in
+  let truthy w =
+    let b = fresh cx in
+    emit cx "  %s = icmp ne i64 %s, 0" b (payload w);
+    b
+  in
+  let bin32 mnem a b =
+    let va = to_i32 a in
+    let vb = to_i32 b in
+    let r = fresh cx in
+    emit cx "  %s = %s i32 %s, %s" r mnem va vb;
+    Some (of_i32 r)
+  in
+  (* the shift count is masked `& 31` (prim.rs `wrapping_shl`/`shr` on a masked count),
+     which also keeps the LLVM shift amount in range (an unmasked >=32 would be poison) *)
+  let shift32 mnem a b =
+    let va = to_i32 a in
+    let vb = to_i32 b in
+    let m = fresh cx in
+    emit cx "  %s = and i32 %s, 31" m vb;
+    let r = fresh cx in
+    emit cx "  %s = %s i32 %s, %s" r mnem va m;
+    Some (of_i32 r)
+  in
+  let cmp32 cond a b =
+    let va = to_i32 a in
+    let vb = to_i32 b in
+    let c = fresh cx in
+    emit cx "  %s = icmp %s i32 %s, %s" c cond va vb;
+    Some (of_i1 c)
+  in
+  match op, ops with
+  | C.AddInt, [ a; b ] -> bin32 "add" a b
+  | C.SubInt, [ a; b ] -> bin32 "sub" a b
+  | C.MulInt, [ a; b ] -> bin32 "mul" a b
+  | C.AndInt, [ a; b ] -> bin32 "and" a b
+  | C.OrInt, [ a; b ] -> bin32 "or" a b
+  | C.XorInt, [ a; b ] -> bin32 "xor" a b
+  | C.ShlInt, [ a; b ] -> shift32 "shl" a b
+  | C.ShrInt, [ a; b ] -> shift32 "ashr" a b
+  | C.ZshrInt, [ a; b ] -> shift32 "lshr" a b
+  | C.ComplementInt, [ a ] ->
+    let va = to_i32 a in
+    let r = fresh cx in
+    emit cx "  %s = xor i32 %s, -1" r va;
+    Some (of_i32 r)
+  | C.EqInt, [ a; b ] -> cmp32 "eq" a b
+  | C.LtInt, [ a; b ] -> cmp32 "slt" a b
+  | C.EqBool, [ a; b ] ->
+    let ba = truthy a in
+    let bb = truthy b in
+    let e = fresh cx in
+    emit cx "  %s = icmp eq i1 %s, %s" e ba bb;
+    Some (of_i1 e)
+  | C.AndBool, [ a; b ] ->
+    let ba = truthy a in
+    let bb = truthy b in
+    let r = fresh cx in
+    emit cx "  %s = and i1 %s, %s" r ba bb;
+    Some (of_i1 r)
+  | C.OrBool, [ a; b ] ->
+    let ba = truthy a in
+    let bb = truthy b in
+    let r = fresh cx in
+    emit cx "  %s = or i1 %s, %s" r ba bb;
+    Some (of_i1 r)
+  | C.NotBool, [ a ] ->
+    let ba = truthy a in
+    let r = fresh cx in
+    emit cx "  %s = xor i1 %s, true" r ba;
+    Some (of_i1 r)
+  | _ -> None
+
 (* Emit a `br i1` guarded by [ok]: fall through to a fresh continuation block on true, jump to [fail] on
    false. Returns after emitting the continuation block's label (subsequent code runs on match). *)
 let test_or_fail cx (ok : string) ~(fail : string) (tag : string) : unit =
@@ -959,26 +1069,29 @@ and cexpr cx (env : env) ~(tail : bool) (c : A.cexpr) : string option =
   match c with
   | A.CAtom a -> finish (atom cx env a)
   | A.CPrim (op, args) ->
-    let sym, needs_ctx = prim_sym op in
     (* A primop consumes its operands' *values* (e.g. `RecordGet` on a by-need dict), so force them. *)
     let ops = eval_atoms ~force:true cx env args in
-    let t = fresh cx in
-    if needs_ctx
-    then
-      emit
-        cx
-        "  %s = call i64 @%s(ptr %%ctx, %s)"
-        t
-        sym
-        (String.concat ", " (List.map (fun o -> "i64 " ^ o) ops))
-    else
-      emit
-        cx
-        "  %s = call i64 @%s(%s)"
-        t
-        sym
-        (String.concat ", " (List.map (fun o -> "i64 " ^ o) ops));
-    finish t
+    (match inline_prim cx op ops with
+     | Some t -> finish t
+     | None ->
+       let sym, needs_ctx = prim_sym op in
+       let t = fresh cx in
+       if needs_ctx
+       then
+         emit
+           cx
+           "  %s = call i64 @%s(ptr %%ctx, %s)"
+           t
+           sym
+           (String.concat ", " (List.map (fun o -> "i64 " ^ o) ops))
+       else
+         emit
+           cx
+           "  %s = call i64 @%s(%s)"
+           t
+           sym
+           (String.concat ", " (List.map (fun o -> "i64 " ^ o) ops));
+       finish t)
   | A.CLam (ps, body) -> finish (make_closure cx env (lift cx env ps body))
   | A.CApp (f, args) ->
     (match direct_target cx env f (List.length args) with

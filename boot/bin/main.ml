@@ -327,7 +327,8 @@ let emit_native_llvm
     sh
       "clang -c"
       (Stdlib.Printf.sprintf
-         "clang -c %s %s -o %s 2>%s"
+         "clang -c %s %s %s -o %s 2>%s"
+         (Native_link.opt_cflags ())
          (Native_link.section_cflags ())
          (Filename.quote ll)
          (Filename.quote obj)
@@ -364,7 +365,8 @@ let emit_native_llvm
              sh
                "clang -c foreign"
                (Stdlib.Printf.sprintf
-                  "clang -c %s -I%s %s -o %s 2>%s"
+                  "clang -c %s %s -I%s %s -o %s 2>%s"
+                  (Native_link.opt_cflags ())
                   (Native_link.section_cflags ())
                   (Filename.quote inc)
                   (Filename.quote src)

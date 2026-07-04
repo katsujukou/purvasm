@@ -35,6 +35,13 @@ let dead_strip_link_flag () : string =
 let section_cflags () : string =
   if Lazy.force host_is_macos then "" else "-ffunction-sections -fdata-sections"
 
+(** Optimisation flag for every `clang -c` of the native pipeline (generated `.ll` and ulib
+    foreign `.c` alike). The emitted IR is deliberately naive — per-step virtual registers and
+    conservative root/reload traffic (ADR-0072 §6) — so leaving it `-O0` (clang's default)
+    prices that boilerplate at face value. `musttail` is a semantic guarantee, preserved under
+    optimisation, and the standing differential is the gate for the whole pipeline. *)
+let opt_cflags () : string = "-O2"
+
 (** The ["foreign"] map of `<ulib_dir>/ulib.json`: [(qualified key, relative `.c` path)]. An absent file
     or absent/ill-typed ["foreign"] field yields [[]] — those keys then resolve from the runtime staticlib
     (or a truly unbound one becomes a link error). Malformed JSON is tolerated as "no mapping" rather than
