@@ -174,3 +174,42 @@ Alternatives).
 - **`dlsym`-style runtime symbol resolution instead of interface metadata.** Replaces a
   compile-time fact with a runtime lookup and keeps the arity question open at every call.
   Rejected.
+
+> **Progress (2026-07-05):** Implemented as revised, plus a post-acceptance review round:
+> the driver now derives the surface **from the same code that writes the `.pmi`**
+> (`Pvm.Compile.compile_module` → `Artifact.interface_of` → `Efn`/`Erecfn` → codegen
+> `call_fact`), and codegen direct-calls a key only where the natively-lowered shape *agrees*
+> with the published fact (same kind and arity) — a disagreement falls back to generic instead
+> of baking a wrong ABI, and the exported-`$d` emission keys off the same intersection so every
+> `declare` resolves. The Level-2 writer gained byte-identity regression tests for
+> `recursive:true` / `["recfn", n]` against boot's output.
+>
+> Validation: boot e2e **216/216** (three new tests: two real multi-module differentials run
+> with the surface supplied, and a structural pin that a neighbour's `$d` is declared
+> `tailcc` and an exported `$d` is external); examples sweep 7/7; self-compile **488/488
+> byte-identical** at `format_version` 3 against a fresh boot reference. Cross-module direct
+> calls are live: the bench programs each declare **22–53** external `$d` symbols.
+>
+> **Measured result — honest and negative on wall-clock.** Paired, interleaved runs
+> (alternating before/after binaries on the same machine, min of 5; before = the same
+> toolchain with an empty surface): fib **1.02×**, quicksort **1.06×**, count-state **1.03×**,
+> json-parse **1.04×**, map-fold-array **1.01×**; the full 244-module self-compile is **flat**
+> (75.7 s vs 76.8 s / 76.5 s vs 77.4 s — if anything ~1% slower, within noise). Two
+> measurement lessons are recorded with it: session-to-session comparisons (an earlier
+> "1 m 23 s → 1 m 15 s" reading) and solo-vs-full-sweep runs (one-off ~1.6× readings) were
+> machine-condition artifacts — only interleaved paired runs settled it; and the bench
+> harness's per-leg cache silently reused executables of the *previous* toolchain until it was
+> keyed on the `purvm` binary's mtime (fixed in `run-benchmarks.sh`).
+>
+> **Interpretation.** [0076](0076-direct-known-arity-calls-musttail.md)'s ceiling attribution
+> — "the remainder is the cross-module Prelude combinator traffic" — is **refuted at v1's
+> cost structure for this corpus**: the hot loops were already module-local direct after 0076,
+> and the cross-module sites this record converts sit on cold paths. The residual `llvm/ml`
+> gap is dominated by per-operation costs a call-path change cannot touch: the `pv_prim_*`
+> extern boundaries ([0072](0072-anf-to-llvm-lowering.md) §7), conservative root/reload
+> traffic ([0072](0072-anf-to-llvm-lowering.md) §6), and the fact that the generated `.ll` is
+> compiled `-O0` today. Those are the next levers, now with a measurement pointing squarely at
+> them. This record's standing value is the **contract**: recursiveness is interface-visible
+> and hash-guarded, the external `$d` symbol ABI exists, and the interface is the proven
+> carrier that representation publication ([0059](0059-native-abi-value-representation.md) §3)
+> rides on.
