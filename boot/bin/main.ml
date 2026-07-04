@@ -459,7 +459,10 @@ let compile_action corefn output =
 
 (* Run the image. An `Effect` entry is performed for its effects and its `Unit`
    result is suppressed; a value entry's result is printed. *)
-let run_action image =
+let run_action image args =
+  (* Guest argv (ADR-0075 §4): `[image] ++ trailing args`, the same drop-one shape a native
+     binary or Node script presents, so a `.pvm` program reads its inputs uniformly. *)
+  Ffi.set_guest_argv (Array.of_list (image :: args));
   let img = Pvm.Image.read_file image in
   let v = Pvm.Image.run ~host:Ffi.host img in
   if not img.Pvm.Image.is_effect then Stdlib.print_endline (Vm.Value.to_string v)
@@ -647,7 +650,17 @@ let run_cmd =
   Cmd.v
     (Cmd.info "run" ~doc:"Run a linked .pvm image.")
     Term.(
-      const run_action $ Arg.(required & pos 0 (some string) None & info [] ~docv:"IMAGE"))
+      const run_action
+      $ Arg.(required & pos 0 (some string) None & info [] ~docv:"IMAGE")
+      $ Arg.(
+          value
+          & pos_right 0 string []
+          & info
+              []
+              ~docv:"ARGS"
+              ~doc:
+                "Arguments forwarded to the guest program's argv (after the image path — \
+                 the drop-one convention, ADR-0075)."))
 
 let cmd =
   let open Cmdliner in

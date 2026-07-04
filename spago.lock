@@ -1,6 +1,107 @@
 {
   "workspace": {
     "packages": {
+      "bench-common": {
+        "path": "benchmarks/common",
+        "core": {
+          "dependencies": [
+            "arrays",
+            "effect",
+            "integers",
+            "maybe",
+            "prelude",
+            "purvasm-system"
+          ]
+        },
+        "test": {
+          "dependencies": []
+        }
+      },
+      "bench-count-state": {
+        "path": "benchmarks/bench-count-state",
+        "core": {
+          "dependencies": [
+            "bench-common",
+            "console",
+            "effect",
+            "prelude",
+            "tailrec",
+            "transformers"
+          ]
+        },
+        "test": {
+          "dependencies": []
+        }
+      },
+      "bench-fib": {
+        "path": "benchmarks/bench-fib",
+        "core": {
+          "dependencies": [
+            "bench-common",
+            "console",
+            "effect",
+            "prelude"
+          ]
+        },
+        "test": {
+          "dependencies": []
+        }
+      },
+      "bench-json-parse": {
+        "path": "benchmarks/bench-json-parse",
+        "core": {
+          "dependencies": [
+            "argonaut-core",
+            "arrays",
+            "bench-common",
+            "console",
+            "effect",
+            "either",
+            "maybe",
+            "prelude",
+            "strings"
+          ]
+        },
+        "test": {
+          "dependencies": []
+        }
+      },
+      "bench-map-fold-array": {
+        "path": "benchmarks/bench-map-fold-array",
+        "core": {
+          "dependencies": [
+            "arrays",
+            "bench-common",
+            "console",
+            "effect",
+            "foldable-traversable",
+            "prelude"
+          ]
+        },
+        "test": {
+          "dependencies": []
+        }
+      },
+      "bench-quicksort": {
+        "path": "benchmarks/bench-quicksort",
+        "core": {
+          "dependencies": [
+            "arrays",
+            "bench-common",
+            "console",
+            "effect",
+            "foldable-traversable",
+            "integers",
+            "maybe",
+            "prelude",
+            "tuples",
+            "unfoldable"
+          ]
+        },
+        "test": {
+          "dependencies": []
+        }
+      },
       "cli": {
         "path": "cli",
         "core": {

@@ -617,6 +617,19 @@ let rec mkdir_p (d : string) : unit =
     try Sys.mkdir d 0o755 with
     | _ -> ())
 
+(* The argv the guest's `argvImpl` leaf observes (ADR-0075 §4). Defaults to the process's own
+   `Sys.argv` (the boot-native convention: element 0 the executable); `purvm run` overrides it
+   with `[image path] ++ trailing args` so a `.pvm` program sees the same drop-one shape as a
+   native binary or a Node script. A mutable ref rather than a [host] parameter because the
+   registry is a shared static closure threaded through every runner; only the VM `run` driver
+   ever overrides, before evaluation starts. *)
+let guest_argv : string array ref = ref Sys.argv
+
+(** Override the argv the guest's `argvImpl` observes (ADR-0075 §4): `purvm run IMAGE ARGS…` sets
+    `[IMAGE] ++ ARGS` so `.pvm` programs receive arguments like any native binary. Call before
+    evaluation starts. *)
+let set_guest_argv (argv : string array) : unit = guest_argv := argv
+
 let host : Cesk.Machine.host =
   let unary (f : V.t -> V.t) =
     ( 1
@@ -811,8 +824,9 @@ let host : Cesk.Machine.host =
            | _ -> Cesk.Errors.stuck "mkdirRecImpl: not a String"))
     | "Purvasm.System.Process.argvImpl" ->
       (* `argvImpl :: Effect (Array String)` is itself the thunk: forcing it (applying unit)
-         reads `Sys.argv` (element 0 is the executable, as on the native target). *)
-      Some (1, fun _ -> V.VArray (Array.map (fun s -> V.VString s) Sys.argv))
+         reads the guest argv (element 0 the executable/image, per the ADR-0045/0056 drop-one
+         convention) — [guest_argv] below, `Sys.argv` unless the driver overrode it. *)
+      Some (1, fun _ -> V.VArray (Array.map (fun s -> V.VString s) !guest_argv))
     | "Purvasm.System.Process.exitImpl" ->
       (* `exitImpl :: Int -> Effect Unit`: forcing the thunk terminates the process. Does not
          return — the `V.VInt 0` is unreachable, present only to satisfy the value type. *)
