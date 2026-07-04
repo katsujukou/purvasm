@@ -292,9 +292,9 @@ let resolve_runtime_include () =
    init/entry object (ADR-0072 §2/§3), compile each with `clang -c`, compile any ulib-shipped native
    `foreign` `.c` the program references (ADR-0073), and dead-strip-link them all with the runtime
    staticlib into a native executable — the CLI form of the e2e differential harness. *)
-let emit_native_llvm ~bdir ~output ~is_effect ~runtime_lib ~ulib anf =
+let emit_native_llvm ~bdir ~output ~is_effect ~runtime_lib ~ulib ~heap_words anf =
   let rt = resolve_runtime_lib runtime_lib in
-  let split = Llvm_backend.Codegen_llvm.program_split ~is_effect anf in
+  let split = Llvm_backend.Codegen_llvm.program_split ~is_effect ?heap_words anf in
   let sh label cmd =
     if Sys.command cmd <> 0
     then (
@@ -380,7 +380,18 @@ let emit_native_llvm ~bdir ~output ~is_effect ~runtime_lib ~ulib anf =
    link the CoreFn closure to one term, normalise to optimised ANF, then emit via the chosen [backend]. The
    entry is treated as an `Effect` by default (the runner forces it to unit); `--arg N` applies an
    `Int -> Int` entry and `--value` takes a bare value. *)
-let native_action backend runtime_lib corefn_dir output entry_module entry arg value ulib =
+let native_action
+      backend
+      runtime_lib
+      heap_words
+      corefn_dir
+      output
+      entry_module
+      entry
+      arg
+      value
+      ulib
+  =
   mkdir_p (build_dir output);
   let em = split_module entry_module in
   let term0 =
@@ -407,7 +418,7 @@ let native_action backend runtime_lib corefn_dir output entry_module entry arg v
   in
   let bdir = build_dir output in
   match backend with
-  | "llvm" -> emit_native_llvm ~bdir ~output ~is_effect ~runtime_lib ~ulib anf
+  | "llvm" -> emit_native_llvm ~bdir ~output ~is_effect ~runtime_lib ~ulib ~heap_words anf
   | "ocaml" ->
     write_file
       (Filename.concat bdir "app.ml")
@@ -568,6 +579,19 @@ let native_cmd =
             "Path to the runtime staticlib libpurvasm_rt.a ($(b,llvm) backend). Defaults \
              to $(b,\\$PURVASM_RT_A) or runtime/target/{debug,release}.")
   in
+  let heap_words =
+    Arg.(
+      value
+      & opt (some int) None
+      & info
+          [ "heap-words" ]
+          ~docv:"WORDS"
+          ~doc:
+            "Words per GC semi-space baked into the emitted binary ($(b,llvm) backend; \
+             the v1 heap is fixed-size, ADR-0066). Defaults to the codegen default; a \
+             program whose live set exceeds a semi-space aborts with a heap OOM and \
+             needs a larger value here.")
+  in
   Cmd.v
     (Cmd.info
        "native"
@@ -578,6 +602,7 @@ let native_cmd =
       const native_action
       $ backend
       $ runtime_lib
+      $ heap_words
       $ corefn_dir_arg
       $ output_arg
       $ em

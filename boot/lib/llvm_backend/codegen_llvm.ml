@@ -516,11 +516,31 @@ let test_or_fail cx (ok : string) ~(fail : string) (tag : string) : unit =
   emit cx "  br i1 %s, label %%%s, label %%%s" ok cont fail;
   emit cx "%s:" cont
 
+(* The boxed (`Number`/`String`) literals a binder compares against. Their allocation cannot happen
+   *inside* the match (the no-allocation invariant below — a mid-match safepoint would invalidate the
+   raw field/element operands nested binders hold), so the alt entry pre-allocates and roots one value
+   per distinct literal and the matcher only *compares* against the rooted handle. Keyed by structural
+   [compare] (not `=`), so a pathological NaN literal cannot fail its own lookup. *)
+let rec binder_boxed_lits (b : C.binder) : C.lit list =
+  match b with
+  | C.BLit ((C.LNumber _ | C.LString _) as l) -> [ l ]
+  | C.BLit _ | C.BNull | C.BVar _ -> []
+  | C.BNamed (_, inner) -> binder_boxed_lits inner
+  | C.BCtor (_, subs) | C.BArray subs -> List.concat_map binder_boxed_lits subs
+  | C.BRecord fields -> List.concat_map (fun (_, s) -> binder_boxed_lits s) fields
+
 (* Match [binder] against value operand [scrut] (ADR-0072 §5, the CPS cascade). On a mismatch, branch to
    [fail]; on a match, fall through (in a new block) with the env extended by the binder's bindings. No
    guest allocation happens inside a match, so [scrut] stays valid throughout (the body may allocate, but
-   its bound values are rooted on capture — root-on-create). Records/arrays are later slices. *)
-let rec match_binder cx (env : env) ~(fail : string) (binder : C.binder) (scrut : string)
+   its bound values are rooted on capture — root-on-create); a boxed literal's allocation is hoisted to
+   the alt entry and arrives through [lits] (root handles keyed by the literal, [binder_boxed_lits]). *)
+let rec match_binder
+          cx
+          (env : env)
+          ~(fail : string)
+          ~(lits : (C.lit * string) list)
+          (binder : C.binder)
+          (scrut : string)
   : env
   =
   match binder with
@@ -528,17 +548,44 @@ let rec match_binder cx (env : env) ~(fail : string) (binder : C.binder) (scrut 
   | C.BVar x -> bind env x (root cx scrut)
   | C.BNamed (x, inner) ->
     let env = bind env x (root cx scrut) in
-    match_binder cx env ~fail inner scrut
-  | C.BLit l ->
+    match_binder cx env ~fail ~lits inner scrut
+  | C.BLit ((C.LInt _ | C.LBool _) as l) ->
     let lit =
       match l with
       | C.LInt n -> imm_int n
       | C.LBool b -> imm_bool b
-      | C.LNumber _ | C.LString _ ->
-        failwith "codegen_llvm: Number/String literal binder not in slice 2"
+      | _ -> assert false
     in
     let ok = fresh cx in
     emit cx "  %s = icmp eq i64 %s, %s" ok scrut lit;
+    test_or_fail cx ok ~fail "lit_ok";
+    env
+  | C.BLit ((C.LNumber _ | C.LString _) as l) ->
+    (* Compare against the alt-entry-allocated literal via the runtime's `Eq` primop — the one tested
+       source of truth for IEEE (`NaN`/`±0.0`) and byte-equality semantics (ADR-0071 §6). The primop
+       reads, never allocates, so the invariant above holds. *)
+    let prim =
+      match l with
+      | C.LNumber _ -> "pv_prim_eq_number"
+      | _ -> "pv_prim_eq_string"
+    in
+    let h =
+      match List.find_opt (fun (k, _) -> compare k l = 0) lits with
+      | Some (_, h) -> h
+      | None -> failwith "codegen_llvm: boxed literal binder missing its hoisted value"
+    in
+    let eq = fresh cx in
+    emit
+      cx
+      "  %s = call i64 @%s(ptr %%ctx, i64 %s, i64 %s)"
+      eq
+      prim
+      scrut
+      (get_current cx h);
+    let pay = fresh cx in
+    emit cx "  %s = ashr i64 %s, 1" pay eq;
+    let ok = fresh cx in
+    emit cx "  %s = icmp ne i64 %s, 0" ok pay;
     test_or_fail cx ok ~fail "lit_ok";
     env
   | C.BCtor (name, subs) ->
@@ -576,7 +623,7 @@ let rec match_binder cx (env : env) ~(fail : string) (binder : C.binder) (scrut 
              fld
              scrut
              (1 + i);
-           match_binder cx env ~fail sub fld)
+           match_binder cx env ~fail ~lits sub fld)
         env
         (List.mapi (fun i s -> i, s) subs))
   | C.BRecord fields ->
@@ -591,10 +638,33 @@ let rec match_binder cx (env : env) ~(fail : string) (binder : C.binder) (scrut 
            fld
            scrut
            (label_id label);
-         match_binder cx env ~fail sub fld)
+         match_binder cx env ~fail ~lits sub fld)
       env
       fields
-  | C.BArray _ -> failwith "codegen_llvm: array binder not in slice 2"
+  | C.BArray subs ->
+    (* Exact-length element-wise match (ADR-0012): a wrong length is an ordinary fall-through; a
+       non-array scrutinee faults inside the primop (type-impossible → stuck). The empty array is
+       the immediate sentinel (ADR-0071 §6), which `LengthArray` reports as `0` — so `[]` matches
+       exactly the sentinel, and a heap `Array` (always non-empty) never matches it. Length and
+       element reads are allocation-free, so [scrut] stays valid. *)
+    let n = List.length subs in
+    let len = fresh cx in
+    emit cx "  %s = call i64 @pv_prim_length_array(ptr %%ctx, i64 %s)" len scrut;
+    let ok = fresh cx in
+    emit cx "  %s = icmp eq i64 %s, %s" ok len (imm_int n);
+    test_or_fail cx ok ~fail "arr_len";
+    List.fold_left
+      (fun env (i, sub) ->
+         let elt = fresh cx in
+         emit
+           cx
+           "  %s = call i64 @pv_prim_index_array(ptr %%ctx, i64 %s, i64 %s)"
+           elt
+           scrut
+           (imm_int i);
+         match_binder cx env ~fail ~lits sub elt)
+      env
+      (List.mapi (fun i s -> i, s) subs)
 
 (* Build a recursive group as **all-by-need `ByNeed` cells over one shared env** (ADR-0070 §4, mirroring
    the runtime `build_group`) and return [env] extended with each member bound to its (rooted) cell handle.
@@ -839,9 +909,17 @@ and cexpr cx (env : env) ~(tail : bool) (c : A.cexpr) : string option =
       (fun i (alt : A.alt) ->
          emit cx "%s:" (List.nth try_labels i);
          let next_fail = if i + 1 < n then List.nth try_labels (i + 1) else fail_label in
+         (* Pre-allocate + root this alt's boxed literal binders (`Number`/`String`) before any
+            binder test runs, so the match itself stays allocation-free ([binder_boxed_lits]). *)
+         let lits =
+           List.concat_map binder_boxed_lits alt.binders
+           |> List.sort_uniq compare
+           |> List.map (fun l -> l, root cx (atom cx env (A.ALit l)))
+         in
          let env' =
            List.fold_left2
-             (fun env b h -> match_binder cx env ~fail:next_fail b (get_current cx h))
+             (fun env b h ->
+                match_binder cx env ~fail:next_fail ~lits b (get_current cx h))
              env
              alt.binders
              scrut_handles

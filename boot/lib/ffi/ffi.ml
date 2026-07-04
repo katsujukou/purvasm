@@ -725,15 +725,24 @@ let host : Cesk.Machine.host =
                (try Stdlib.float_of_string s with
                 | _ -> Stdlib.Float.nan)
            | _ -> Cesk.Errors.stuck "parseFloatImpl: not a String"))
-    (* `Purvasm.Compiler.Bytecode.Image.floatBitsDecimalImpl :: Number -> String` (ADR-0038 §4):
-       a `Number`'s IEEE-754 bits read back as a signed 64-bit integer, as decimal — byte-identical
-       to `Pvm.Image`'s `Int64.to_string (Int64.bits_of_float f)`, so a `Number` literal serialises
-       identically in the self-host. A genuinely-native leaf (there is no float-bits primop). *)
-    | "Purvasm.Compiler.Bytecode.Image.floatBitsDecimalImpl" ->
+    (* `Purvasm.Number.floatBitsHi`/`floatBitsLo :: Number -> Int` (ADR-0038 §4's float-bits read):
+       the halves of a `Number`'s IEEE-754 bits, each reinterpreted as a signed 32-bit `Int`. The
+       representation-level primitive the self-host's bit-exact `Number` serialisation builds on —
+       the 64-bit decimal *rendering* is ordinary PureScript over the pair (the compiler's
+       `Util.Int64Decimal`), so no formatting policy lives in a leaf. *)
+    | "Purvasm.Number.floatBitsHi" ->
       Some
         (unary (function
-           | V.VNumber f -> V.VString (Int64.to_string (Int64.bits_of_float f))
-           | _ -> Cesk.Errors.stuck "floatBitsDecimalImpl: not a Number"))
+           | V.VNumber f ->
+             V.VInt
+               (Int32.to_int
+                  (Int64.to_int32 (Int64.shift_right_logical (Int64.bits_of_float f) 32)))
+           | _ -> Cesk.Errors.stuck "floatBitsHi: not a Number"))
+    | "Purvasm.Number.floatBitsLo" ->
+      Some
+        (unary (function
+           | V.VNumber f -> V.VInt (Int32.to_int (Int64.to_int32 (Int64.bits_of_float f)))
+           | _ -> Cesk.Errors.stuck "floatBitsLo: not a Number"))
     (* `purvasm-base` `Purvasm.String` byte primitives (ADR-0038): pure UTF-8 byte ops. In the
        native backend these also live in the `Rt` prelude (a codegen fallback for unbound refs);
        the VM / oracle need them in the host registry to resolve them through the foreign rung. *)

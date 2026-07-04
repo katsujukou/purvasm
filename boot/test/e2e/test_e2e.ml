@@ -1185,6 +1185,78 @@ let test_llvm_case_just () =
 let test_llvm_case_nothing () =
   same_on_llvm "case Nothing" (classify_term (C.Ctor ("Nothing", 0)))
 
+(* Array binders (ADR-0012 exact-length element-wise match): a three-alt case over one scrutinee —
+   `[a,b] → a*10+b` / `[] → -1` / `_ → -2` — exercised at each shape: the exact length, the empty
+   sentinel (ADR-0071 §6 — `[]` is an immediate, not a heap object), and the wrong-length
+   fall-through to the wildcard. Nested ctor sub-binders ride the same path. *)
+let array_case_term scrut =
+  C.Case
+    ( [ scrut ]
+    , [ { C.binders = [ C.BArray [ C.BVar "a"; C.BVar "b" ] ]
+        ; result =
+            C.Unconditional
+              (C.Prim (C.AddInt, [ C.Prim (C.MulInt, [ C.Var "a"; int 10 ]); C.Var "b" ]))
+        }
+      ; { C.binders = [ C.BArray [] ]; result = C.Unconditional (int (-1)) }
+      ; { C.binders = [ C.BNull ]; result = C.Unconditional (int (-2)) }
+      ] )
+
+let test_llvm_array_binder_pair () =
+  same_on_llvm "case [3,4] of [a,b]" (array_case_term (C.Array [ int 3; int 4 ]))
+
+let test_llvm_array_binder_empty () =
+  same_on_llvm "case [] of []" (array_case_term (C.Array []))
+
+let test_llvm_array_binder_fallthrough () =
+  same_on_llvm "case [7] falls through" (array_case_term (C.Array [ int 7 ]))
+
+let test_llvm_array_binder_nested () =
+  same_on_llvm
+    "case [Just 5] of [Just x]"
+    (C.Case
+       ( [ C.Array [ C.App (C.Ctor ("Just", 1), int 5) ] ]
+       , [ { C.binders = [ C.BArray [ C.BCtor ("Just", [ C.BVar "x" ]) ] ]
+           ; result = C.Unconditional (C.Var "x")
+           }
+         ; { C.binders = [ C.BNull ]; result = C.Unconditional (int (-1)) }
+         ] ))
+
+(* Boxed literal binders (`String`/`Number`): the literal is allocated at the alt entry and compared
+   via the runtime `Eq` primop (byte equality / IEEE). Each case walks past a non-matching literal
+   alt first, exercising the fall-through, then matches the second. *)
+let lit_case_term (lits : C.lit list) (scrut : C.term) =
+  C.Case
+    ( [ scrut ]
+    , List.mapi
+        (fun i l ->
+           { C.binders = [ C.BLit l ]; C.result = C.Unconditional (int (i + 1)) })
+        lits
+      @ [ { C.binders = [ C.BNull ]; result = C.Unconditional (int 0) } ] )
+
+let test_llvm_string_lit_binder () =
+  same_on_llvm
+    "case \"b\" of \"a\"/\"b\""
+    (lit_case_term [ C.LString "a"; C.LString "b" ] (C.Lit (C.LString "b")))
+
+let test_llvm_number_lit_binder () =
+  same_on_llvm
+    "case 2.5 of 1.5/2.5"
+    (lit_case_term [ C.LNumber 1.5; C.LNumber 2.5 ] (C.Lit (C.LNumber 2.5)))
+
+let test_llvm_string_lit_binder_nested () =
+  same_on_llvm
+    "case Just \"x\" of Just \"y\" / Just \"x\""
+    (C.Case
+       ( [ C.App (C.Ctor ("Just", 1), C.Lit (C.LString "x")) ]
+       , [ { C.binders = [ C.BCtor ("Just", [ C.BLit (C.LString "y") ]) ]
+           ; result = C.Unconditional (int 1)
+           }
+         ; { C.binders = [ C.BCtor ("Just", [ C.BLit (C.LString "x") ]) ]
+           ; result = C.Unconditional (int 2)
+           }
+         ; { C.binders = [ C.BNull ]; result = C.Unconditional (int 0) }
+         ] ))
+
 (* --- unsaturated constructors (ADR-0072 §5): a partially-applied ctor is a first-class function that
    accumulates the remaining fields, then builds the ADT. ------------------------------------------------ *)
 
@@ -2486,6 +2558,19 @@ let llvm_groups =
         ; Alcotest.test_case "tailapp" `Quick test_llvm_tailapp
         ; Alcotest.test_case "case_just" `Quick test_llvm_case_just
         ; Alcotest.test_case "case_nothing" `Quick test_llvm_case_nothing
+        ; Alcotest.test_case "array_binder_pair" `Quick test_llvm_array_binder_pair
+        ; Alcotest.test_case "array_binder_empty" `Quick test_llvm_array_binder_empty
+        ; Alcotest.test_case
+            "array_binder_fallthrough"
+            `Quick
+            test_llvm_array_binder_fallthrough
+        ; Alcotest.test_case "array_binder_nested" `Quick test_llvm_array_binder_nested
+        ; Alcotest.test_case "string_lit_binder" `Quick test_llvm_string_lit_binder
+        ; Alcotest.test_case "number_lit_binder" `Quick test_llvm_number_lit_binder
+        ; Alcotest.test_case
+            "string_lit_binder_nested"
+            `Quick
+            test_llvm_string_lit_binder_nested
         ; Alcotest.test_case "unsat_ctor_nullary" `Quick test_llvm_unsat_ctor_nullary
         ; Alcotest.test_case "unsat_ctor_partial" `Quick test_llvm_unsat_ctor_partial
         ; Alcotest.test_case

@@ -220,14 +220,18 @@ stageDeclaredDeps { ulibDir, packagesDir } patches srcDir = do
 -- | compiles the reachable `.c`, resolving each `pvf_*` symbol from exactly one provider (ADR-0073 §3).
 -- | Namespacing the copies by package avoids a name clash between two packages' `.c` files. No native
 -- | foreign anywhere ⇒ no manifest is written (the overlay is presence-driven, ADR-0038).
+-- |
+-- | Every `ulib/<pkg>/` directory is scanned — not only the ones carrying `.purs` patches: a package
+-- | whose registry corefn is kept verbatim and which ships *only* a native `.c` (foreign-impl
+-- | completion at the `.c` rung — `numbers`' `Data.Number` math family) has a `ulib.json` but no
+-- | patch modules, and keying the scan off patches would silently drop its foreigns.
 stageNativeForeign
   :: forall r
    . FilePath
   -> FilePath
-  -> Array Patch
   -> Run (FS + EXCEPT String + r) Unit
-stageNativeForeign ulibDir out patches = do
-  let ulibPkgs = Array.nub (map _.package patches)
+stageNativeForeign ulibDir out = do
+  ulibPkgs <- listDir ulibDir
   perPkg <- traverse readPkgForeign ulibPkgs
   case Array.concat perPkg of
     [] -> pure unit

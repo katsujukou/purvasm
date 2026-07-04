@@ -63,7 +63,8 @@
             "fmt",
             "foreign-object",
             "lists",
-            "prelude"
+            "prelude",
+            "purvasm-base"
           ]
         },
         "test": {

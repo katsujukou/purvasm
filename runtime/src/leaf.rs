@@ -144,6 +144,155 @@ extern "C" fn leaf_exit_thunk(ctx: *mut Heap, clo: u64, _args: *const u64, _n: u
     })
 }
 
+/// Read the single captured value of an effectful leaf's thunk (env slot 0) — the `\x -> thunk` shape
+/// every arity-1 leaf below uses ([`leaf_write_line`]'s layout: closure env at slot 2).
+unsafe fn thunk_capture(ctx: *mut Heap, clo: u64) -> TaggedWord {
+    let h = heap(ctx);
+    let cp = HeapPtr::from_word(TaggedWord::from_bits(clo));
+    let env = HeapPtr::from_word(h.read_field(cp, 2));
+    h.read_field(env, 0)
+}
+
+/// Build the `\arg -> thunk` closure of an arity-1 effectful leaf: capture `arg`, return the thunk
+/// whose force runs `code` ([`leaf_write_line`]'s shape, shared by the FS/System family below).
+unsafe fn capture1_thunk(
+    ctx: *mut Heap,
+    arg: TaggedWord,
+    code: extern "C" fn(*mut Heap, u64, *const u64, usize) -> u64,
+) -> u64 {
+    let h = heap(ctx);
+    let env = h.new_array(&[arg]);
+    h.new_closure_raw(code as usize as u64, 1, env.as_word())
+        .as_word()
+        .to_bits()
+}
+
+/// `Purvasm.FS.readTextImpl :: String -> Effect String` (ADR-0056) — force reads the whole file as
+/// UTF-8 text. A read failure is a fatal boundary fault (boot's OCaml exception has the same shape).
+#[export_name = "pvf_Purvasm_2eFS_2ereadTextImpl"]
+extern "C" fn leaf_fs_read_text(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: usize) -> u64 {
+    // SAFETY: as [`leaf_write_line`].
+    guard(|| unsafe { capture1_thunk(ctx, args_slice(args, nargs)[0], leaf_fs_read_text_thunk) })
+}
+
+extern "C" fn leaf_fs_read_text_thunk(ctx: *mut Heap, clo: u64, _a: *const u64, _n: usize) -> u64 {
+    // SAFETY: as [`leaf_write_line_thunk`]; the path is copied out before the `new_str` safepoint.
+    guard(|| unsafe {
+        let h = heap(ctx);
+        let path = h.str_read(HeapPtr::from_word(thunk_capture(ctx, clo)));
+        let bytes =
+            std::fs::read(&path).unwrap_or_else(|e| panic!("Purvasm.FS.readTextImpl: {path}: {e}"));
+        h.new_str(&bytes).as_word().to_bits()
+    })
+}
+
+/// `Purvasm.FS.existsImpl :: String -> Effect Boolean` (ADR-0056).
+#[export_name = "pvf_Purvasm_2eFS_2eexistsImpl"]
+extern "C" fn leaf_fs_exists(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: usize) -> u64 {
+    // SAFETY: as [`leaf_write_line`].
+    guard(|| unsafe { capture1_thunk(ctx, args_slice(args, nargs)[0], leaf_fs_exists_thunk) })
+}
+
+extern "C" fn leaf_fs_exists_thunk(ctx: *mut Heap, clo: u64, _a: *const u64, _n: usize) -> u64 {
+    // SAFETY: as [`leaf_write_line_thunk`]; no allocation.
+    guard(|| unsafe {
+        let h = heap(ctx);
+        let path = h.str_read(HeapPtr::from_word(thunk_capture(ctx, clo)));
+        TaggedWord::bool(std::path::Path::new(&path).exists()).to_bits()
+    })
+}
+
+/// `Purvasm.FS.mkdirRecImpl :: String -> Effect Unit` (ADR-0056) — `mkdir -p` (idempotent).
+#[export_name = "pvf_Purvasm_2eFS_2emkdirRecImpl"]
+extern "C" fn leaf_fs_mkdir_rec(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: usize) -> u64 {
+    // SAFETY: as [`leaf_write_line`].
+    guard(|| unsafe { capture1_thunk(ctx, args_slice(args, nargs)[0], leaf_fs_mkdir_rec_thunk) })
+}
+
+extern "C" fn leaf_fs_mkdir_rec_thunk(ctx: *mut Heap, clo: u64, _a: *const u64, _n: usize) -> u64 {
+    // SAFETY: as [`leaf_write_line_thunk`]; no allocation.
+    guard(|| unsafe {
+        let h = heap(ctx);
+        let path = h.str_read(HeapPtr::from_word(thunk_capture(ctx, clo)));
+        std::fs::create_dir_all(&path)
+            .unwrap_or_else(|e| panic!("Purvasm.FS.mkdirRecImpl: {path}: {e}"));
+        TaggedWord::unit().to_bits()
+    })
+}
+
+/// `Purvasm.FS.writeTextImpl :: String -> String -> Effect Unit` (ADR-0056) — arity 2: the outer call
+/// captures `(path, contents)` in the thunk's env; its force writes the file.
+#[export_name = "pvf_Purvasm_2eFS_2ewriteTextImpl"]
+extern "C" fn leaf_fs_write_text(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: usize) -> u64 {
+    // SAFETY: as [`leaf_write_line`]; `new_array` self-roots both captures across its allocation.
+    guard(|| unsafe {
+        let h = heap(ctx);
+        let a = args_slice(args, nargs);
+        let env = h.new_array(&[a[0], a[1]]);
+        h.new_closure_raw(leaf_fs_write_text_thunk as usize as u64, 1, env.as_word())
+            .as_word()
+            .to_bits()
+    })
+}
+
+extern "C" fn leaf_fs_write_text_thunk(ctx: *mut Heap, clo: u64, _a: *const u64, _n: usize) -> u64 {
+    // SAFETY: as [`leaf_write_line_thunk`]; both strings are copied out first, then no allocation.
+    guard(|| unsafe {
+        let h = heap(ctx);
+        let cp = HeapPtr::from_word(TaggedWord::from_bits(clo));
+        let env = HeapPtr::from_word(h.read_field(cp, 2));
+        let path = h.str_read(HeapPtr::from_word(h.read_field(env, 0)));
+        let contents = h.str_read(HeapPtr::from_word(h.read_field(env, 1)));
+        std::fs::write(&path, contents.as_bytes())
+            .unwrap_or_else(|e| panic!("Purvasm.FS.writeTextImpl: {path}: {e}"));
+        TaggedWord::unit().to_bits()
+    })
+}
+
+/// `Purvasm.System.Env.getenvImpl :: String -> Effect String` (ADR-0055/0056) — an unset (or
+/// non-UTF-8) variable yields `""`; the `lookupEnv` wrapper folds `""` to `Nothing`.
+#[export_name = "pvf_Purvasm_2eSystem_2eEnv_2egetenvImpl"]
+extern "C" fn leaf_getenv(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: usize) -> u64 {
+    // SAFETY: as [`leaf_write_line`].
+    guard(|| unsafe { capture1_thunk(ctx, args_slice(args, nargs)[0], leaf_getenv_thunk) })
+}
+
+extern "C" fn leaf_getenv_thunk(ctx: *mut Heap, clo: u64, _a: *const u64, _n: usize) -> u64 {
+    // SAFETY: as [`leaf_write_line_thunk`]; the name is copied out before the `new_str` safepoint.
+    guard(|| unsafe {
+        let h = heap(ctx);
+        let name = h.str_read(HeapPtr::from_word(thunk_capture(ctx, clo)));
+        let v = std::env::var(&name).unwrap_or_default();
+        h.new_str(v.as_bytes()).as_word().to_bits()
+    })
+}
+
+/// `Purvasm.System.Process.argvImpl :: Effect (Array String)` (ADR-0056) — the leaf itself is the
+/// thunk (arity 1, boot parity): forcing it reads the process argv, element 0 the executable.
+#[export_name = "pvf_Purvasm_2eSystem_2eProcess_2eargvImpl"]
+extern "C" fn leaf_argv(ctx: *mut Heap, _clo: u64, _args: *const u64, _nargs: usize) -> u64 {
+    // SAFETY: as [`leaf_write_line`]. Each `new_str` is a safepoint that can move the earlier ones,
+    // so every element is rooted as it is built and reloaded for the array (ADR-0066 §3).
+    guard(|| unsafe {
+        let h = heap(ctx);
+        let f = h.frame();
+        let handles: Vec<_> = std::env::args()
+            .map(|arg| {
+                let s = h.new_str(arg.as_bytes()).as_word();
+                h.root(s)
+            })
+            .collect();
+        let vals: Vec<TaggedWord> = handles.iter().map(|&r| h.get(r)).collect();
+        let arr = if vals.is_empty() {
+            crate::abi::pv_empty_array()
+        } else {
+            h.new_array(&vals).as_word().to_bits()
+        };
+        h.pop_frame(f);
+        arr
+    })
+}
+
 /// `Partial._crashWith :: String -> a` — a pure partial crash: forcing it halts with the message
 /// (matches `codegen_ml`'s `stuck`). The panic is contained at the FFI boundary (ADR-0071 §7) → abort.
 #[export_name = "pvf_Partial_2e_5fcrashWith"]
@@ -153,6 +302,30 @@ extern "C" fn leaf_crash_with(ctx: *mut Heap, _clo: u64, args: *const u64, nargs
         let h = heap(ctx);
         let msg = h.str_read(HeapPtr::from_word(args_slice(args, nargs)[0]));
         panic!("Partial.crashWith: {msg}");
+    })
+}
+
+/// `Purvasm.Number.floatBitsHi :: Number -> Int` (ADR-0038 §4's float-bits read) — the high 32 bits
+/// of the `Number`'s IEEE-754 representation, reinterpreted as a signed 32-bit `Int`. Pure; the
+/// 64-bit decimal rendering the serialiser needs is guest PureScript over the `Hi`/`Lo` pair.
+#[export_name = "pvf_Purvasm_2eNumber_2efloatBitsHi"]
+extern "C" fn leaf_float_bits_hi(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: usize) -> u64 {
+    // SAFETY: as [`leaf_show_int`]; `args[0]` a `Number`.
+    guard(|| unsafe {
+        let h = heap(ctx);
+        let p = h.checked_ptr(args_slice(args, nargs)[0]);
+        TaggedWord::int((h.number_bits(p) >> 32) as i32).to_bits()
+    })
+}
+
+/// `Purvasm.Number.floatBitsLo :: Number -> Int` — the low 32 bits, as [`leaf_float_bits_hi`].
+#[export_name = "pvf_Purvasm_2eNumber_2efloatBitsLo"]
+extern "C" fn leaf_float_bits_lo(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: usize) -> u64 {
+    // SAFETY: as [`leaf_show_int`]; `args[0]` a `Number`.
+    guard(|| unsafe {
+        let h = heap(ctx);
+        let p = h.checked_ptr(args_slice(args, nargs)[0]);
+        TaggedWord::int(h.number_bits(p) as i32).to_bits()
     })
 }
 

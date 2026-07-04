@@ -72,6 +72,26 @@ uint64_t pv_number_bits(PVContext *ctx, PVWord number);
 int32_t pv_int_payload(PVContext *ctx, PVWord i);
 /** An immediate `Boolean`'s payload as 0/1. `ctx` is unused (immediate) but taken for uniformity. */
 int pv_bool_payload(PVContext *ctx, PVWord b);
+/**
+ * A `String`'s UTF-8 byte length. Pairs with `pv_str_copy` — the two-call copy-out shape deliberately
+ * never hands the leaf an interior pointer into the moving heap.
+ */
+size_t pv_str_len(PVContext *ctx, PVWord s);
+/**
+ * Copy a `String`'s UTF-8 bytes into the caller's buffer of capacity `cap`; returns the count copied
+ * (`min(len, cap)` — size the buffer with `pv_str_len`). The copied bytes are caller-owned and stay
+ * valid regardless of later `pv_*` calls.
+ */
+size_t pv_str_copy(PVContext *ctx, PVWord s, uint8_t *dst, size_t cap);
+
+/* ── Immediate constructors (no allocation, hence no ctx; the encoding stays the runtime's) ─────────── */
+
+/** An immediate `Int` from a C `int32_t`. */
+PVWord pv_int(int32_t v);
+/** An immediate `Boolean` from a C truth value (0 = false, non-0 = true). */
+PVWord pv_bool(int v);
+/** The immediate `Unit` value. */
+PVWord pv_unit(void);
 
 /* ── Value constructors (each self-roots its arguments across its own allocation) ───────────────────── */
 

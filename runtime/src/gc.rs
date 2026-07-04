@@ -49,6 +49,14 @@ pub struct Heap {
     cap: usize,
     /// Bump cursor: words used in `space`.
     top: usize,
+    /// Object-start bitmap for the **active** space: bit `i` is set iff a live object header begins
+    /// at word `i` (`i < top`). The O(1) oracle behind [`is_object_start`](Heap::is_object_start) —
+    /// the per-dereference liveness/shape check (ADR-0071 §1) was a full record-walk (O(objects))
+    /// before this, which made every `pv_read_field`/`apply` linear in the heap and the compiled
+    /// self-compiler quadratic-plus. Maintained by `alloc` (set the new base's bit) and rebuilt
+    /// after each collection ([`rebuild_starts`](Heap::rebuild_starts)); packed 64 words per `u64`
+    /// (~0.2 % of the space).
+    starts_bits: Vec<u64>,
     /// The **shadow stack** (ADR-0066 §1): the authoritative root set for a collection. Each entry is
     /// a value slot the collector rewrites in place on relocation; a [`Root`] indexes it. `alloc`
     /// feeds this to the collector on overflow, so a value rooted here survives (and is reloaded via
@@ -129,6 +137,7 @@ impl Heap {
             reserve: alloc_space(words_per_space),
             cap: words_per_space,
             top: 0,
+            starts_bits: vec![0u64; words_per_space.div_ceil(64)],
             roots: Vec::new(),
             #[cfg(debug_assertions)]
             root_gens: Vec::new(),
@@ -397,6 +406,7 @@ impl Heap {
         }
         let base = self.top;
         self.top += words;
+        self.starts_bits[base >> 6] |= 1u64 << (base & 63);
         // Derive the header pointer from the stable base (never a fresh buffer re-borrow — see the
         // struct docs). SAFETY: `base < cap` (checked), so the word is within the space allocation.
         let hdr = unsafe { self.space.as_ptr().add(base) };
@@ -917,15 +927,13 @@ impl Heap {
     // --- pointer validation -------------------------------------------------
 
     /// Whether `p` addresses the **header word of a live object** in the active space — not merely an
-    /// in-bounds word. The active space is a gap-free run of `[Header][payload; size]` records from
-    /// offset 0 to `top`; this walks that run and returns `true` iff `p` is exactly one of the record
-    /// starts. An *interior* payload word — which a stale pointer can come to alias after a couple of
-    /// collect/swap cycles — is therefore rejected ([P1]): without this, a safe caller could read a
+    /// in-bounds word. An *interior* payload word — which a stale pointer can come to alias after a
+    /// couple of collect/swap cycles — is rejected ([P1]): without this, a safe caller could read a
     /// payload word as a header (or, in `apply`, transmute-and-call a payload-derived word) —
-    /// reachable UB that the earlier in-bounds-only check let through. Aliasing another *header*
-    /// start remains an accepted logic bug (a real live object, memory-safe). O(objects): a v1
-    /// backstop for the hand-written safe API; codegen proves liveness via shadow-stack roots instead
-    /// (ADR-0064 §4).
+    /// reachable UB that an in-bounds-only check would let through. Aliasing another *header* start
+    /// remains an accepted logic bug (a real live object, memory-safe). O(1): a bit test against
+    /// [`starts_bits`](Heap::starts_bits) — the earlier full record-walk made every dereference
+    /// O(objects) and the compiled self-compiler quadratic-plus.
     #[inline]
     fn is_object_start(&self, p: HeapPtr) -> bool {
         let base = self.space.as_ptr() as usize;
@@ -934,15 +942,7 @@ impl Heap {
             return false;
         }
         let target = (addr - base) / WORD;
-        // Each record start carries a valid live header (written by `alloc`, never forwarded in the
-        // active space), so striding by `1 + size` visits exactly the record starts in `[0, top)`.
-        let mut off = 0usize;
-        while off < target {
-            // SAFETY: `off < target < top <= cap`; read the header through the stable space base.
-            let hdr = Header::from_bits(unsafe { *self.space.as_ptr().add(off) });
-            off += 1 + hdr.size_words() as usize;
-        }
-        off == target
+        self.starts_bits[target >> 6] & (1u64 << (target & 63)) != 0
     }
 
     /// Release-check that a [`HeapPtr`] reaching the safe API is a live object *header* in this heap,
@@ -989,6 +989,21 @@ impl Heap {
         // shadow-stack slots were rewritten in place by `collect_core`; `root_gens` is unaffected
         // (same slots, new values).
         core::mem::swap(&mut self.space, &mut self.reserve);
+        self.rebuild_starts();
+    }
+
+    /// Rebuild [`starts_bits`](Heap::starts_bits) for the (post-swap) active space: zero the bitmap,
+    /// then stride the gap-free `[Header][payload; size]` records `0..top` marking each start. O(top)
+    /// once per collection — the amortised price of the O(1) per-dereference check.
+    fn rebuild_starts(&mut self) {
+        self.starts_bits.fill(0);
+        let mut off = 0usize;
+        while off < self.top {
+            self.starts_bits[off >> 6] |= 1u64 << (off & 63);
+            // SAFETY: `off < top <= cap`; read the freshly-evacuated header via the stable base.
+            let hdr = Header::from_bits(unsafe { *self.space.as_ptr().add(off) });
+            off += 1 + hdr.size_words() as usize;
+        }
     }
 
     /// Collect with an **explicit** root slice — **test-only** (`#[cfg(test)]`, ADR-0066 §4). This is
@@ -1004,6 +1019,7 @@ impl Heap {
         );
         self.top = collect_core(self.space, self.reserve, self.top, roots);
         core::mem::swap(&mut self.space, &mut self.reserve);
+        self.rebuild_starts();
     }
 }
 

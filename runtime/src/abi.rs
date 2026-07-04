@@ -388,6 +388,62 @@ pub unsafe extern "C" fn pv_bool_payload(_ctx: *mut Heap, w: u64) -> i32 {
     guard(|| TaggedWord::from_bits(w).as_bool() as i32)
 }
 
+/// Make an immediate `Int` value word from a C `int32_t` (ADR-0073 §2 write side, the on-demand immediate
+/// constructors). Immediates allocate nothing, so no `ctx`; the *encoding* stays the runtime's — the leaf
+/// computes nothing itself.
+#[no_mangle]
+pub extern "C" fn pv_int(v: i32) -> u64 {
+    TaggedWord::int(v).to_bits()
+}
+
+/// Make an immediate `Boolean` value word from a C truth value (`0` = false, non-`0` = true).
+#[no_mangle]
+pub extern "C" fn pv_bool(v: i32) -> u64 {
+    TaggedWord::bool(v != 0).to_bits()
+}
+
+/// The immediate `Unit` value word.
+#[no_mangle]
+pub extern "C" fn pv_unit() -> u64 {
+    TaggedWord::unit().to_bits()
+}
+
+/// A `String`'s UTF-8 byte length (ADR-0073 §2 read side). Pairs with [`pv_str_copy`]: the two-call
+/// copy-out shape deliberately never hands C an interior pointer into the moving heap.
+///
+/// # Safety
+/// `ctx` live; `s` a value word denoting a `String`.
+#[no_mangle]
+pub unsafe extern "C" fn pv_str_len(ctx: *mut Heap, s: u64) -> usize {
+    guard(|| {
+        let h = heap(ctx);
+        let p = h.checked_ptr(TaggedWord::from_bits(s));
+        h.str_len(p)
+    })
+}
+
+/// Copy a `String`'s UTF-8 bytes into a caller-owned buffer of capacity `cap`, returning the byte count
+/// copied (`min(len, cap)` — size the buffer with [`pv_str_len`]). Copy-out keeps the moving heap opaque:
+/// no pointer into it ever escapes to C, so the bytes stay valid regardless of later `pv_*` calls.
+///
+/// # Safety
+/// `ctx` live; `s` a value word denoting a `String`; `dst` writable for `cap` bytes (or `cap == 0`).
+#[no_mangle]
+pub unsafe extern "C" fn pv_str_copy(ctx: *mut Heap, s: u64, dst: *mut u8, cap: usize) -> usize {
+    guard(|| {
+        let h = heap(ctx);
+        let p = h.checked_ptr(TaggedWord::from_bits(s));
+        let src = h.str_read(p);
+        let n = src.len().min(cap);
+        if n > 0 {
+            // SAFETY: `dst` is caller-guaranteed writable for `cap >= n` bytes; `src` is a fresh owned
+            // copy of the heap bytes, so the ranges cannot overlap.
+            unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst, n) };
+        }
+        n
+    })
+}
+
 /// Allocate a mutable [`Ref`](crate::heap::Kind::Ref) cell holding `init` (ADR-0071 §6).
 ///
 /// # Safety

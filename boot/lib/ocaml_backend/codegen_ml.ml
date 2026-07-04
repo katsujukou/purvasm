@@ -202,8 +202,14 @@ let foreign = function
   | "Data.Number.isNaN" -> VClos (fun v -> VBool (Float.is_nan (as_num v)))
   | "Data.Number.parseFloatImpl" ->
     VClos (fun v -> VNumber (try float_of_string (as_str v) with _ -> Float.nan))
-  | "Purvasm.Compiler.Bytecode.Image.floatBitsDecimalImpl" ->
-    VClos (fun v -> VString (Int64.to_string (Int64.bits_of_float (as_num v))))
+  | "Purvasm.Number.floatBitsHi" ->
+    VClos
+      (fun v ->
+        VInt
+          (Int32.to_int
+             (Int64.to_int32 (Int64.shift_right_logical (Int64.bits_of_float (as_num v)) 32))))
+  | "Purvasm.Number.floatBitsLo" ->
+    VClos (fun v -> VInt (Int32.to_int (Int64.to_int32 (Int64.bits_of_float (as_num v)))))
   (* Host-system leaves (ADR-0022/0056); mirror `Ffi.host`. File IO (`purvasm-fs`, `Purvasm.FS.*`)
      and process/environment (`purvasm-system`, `Purvasm.System.*`). Each returns an `Effect` thunk
      that performs the IO when forced. *)
