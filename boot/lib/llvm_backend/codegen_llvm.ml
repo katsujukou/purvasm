@@ -571,16 +571,52 @@ let get_current cx (handle : string) : string =
   t
 
 (* Evaluate a list of atoms and return their **current** value operands, mutually protected against
-   each other's allocation. Once `atom` can allocate (slice 4: `String`/`Number` literals, `foreign`
-   closures), collecting several results into registers and then calling — e.g. `CRecord`'s values,
-   `CApp`'s `f`+args, `CCtor`'s fields — would let a later atom's GC stale an earlier value. So each atom
-   is `pv_root`ed as it is produced (left-to-right), and all are read back with `pv_get` *after* every
-   allocation is done. The transient roots live in the enclosing function frame (freed at return);
-   bounding them is the deferred rooting minimisation (ADR-0072 §6). *)
+   each other's safepoints. Collecting several results into registers and then calling — e.g.
+   `CRecord`'s values, `CApp`'s `f`+args, `CCtor`'s fields — would let a later atom's GC stale an
+   earlier value, so a value produced before a later safepoint is rooted and re-read after every
+   evaluation is done (root-on-create). The rooting is *need-driven* (ADR-0072 §6), from the two
+   static facts this list exposes:
+
+   - which evaluations can reach a safepoint at all — a `String`/`Number` literal or a `foreign`
+     closure allocates, and a *forced* variable may run a suspension (arbitrary guest code); an
+     unforced variable read and an immediate literal cannot;
+   - an `Int`/`Boolean` literal is an immediate operand — it is not a heap word, so it is never
+     rooted (and [force_atom] already passes literals through unforced).
+
+   So an atom is rooted+reloaded only when a *later* atom in the list can safepoint; the common
+   all-vars/immediates list (a primop's or a direct call's operands) emits no `pv_root`/`pv_get`
+   at all. The words handed back stay valid up to the consuming call — a runtime entry roots its
+   own operands before it allocates (ADR-0071 §5), the same contract the previous
+   always-root-then-reload form relied on. *)
 let eval_atoms cx ?(force = false) (env : env) (atoms : A.atom list) : string list =
+  let can_safepoint : A.atom -> bool = function
+    | A.ALit (C.LInt _ | C.LBool _) -> false
+    | A.ALit (C.LNumber _ | C.LString _) | A.AForeign _ -> true
+    | A.AVar _ ->
+      force (* forcing may run a suspension; a plain read cannot move the heap *)
+  in
+  let is_immediate : A.atom -> bool = function
+    | A.ALit (C.LInt _ | C.LBool _) -> true
+    | _ -> false
+  in
   let one = if force then force_atom else atom in
-  let handles = List.fold_left (fun acc a -> root cx (one cx env a) :: acc) [] atoms in
-  List.rev_map (get_current cx) handles
+  let rec go = function
+    | [] -> []
+    | a :: rest ->
+      let later_safepoint = List.exists can_safepoint rest in
+      let slot =
+        if is_immediate a
+        then `Raw (one cx env a)
+        else (
+          let v = one cx env a in
+          if later_safepoint then `Rooted (root cx v) else `Raw v)
+      in
+      slot :: go rest
+  in
+  go atoms
+  |> List.map (function
+    | `Raw v -> v
+    | `Rooted h -> get_current cx h)
 
 (* Inline the trivially-transcribable scalar primops (ADR-0072 §7) instead of an extern
    `pv_prim_*` call per operation: exactly the ops whose runtime semantics (prim.rs) are a
@@ -866,13 +902,23 @@ let build_grec
   let members = List.map fst binds in
   let k = List.length members in
   let member_set = List.fold_left (fun s m -> SS.add m s) SS.empty members in
-  (* free vars of the group captured from *outside* it (members excluded) *)
+  (* Free vars of the group captured from *outside* it: members excluded, and so are
+     top-level globals not shadowed by an enclosing local (ADR-0072 §6) — a global is read
+     via its `@…$root` handle at use time, so copying it into the shared env only costs an
+     env slot AND hides the binding from [direct_target] (an env-read callee has no
+     [known_fn], so a saturated call to a known top-level function would fall back to the
+     generic `pv_apply`). Init order is unchanged: the group's init runs after its spine
+     dependencies', exactly when the capture would have been taken. *)
+  let enclosing_locals = List.fold_left (fun s (x, _) -> SS.add x s) SS.empty env in
+  let readable_globals = SS.diff cx.gkeys enclosing_locals in
   let outside =
     SS.elements
-      (List.fold_left
-         (fun acc (_, rhs) -> SS.union acc (fv_expr member_set rhs))
-         SS.empty
-         binds)
+      (SS.diff
+         (List.fold_left
+            (fun acc (_, rhs) -> SS.union acc (fv_expr member_set rhs))
+            SS.empty
+            binds)
+         readable_globals)
   in
   (* the shared env layout: the k member cells, then the outside captures *)
   let shared_layout = members @ outside in
