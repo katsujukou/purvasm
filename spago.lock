@@ -163,6 +163,7 @@
             "filterable",
             "fmt",
             "foreign-object",
+            "language-cst-parser",
             "lists",
             "prelude",
             "purvasm-base"
@@ -251,6 +252,21 @@
             "effect",
             "prelude",
             "purvasm-stdio"
+          ]
+        },
+        "test": {
+          "dependencies": []
+        }
+      },
+      "ex-rust-ffi": {
+        "path": "examples/rust-ffi",
+        "core": {
+          "dependencies": [
+            "arrays",
+            "console",
+            "effect",
+            "fmt",
+            "prelude"
           ]
         },
         "test": {
@@ -1595,6 +1611,39 @@
         "integers",
         "maybe",
         "prelude"
+      ]
+    },
+    "language-cst-parser": {
+      "type": "registry",
+      "version": "0.14.1",
+      "integrity": "sha256-tnue0oM2/EmyNJmLoJDnmUDfinKLJHi2fcSGt7d6ewU=",
+      "dependencies": [
+        "arrays",
+        "const",
+        "control",
+        "either",
+        "enums",
+        "foldable-traversable",
+        "free",
+        "functions",
+        "functors",
+        "identity",
+        "integers",
+        "lazy",
+        "lists",
+        "maybe",
+        "newtype",
+        "numbers",
+        "ordered-collections",
+        "partial",
+        "prelude",
+        "st",
+        "strings",
+        "transformers",
+        "tuples",
+        "typelevel-prelude",
+        "unfoldable",
+        "unsafe-coerce"
       ]
     },
     "lazy": {

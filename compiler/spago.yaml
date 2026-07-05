@@ -7,11 +7,12 @@ package:
     - filterable
     - fmt
     - foreign-object
+    - language-cst-parser
     - lists
     - prelude
     - purvasm-base
   test:
     main: Test.Unit.Purvasm.Compiler
-    dependencies: 
+    dependencies:
       - spec
       - spec-node
