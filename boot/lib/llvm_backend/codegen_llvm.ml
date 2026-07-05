@@ -466,21 +466,36 @@ let atom cx (env : env) : A.atom -> string = function
    that forces a cell to its value and passes anything else through (literals never are cells).
    Construction sites (`Ctor`/`Record`/`Array` fields, `apply` head/args) use the raw [atom], so the cell
    propagates and the knot-tie stores it unforced. *)
+(* Force an arbitrary value iff it is a by-need cell, with the **immediate fast path inline**
+   (ADR-0072 §6): an immediate word (LSB = 1 — the tag bit, the very encoding [imm_int]
+   emits) can never be a cell, so the extern crossing (and its guard frame) is paid only for
+   pointer words. The slow path is byte-for-byte the previous behaviour and remains the only
+   safepoint, so callers' conservative safepoint accounting (e.g. [eval_atoms] under
+   [~force]) is unchanged. The explicit entry block gives the phi its predecessor label. *)
+let force_value cx (v : string) : string =
+  let chk = fresh_label cx "fchk" in
+  let slow = fresh_label cx "fslow" in
+  let done_ = fresh_label cx "fdone" in
+  emit cx "  br label %%%s" chk;
+  emit cx "%s:" chk;
+  let bit = fresh cx in
+  emit cx "  %s = and i64 %s, 1" bit v;
+  let imm = fresh cx in
+  emit cx "  %s = icmp ne i64 %s, 0" imm bit;
+  emit cx "  br i1 %s, label %%%s, label %%%s" imm done_ slow;
+  emit cx "%s:" slow;
+  let forced = fresh cx in
+  emit cx "  %s = call i64 @pv_force_if_byneed(ptr %%ctx, i64 %s)" forced v;
+  emit cx "  br label %%%s" done_;
+  emit cx "%s:" done_;
+  let r = fresh cx in
+  emit cx "  %s = phi i64 [ %s, %%%s ], [ %s, %%%s ]" r v chk forced slow;
+  r
+
 let force_atom cx (env : env) (a : A.atom) : string =
   match a with
-  | A.AVar _ ->
-    let v = atom cx env a in
-    let t = fresh cx in
-    emit cx "  %s = call i64 @pv_force_if_byneed(ptr %%ctx, i64 %s)" t v;
-    t
+  | A.AVar _ -> force_value cx (atom cx env a)
   | A.ALit _ | A.AForeign _ -> atom cx env a
-
-(* Force an arbitrary produced value iff it is a by-need cell — for a demand site whose value is an
-   `expr` result (a guard, the entry's final output), not an `atom` reachable by `force_atom`. *)
-let force_value cx (v : string) : string =
-  let t = fresh cx in
-  emit cx "  %s = call i64 @pv_force_if_byneed(ptr %%ctx, i64 %s)" t v;
-  t
 
 (* Root a freshly produced value and return its handle operand (root-on-create). *)
 let root cx (v : string) : string =
