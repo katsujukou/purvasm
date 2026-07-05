@@ -562,6 +562,24 @@ pub(crate) fn empty_array() -> TaggedWord {
     TaggedWord::unit()
 }
 
+/// An `Array`'s element count (ADR-0073 §2 accessor growth, prompted by ADR-0078's `Vec`
+/// conversions): the empty-array sentinel reads as 0, a heap `Array` as its element count.
+///
+/// # Safety
+/// `ctx` live; `a` a value word denoting an `Array` (heap object or the empty sentinel).
+#[no_mangle]
+pub unsafe extern "C" fn pv_array_len(ctx: *mut Heap, a: u64) -> usize {
+    guard(|| {
+        let w = TaggedWord::from_bits(a);
+        if w.to_bits() == empty_array().to_bits() {
+            return 0;
+        }
+        let h = heap(ctx);
+        let p = h.checked_ptr(w);
+        h.array_len(p) as usize
+    })
+}
+
 /// Allocate a [`Str`](crate::heap::Kind::Str) from UTF-8 `bytes` (ADR-0071 §6). Asserts valid UTF-8
 /// (ADR-0067 §5); the empty string is a valid `Str`. Self-rooting is trivial (bytes are raw).
 ///

@@ -708,6 +708,16 @@ impl Heap {
         self.read_field(c, 2)
     }
 
+    /// An `Array`'s element count — the read side of `pv_array_len` (ADR-0073 §2's grow-on-demand
+    /// accessor policy, prompted by ADR-0078's `Vec` conversions). **Release-checked**: asserts the
+    /// object is an `Array` (the empty-array immediate sentinel is handled at the ABI layer).
+    #[inline]
+    pub fn array_len(&self, a: HeapPtr) -> u64 {
+        let hdr = self.header(a); // checked: validates `a` is a live object header
+        assert_eq!(hdr.kind(), Kind::Array, "array_len on a non-Array object");
+        hdr.size_words()
+    }
+
     /// Copy a `Str`'s bytes out to an owned `String`. Copies (never borrows into the moving heap,
     /// ADR-0063 §2); valid UTF-8 by the `new_str` invariant.
     pub fn str_read(&self, s: HeapPtr) -> String {
