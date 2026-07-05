@@ -38,9 +38,17 @@ leaf, exported under the same `pvf_<mangle(key)>` symbol, calling only the `pv_*
 `purvasm.h` declares. Everything [0073](0073-ulib-shipped-native-foreign-and-link-time-resolution.md)
 fixed is **unchanged**: the one-provider-per-key link resolution (§3), the metadata model
 (`arity`/`effectful` from the `foreign import` signature at Level 2+, boot's manifest expedient;
-`source` in the manifest/build config), the runtime surface (no new `pv_*` symbol, no runtime code
-change), and C authoring (which remains fully supported — the zero-dependency floor; Rust is a
+`source` in the manifest/build config), the runtime surface ~~(no new `pv_*` symbol, no runtime code
+change)~~, and C authoring (which remains fully supported — the zero-dependency floor; Rust is a
 per-foreign additive choice).
+
+> **Correction (2026-07-05):** "no new `pv_*` symbol / no runtime code change" held for the layer
+> itself but was overtaken during implementation the same day: `pv_closure_env` was added — under
+> ADR-0073 §2's grow-on-demand *accessor* policy, not as a requirement of this layer — so the
+> effect-thunk path (Rust *and* C) reads its captures without knowing the closure layout (see the
+> §3 Progress notes). The invariant that survives, here and in Non-goals: the DX layer **requires**
+> no ABI growth (it functioned on the pre-accessor surface), and resolution, metadata, and runtime
+> *semantics* are untouched.
 
 ### 2. The load-bearing restriction: the layer speaks `purvasm.h`, never `purvasm-rt` internals
 
@@ -109,6 +117,50 @@ memory.
 > monorepo-internal with `publish = false` at least until, post-v1.0: external users are writing
 > purvasm foreign crates, an ABI-compatibility policy can be stated, and a crates.io publishing
 > process is actually needed.
+>
+> **Progress (2026-07-05):** the crate layer is implemented (`crates/` workspace): `purvasm-sys`,
+> `purvasm-foreign` (`Ctx<'f>`/`PvValue<'f>` rooted handles, `FromPv`/`IntoPv`, hidden `__rt`
+> shims), `purvasm-foreign-macros` (`#[pv_foreign]`, pure + `effect` shapes, mangle pinned against
+> the compiler's vectors). Leaves run end-to-end against `purvasm-rt`'s rlib in tests (scalar/
+> string conversion, multi-allocation rooting, effect thunk capture+perform, 2000-call GC-pressure
+> churn) and pass under Miri (the address-path `call_code` apply is `ignore`d there, per the
+> ADR-0071 §3 never-run-under-Miri realisation; capture-shape has a Miri-checkable companion
+> test). Two findings folded back: Miri rejects declaration/definition **signedness** mismatches
+> inside one Rust graph, so `purvasm-sys` follows `abi.rs` (`u32` for closure arity / ADT tag)
+> where the header spells `int32_t` — follow-up: align `purvasm.h` to `uint32_t`; and the closure
+> env slot the effect thunk reads (`pv_read_field(closure, 2)`) is centralised in one `__rt`
+> constant — follow-up: a dedicated `pv_closure_env` accessor in `purvasm.h` would retire that
+> layout knowledge. Driver orchestration (§5) is not yet started.
+>
+> **Progress (2026-07-05, cont.):** both follow-ups landed. `purvasm.h` now spells `uint32_t` for
+> the closure arity and ADT `tag` (matching the definitions; codegen is unaffected — textual
+> `.ll` speaks signless `i32`), and **`pv_closure_env`** was added under ADR-0073 §2's
+> grow-on-demand accessor policy (the Non-goals "no new `pv_*` symbol" pin — that the DX layer
+> *needs* none — remains true), retiring the layout constant from `purvasm-foreign` and its tests.
+> Existing `.c` foreigns compile unchanged; runtime + crates suites and both Miri runs are green.
+> One recorded coupling: `codegen_llvm.ml` also reads the closure env slot directly (three
+> `pv_read_field(…, 2)` sites) and deliberately does NOT switch to the accessor — codegen is the
+> runtime's internal lowering ABI, and the [0072](0072-anf-to-llvm-lowering.md) §7 direction is
+> *fewer* extern crossings, not more; the slot constant gets centralised codegen-side at the next
+> codegen touch, and any future layout move is coordinated lockstep between runtime and codegen.
+>
+> **Policy (2026-07-05, maintainer):** **`ulib` ships native foreigns in C only.** A Rust foreign
+> in the default distribution would impose the cargo/rustc requirement on every user whose
+> program reaches it — users who wrote no Rust — gutting §5's "costs nothing unless a Rust
+> foreign is present" property. The `rust-crate` channel is for **user/third-party packages**,
+> whose authors chose Rust and accept the toolchain requirement for their consumers. This is
+> cheap to hold: ADR-0073 §1 keeps ulib's native residue tiny (`showNumberImpl`-class `.c`).
+> Revisit only alongside a prebuilt-distribution story. Corollary: the acceptance demo is a
+> scratch consumer package, not a shipped-ulib Rust foreign.
+>
+> **Correction (2026-07-05, maintainer):** there will be **no permanent foreign manifest** — not
+> even for `source`. The durable design is the purs-wasm model end to end: `arity`/`effectful`
+> read from the `foreign import` signature in the `.purs` source, and the implementing artifact
+> (`.c` or Rust crate) discovered by **co-location convention** next to the module. The
+> `ulib.json` `"foreign"` map — including §5's tagged `{kind, path}` schema — exists only as the
+> **boot escape hatch** (boot has no PureScript CST parser) and dissolves at Level 2+. The
+> provider map, exactly-one validation, bundle link, and `nm` audit are discovery-agnostic and
+> survive unchanged; only where the providers are *found* differs per level.
 
 ### 4. Panic containment at the `pvf_*` boundary
 
@@ -204,7 +256,8 @@ today — the cargo/rustc dependency and the bundle step cost nothing unless a R
 
 ### Non-goals (unchanged invariants)
 
-No new `pv_*` symbol and no runtime behaviour change; no override/priority between providers
+~~No new `pv_*` symbol and~~ no runtime *behaviour* change (the `pv_closure_env` accessor addition
+is the recorded exception — §1 Correction); no override/priority between providers
 ([0073](0073-ulib-shipped-native-foreign-and-link-time-resolution.md) §3); leaves stay first-order in
 spirit (the safe layer exposes `apply` with the same contract the C header does, nothing more); no
 threads/async inside a leaf (single-capability v1, [0064](0064-v1-single-capability-native-abi-codegen-contract.md)

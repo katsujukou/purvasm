@@ -49,7 +49,8 @@ typedef uint64_t PVWord;
 /**
  * A native leaf's code, exported as `pvf_<mangle(key)>` (ADR-0073 §3): `(ctx, closure, args, nargs)`.
  * `args` points at `nargs` argument words (or is unused when `nargs == 0`). `closure` is this leaf's own
- * closure value — read captured env slots from it via `pv_read_field` when the leaf captures.
+ * closure value — when the leaf captures, read its env via `pv_closure_env`, then the individual
+ * captures out of that env via `pv_read_field`.
  */
 typedef PVWord (*PVCodeFn)(PVContext *ctx, PVWord closure, const PVWord *args, size_t nargs);
 
@@ -104,13 +105,13 @@ PVWord pv_new_array(PVContext *ctx, const PVWord *elems, size_t n);
 /** The canonical empty `Array` (no allocation). */
 PVWord pv_empty_array(void);
 /** An algebraic-data value: constructor `tag`, then `n` field words at `fields`. */
-PVWord pv_new_adt(PVContext *ctx, int32_t tag, const PVWord *fields, size_t n);
+PVWord pv_new_adt(PVContext *ctx, uint32_t tag, const PVWord *fields, size_t n);
 /** A record from parallel `ids` (sorted FNV-1a-64 label ids) and `values`, length `n` (ADR-0069). */
 PVWord pv_new_record(PVContext *ctx, const PVWord *ids, const PVWord *values, size_t n);
 /** A mutable one-cell `Ref` initialised to `init`. */
 PVWord pv_new_ref(PVContext *ctx, PVWord init);
 /** A no-/some-capture closure over `code` (an `AbiCodeFn` address) of `arity`, capturing `env`. */
-PVWord pv_make_closure(PVContext *ctx, uint64_t code, int32_t arity, PVWord env);
+PVWord pv_make_closure(PVContext *ctx, uint64_t code, uint32_t arity, PVWord env);
 
 /* ── Field / record access ─────────────────────────────────────────────────────────────────────────── */
 
@@ -118,7 +119,10 @@ PVWord pv_make_closure(PVContext *ctx, uint64_t code, int32_t arity, PVWord env)
 PVWord pv_record_get(PVContext *ctx, PVWord record, PVWord id);
 /** A record with field `id` set to `value` (immutable copy-on-update, ADR-0069). */
 PVWord pv_record_set(PVContext *ctx, PVWord record, PVWord id, PVWord value);
-/** Read value-slot `i` of a heap object (e.g. a closure's captured env, ADR-0066). */
+/** A `Closure`'s captured `env` value — how an effect-thunk leaf reaches its captures without
+    knowing the closure layout (the layout stays the runtime's). */
+PVWord pv_closure_env(PVContext *ctx, PVWord closure);
+/** Read value-slot `i` of a heap object (e.g. a capture out of a `pv_closure_env` env, ADR-0066). */
 PVWord pv_read_field(PVContext *ctx, PVWord obj, uint64_t i);
 /** Write value-slot `i` of a heap object. */
 void pv_write_field(PVContext *ctx, PVWord obj, uint64_t i, PVWord v);

@@ -409,6 +409,21 @@ pub unsafe extern "C" fn pv_bool_payload(_ctx: *mut Heap, w: u64) -> i32 {
     guard(|| TaggedWord::from_bits(w).as_bool() as i32)
 }
 
+/// Read a `Closure`'s captured `env` value (ADR-0073 §2's grow-on-demand accessor policy, prompted by
+/// ADR-0078): the read side an effect-thunk foreign uses to reach its captures without knowing the
+/// closure layout — which stays the runtime's, like every rep behind the accessor surface.
+///
+/// # Safety
+/// `ctx` live; `c` a value word denoting a `Closure`.
+#[no_mangle]
+pub unsafe extern "C" fn pv_closure_env(ctx: *mut Heap, c: u64) -> u64 {
+    guard(|| {
+        let h = heap(ctx);
+        let p = h.checked_ptr(TaggedWord::from_bits(c));
+        h.closure_env(p).to_bits()
+    })
+}
+
 /// Make an immediate `Int` value word from a C `int32_t` (ADR-0073 §2 write side, the on-demand immediate
 /// constructors). Immediates allocate nothing, so no `ctx`; the *encoding* stays the runtime's — the leaf
 /// computes nothing itself.

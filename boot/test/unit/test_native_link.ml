@@ -88,6 +88,73 @@ let test_non_string_value_skipped () =
     [ "A.f" ]
     (List.sort compare (List.map fst (Native_link.manifest_foreign ~ulib_dir:d)))
 
+(* --- the tagged provider schema + plan (ADR-0078 §5) ------------------------------------------- *)
+
+(* Tagged `{kind, path}` values parse into their provider kinds; the bare-string shorthand stays C. *)
+let test_tagged_schema_parses_both_kinds () =
+  let d =
+    with_ulib_json
+      {|{ "foreign": {
+            "A.f": "A.foreign.c",
+            "B.g": { "kind": "c", "path": "B.foreign.c" },
+            "C.h": { "kind": "rust-crate", "path": "c-crate" } } }|}
+  in
+  match Native_link.foreign_plan ~ulib_dir:d ~keys:[ "A.f"; "B.g"; "C.h" ] with
+  | Error e -> Alcotest.fail e
+  | Ok { c_files; rust_crates } ->
+    Alcotest.(check strings)
+      "c sources (shorthand + tagged)"
+      [ Filename.concat d "A.foreign.c"; Filename.concat d "B.foreign.c" ]
+      c_files;
+    Alcotest.(check strings) "rust crates" [ Filename.concat d "c-crate" ] rust_crates
+
+(* Several keys naming one crate dedup to a single crate build (ADR-0078 §5). *)
+let test_plan_dedups_shared_crate () =
+  let d =
+    with_ulib_json
+      {|{ "foreign": {
+            "A.f": { "kind": "rust-crate", "path": "shared" },
+            "A.g": { "kind": "rust-crate", "path": "shared" } } }|}
+  in
+  match Native_link.foreign_plan ~ulib_dir:d ~keys:[ "A.f"; "A.g" ] with
+  | Error e -> Alcotest.fail e
+  | Ok { rust_crates; _ } ->
+    Alcotest.(check strings) "one crate" [ Filename.concat d "shared" ] rust_crates
+
+(* A key mapped twice is rejected by name, before any link (ADR-0078 §5 exactly-one). *)
+let test_plan_rejects_duplicate_key () =
+  let d =
+    with_ulib_json
+      {|{ "foreign": {
+            "A.f": "one.c",
+            "A.f": { "kind": "rust-crate", "path": "two" } } }|}
+  in
+  match Native_link.foreign_plan ~ulib_dir:d ~keys:[ "A.f" ] with
+  | Ok _ -> Alcotest.fail "duplicate provider must be rejected"
+  | Error e ->
+    Alcotest.(check string) "names the key" "duplicate native foreign provider for A.f" e
+
+(* An unreferenced duplicate does not block a build that never links it. *)
+let test_plan_ignores_unreferenced_duplicate () =
+  let d =
+    with_ulib_json {|{ "foreign": { "A.f": "one.c", "A.f": "two.c", "B.g": "b.c" } }|}
+  in
+  match Native_link.foreign_plan ~ulib_dir:d ~keys:[ "B.g" ] with
+  | Error e -> Alcotest.fail e
+  | Ok { c_files; _ } ->
+    Alcotest.(check strings) "only the referenced key" [ Filename.concat d "b.c" ] c_files
+
+(* An unknown kind degrades to "no mapping" (the manifest-tolerance policy), never a crash. *)
+let test_unknown_kind_is_skipped () =
+  let d =
+    with_ulib_json {|{ "foreign": { "A.f": { "kind": "zig", "path": "a.zig" } } }|}
+  in
+  match Native_link.foreign_plan ~ulib_dir:d ~keys:[ "A.f" ] with
+  | Error e -> Alcotest.fail e
+  | Ok { c_files; rust_crates } ->
+    Alcotest.(check strings) "no c" [] c_files;
+    Alcotest.(check strings) "no rust" [] rust_crates
+
 let suite =
   [ Alcotest.test_case "manifest_pairs" `Quick test_manifest_pairs
   ; Alcotest.test_case
@@ -102,6 +169,17 @@ let suite =
   ; Alcotest.test_case "no_foreign_field_is_empty" `Quick test_no_foreign_field_is_empty
   ; Alcotest.test_case "malformed_json_is_empty" `Quick test_malformed_json_is_empty
   ; Alcotest.test_case "non_string_value_skipped" `Quick test_non_string_value_skipped
+  ; Alcotest.test_case
+      "tagged_schema_parses_both_kinds"
+      `Quick
+      test_tagged_schema_parses_both_kinds
+  ; Alcotest.test_case "plan_dedups_shared_crate" `Quick test_plan_dedups_shared_crate
+  ; Alcotest.test_case "plan_rejects_duplicate_key" `Quick test_plan_rejects_duplicate_key
+  ; Alcotest.test_case
+      "plan_ignores_unreferenced_duplicate"
+      `Quick
+      test_plan_ignores_unreferenced_duplicate
+  ; Alcotest.test_case "unknown_kind_is_skipped" `Quick test_unknown_kind_is_skipped
   ]
 
 let () = Alcotest.run "native_link" [ "native_link", suite ]

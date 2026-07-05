@@ -595,6 +595,21 @@ impl Heap {
         self.read_raw(n, 0)
     }
 
+    /// A `Closure`'s captured `env` word — the read side of `pv_closure_env` (ADR-0073 §2's
+    /// grow-on-demand accessor policy, prompted by ADR-0078): an effect-thunk foreign reaches its
+    /// captures through this, so the closure layout (`code`/`arity` raw words, env at value slot 2)
+    /// stays the runtime's. **Release-checked**: asserts the object is a `Closure`.
+    #[inline]
+    pub fn closure_env(&self, c: HeapPtr) -> TaggedWord {
+        let hdr = self.header(c); // checked: validates `c` is a live object header
+        assert_eq!(
+            hdr.kind(),
+            Kind::Closure,
+            "closure_env on a non-Closure object"
+        );
+        self.read_field(c, 2)
+    }
+
     /// Copy a `Str`'s bytes out to an owned `String`. Copies (never borrows into the moving heap,
     /// ADR-0063 §2); valid UTF-8 by the `new_str` invariant.
     pub fn str_read(&self, s: HeapPtr) -> String {
