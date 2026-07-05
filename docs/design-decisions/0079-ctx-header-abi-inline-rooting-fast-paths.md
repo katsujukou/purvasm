@@ -226,3 +226,37 @@ build verifies the ABI's own version constant instead of a bespoke version strin
   larger contract with its own failure modes (safepoint discipline around an inline
   allocator is a different design); this record deliberately exposes only the five
   operations the measurements convict.
+
+> **Progress (2026-07-05):** Implemented in the §5 order — phase 1 (header + runtime,
+> reviewed and landed inert), phase 2 (`purvasm-sys` mirror + leaf/rlib regression, green),
+> phase 3 (the codegen switch).
+>
+> **The three nets, verified empirically.** Compile time: both mirrors' `const` layout
+> assertions build (`size_of == 32`, per-field `offset_of!`). Link time: every inline object
+> carries `U pv_ctx_abi_v1` (via an `llvm.used`-kept internal constant), and linking inline
+> objects against the **debug** staticlib fails with `Undefined symbols: _pv_ctx_abi_v1` —
+> the wrong-pairing experiment was run deliberately and failed exactly as designed (the debug
+> profile exports `pv_ctx_abi_v1_debug` instead, a phase-1 amendment). Run time:
+> `pv_abi_check(1)` sits in every generated entry stub, before `pv_init_all`.
+>
+> **Mode switch as shipped:** one `--debug` axis drives staticlib choice, emission
+> (`inline_abi` — release = §3 fast paths, debug = entry-calls-only pre-0079 IR), and a
+> driver hint when a release build resolves a debug staticlib. The e2e harness now resolves
+> both profiles (release for the default differential, debug for a dedicated
+> `split_debug_pairing` differential that keeps the generation net exercised);
+> `examples-ci` builds the release staticlib.
+>
+> Validation: boot e2e **217/217** (forced-GC fixtures under inline rooting included —
+> collections triggered mid-body with IR-written roots), examples sweep 7/7, runtime
+> `cargo test` 94/94 + **Miri `--lib` 85/85 clean** (the raw-region rewrite), crates
+> 9/9 + clippy + fmt, self-compile **488/488 byte-identical**.
+>
+> **Measured (paired interleaved, min-of-5, vs the immediately preceding toolchain):**
+> fib **1.20×**, quicksort **1.22×**, count-state **1.10×**, json-parse **1.10×**,
+> map-fold-array **1.33×** — the largest single movement since
+> [0076](0076-direct-known-arity-calls-musttail.md), exactly where the boundary-count
+> analysis pointed. Cost: the Level-2 native *build* step grew ~24 s → ~55 s (bigger `.ll`,
+> more IR under `-O2`) — acceptable against the run-time gain; `-O2` and the inlined scalar
+> primops now have visible instruction streams to optimise, as this record predicted.
+> Remaining v1 gap by construction: the genuinely dynamic `pv_apply` traffic (PAP CAFs —
+> optimizer territory), allocation, and the leaf boundaries.

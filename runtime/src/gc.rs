@@ -389,7 +389,10 @@ impl Heap {
             self.root_gens[r.index], r.generation,
             "stale Root: shadow-stack slot was popped and reused"
         );
-        assert!(r.index < self.roots_len(), "Root index past the shadow-stack top");
+        assert!(
+            r.index < self.roots_len(),
+            "Root index past the shadow-stack top"
+        );
         // SAFETY: bounds-checked against `roots_len` just above; stable base.
         unsafe { TaggedWord::from_bits(*self.header.roots_base.add(r.index)) }
     }
@@ -411,7 +414,10 @@ impl Heap {
     /// the caller pushed the slot within the current frame.
     #[inline]
     fn root_slot(&self, i: usize) -> TaggedWord {
-        assert!(i < self.roots_len(), "root_slot index past the shadow-stack top");
+        assert!(
+            i < self.roots_len(),
+            "root_slot index past the shadow-stack top"
+        );
         // SAFETY: bounds-checked just above; stable base.
         unsafe { TaggedWord::from_bits(*self.header.roots_base.add(i)) }
     }

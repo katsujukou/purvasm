@@ -794,16 +794,22 @@ let repo_root : string option =
   in
   up (Sys.getcwd ())
 
-let rt_staticlib : string option =
+(* The two runtime staticlib profiles (ADR-0079 §2's mode-switched contract): default llvm
+   tests emit the inline ctx-header fast paths and MUST link the release lib (the debug lib
+   packs generations into handles — the profile-gated `pv_ctx_abi_v<N>` stamp makes the wrong
+   pairing a link error); the `--debug`-pairing tests emit entry calls only and link the debug
+   lib to keep the generation net exercised. `$PURVASM_RT_A` overrides both (the caller asserts
+   the profile matches how it is used). *)
+let rt_staticlib_of (profile : string) : string option =
   let exists p = if Sys.file_exists p then Some p else None in
   match Sys.getenv_opt "PURVASM_RT_A" with
   | Some p when Sys.file_exists p -> Some p
   | _ ->
     Option.bind repo_root (fun root ->
-      match exists (Filename.concat root "runtime/target/debug/libpurvasm_rt.a") with
-      | Some p -> Some p
-      | None -> exists (Filename.concat root "runtime/target/release/libpurvasm_rt.a"))
+      exists (Filename.concat root ("runtime/target/" ^ profile ^ "/libpurvasm_rt.a")))
 
+let rt_staticlib : string option = rt_staticlib_of "release"
+let rt_staticlib_debug : string option = rt_staticlib_of "debug"
 let has_clang : bool = Sys.command "clang --version >/dev/null 2>&1" = 0
 let llvm_available : bool = rt_staticlib <> None && has_clang
 
@@ -840,24 +846,27 @@ let compile_foreign_c ~(dir : string) (csrc : string) : string =
 let llvm_run
       ?(is_effect = false)
       ?(modular = false)
+      ?(debug = false)
       ?(foreign_c = [])
       ?heap_words
       (t : C.term)
   : string
   =
-  let rt = Option.get rt_staticlib in
+  let rt = Option.get (if debug then rt_staticlib_debug else rt_staticlib) in
   let dir =
     Filename.concat
       (Filename.get_temp_dir_name ())
-      (Printf.sprintf "purvasm_ll_%x" (Hashtbl.hash (t, heap_words, modular, foreign_c)))
+      (Printf.sprintf
+         "purvasm_ll_%x"
+         (Hashtbl.hash (t, heap_words, modular, debug, foreign_c)))
   in
   (try Sys.mkdir dir 0o755 with
    | Sys_error _ -> ());
   let anf = Middle_end.Transl.transl t in
   let src =
     if modular
-    then Llvm_backend.Codegen_llvm.program_modular ~is_effect ?heap_words anf
-    else Llvm_backend.Codegen_llvm.program ~is_effect ?heap_words anf
+    then Llvm_backend.Codegen_llvm.program_modular ~is_effect ?heap_words ~debug anf
+    else Llvm_backend.Codegen_llvm.program ~is_effect ?heap_words ~debug anf
   in
   (* Quote every path (ADR-0072 §10 harness): a `TMPDIR` with spaces must not break the command line. *)
   let genll = Filename.concat dir "gen.ll" in
@@ -904,10 +913,16 @@ let llvm_run
    (`-dead_strip` on ld64, `--gc-sections` + per-function sections on GNU ld/lld — [Native_link])
    so unreferenced symbols — a pruned dead binding's code/globals — are removed (ADR-0072 §3
    tree-shaking). *)
-let build_split_exe ?(is_effect = false) ?heap_words ?surface ~(dir : string) (t : C.term)
+let build_split_exe
+      ?(is_effect = false)
+      ?(debug = false)
+      ?heap_words
+      ?surface
+      ~(dir : string)
+      (t : C.term)
   : string
   =
-  let rt = Option.get rt_staticlib in
+  let rt = Option.get (if debug then rt_staticlib_debug else rt_staticlib) in
   (try Sys.mkdir dir 0o755 with
    | Sys_error _ -> ());
   let out =
@@ -915,6 +930,7 @@ let build_split_exe ?(is_effect = false) ?heap_words ?surface ~(dir : string) (t
       ~is_effect
       ?heap_words
       ?surface
+      ~debug
       (Middle_end.Transl.transl t)
   in
   (* one `.ll` → `.o` (`clang -c`), quoting every path; return the `.o` path *)
@@ -959,13 +975,17 @@ let build_split_exe ?(is_effect = false) ?heap_words ?surface ~(dir : string) (t
   then Alcotest.failf "link failed; see %s" err;
   genexe
 
-let llvm_run_split ?(is_effect = false) ?heap_words ?surface (t : C.term) : string =
+let llvm_run_split ?(is_effect = false) ?(debug = false) ?heap_words ?surface (t : C.term)
+  : string
+  =
   let dir =
     Filename.concat
       (Filename.get_temp_dir_name ())
-      (Printf.sprintf "purvasm_lls_%x" (Hashtbl.hash (t, heap_words, surface <> None)))
+      (Printf.sprintf
+         "purvasm_lls_%x"
+         (Hashtbl.hash (t, heap_words, debug, surface <> None)))
   in
-  let genexe = build_split_exe ~is_effect ?heap_words ?surface ~dir t in
+  let genexe = build_split_exe ~is_effect ~debug ?heap_words ?surface ~dir t in
   let outf = Filename.concat dir "out" in
   if
     Sys.command (Printf.sprintf "%s > %s" (Filename.quote genexe) (Filename.quote outf))
@@ -1010,11 +1030,12 @@ let same_on_llvm_modular_effect (label : string) (t : C.term) =
 
 (* The **separate-compilation** path (ADR-0072 §1/§3, Part B2): each module compiled to its own `.o`, all
    linked with the runtime. Same differential contract against the CESK oracle. *)
-let same_on_llvm_split ?heap_words ?surface (label : string) (t : C.term) =
+let same_on_llvm_split ?(debug = false) ?heap_words ?surface (label : string) (t : C.term)
+  =
   Alcotest.(check string)
     label
     (V.to_string (Cesk.Machine.eval ~host:Ffi.host t))
-    (llvm_run_split ?heap_words ?surface t)
+    (llvm_run_split ~debug ?heap_words ?surface t)
 
 let same_on_llvm_split_effect ?surface (label : string) (t : C.term) =
   let out =
@@ -1869,6 +1890,30 @@ let test_llvm_split_toplevel_shadow () =
                ( "alg"
                , C.Lam ("x", C.Prim (C.AddInt, [ C.Var "x"; C.Var "g" ]))
                , C.App (C.Var "alg", int 100) ) ) ))
+
+(* The `--debug`-pairing differentials (ADR-0079 §2): entry-call-only emission against the
+   generation-checking debug staticlib — the pre-0079 IR kept under differential coverage so the
+   debugging net stays honest. Gated on the debug lib being built. *)
+let test_llvm_split_debug_pairing () =
+  if rt_staticlib_debug = None
+  then Alcotest.skip ()
+  else (
+    let fib =
+      C.Lam
+        ( "n"
+        , C.If
+            ( C.Prim (C.LtInt, [ C.Var "n"; int 2 ])
+            , C.Var "n"
+            , C.Prim
+                ( C.AddInt
+                , [ C.App (C.Var "fib", C.Prim (C.SubInt, [ C.Var "n"; int 1 ]))
+                  ; C.App (C.Var "fib", C.Prim (C.SubInt, [ C.Var "n"; int 2 ]))
+                  ] ) ) )
+    in
+    same_on_llvm_split
+      ~debug:true
+      "split fib (debug pairing: entry calls + debug staticlib)"
+      (C.Letrec ([ "fib", fib ], C.App (C.Var "fib", int 10))))
 
 (* Real compiled-PureScript programs spanning **multiple modules**, each compiled to its own `.o` and
    linked: the genuine separate-compilation exercise (`Main` + `Data.*`/`Prelude` module objects + the
@@ -2727,6 +2772,7 @@ let llvm_groups =
         ; Alcotest.test_case "mod_prelude_quotient" `Quick test_llvm_mod_prelude_quotient
         ; Alcotest.test_case "mod_effect_console" `Quick test_llvm_mod_effect_console
         ; Alcotest.test_case "split_fib" `Quick test_llvm_split_fib
+        ; Alcotest.test_case "split_debug_pairing" `Quick test_llvm_split_debug_pairing
         ; Alcotest.test_case
             "split_mangle_injective"
             `Quick

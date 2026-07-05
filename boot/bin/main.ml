@@ -311,8 +311,25 @@ let emit_native_llvm
       anf
   =
   let rt = resolve_runtime_lib ~debug runtime_lib in
+  (* Emission mode follows the `--debug` axis (ADR-0079 §2): release = inline ctx-header fast
+     paths, debug = entry calls only. A wrong pairing (an inline object against a debug
+     staticlib) is a LINK error via the profile-gated `pv_ctx_abi_v<N>` stamp; hint at the
+     likely cause up front when the resolved lib looks like the wrong profile. *)
+  if
+    (not debug)
+    &&
+    let rec has_sub i =
+      i + 13 <= String.length rt
+      && (String.sub rt i 13 = "target/debug/" || has_sub (i + 1))
+    in
+    has_sub 0
+  then
+    Stdlib.prerr_endline
+      "warning: release build is pairing with a DEBUG runtime staticlib; the link will \
+       fail (undefined pv_ctx_abi_v*). Run `cargo build --release` in runtime/, or pass \
+       --debug.";
   let split =
-    Llvm_backend.Codegen_llvm.program_split ~is_effect ?heap_words ~surface anf
+    Llvm_backend.Codegen_llvm.program_split ~is_effect ?heap_words ~surface ~debug anf
   in
   let sh label cmd =
     if Sys.command cmd <> 0
@@ -635,10 +652,14 @@ let native_cmd =
       & info
           [ "debug" ]
           ~doc:
-            "Prefer the DEBUG runtime staticlib (runtime/target/debug — runtime \
-             assertions on, not perf-representative) over release in the repo lookup \
-             ($(b,llvm) backend). Default prefers release; $(b,--runtime-lib) / \
-             $(b,\\$PURVASM_RT_A) always win.")
+            "Debug pairing for the $(b,llvm) backend (ADR-0079): emit entry-call-only IR \
+             (no inline ctx-header fast paths — every rooting operation goes through the \
+             guarded, generation-checked runtime entries) and prefer the DEBUG runtime \
+             staticlib (runtime/target/debug — runtime assertions on, not \
+             perf-representative) in the repo lookup. The two must pair: the \
+             profile-gated pv_ctx_abi_v* link stamp rejects a mixed build. Default is \
+             the release pairing (inline fast paths + release staticlib); \
+             $(b,--runtime-lib) / $(b,\\$PURVASM_RT_A) always win the lib lookup.")
   in
   let heap_words =
     Arg.(

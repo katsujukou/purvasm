@@ -338,6 +338,10 @@ type ctx =
        stale after any safepoint —, its own direct-entry info) *)
   ; mutable in_direct : bool
     (* emitting a `tailcc` direct entry (so `%env` exists and `musttail` is legal) *)
+  ; inline_abi : bool
+    (* release mode (ADR-0079): emit the rooting/trampoline fast paths as inline IR against
+       the `pv_ctx_header`; [false] under `--debug` — every operation stays an entry call
+       (the pre-0079 IR), pairing with the generation-checking debug runtime *)
   }
 
 let fresh cx : string =
@@ -354,6 +358,130 @@ let emit cx fmt =
        Buffer.add_string cx.fn s;
        Buffer.add_char cx.fn '\n')
     fmt
+
+(* --- the ctx-header ABI fast paths (ADR-0079 §3) ---------------------------------------------------
+
+   In release mode ([inline_abi]) the five rooting/trampoline operations are plain IR against the
+   `pv_ctx_header` at offset 0 of `%ctx`: the shadow stack is `roots_base[0..roots_len]`, a handle
+   is the bare slot index, a frame mark is a length, `pending_tail` is the settle flag. The offsets
+   and version below are LOCKSTEP with `include/purvasm.h` (and the runtime's `CtxHeader` /
+   `purvasm-sys`'s mirror, each pinned by compile-time layout assertions). Slow paths — growth, an
+   actually-stashed tail — call the unchanged entries. Under `--debug` every operation is an entry
+   call (the pre-0079 IR): the debug runtime packs generations into handles and keeps `root_gens`
+   bookkeeping the inline paths would not update (ADR-0079 §2), and the profile-gated
+   `pv_ctx_abi_v<N>` link stamp turns a wrong pairing into a link error. *)
+
+let ctx_header_version = 1
+let off_roots_len = 8
+let off_roots_cap = 16
+let off_pending_tail = 24
+(* `roots_base` sits at offset 0: its load reads `ptr %ctx` directly. *)
+
+(* A header field's address, computed at the use site — the base moves on growth, so nothing is
+   cached across calls; folding the reloads between safepoints is the optimiser's job (§3). *)
+let header_field cx (off : int) : string =
+  let a = fresh cx in
+  emit cx "  %s = getelementptr i8, ptr %%ctx, i64 %d" a off;
+  a
+
+let abi_frame_open cx : string =
+  if not cx.inline_abi
+  then (
+    let m = fresh cx in
+    emit cx "  %s = call i64 @pv_frame(ptr %%ctx)" m;
+    m)
+  else (
+    let m = fresh cx in
+    emit cx "  %s = load i64, ptr %s" m (header_field cx off_roots_len);
+    m)
+
+let abi_pop_frame cx (mark : string) : unit =
+  if not cx.inline_abi
+  then emit cx "  call void @pv_pop_frame(ptr %%ctx, i64 %s)" mark
+  else emit cx "  store i64 %s, ptr %s" mark (header_field cx off_roots_len)
+
+let abi_get cx (handle : string) : string =
+  if not cx.inline_abi
+  then (
+    let t = fresh cx in
+    emit cx "  %s = call i64 @pv_get(ptr %%ctx, i64 %s)" t handle;
+    t)
+  else (
+    let base = fresh cx in
+    emit cx "  %s = load ptr, ptr %%ctx" base;
+    let slot = fresh cx in
+    emit cx "  %s = getelementptr i64, ptr %s, i64 %s" slot base handle;
+    let t = fresh cx in
+    emit cx "  %s = load i64, ptr %s" t slot;
+    t)
+
+(* The in-capacity store is the fast path; `len == cap` falls to the entry, which grows (the one
+   action that moves `roots_base`) and returns the same bare-index handle the fast path computes. *)
+let abi_root cx (v : string) : string =
+  if not cx.inline_abi
+  then (
+    let h = fresh cx in
+    emit cx "  %s = call i64 @pv_root(ptr %%ctx, i64 %s)" h v;
+    h)
+  else (
+    let chk = fresh_label cx "rchk" in
+    let fast = fresh_label cx "rfast" in
+    let slow = fresh_label cx "rslow" in
+    let done_ = fresh_label cx "rdone" in
+    emit cx "  br label %%%s" chk;
+    emit cx "%s:" chk;
+    let lenp = header_field cx off_roots_len in
+    let len = fresh cx in
+    emit cx "  %s = load i64, ptr %s" len lenp;
+    let cap = fresh cx in
+    emit cx "  %s = load i64, ptr %s" cap (header_field cx off_roots_cap);
+    let full = fresh cx in
+    emit cx "  %s = icmp eq i64 %s, %s" full len cap;
+    emit cx "  br i1 %s, label %%%s, label %%%s" full slow fast;
+    emit cx "%s:" fast;
+    let base = fresh cx in
+    emit cx "  %s = load ptr, ptr %%ctx" base;
+    let slot = fresh cx in
+    emit cx "  %s = getelementptr i64, ptr %s, i64 %s" slot base len;
+    emit cx "  store i64 %s, ptr %s" v slot;
+    let len1 = fresh cx in
+    emit cx "  %s = add i64 %s, 1" len1 len;
+    emit cx "  store i64 %s, ptr %s" len1 lenp;
+    emit cx "  br label %%%s" done_;
+    emit cx "%s:" slow;
+    let hs = fresh cx in
+    emit cx "  %s = call i64 @pv_root(ptr %%ctx, i64 %s)" hs v;
+    emit cx "  br label %%%s" done_;
+    emit cx "%s:" done_;
+    let h = fresh cx in
+    emit cx "  %s = phi i64 [ %s, %%%s ], [ %s, %%%s ]" h len fast hs slow;
+    h)
+
+let abi_settle cx (r : string) : string =
+  if not cx.inline_abi
+  then (
+    let t = fresh cx in
+    emit cx "  %s = call i64 @pv_settle(ptr %%ctx, i64 %s)" t r;
+    t)
+  else (
+    let chk = fresh_label cx "schk" in
+    let slow = fresh_label cx "sslow" in
+    let done_ = fresh_label cx "sdone" in
+    emit cx "  br label %%%s" chk;
+    emit cx "%s:" chk;
+    let pf = fresh cx in
+    emit cx "  %s = load i64, ptr %s" pf (header_field cx off_pending_tail);
+    let has = fresh cx in
+    emit cx "  %s = icmp ne i64 %s, 0" has pf;
+    emit cx "  br i1 %s, label %%%s, label %%%s" has slow done_;
+    emit cx "%s:" slow;
+    let rs = fresh cx in
+    emit cx "  %s = call i64 @pv_settle(ptr %%ctx, i64 %s)" rs r;
+    emit cx "  br label %%%s" done_;
+    emit cx "%s:" done_;
+    let t = fresh cx in
+    emit cx "  %s = phi i64 [ %s, %%%s ], [ %s, %%%s ]" t r chk rs slow;
+    t)
 
 (* env: a guest variable → the SSA operand holding its **root handle** (root-on-create), plus the
    static function info when the binding is a known lambda (ADR-0076 §2 — a direct-call candidate).
@@ -382,17 +510,12 @@ let bind_fn (env : env) (x : string) (handle : string) (fn : fn_info) : env =
    the local lookup is tried first regardless. *)
 let read_var cx (env : env) (x : string) : string =
   match List.assoc_opt x env with
-  | Some { handle; _ } ->
-    let t = fresh cx in
-    emit cx "  %s = call i64 @pv_get(ptr %%ctx, i64 %s)" t handle;
-    t
+  | Some { handle; _ } -> abi_get cx handle
   | None when SS.mem x cx.gkeys ->
     cx.externs <- SS.add x cx.externs;
     let handle = fresh cx in
     emit cx "  %s = load i64, ptr @%s$root" handle (mangle x);
-    let t = fresh cx in
-    emit cx "  %s = call i64 @pv_get(ptr %%ctx, i64 %s)" t handle;
-    t
+    abi_get cx handle
   | None ->
     failwith (Printf.sprintf "codegen_llvm: unbound variable %s (unresolved foreign?)" x)
 
@@ -498,10 +621,7 @@ let force_atom cx (env : env) (a : A.atom) : string =
   | A.ALit _ | A.AForeign _ -> atom cx env a
 
 (* Root a freshly produced value and return its handle operand (root-on-create). *)
-let root cx (v : string) : string =
-  let h = fresh cx in
-  emit cx "  %s = call i64 @pv_root(ptr %%ctx, i64 %s)" h v;
-  h
+let root cx (v : string) : string = abi_root cx v
 
 (* Materialise an i64 arg buffer for a call — an [alloca] holding the operands — returning the pointer
    operand and count. Zero args → a null pointer (the runtime treats len 0 as empty). *)
@@ -576,14 +696,11 @@ let lift cx (env : env) (params : string list) (body : A.expr) : lifted =
 
 (* Emit the current function's return: pop the shadow-stack frame, then `ret`. *)
 let emit_ret cx (v : string) : unit =
-  emit cx "  call void @pv_pop_frame(ptr %%ctx, i64 %s)" cx.frame;
+  abi_pop_frame cx cx.frame;
   emit cx "  ret i64 %s" v
 
 (* Read the current value of a rooted handle (post-safepoint) — [pv_get] on a bare handle operand. *)
-let get_current cx (handle : string) : string =
-  let t = fresh cx in
-  emit cx "  %s = call i64 @pv_get(ptr %%ctx, i64 %s)" t handle;
-  t
+let get_current cx (handle : string) : string = abi_get cx handle
 
 (* Evaluate a list of atoms and return their **current** value operands, mutually protected against
    each other's safepoints. Collecting several results into registers and then calling — e.g.
@@ -1198,7 +1315,7 @@ and cexpr cx (env : env) ~(tail : bool) (c : A.cexpr) : string option =
        then (
          (* musttail (ADR-0076 §3): pop this frame first — the callee opens its own — with every
             operand (env word included) computed before the pop; no safepoint in between. *)
-         emit cx "  call void @pv_pop_frame(ptr %%ctx, i64 %s)" cx.frame;
+         abi_pop_frame cx cx.frame;
          let r = fresh cx in
          emit
            cx
@@ -1221,8 +1338,7 @@ and cexpr cx (env : env) ~(tail : bool) (c : A.cexpr) : string option =
          (* Settle (ADR-0076 §3): the callee's body may have stashed a generic tail bounce
             (`pv_tailcall`) that no enclosing `pv_apply` loop will take on this direct path —
             run it to a real value; a real value passes through. *)
-         let r' = fresh cx in
-         emit cx "  %s = call i64 @pv_settle(ptr %%ctx, i64 %s)" r' r;
+         let r' = abi_settle cx r in
          if tail
          then (
            (* tail position inside a non-`tailcc` context (an init fn / entry stub): an ordinary
@@ -1241,7 +1357,7 @@ and cexpr cx (env : env) ~(tail : bool) (c : A.cexpr) : string option =
             (ignored). *)
          let p, n = arg_buffer cx ops in
          emit cx "  call void @pv_tailcall(ptr %%ctx, i64 %s, ptr %s, i64 %d)" fv p n;
-         emit cx "  call void @pv_pop_frame(ptr %%ctx, i64 %s)" cx.frame;
+         abi_pop_frame cx cx.frame;
          emit cx "  ret i64 %s" imm_unit;
          None)
        else (
@@ -1486,9 +1602,8 @@ let emit_function cx (l : lifted) : unit =
   (* --- the direct entry `@<name>$d` (ADR-0076 §1): body under `tailcc`, args as parameters ------- *)
   cx.fn <- Buffer.create 256;
   cx.ssa <- 0;
-  let frame = "%frame" in
+  let frame = abi_frame_open cx in
   cx.frame <- frame;
-  emit cx "  %s = call i64 @pv_frame(ptr %%ctx)" frame;
   (* params: parameter i ↦ a rooted slot *)
   let env =
     List.mapi (fun i p -> p, i) l.params
@@ -1608,6 +1723,7 @@ let declarations : string =
   String.concat
     "\n"
     [ "declare ptr @pv_runtime_new(i64)"
+    ; "declare void @pv_abi_check(i32)"
     ; "declare void @pv_runtime_free(ptr)"
     ; "declare i64 @pv_apply(ptr, i64, ptr, i64)"
     ; "declare void @pv_tailcall(ptr, i64, ptr, i64)"
@@ -1686,7 +1802,7 @@ let default_heap_words = 1 lsl 20
     false`) computes its `Int` value and prints it (`pv_print_int`, matching the oracle's `to_string`); an
     **`Effect`** entry runs `pv_run_effect` then drains the output sink (ADR-0072 §8). The entry body is
     compiled in non-tail (value) position, then the stub prints/runs, frees the runtime, and returns. *)
-let make_cx ?(gkeys = SS.empty) ?(xfns = SM.empty) () : ctx =
+let make_cx ?(gkeys = SS.empty) ?(xfns = SM.empty) ?(inline_abi = true) () : ctx =
   { md = Buffer.create 4096
   ; globals = Buffer.create 256
   ; fn = Buffer.create 256
@@ -1704,7 +1820,25 @@ let make_cx ?(gkeys = SS.empty) ?(xfns = SM.empty) () : ctx =
   ; xdecls = SM.empty
   ; self_ctx = None
   ; in_direct = false
+  ; inline_abi
   }
+
+(* The per-object link-time ABI stamp (ADR-0079 §1): an inline-emitting object carries a kept-alive
+   reference to `pv_ctx_abi_v<N>`, which only the matching-version RELEASE runtime defines — so a
+   stale object, or an inline object paired with the debug staticlib, fails at link with an
+   undefined versioned symbol. `llvm.used` keeps the reference through dead-strip. Entry-call
+   (`--debug`) objects carry nothing and link against either profile. *)
+let abi_stamp cx : string =
+  if not cx.inline_abi
+  then ""
+  else
+    Printf.sprintf
+      "@pv_ctx_abi_v%d = external global i8\n\
+       @pv_abi_stamp = internal constant ptr @pv_ctx_abi_v%d\n\
+       @llvm.used = appending global [1 x ptr] [ptr @pv_abi_stamp], section \
+       \"llvm.metadata\"\n"
+      ctx_header_version
+      ctx_header_version
 
 (* `declare` lines for the native foreign `AbiCodeFn` symbols this object references (ADR-0073 §3). Each has
    the leaf ABI `i64 (ptr ctx, i64 clo, ptr args, i64 nargs)`; the symbol is resolved at link from the
@@ -1728,12 +1862,21 @@ let xfn_decls cx : string =
       (String.concat "" (List.init arity (fun _ -> ", i64"))))
   |> String.concat "\n"
 
-let program ?(is_effect = false) ?(heap_words = default_heap_words) (e : A.expr) : string =
-  let cx = make_cx () in
+let program
+      ?(is_effect = false)
+      ?(heap_words = default_heap_words)
+      ?(debug = false)
+      (e : A.expr)
+  : string
+  =
+  let cx = make_cx ~inline_abi:(not debug) () in
   (* the entry stub's own body buffer *)
-  cx.frame <- "%frame";
   emit cx "  %%ctx = call ptr @pv_runtime_new(i64 %d)" heap_words;
-  emit cx "  %%frame = call i64 @pv_frame(ptr %%ctx)";
+  (* the run-time half of the ADR-0079 §1 version net (the link-time half is the per-object
+     `pv_ctx_abi_v<N>` stamp) *)
+  emit cx "  call void @pv_abi_check(i32 %d)" ctx_header_version;
+  let frame0 = abi_frame_open cx in
+  cx.frame <- frame0;
   let v = Option.get (expr cx [] ~tail:false e) in
   if is_effect
   then (
@@ -1745,15 +1888,16 @@ let program ?(is_effect = false) ?(heap_words = default_heap_words) (e : A.expr)
        x`, or a call returning a by-need value) before `pv_print_int` reads its payload. The `Effect`
        path needs no force — `pv_run_effect`→`pv_apply` auto-forces a by-need callee. *)
     emit cx "  call void @pv_print_int(i64 %s)" (force_value cx v);
-  emit cx "  call void @pv_pop_frame(ptr %%ctx, i64 %%frame)";
+  abi_pop_frame cx frame0;
   emit cx "  call void @pv_runtime_free(ptr %%ctx)";
   emit cx "  ret i32 0";
   let entry_body = Buffer.contents cx.fn in
   (* emit the lifted functions the entry (and transitively) queued *)
   emit_pending cx;
   Printf.sprintf
-    "; ModuleID = 'purvasm'\n\n%s\n%s\n\n%s\n%s\ndefine i32 @main() {\nentry:\n%s}\n"
+    "; ModuleID = 'purvasm'\n\n%s\n%s\n%s\n\n%s\n%s\ndefine i32 @main() {\nentry:\n%s}\n"
     declarations
+    (abi_stamp cx)
     (foreign_decls cx)
     (Buffer.contents cx.globals)
     (Buffer.contents cx.md)
@@ -1939,8 +2083,7 @@ let reachable_gdefs ~(gkeys : SS.t) (entry : A.expr) (gdefs : gdef list) : gdef 
    already have popped any transient frame, so the root lands in the persistent init region of the shadow
    stack (never popped) and the global's handle stays relocation-valid for the program's lifetime. *)
 let store_root_global cx (key : string) (v : string) : unit =
-  let h = fresh cx in
-  emit cx "  %s = call i64 @pv_root(ptr %%ctx, i64 %s)" h v;
+  let h = abi_root cx v in
   emit cx "  store i64 %s, ptr @%s$root" h (mangle key)
 
 (* Wrap an init-body emitter in `define void @<mangle name>$init(ptr %ctx)`, using a fresh function buffer
@@ -1988,25 +2131,23 @@ let emit_gdef cx : gdef -> unit = function
       store_root_global cx key clo)
   | Gcaf (key, e) ->
     emit_init_fn cx ~name:key (fun () ->
-      let frame = "%frame" in
+      let frame = abi_frame_open cx in
       cx.frame <- frame;
-      emit cx "  %s = call i64 @pv_frame(ptr %%ctx)" frame;
       let v = Option.get (expr cx [] ~tail:false e) in
-      emit cx "  call void @pv_pop_frame(ptr %%ctx, i64 %s)" frame;
+      abi_pop_frame cx frame;
       store_root_global cx key v)
   | Grec binds ->
     emit_init_fn
       cx
       ~name:(fst (List.hd binds))
       (fun () ->
-         let frame = "%frame" in
+         let frame = abi_frame_open cx in
          cx.frame <- frame;
-         emit cx "  %s = call i64 @pv_frame(ptr %%ctx)" frame;
          (* stable member code symbols, so [cx.gfns]'s pre-registered `$d` names line up *)
          let env' = build_grec ~named:(fun m -> Some (mangle m)) cx [] binds in
          (* read each member's current cell value *before* popping the transient roots *)
          let vals = List.map (fun (m, _) -> m, read_var cx env' m) binds in
-         emit cx "  call void @pv_pop_frame(ptr %%ctx, i64 %s)" frame;
+         abi_pop_frame cx frame;
          List.iter (fun (m, v) -> store_root_global cx m v) vals)
 
 (* Emit each gdef's root-handle global definition(s) (handle 0 = an invalid sentinel; init overwrites
@@ -2081,10 +2222,12 @@ let emit_init_all cx (gdefs : gdef list) : unit =
 let emit_entry_stub cx ~(is_effect : bool) ~(heap_words : int) (entry : A.expr) : string =
   cx.fn <- Buffer.create 256;
   cx.ssa <- 0;
-  cx.frame <- "%frame";
   emit cx "  %%ctx = call ptr @pv_runtime_new(i64 %d)" heap_words;
+  (* the run-time half of the ADR-0079 §1 version net, checked before any init runs *)
+  emit cx "  call void @pv_abi_check(i32 %d)" ctx_header_version;
   emit cx "  call void @pv_init_all(ptr %%ctx)";
-  emit cx "  %%frame = call i64 @pv_frame(ptr %%ctx)";
+  let frame0 = abi_frame_open cx in
+  cx.frame <- frame0;
   let v = Option.get (expr cx [] ~tail:false entry) in
   if is_effect
   then (
@@ -2092,7 +2235,7 @@ let emit_entry_stub cx ~(is_effect : bool) ~(heap_words : int) (entry : A.expr) 
     emit cx "  %s = call i64 @pv_run_effect(ptr %%ctx, i64 %s)" r v;
     emit cx "  call void @pv_drain_output(ptr %%ctx)")
   else emit cx "  call void @pv_print_int(i64 %s)" (force_value cx v);
-  emit cx "  call void @pv_pop_frame(ptr %%ctx, i64 %%frame)";
+  abi_pop_frame cx frame0;
   emit cx "  call void @pv_runtime_free(ptr %%ctx)";
   emit cx "  ret i32 0";
   Buffer.contents cx.fn
@@ -2108,12 +2251,16 @@ let extern_global_decls cx ~(defined : SS.t) : string =
     binding as a root-handle global `@<mangle key>$root` + `@<mangle key>$init`, one `pv_init_all`, one
     `@main`. B1's single-object form (all globals defined locally, so no `external`); [program_split] is the
     multi-object form. *)
-let program_modular ?(is_effect = false) ?(heap_words = default_heap_words) (e : A.expr)
+let program_modular
+      ?(is_effect = false)
+      ?(heap_words = default_heap_words)
+      ?(debug = false)
+      (e : A.expr)
   : string
   =
   let gdefs, entry = split_spine (uniquify_toplevel e) in
   let gkeys = SS.of_list (List.concat_map gdef_keys gdefs) in
-  let cx = make_cx ~gkeys () in
+  let cx = make_cx ~gkeys ~inline_abi:(not debug) () in
   (* every binding is emitted, but only the reachable ones are initialised (dead init is pruned; the
      dead-strip link removes their now-unreferenced code/globals — ADR-0072 §3). *)
   emit_gdefs cx gdefs;
@@ -2121,8 +2268,18 @@ let program_modular ?(is_effect = false) ?(heap_words = default_heap_words) (e :
   let entry_body = emit_entry_stub cx ~is_effect ~heap_words entry in
   emit_pending cx;
   Printf.sprintf
-    "; ModuleID = 'purvasm'\n\n%s\n%s\n%s\n\n%s\n%s\ndefine i32 @main() {\nentry:\n%s}\n"
+    "; ModuleID = 'purvasm'\n\n\
+     %s\n\
+     %s\n\
+     %s\n\
+     %s\n\n\
+     %s\n\
+     %s\n\
+     define i32 @main() {\n\
+     entry:\n\
+     %s}\n"
     declarations
+    (abi_stamp cx)
     (extern_global_decls cx ~defined:gkeys)
     (foreign_decls cx)
     (Buffer.contents cx.globals)
@@ -2149,15 +2306,21 @@ let module_of_key (k : string) : string =
     code, plus `external` decls for referenced globals owned by *other* modules and `declare tailcc`
     externs for the cross-module direct entries it calls (ADR-0077 §3). No `pv_init_all`, no
     `@main` — those live in the init/entry object ([entry_ll]). *)
-let module_ll ~(gkeys : SS.t) ~(xfns : fn_info SM.t) ~(defined : SS.t) (gdefs : gdef list)
+let module_ll
+      ~(gkeys : SS.t)
+      ~(xfns : fn_info SM.t)
+      ~(inline_abi : bool)
+      ~(defined : SS.t)
+      (gdefs : gdef list)
   : string
   =
-  let cx = make_cx ~gkeys ~xfns () in
+  let cx = make_cx ~gkeys ~xfns ~inline_abi () in
   emit_gdefs cx gdefs;
   emit_pending cx;
   Printf.sprintf
-    "; ModuleID = 'purvasm.module'\n\n%s\n%s\n%s\n%s\n\n%s\n%s"
+    "; ModuleID = 'purvasm.module'\n\n%s\n%s\n%s\n%s\n%s\n\n%s\n%s"
     declarations
+    (abi_stamp cx)
     (extern_global_decls cx ~defined)
     (foreign_decls cx)
     (xfn_decls cx)
@@ -2172,11 +2335,12 @@ let entry_ll
       ?(heap_words = default_heap_words)
       ~(gkeys : SS.t)
       ~(xfns : fn_info SM.t)
+      ~(inline_abi : bool)
       (gdefs : gdef list)
       (entry : A.expr)
   : string
   =
-  let cx = make_cx ~gkeys ~xfns () in
+  let cx = make_cx ~gkeys ~xfns ~inline_abi () in
   (* initialise only the bindings reachable from the entry (ADR-0072 §3); the unreachable module objects'
      code/globals are dropped by the dead-strip link. *)
   let reach = reachable_gdefs ~gkeys entry gdefs in
@@ -2196,6 +2360,7 @@ let entry_ll
      %s\n\
      %s\n\
      %s\n\
+     %s\n\
      %s\n\n\
      %s\n\
      %s\n\
@@ -2203,6 +2368,7 @@ let entry_ll
      entry:\n\
      %s}\n"
     declarations
+    (abi_stamp cx)
     init_decls
     (extern_global_decls cx ~defined:SS.empty)
     (foreign_decls cx)
@@ -2236,9 +2402,11 @@ let program_split
       ?(is_effect = false)
       ?(heap_words = default_heap_words)
       ?(surface = SM.empty)
+      ?(debug = false)
       (e : A.expr)
   : split_output
   =
+  let inline_abi = not debug in
   let gdefs, entry = split_spine (uniquify_toplevel e) in
   let gkeys = SS.of_list (List.concat_map gdef_keys gdefs) in
   let xfns =
@@ -2285,10 +2453,10 @@ let program_split
     |> List.map (fun m ->
       let gs = List.rev !(Hashtbl.find tbl m) in
       let defined = SS.of_list (List.concat_map gdef_keys gs) in
-      m, module_ll ~gkeys ~xfns ~defined gs)
+      m, module_ll ~gkeys ~xfns ~inline_abi ~defined gs)
   in
   { modules
-  ; entry = entry_ll ~is_effect ~heap_words ~gkeys ~xfns gdefs entry
+  ; entry = entry_ll ~is_effect ~heap_words ~gkeys ~xfns ~inline_abi gdefs entry
   ; foreigns = cf_expr e
   }
 

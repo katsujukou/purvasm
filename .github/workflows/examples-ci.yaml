@@ -74,8 +74,11 @@ jobs:
         run: dune build
         working-directory: boot
 
+      # RELEASE: the default native pipeline emits the ADR-0079 inline ctx-header fast paths,
+      # which pair only with the release staticlib (the profile-gated `pv_ctx_abi_v<N>` stamp
+      # makes a debug pairing a link error).
       - name: Build runtime staticlib
-        run: cargo build
+        run: cargo build --release
         working-directory: runtime
 
       # One workspace build yields both the examples' CoreFn (for purvm) and the JS output
