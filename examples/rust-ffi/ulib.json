@@ -1,0 +1,6 @@
+{
+  "foreign": {
+    "Lib.rand": { "kind": "rust-crate", "path": "foreign" },
+    "Lib.shuffle": { "kind": "rust-crate", "path": "foreign" }
+  }
+}

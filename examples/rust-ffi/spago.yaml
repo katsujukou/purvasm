@@ -1,0 +1,8 @@
+package:
+  name: ex-rust-ffi
+  dependencies:
+    - arrays
+    - console
+    - effect
+    - fmt
+    - prelude

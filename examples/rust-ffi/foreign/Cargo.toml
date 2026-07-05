@@ -1,0 +1,13 @@
+[package]
+name = "ex-rust-ffi-foreign"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# The safe foreign-authoring layer (ADR-0078 §3), plus an ordinary crates.io dependency —
+# the point of writing this leaf in Rust rather than C.
+purvasm-foreign = { path = "../../../crates/purvasm-foreign" }
+rand = "0.9"
+
+[workspace]

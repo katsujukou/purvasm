@@ -37,7 +37,11 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-# One line per example: <directory> <entry module> [XFAIL:<reason>]. The completeness check
+# One line per example: <directory> <entry module> [XFAIL:<reason> | LLVM-ONLY]. LLVM-ONLY marks
+# an example only the LLVM-native backend can run (a Rust foreign, ADR-0078): the vm/ml columns
+# are skipped, the llvm column is REQUIRED, and the JS column (with --with-js) diffs against the
+# llvm output — which is why such an example must print deterministic (property-shaped) output.
+# The completeness check
 # below errors on an `examples/*/spago.yaml` directory missing from this table, so an example
 # cannot be silently left out of the sweep.
 EXAMPLES="
@@ -48,6 +52,7 @@ record-meta      Example.RecordMeta.Main
 recursion-scheme Example.RecursionScheme.Main
 recursive-value  Example.RecursiveValue.Main
 transformer      Example.Transformer.Main
+rust-ffi         Example.RustFFI.Main LLVM-ONLY
 "
 
 if [ ! -x "$PURVM" ]; then
@@ -80,6 +85,17 @@ echo "$EXAMPLES" | while read -r name module xfail; do
   base="$WORK/$name"
   mkdir -p "$base"
 
+  llvm_only=0
+  if [ "$xfail" = "LLVM-ONLY" ]; then
+    llvm_only=1
+    xfail=""
+  fi
+  # An example shipping its own native foreigns (ADR-0078) carries a ulib.json manifest.
+  nf=""
+  if [ -f "examples/$name/ulib.json" ]; then
+    nf="--native-foreign examples/$name"
+  fi
+
   corefn="output/$module"
   if [ ! -f "$corefn/corefn.json" ]; then
     echo "error: $corefn/corefn.json missing — run \`spago build\` first" >&2
@@ -88,18 +104,28 @@ echo "$EXAMPLES" | while read -r name module xfail; do
     continue
   fi
 
-  "$PURVM" build --corefn-dir output --ulib dist/ulib -m "$module" -o "$base/vm" \
-    >"$base/vm.build.log" 2>&1 \
-    && "$PURVM" run "$base/vm/app.pvm" >"$base/vm.out" 2>"$base/vm.err"
-  vm_rc=$?
-  "$PURVM" native --backend ocaml --corefn-dir output --ulib dist/ulib -m "$module" -o "$base/ml" \
-    >"$base/ml.build.log" 2>&1 \
-    && "$base/ml/app" >"$base/ml.out" 2>"$base/ml.err"
-  ml_rc=$?
-  "$PURVM" native --backend llvm --corefn-dir output --ulib dist/ulib -m "$module" -o "$base/llvm" \
+  if [ $llvm_only -eq 0 ]; then
+    "$PURVM" build --corefn-dir output --ulib dist/ulib -m "$module" -o "$base/vm" \
+      >"$base/vm.build.log" 2>&1 \
+      && "$PURVM" run "$base/vm/app.pvm" >"$base/vm.out" 2>"$base/vm.err"
+    vm_rc=$?
+    "$PURVM" native --backend ocaml --corefn-dir output --ulib dist/ulib -m "$module" -o "$base/ml" \
+      >"$base/ml.build.log" 2>&1 \
+      && "$base/ml/app" >"$base/ml.out" 2>"$base/ml.err"
+    ml_rc=$?
+  fi
+  "$PURVM" native --backend llvm --corefn-dir output --ulib dist/ulib $nf -m "$module" -o "$base/llvm" \
     >"$base/llvm.build.log" 2>&1 \
     && "$base/llvm/app" >"$base/llvm.out" 2>"$base/llvm.err"
   llvm_rc=$?
+  if [ $llvm_only -eq 1 ]; then
+    # LLVM-ONLY: the llvm column is the ground truth; stub the skipped columns with its
+    # output so the shared diff/report logic below applies unchanged (JS still diffs).
+    vm_rc=$llvm_rc
+    ml_rc=$llvm_rc
+    cp "$base/llvm.out" "$base/vm.out" 2>/dev/null
+    cp "$base/llvm.out" "$base/ml.out" 2>/dev/null
+  fi
 
   status="OK"
   if [ $vm_rc -ne 0 ] || [ $ml_rc -ne 0 ] || [ $llvm_rc -ne 0 ]; then
