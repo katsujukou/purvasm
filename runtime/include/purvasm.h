@@ -104,6 +104,9 @@ PVWord pv_new_number(PVContext *ctx, uint64_t bits);
 PVWord pv_new_array(PVContext *ctx, const PVWord *elems, size_t n);
 /** The canonical empty `Array` (no allocation). */
 PVWord pv_empty_array(void);
+/** An `Array`'s element count (the empty array reads as 0) — pairs with `pv_read_field` for the
+    FFI's array conversions (ADR-0078). */
+size_t pv_array_len(PVContext *ctx, PVWord array);
 /** An algebraic-data value: constructor `tag`, then `n` field words at `fields`. */
 PVWord pv_new_adt(PVContext *ctx, uint32_t tag, const PVWord *fields, size_t n);
 /** A record from parallel `ids` (sorted FNV-1a-64 label ids) and `values`, length `n` (ADR-0069). */
