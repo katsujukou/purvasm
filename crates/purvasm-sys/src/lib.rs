@@ -72,6 +72,8 @@ extern "C" {
     pub fn pv_new_array(ctx: *mut PVContext, elems: *const PVWord, n: usize) -> PVWord;
     /// The canonical empty `Array` (no allocation).
     pub fn pv_empty_array() -> PVWord;
+    /// An `Array`'s element count (the empty array reads as 0).
+    pub fn pv_array_len(ctx: *mut PVContext, array: PVWord) -> usize;
     /// An algebraic-data value: constructor `tag`, then `n` field words.
     pub fn pv_new_adt(ctx: *mut PVContext, tag: u32, fields: *const PVWord, n: usize) -> PVWord;
     /// A record from parallel sorted FNV-1a-64 `ids` and `values` (ADR-0069).

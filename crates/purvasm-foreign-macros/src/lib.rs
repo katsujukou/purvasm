@@ -122,6 +122,22 @@ enum ParamKind {
     Owned,
     /// `&str`: convert to a shim-owned `String`, pass a borrow of it to the user fn.
     StrRef,
+    /// `&[T]`: convert to a shim-owned `Vec<T>`, pass a borrow of it to the user fn.
+    /// (Boxed: `Type` dwarfs the other variants — clippy's `large_enum_variant`.)
+    SliceRef(Box<Type>),
+}
+
+/// The element type of a `&[T]` parameter, if the type is one — the slice analogue of
+/// [`is_str_ref`]: same shim-owned-buffer shape, `Vec<T>` instead of `String`.
+fn slice_ref_elem(ty: &Type) -> Option<Type> {
+    if let Type::Reference(r) = ty {
+        if r.mutability.is_none() {
+            if let Type::Slice(sl) = &*r.elem {
+                return Some((*sl.elem).clone());
+            }
+        }
+    }
+    None
 }
 
 #[proc_macro_attribute]
@@ -170,11 +186,14 @@ fn expand(args: Args, func: &ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                 };
                 let kind = if is_str_ref(&pt.ty) {
                     ParamKind::StrRef
+                } else if let Some(elem) = slice_ref_elem(&pt.ty) {
+                    ParamKind::SliceRef(Box::new(elem))
                 } else if matches!(&*pt.ty, Type::Reference(_)) {
                     return Err(syn::Error::new_spanned(
                         &pt.ty,
-                        "pv_foreign: the only supported reference parameter is `&str` \
-                         (take the owned type — String, i32, f64, bool, PvValue — instead)",
+                        "pv_foreign: the only supported reference parameters are `&str` and \
+                         `&[T]` (take the owned type — String, Vec<T>, i32, f64, bool, \
+                         PvValue — otherwise)",
                     ));
                 } else {
                     ParamKind::Owned
@@ -198,6 +217,10 @@ fn expand(args: Args, func: &ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                 let #bind: ::std::string::String =
                     ::purvasm_foreign::FromPv::from_pv(__cx, __vals[#i]);
             },
+            ParamKind::SliceRef(elem) => quote! {
+                let #bind: ::std::vec::Vec<#elem> =
+                    ::purvasm_foreign::FromPv::from_pv(__cx, __vals[#i]);
+            },
             ParamKind::Owned => quote! {
                 let #bind = ::purvasm_foreign::FromPv::from_pv(__cx, __vals[#i]);
             },
@@ -208,6 +231,7 @@ fn expand(args: Args, func: &ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             let bind = format_ident!("__arg_{}", ident);
             match kind {
                 ParamKind::StrRef => quote! { #bind.as_str() },
+                ParamKind::SliceRef(_) => quote! { #bind.as_slice() },
                 ParamKind::Owned => quote! { #bind },
             }
         });

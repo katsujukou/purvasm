@@ -148,6 +148,11 @@ impl<'f> Ctx<'f> {
 
     /* ── access / application ──────────────────────────────────────────────────────────────── */
 
+    /// An `Array`'s element count (the empty array reads as 0).
+    pub fn array_len(&self, v: PvValue<'f>) -> usize {
+        unsafe { sys::pv_array_len(self.raw, self.word_of(v)) }
+    }
+
     /// Read value-slot `i` of a heap object.
     pub fn read_field(&self, obj: PvValue<'f>, i: u64) -> PvValue<'f> {
         let w = self.word_of(obj);

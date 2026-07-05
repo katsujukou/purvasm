@@ -76,3 +76,21 @@ impl<'f> IntoPv<'f> for PvValue<'f> {
         self
     }
 }
+
+/// An `Array` of convertible elements, copied out element-by-element (each element handle is
+/// rooted for the frame — fine at leaf scale; a leaf is small by policy, ADR-0073 §1).
+impl<'f, T: FromPv<'f>> FromPv<'f> for Vec<T> {
+    fn from_pv(cx: &Ctx<'f>, v: PvValue<'f>) -> Self {
+        let n = cx.array_len(v);
+        (0..n)
+            .map(|i| T::from_pv(cx, cx.read_field(v, i as u64)))
+            .collect()
+    }
+}
+
+impl<'f, T: IntoPv<'f>> IntoPv<'f> for Vec<T> {
+    fn into_pv(self, cx: &Ctx<'f>) -> PvValue<'f> {
+        let elems: Vec<PvValue<'f>> = self.into_iter().map(|x| x.into_pv(cx)).collect();
+        cx.new_array(&elems)
+    }
+}
