@@ -138,6 +138,34 @@ PVWord pv_apply(PVContext *ctx, PVWord f, const PVWord *args, size_t nargs);
 /** Force a by-need cell to its value; passes any non-cell through unchanged (ADR-0070). */
 PVWord pv_force_if_byneed(PVContext *ctx, PVWord v);
 
+/* ════════════════════════════════════════════════════════════════════════════════════════════════════
+ * GENERATED-CODE ABI (ADR-0079) — NOT part of the foreign-author API above.
+ *
+ * A `PVContext*` points to storage whose FIRST BYTES are a `pv_ctx_header`. Exactly TWO consumers may
+ * rely on that prefix: the compiler's generated code (release-mode inline rooting/trampoline fast
+ * paths) and the runtime / `purvasm-sys` `#[repr(C)]` mirrors (each side carries compile-time layout
+ * assertions). **A foreign provider must NOT read or write `pv_ctx_header`** — the supported foreign
+ * surface is, and remains, the `pv_*` functions above (ADR-0073 §2). `PVContext` itself stays opaque:
+ * this is a documented prefix guarantee, not a struct member to reach through.
+ *
+ * The layout is versioned CONTRACT: any change bumps `PV_CTX_HEADER_VERSION`, renames the
+ * `pv_ctx_abi_v<N>` link-time stamp the runtime exports for its own version (a stale object then
+ * fails to link), and is caught at run time by `pv_abi_check` as the final backstop.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════ */
+
+typedef struct pv_ctx_header {
+  uint64_t *roots_base;   /* the shadow stack's storage (moves only on slow-path growth)      */
+  uint64_t  roots_len;    /* one past the top root = the next handle = the frame mark         */
+  uint64_t  roots_cap;    /* fast-path bound; roots_len == roots_cap -> slow-path pv_root     */
+  uint64_t  pending_tail; /* 0 = no stashed generic tail (pv_settle fast path)                */
+} pv_ctx_header;
+
+#define PV_CTX_HEADER_VERSION 1
+
+/** Run-time ABI-version backstop (ADR-0079 §1): the generated entry stub calls this once at startup;
+    a mismatch aborts loudly. (The per-object net is the `pv_ctx_abi_v<N>` link-time symbol.) */
+void pv_abi_check(uint32_t version);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

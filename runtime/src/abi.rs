@@ -243,6 +243,44 @@ pub extern "C" fn pv_print_int(v: u64) {
     })
 }
 
+// --- the ctx-header ABI (ADR-0079 §1) ---------------------------------------------------------------
+
+/// The `pv_ctx_header` ABI version this runtime implements (mirrors `PV_CTX_HEADER_VERSION` in
+/// `include/purvasm.h`; the compile-time layout assertions live beside `CtxHeader` in `gc.rs`).
+pub const PV_CTX_HEADER_VERSION: u32 = 1;
+
+/// The per-object link-time version stamp (ADR-0079 §1): every generated object that emits
+/// header-offset fast paths references this symbol, so linking an object compiled against any
+/// other header version fails loudly with an undefined `pv_ctx_abi_v<N>` — per object, at zero
+/// runtime cost. Only the symbol for THIS runtime's version exists — and only in the RELEASE
+/// profile: the debug runtime packs a generation into root handles and keeps `root_gens`
+/// bookkeeping the inline fast paths would neither produce nor update (ADR-0079 §2's
+/// mode-switched contract), so an inline-emitting object linked against a debug staticlib must
+/// fail at link, not corrupt the generation net at run time. The debug profile exports the
+/// `_debug`-suffixed sibling instead (nothing references it yet; it exists so an `nm` audit can
+/// tell the profiles apart).
+#[cfg(not(debug_assertions))]
+#[no_mangle]
+pub static pv_ctx_abi_v1: u8 = 0;
+
+/// The debug-profile sibling of [`pv_ctx_abi_v1`] (see there).
+#[cfg(debug_assertions)]
+#[no_mangle]
+pub static pv_ctx_abi_v1_debug: u8 = 0;
+
+/// The run-time backstop of the ADR-0079 §1 net, called once from the generated entry stub:
+/// aborts loudly on a header-version mismatch the linker did not mediate. Also the mechanism
+/// the ADR-0078 §5 driver-side ABI check consumes.
+#[no_mangle]
+pub extern "C" fn pv_abi_check(version: u32) {
+    if version != PV_CTX_HEADER_VERSION {
+        eprintln!(
+            "purvasm: ABI mismatch: object expects pv_ctx_header v{version}, runtime provides v{PV_CTX_HEADER_VERSION}"
+        );
+        std::process::abort();
+    }
+}
+
 // --- shadow-stack rooting (ADR-0071 §5) -------------------------------------------------------------
 
 /// Open a shadow-stack frame; returns an opaque mark for [`pv_pop_frame`].

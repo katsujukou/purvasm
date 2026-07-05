@@ -31,6 +31,42 @@ pub(crate) const BYNEED_UNFORCED: u64 = 0;
 pub(crate) const BYNEED_BUILDING: u64 = 1;
 pub(crate) const BYNEED_FORCED: u64 = 2;
 
+/// The ABI context header (ADR-0079 §1): the **first bytes of every [`Heap`]**, mirrored by
+/// `pv_ctx_header` in `include/purvasm.h`. Release-mode codegen bakes these offsets into its
+/// inline rooting/trampoline fast paths, and the ADR-0078 sys layer mirrors the struct — the
+/// layout is CONTRACT. Any change bumps `PV_CTX_HEADER_VERSION` (and the `pv_ctx_abi_v<N>`
+/// link symbol) in lockstep with the header file; the `const` assertions below pin the layout
+/// at compile time on this side of the mirror (a drift is layout, not aliasing — Miri cannot
+/// see it, ADR-0079 §1).
+///
+/// The shadow-stack storage it points at follows the semi-space discipline (stable raw base,
+/// no whole-buffer `&mut` re-borrows, ADR-0063 §2/§8); the base moves only on growth, inside
+/// the slow-path [`Heap::root`].
+#[repr(C)]
+pub(crate) struct CtxHeader {
+    /// The shadow stack's storage base (owns the allocation; freed in [`Heap`]'s `Drop`).
+    roots_base: *mut u64,
+    /// One past the top root = the next handle = the frame mark.
+    roots_len: u64,
+    /// Fast-path bound: `roots_len == roots_cap` → the slow-path entry grows.
+    roots_cap: u64,
+    /// `0` = no stashed generic tail (`pv_settle`'s fast path); non-zero = stashed.
+    pending_tail: u64,
+}
+
+// The two compile-time halves of the ADR-0079 §1 layout net (the run/link-time halves are
+// `pv_abi_check` and the `pv_ctx_abi_v<N>` symbol, in `abi.rs`).
+const _: () = {
+    assert!(core::mem::size_of::<CtxHeader>() == 32);
+    assert!(core::mem::offset_of!(CtxHeader, roots_base) == 0);
+    assert!(core::mem::offset_of!(CtxHeader, roots_len) == 8);
+    assert!(core::mem::offset_of!(CtxHeader, roots_cap) == 16);
+    assert!(core::mem::offset_of!(CtxHeader, pending_tail) == 24);
+};
+
+/// Initial shadow-stack capacity in words. Small; growth doubles inside the slow-path root.
+const ROOTS_INITIAL_CAP: usize = 256;
+
 /// A single-capability local heap with two equal semi-spaces (ADR-0064 §5).
 ///
 /// Each semi-space is a raw allocation reached through a **single stable base pointer** whose
@@ -40,7 +76,14 @@ pub(crate) const BYNEED_FORCED: u64 = 2;
 /// **invalidates every outstanding `HeapPtr`** — a use-after-invalidation the borrow model rejects
 /// (and `noalias`-based codegen could miscompile). Only raw-pointer arithmetic off the stable base
 /// touches the heap after construction.
+///
+/// `#[repr(C)]` with [`CtxHeader`] first: offset 0 of the context pointer IS the ABI header
+/// (ADR-0079 §1) — the `const` assertion below pins it.
+#[repr(C)]
 pub struct Heap {
+    /// The ABI context header (ADR-0079): shadow-stack storage + the pending-tail flag, at
+    /// offset 0 so generated code and the sys mirror can reach it by fixed offsets.
+    header: CtxHeader,
     /// Stable base of the active allocation space (`cap` words; owns the allocation, freed in `Drop`).
     space: NonNull<u64>,
     /// Stable base of the idle space — the target of the next collection.
@@ -57,11 +100,11 @@ pub struct Heap {
     /// after each collection ([`rebuild_starts`](Heap::rebuild_starts)); packed 64 words per `u64`
     /// (~0.2 % of the space).
     starts_bits: Vec<u64>,
-    /// The **shadow stack** (ADR-0066 §1): the authoritative root set for a collection. Each entry is
-    /// a value slot the collector rewrites in place on relocation; a [`Root`] indexes it. `alloc`
-    /// feeds this to the collector on overflow, so a value rooted here survives (and is reloaded via
-    /// [`Heap::get`]). A `Value`/`TaggedWord`, never a Rust reference into the heap (ADR-0063 §2).
-    roots: Vec<TaggedWord>,
+    // The **shadow stack** (ADR-0066 §1) lives in `header` (ADR-0079): `roots_base[0..roots_len]`
+    // are value slots the collector rewrites in place on relocation; a [`Root`] indexes them.
+    // `alloc` feeds them to the collector on overflow, so a value rooted here survives (and is
+    // reloaded via [`Heap::get`]). Stored as raw `u64` bits (`TaggedWord` is `repr(transparent)`),
+    // never a Rust reference into the heap (ADR-0063 §2).
     /// Debug-only per-slot generation stamps (ADR-0066 §2): let [`Heap::get`] catch a stale `Root`
     /// whose slot index was popped and reused (an ABA the bare bounds check misses). No release cost.
     #[cfg(debug_assertions)]
@@ -100,6 +143,9 @@ pub struct Heap {
     trace: bool,
 }
 
+// ADR-0079 §1: the header IS offset 0 of the context pointer.
+const _: () = assert!(core::mem::offset_of!(Heap, header) == 0);
+
 /// A handle to a value rooted on the shadow stack (ADR-0066 §2). `Copy`, borrows nothing, and is only
 /// a slot index (plus a debug generation stamp) — so it survives shadow-stack growth and never locks
 /// the [`Heap`]. Valid only within its [`RootFrame`]; the API is `pub(crate)`, a trusted discipline.
@@ -133,12 +179,17 @@ impl Heap {
     /// `2 * words_per_space` — the semi-space memory factor, ADR-0064 §2 / Consequences.)
     pub fn new(words_per_space: usize) -> Heap {
         Heap {
+            header: CtxHeader {
+                roots_base: alloc_space(ROOTS_INITIAL_CAP).as_ptr(),
+                roots_len: 0,
+                roots_cap: ROOTS_INITIAL_CAP as u64,
+                pending_tail: 0,
+            },
             space: alloc_space(words_per_space),
             reserve: alloc_space(words_per_space),
             cap: words_per_space,
             top: 0,
             starts_bits: vec![0u64; words_per_space.div_ceil(64)],
-            roots: Vec::new(),
             #[cfg(debug_assertions)]
             root_gens: Vec::new(),
             #[cfg(debug_assertions)]
@@ -205,12 +256,14 @@ impl Heap {
             "pv_tailcall: pending-tail slot already set (protocol violation)"
         );
         self.pending_tail = Some((f, args));
+        self.header.pending_tail = 1; // the ADR-0079 fast-path flag mirrors the Option
     }
 
     /// Take the pending-tail `(f, args)`, clearing the slot (ADR-0071 §4). `None` = the body returned a
     /// real value (index-path heaps never set it).
     #[inline]
     pub(crate) fn take_pending_tail(&mut self) -> Option<(TaggedWord, Vec<TaggedWord>)> {
+        self.header.pending_tail = 0; // cleared with the Option (ADR-0079 fast-path flag)
         self.pending_tail.take()
     }
 
@@ -263,20 +316,36 @@ impl Heap {
     // codegen — all of which emit statically balanced, stack-ordered frames. The debug build stamps
     // each slot with a generation so a stale/reused-index `Root` is caught (§2 misuse boundary).
 
+    /// The current shadow-stack length (root count) — the header is authoritative (ADR-0079).
+    #[inline]
+    fn roots_len(&self) -> usize {
+        self.header.roots_len as usize
+    }
+
     /// Open a shadow-stack frame — capture the current stack length as a [`RootFrame`] mark.
     #[inline]
     pub(crate) fn frame(&self) -> RootFrame {
         RootFrame {
-            len: self.roots.len(),
+            len: self.roots_len(),
         }
     }
 
     /// Push `v` onto the shadow stack; return a [`Root`] handle to its slot. The collector rewrites
     /// the slot on relocation, so [`get`](Heap::get) reads the current (post-collection) value.
+    /// This is ADR-0079's slow path: release codegen inlines the in-capacity store and reaches
+    /// this entry only to grow (which is the one action that moves `roots_base`).
     #[inline]
     pub(crate) fn root(&mut self, v: TaggedWord) -> Root {
-        let index = self.roots.len();
-        self.roots.push(v);
+        if self.header.roots_len == self.header.roots_cap {
+            self.grow_roots();
+        }
+        let index = self.roots_len();
+        // SAFETY: `index < roots_cap` after the growth check; `roots_base` is the region's stable
+        // base (same single-provenance discipline as the semi-spaces).
+        unsafe {
+            *self.header.roots_base.add(index) = v.to_bits();
+        }
+        self.header.roots_len += 1;
         #[cfg(debug_assertions)]
         let generation = {
             let g = self.next_gen;
@@ -291,9 +360,28 @@ impl Heap {
         }
     }
 
+    /// Double the shadow-stack region: allocate, copy the live prefix, free the old region, update
+    /// the header base/cap. The ONLY place `roots_base` moves (ADR-0079 §2).
+    #[cold]
+    fn grow_roots(&mut self) {
+        let old_cap = self.header.roots_cap as usize;
+        let new_cap = old_cap * 2;
+        let new_base = alloc_space(new_cap).as_ptr();
+        // SAFETY: disjoint regions; the live prefix is `roots_len <= old_cap` words.
+        unsafe {
+            core::ptr::copy_nonoverlapping(self.header.roots_base, new_base, self.roots_len());
+            drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(
+                self.header.roots_base,
+                old_cap,
+            )));
+        }
+        self.header.roots_base = new_base;
+        self.header.roots_cap = new_cap as u64;
+    }
+
     /// Read the **current** value of a root — the reload-after-safepoint step (ADR-0066 §2). In debug,
     /// asserts the slot has not been popped and reused (generation match); in release, a stale handle
-    /// whose index is past the top panics on the bounds check (safe — never out-of-bounds UB).
+    /// whose index is past the top is caught by the assert below (safe — never out-of-bounds UB).
     #[inline]
     pub(crate) fn get(&self, r: Root) -> TaggedWord {
         #[cfg(debug_assertions)]
@@ -301,17 +389,19 @@ impl Heap {
             self.root_gens[r.index], r.generation,
             "stale Root: shadow-stack slot was popped and reused"
         );
-        self.roots[r.index]
+        assert!(r.index < self.roots_len(), "Root index past the shadow-stack top");
+        // SAFETY: bounds-checked against `roots_len` just above; stable base.
+        unsafe { TaggedWord::from_bits(*self.header.roots_base.add(r.index)) }
     }
 
     /// Close a frame: truncate the shadow stack back to the mark, releasing every root pushed since.
     #[inline]
     pub(crate) fn pop_frame(&mut self, f: RootFrame) {
         debug_assert!(
-            f.len <= self.roots.len(),
+            f.len <= self.roots_len(),
             "pop_frame: mark exceeds shadow-stack top (double-pop / stale frame)"
         );
-        self.roots.truncate(f.len);
+        self.header.roots_len = f.len as u64;
         #[cfg(debug_assertions)]
         self.root_gens.truncate(f.len);
     }
@@ -321,7 +411,9 @@ impl Heap {
     /// the caller pushed the slot within the current frame.
     #[inline]
     fn root_slot(&self, i: usize) -> TaggedWord {
-        self.roots[i]
+        assert!(i < self.roots_len(), "root_slot index past the shadow-stack top");
+        // SAFETY: bounds-checked just above; stable base.
+        unsafe { TaggedWord::from_bits(*self.header.roots_base.add(i)) }
     }
 
     // --- C-ABI rooting (ADR-0071 §5): opaque `u64` handles codegen round-trips verbatim -----------
@@ -999,7 +1091,18 @@ impl Heap {
     /// Fed by disjoint field borrows — `self.space`/`self.reserve`/`self.top` are `Copy`, `self.roots`
     /// is borrowed mutably — so there is no `mem::take` window in which the root set is empty.
     fn gc(&mut self) {
-        self.top = collect_core(self.space, self.reserve, self.top, &mut self.roots);
+        // A transient `&mut [TaggedWord]` view of the shadow-stack region for the collector
+        // (`TaggedWord` is `repr(transparent)` over `u64`). Raw-parent -> temporary unique view ->
+        // back to raw-parent is the sanctioned borrow shape: the view dies before any further
+        // raw-pointer access to the region.
+        // SAFETY: `roots_base[0..roots_len]` is initialised and in-bounds; no other view exists.
+        let roots_view = unsafe {
+            core::slice::from_raw_parts_mut(
+                self.header.roots_base as *mut TaggedWord,
+                self.roots_len(),
+            )
+        };
+        self.top = collect_core(self.space, self.reserve, self.top, roots_view);
         // Swap the two stable base pointers (a `Copy` of the raw handles — no buffer re-borrow). The
         // shadow-stack slots were rewritten in place by `collect_core`; `root_gens` is unaffected
         // (same slots, new values).
@@ -1029,7 +1132,7 @@ impl Heap {
     #[cfg(test)]
     pub(crate) fn collect(&mut self, roots: &mut [TaggedWord]) {
         debug_assert!(
-            self.roots.is_empty(),
+            self.roots_len() == 0,
             "explicit-slice collect must not run with a non-empty shadow stack (ADR-0066 §4)"
         );
         self.top = collect_core(self.space, self.reserve, self.top, roots);
@@ -1050,8 +1153,8 @@ fn alloc_space(words: usize) -> NonNull<u64> {
 
 impl Drop for Heap {
     fn drop(&mut self) {
-        // SAFETY: `space`/`reserve` each came from `Box::into_raw` of a `[u64; cap]` boxed slice;
-        // rebuild the exact-length boxed slice to run its deallocation. Done once, on drop.
+        // SAFETY: `space`/`reserve`/`roots_base` each came from `Box::into_raw` of a boxed `[u64]`
+        // slice; rebuild the exact-length boxed slice to run its deallocation. Done once, on drop.
         unsafe {
             drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(
                 self.space.as_ptr(),
@@ -1060,6 +1163,10 @@ impl Drop for Heap {
             drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(
                 self.reserve.as_ptr(),
                 self.cap,
+            )));
+            drop(Box::from_raw(core::ptr::slice_from_raw_parts_mut(
+                self.header.roots_base,
+                self.header.roots_cap as usize,
             )));
         }
     }

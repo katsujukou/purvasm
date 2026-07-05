@@ -107,3 +107,49 @@ extern "C" {
     /// Force a by-need cell to its value; passes any non-cell through unchanged (ADR-0070).
     pub fn pv_force_if_byneed(ctx: *mut PVContext, v: PVWord) -> PVWord;
 }
+
+/* ══════════════════════════════════════════════════════════════════════════════════════════════
+ * GENERATED-CODE ABI (ADR-0079) — mirrored for layout verification, NOT for foreign use.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════ */
+
+/// The generated-code ABI context header (`pv_ctx_header` in `purvasm.h`, ADR-0079 §1): the first
+/// bytes of every `PVContext`. Mirrored here so the sys side carries the same compile-time layout
+/// assertions as the runtime's definition — a drift is layout, which Miri cannot see, so the two
+/// `const` nets below are the detection mechanism (ADR-0079 §1).
+///
+/// **A foreign provider must NOT read or write this** — the supported foreign surface is the
+/// `pv_*` functions above (ADR-0073 §2); exactly two consumers may rely on the prefix guarantee
+/// (generated code and the runtime/sys mirrors). It is `pub` only so a future privileged consumer
+/// (the safe-wrapper's internals, never its users) can name the type.
+#[repr(C)]
+pub struct PvCtxHeader {
+    /// The shadow stack's storage base (moves only on slow-path growth).
+    pub roots_base: *mut u64,
+    /// One past the top root = the next handle = the frame mark.
+    pub roots_len: u64,
+    /// Fast-path bound: `roots_len == roots_cap` → the slow-path `pv_root` grows.
+    pub roots_cap: u64,
+    /// `0` = no stashed generic tail (`pv_settle`'s fast path).
+    pub pending_tail: u64,
+}
+
+/// `PV_CTX_HEADER_VERSION` in `purvasm.h` (ADR-0079 §1). Bumped in lockstep with any
+/// [`PvCtxHeader`] layout change (alongside the `pv_ctx_abi_v<N>` link-time stamp).
+pub const PV_CTX_HEADER_VERSION: u32 = 1;
+
+// The sys half of the ADR-0079 §1 compile-time layout net (the runtime's definition carries the
+// identical assertions beside `CtxHeader` in `gc.rs`).
+const _: () = {
+    assert!(core::mem::size_of::<PvCtxHeader>() == 32);
+    assert!(core::mem::offset_of!(PvCtxHeader, roots_base) == 0);
+    assert!(core::mem::offset_of!(PvCtxHeader, roots_len) == 8);
+    assert!(core::mem::offset_of!(PvCtxHeader, roots_cap) == 16);
+    assert!(core::mem::offset_of!(PvCtxHeader, pending_tail) == 24);
+};
+
+extern "C" {
+    /// Run-time ABI-version backstop (ADR-0079 §1): the generated entry stub calls this once at
+    /// startup; a mismatch aborts loudly. Also the mechanism the ADR-0078 §5 driver-side ABI
+    /// check consumes. Not part of the foreign surface.
+    pub fn pv_abi_check(version: u32);
+}
