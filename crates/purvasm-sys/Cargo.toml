@@ -1,0 +1,6 @@
+[package]
+name = "purvasm-sys"
+version = "0.0.0"
+edition = "2021"
+description = "Raw extern \"C\" declarations of the purvasm pv_* C ABI — a 1:1 mirror of purvasm.h (ADR-0078 §3)"
+publish = false

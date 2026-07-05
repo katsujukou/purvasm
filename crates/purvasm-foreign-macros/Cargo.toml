@@ -1,0 +1,14 @@
+[package]
+name = "purvasm-foreign-macros"
+version = "0.0.0"
+edition = "2021"
+description = "The #[pv_foreign] attribute macro — the bindgen analogue of ADR-0078 §3"
+publish = false
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }

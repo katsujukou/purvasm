@@ -1,0 +1,15 @@
+[package]
+name = "purvasm-foreign"
+version = "0.0.0"
+edition = "2021"
+description = "Safe, idiomatic layer for writing purvasm native foreigns over the pv_* C ABI (ADR-0078)"
+publish = false
+
+[dependencies]
+purvasm-sys = { path = "../purvasm-sys" }
+purvasm-foreign-macros = { path = "../purvasm-foreign-macros" }
+
+[dev-dependencies]
+# Tests link the runtime's rlib front door (ADR-0071 §1) so leaves run in-process — and under
+# Miri (ADR-0078 Consequences). Foreign code itself depends only on purvasm-sys (ADR-0078 §2).
+purvasm-rt = { path = "../../runtime" }
