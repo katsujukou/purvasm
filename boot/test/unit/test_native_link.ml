@@ -101,12 +101,17 @@ let test_tagged_schema_parses_both_kinds () =
   in
   match Native_link.foreign_plan ~ulib_dir:d ~keys:[ "A.f"; "B.g"; "C.h" ] with
   | Error e -> Alcotest.fail e
-  | Ok { c_files; rust_crates } ->
+  | Ok { c_files; c_keys; rust_crates; rust_keys } ->
     Alcotest.(check strings)
       "c sources (shorthand + tagged)"
       [ Filename.concat d "A.foreign.c"; Filename.concat d "B.foreign.c" ]
       c_files;
-    Alcotest.(check strings) "rust crates" [ Filename.concat d "c-crate" ] rust_crates
+    Alcotest.(check strings) "c keys" [ "A.f"; "B.g" ] c_keys;
+    Alcotest.(check strings) "rust crates" [ Filename.concat d "c-crate" ] rust_crates;
+    Alcotest.(check strings)
+      "rust keys (the nm-audit expectation set)"
+      [ "C.h" ]
+      rust_keys
 
 (* Several keys naming one crate dedup to a single crate build (ADR-0078 §5). *)
 let test_plan_dedups_shared_crate () =
@@ -151,7 +156,7 @@ let test_unknown_kind_is_skipped () =
   in
   match Native_link.foreign_plan ~ulib_dir:d ~keys:[ "A.f" ] with
   | Error e -> Alcotest.fail e
-  | Ok { c_files; rust_crates } ->
+  | Ok { c_files; rust_crates; _ } ->
     Alcotest.(check strings) "no c" [] c_files;
     Alcotest.(check strings) "no rust" [] rust_crates
 

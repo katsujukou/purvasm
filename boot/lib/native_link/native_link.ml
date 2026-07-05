@@ -108,7 +108,13 @@ let manifest_foreign ~(ulib_dir : string) : (string * string) list =
     directories to fold into the bundle staticlib (ADR-0078 §5). *)
 type plan =
   { c_files : string list
+  ; c_keys : string list
+    (** the referenced keys the `.c` sources provide — with [rust_keys], the driver's input for
+        the against-runtime-intrinsics exactly-one check (ADR-0078 §5) *)
   ; rust_crates : string list
+  ; rust_keys : string list
+    (** the referenced keys the Rust crates provide — the `nm`-audit's expected-symbol set
+        (each key's expected symbol is `pvf_<mangle key>`, ADR-0078 §5) *)
   }
 
 (** Resolve the referenced [keys] against the manifest into a [plan], rejecting a key mapped by
@@ -116,8 +122,23 @@ type plan =
     validated by the driver, not delegated to archive-semantics linking). Keys with no mapping are
     omitted (they resolve from the runtime staticlib, whose duplicate/missing detection is the
     `nm`-audit step's job at bundle time). *)
-let foreign_plan ~(ulib_dir : string) ~(keys : string list) : (plan, string) result =
-  let m = manifest_providers ~ulib_dir in
+let foreign_plan_dirs ~(dirs : string list) ~(keys : string list) : (plan, string) result =
+  let m =
+    (* Providers from every manifest dir — the ulib overlay plus any project-local foreign dirs
+       (the boot escape-hatch form of ADR-0073 §3's "project build config" `source` mapping) —
+       with each provider's path resolved against ITS OWN dir. A cross-dir duplicate key is a
+       duplicate provider like any other. *)
+    List.concat_map
+      (fun dir ->
+         List.map
+           (fun (k, p) ->
+              ( k
+              , match p with
+                | C_source rel -> C_source (Filename.concat dir rel)
+                | Rust_crate rel -> Rust_crate (Filename.concat dir rel) ))
+           (manifest_providers ~ulib_dir:dir))
+      dirs
+  in
   let referenced = List.filter (fun (k, _) -> List.mem k keys) m in
   let dup =
     List.find_opt
@@ -127,11 +148,10 @@ let foreign_plan ~(ulib_dir : string) ~(keys : string list) : (plan, string) res
   match dup with
   | Some (k, _) -> Error (Printf.sprintf "duplicate native foreign provider for %s" k)
   | None ->
-    let abs rel = Filename.concat ulib_dir rel in
     let c_files =
       List.filter_map
         (function
-          | _, C_source rel -> Some (abs rel)
+          | _, C_source path -> Some path
           | _, Rust_crate _ -> None)
         referenced
       |> List.sort_uniq Stdlib.compare
@@ -139,12 +159,36 @@ let foreign_plan ~(ulib_dir : string) ~(keys : string list) : (plan, string) res
     let rust_crates =
       List.filter_map
         (function
-          | _, Rust_crate rel -> Some (abs rel)
+          | _, Rust_crate path -> Some path
           | _, C_source _ -> None)
         referenced
       |> List.sort_uniq Stdlib.compare
     in
-    Ok { c_files; rust_crates }
+    let rust_keys =
+      List.filter_map
+        (function
+          | k, Rust_crate _ -> Some k
+          | _, C_source _ -> None)
+        referenced
+      |> List.sort_uniq Stdlib.compare
+    in
+    let c_keys =
+      List.filter_map
+        (function
+          | k, C_source _ -> Some k
+          | _, Rust_crate _ -> None)
+        referenced
+      |> List.sort_uniq Stdlib.compare
+    in
+    Ok { c_files; c_keys; rust_crates; rust_keys }
+
+(** [foreign_plan_dirs] over a single ulib overlay dir — the pre-0078 call shape. *)
+let foreign_plan ~(ulib_dir : string) ~(keys : string list) : (plan, string) result =
+  foreign_plan_dirs ~dirs:[ ulib_dir ] ~keys
+
+(** The Rust-foreign bundle orchestration (ADR-0078 §5) — synthesis, cargo, and the `nm` audits —
+    re-exported so the CLI driver and the e2e harness share one implementation. *)
+module Bundle = Native_bundle
 
 (** The deduplicated absolute `.c` paths to compile for the referenced foreign [keys] (ADR-0073 §3):
     each referenced key the manifest maps, resolved against [ulib_dir]. Keys with no mapping are

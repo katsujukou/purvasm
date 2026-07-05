@@ -161,6 +161,21 @@ memory.
 > **boot escape hatch** (boot has no PureScript CST parser) and dissolves at Level 2+. The
 > provider map, exactly-one validation, bundle link, and `nm` audit are discovery-agnostic and
 > survive unchanged; only where the providers are *found* differs per level.
+>
+> **Progress (2026-07-05): the §5 driver orchestration and the acceptance demo are DONE on boot.**
+> `Native_link.foreign_plan` (tagged schema, duplicate-key rejection, `c_keys`/`rust_keys`) feeds
+> `emit_native_llvm`; the bundle synthesis / cargo drive (profile follows `--debug`, matching the
+> ADR-0079 stamp) / `nm` audits live in `Native_link.Bundle` (`native_bundle.ml`), shared verbatim
+> by the CLI and the e2e harness. Exactly-one is driver-validated across ALL provider classes:
+> packaged-vs-packaged at plan time, packaged-vs-runtime-intrinsic via the runtime archive's
+> enumerated `pvf_*` exports, and within-bundle via a defined-symbol **count == 1** audit
+> (`llvm-nm` preferred, OCaml-parsed — no `grep` pipeline whose exit status can mask a tool
+> failure). Acceptance e2e (`rust_foreign_bundle`): a scratch crate's `#[pv_foreign]` `&str`
+> leaf, bundled, audited, linked in place of the plain staticlib, and called through ordinary
+> `pvf_*` resolution — `writeLine (shout "ok")` → `OK!`; the full llvm-backend differential
+> group stays green beside it. Remaining for this record: the Level-2 CLI port of the same
+> orchestration (with convention-based discovery per the Correction above, ADR-0080's signature
+> reconstruction supplying arity/effect).
 
 ### 4. Panic containment at the `pvf_*` boundary
 

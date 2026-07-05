@@ -848,17 +848,24 @@ let llvm_run
       ?(modular = false)
       ?(debug = false)
       ?(foreign_c = [])
+      ?rt_a
       ?heap_words
       (t : C.term)
   : string
   =
-  let rt = Option.get (if debug then rt_staticlib_debug else rt_staticlib) in
+  (* [rt_a] overrides the runtime archive — the ADR-0078 §5 bundle test links the bundle
+     staticlib in place of the plain runtime one, exactly as the CLI driver swaps it. *)
+  let rt =
+    match rt_a with
+    | Some a -> a
+    | None -> Option.get (if debug then rt_staticlib_debug else rt_staticlib)
+  in
   let dir =
     Filename.concat
       (Filename.get_temp_dir_name ())
       (Printf.sprintf
          "purvasm_ll_%x"
-         (Hashtbl.hash (t, heap_words, modular, debug, foreign_c)))
+         (Hashtbl.hash (t, heap_words, modular, debug, foreign_c, rt_a)))
   in
   (try Sys.mkdir dir 0o755 with
    | Sys_error _ -> ());
@@ -1543,6 +1550,75 @@ let test_llvm_effect_show () =
     (C.App
        ( C.Foreign "Purvasm.Stdio.writeLineImpl"
        , C.App (C.Foreign "Data.Show.showIntImpl", int 42) ))
+
+(* --- ADR-0078 acceptance: a Rust `#[pv_foreign]` crate, end to end ---------------------------- *)
+
+(* The ADR-0078 acceptance demo: a scratch Rust foreign crate (over `crates/purvasm-foreign`) is
+   bundled with the runtime by [Native_link.Bundle] — the SAME code the CLI driver runs — nm-audited,
+   linked in place of the plain staticlib, and called through the ordinary `pvf_*` resolution:
+   `writeLine (shout "ok")` → "OK!\n". The leaf is arity-1 pure, matching boot's foreign-shape
+   default for unregistered keys (the ADR-0080 expedient). Requires `cargo`; skipped without it. *)
+let test_llvm_rust_foreign_bundle () =
+  if Sys.command "command -v cargo >/dev/null 2>&1" <> 0
+  then print_endline "NOTE: cargo not found; skipping the Rust foreign bundle e2e"
+  else (
+    let root = Option.get repo_root in
+    let dir = Filename.concat (Filename.get_temp_dir_name ()) "purvasm_rust_e2e" in
+    ignore (Sys.command (Printf.sprintf "mkdir -p %s/crate/src" (Filename.quote dir)));
+    let write path s =
+      let oc = open_out path in
+      output_string oc s;
+      close_out oc
+    in
+    write
+      (Filename.concat dir "crate/Cargo.toml")
+      (Printf.sprintf
+         "[package]\n\
+          name = \"e2e-foreign\"\n\
+          version = \"0.0.0\"\n\
+          edition = \"2021\"\n\
+          publish = false\n\n\
+          [dependencies]\n\
+          purvasm-foreign = { path = \"%s\" }\n\n\
+          [workspace]\n"
+         (Filename.concat root "crates/purvasm-foreign"));
+    write
+      (Filename.concat dir "crate/src/lib.rs")
+      "use purvasm_foreign::pv_foreign;\n\n\
+       #[pv_foreign(module = \"Test.E2E\", name = \"shoutImpl\")]\n\
+       fn shout(s: &str) -> String {\n\
+      \    format!(\"{}!\", s.to_uppercase())\n\
+       }\n";
+    let bundle_a =
+      match
+        Native_link.Bundle.build_bundle
+          ~dir
+          ~runtime_dir:(Filename.concat root "runtime")
+          ~debug:false
+          ~crates:[ Filename.concat dir "crate" ]
+      with
+      | Ok a -> a
+      | Error e -> Alcotest.fail e
+    in
+    (match
+       Native_link.Bundle.audit_bundle
+         ~dir
+         ~bundle_a
+         [ ( "Test.E2E.shoutImpl"
+           , Llvm_backend.Codegen_llvm.mangle_foreign "Test.E2E.shoutImpl" )
+         ]
+     with
+     | Ok () -> ()
+     | Error e -> Alcotest.fail e);
+    Alcotest.(check string)
+      "writeLine (shout \"ok\")"
+      "OK!\n"
+      (llvm_run
+         ~is_effect:true
+         ~rt_a:bundle_a
+         (C.App
+            ( C.Foreign "Purvasm.Stdio.writeLineImpl"
+            , C.App (C.Foreign "Test.E2E.shoutImpl", C.Lit (C.LString "ok")) ))))
 
 (* The `Purvasm.String` byte primitives (ADR-0052): build `"Hi"` in place via `unsafeNew` + `unsafeSetByte`
    (72='H', 105='i'), then `writeLine` it. Exercises the linear-build native leaves end to end (codegen →
@@ -2734,6 +2810,7 @@ let llvm_groups =
         ; Alcotest.test_case "record_union" `Quick test_llvm_record_union
         ; Alcotest.test_case "split_record_union" `Quick test_llvm_split_record_union
         ; Alcotest.test_case "effect_show" `Quick test_llvm_effect_show
+        ; Alcotest.test_case "rust_foreign_bundle" `Slow test_llvm_rust_foreign_bundle
         ; Alcotest.test_case
             "foreign_c_show_number_fraction"
             `Quick

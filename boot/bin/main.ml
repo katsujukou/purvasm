@@ -295,6 +295,14 @@ let resolve_runtime_include () =
     in
     Option.map (fun root -> Filename.concat root "runtime/include") (up (Sys.getcwd ()))
 
+(* Fail-or-value over the shared bundle orchestration (ADR-0078 §5, [Native_link.Bundle]): the
+   library reports [Error message]; the CLI prints and exits. *)
+let bundle_ok = function
+  | Ok v -> v
+  | Error e ->
+    Stdlib.Printf.eprintf "error: %s\n" e;
+    Stdlib.exit 1
+
 (* The LLVM native backend (ADR-0071/0072): lower optimised ANF to per-module `.ll` objects + an
    init/entry object (ADR-0072 §2/§3), compile each with `clang -c`, compile any ulib-shipped native
    `foreign` `.c` the program references (ADR-0073), and dead-strip-link them all with the runtime
@@ -306,6 +314,7 @@ let emit_native_llvm
       ~runtime_lib
       ~debug
       ~ulib
+      ~foreign_dirs
       ~heap_words
       ~surface
       anf
@@ -352,46 +361,109 @@ let emit_native_llvm
          (Filename.quote (Filename.concat bdir (tag ^ ".clang.log"))));
     obj
   in
-  (* Compile the ulib `.c` for each referenced foreign the manifest maps (ADR-0073 §3). The linker then
-     resolves each `pvf_*` symbol from exactly one provider — this `.o` or the runtime staticlib — so a
-     duplicate or missing provider is a link error, not a silent fallback. *)
+  (* Resolve the referenced foreigns into the validated provider plan (ADR-0078 §5): kind-split
+     (`.c` vs Rust crate), duplicate packaged providers rejected BY NAME before any link — the
+     driver, not archive-semantics linking, owns exactly-one for packaged providers. *)
+  let plan =
+    match Option.to_list ulib @ foreign_dirs with
+    | [] -> Native_link.{ c_files = []; c_keys = []; rust_crates = []; rust_keys = [] }
+    | dirs ->
+      (match
+         Native_link.foreign_plan_dirs
+           ~dirs
+           ~keys:(Llvm_backend.Codegen_llvm.foreign_keys_of split)
+       with
+       | Ok p -> p
+       | Error e ->
+         Stdlib.Printf.eprintf "error: %s\n" e;
+         Stdlib.exit 1)
+  in
+  (* Exactly-one across ALL provider classes (ADR-0078 §5): a packaged provider (C or Rust)
+     duplicating a runtime-intrinsic `pvf_*` would otherwise be resolved by archive member
+     selection — the final link silently picks one. Enumerate the runtime staticlib's `pvf_*`
+     exports once and reject any packaged key that collides, by name, before anything builds. *)
+  (match plan.Native_link.c_keys @ plan.Native_link.rust_keys with
+   | [] -> ()
+   | packaged ->
+     let pairs =
+       List.map (fun k -> k, Llvm_backend.Codegen_llvm.mangle_foreign k) packaged
+     in
+     bundle_ok (Native_link.Bundle.check_intrinsic_collisions ~dir:bdir ~rt_a:rt pairs));
+  (* Compile the ulib `.c` for each referenced foreign the plan maps (ADR-0073 §3). The linker then
+     resolves each `pvf_*` symbol from exactly one provider — this `.o`, the bundle, or the runtime
+     staticlib — so a missing provider is a link error, not a silent fallback. *)
   let foreign_objs =
-    match ulib with
-    | None -> []
-    | Some ud ->
-      let cfiles =
-        Native_link.foreign_c_files
-          ~ulib_dir:ud
-          ~keys:(Llvm_backend.Codegen_llvm.foreign_keys_of split)
+    match plan.Native_link.c_files with
+    | [] -> []
+    | cfiles ->
+      let inc =
+        match resolve_runtime_include () with
+        | Some p -> p
+        | None ->
+          Stdlib.prerr_endline
+            "error: purvasm.h not found for ulib native foreign. Set $PURVASM_INCLUDE or \
+             build runtime/.";
+          Stdlib.exit 1
       in
-      if cfiles = []
-      then []
-      else (
-        let inc =
-          match resolve_runtime_include () with
-          | Some p -> p
-          | None ->
-            Stdlib.prerr_endline
-              "error: purvasm.h not found for ulib native foreign. Set $PURVASM_INCLUDE \
-               or build runtime/.";
-            Stdlib.exit 1
+      List.mapi
+        (fun i src ->
+           let obj = Filename.concat bdir (Stdlib.Printf.sprintf "foreign_%d.o" i) in
+           sh
+             "clang -c foreign"
+             (Stdlib.Printf.sprintf
+                "clang -c %s %s -I%s %s -o %s 2>%s"
+                (Native_link.opt_cflags ())
+                (Native_link.section_cflags ())
+                (Filename.quote inc)
+                (Filename.quote src)
+                (Filename.quote obj)
+                (Filename.quote
+                   (Filename.concat bdir (Stdlib.Printf.sprintf "foreign_%d.log" i))));
+           obj)
+        cfiles
+  in
+  (* Rust foreign providers (ADR-0078 §5): synthesize the bundle crate (one staticlib folding the
+     runtime rlib + every reachable foreign crate — two Rust staticlibs cannot co-link), drive the
+     user's cargo in the profile matching this build (the ADR-0079 `pv_ctx_abi_v<N>` stamp is
+     profile-gated, so a mismatched pairing is a link error), `nm`-audit the produced archive
+     against the plan's expected `pvf_*` set (archive member selection can hide a dropped symbol
+     from the final link), and swap it in for the plain runtime staticlib. *)
+  let rt =
+    match plan.Native_link.rust_crates with
+    | [] -> rt
+    | crates ->
+      let root =
+        let rec up d =
+          if Sys.file_exists (Filename.concat d "runtime/Cargo.toml")
+          then Some d
+          else (
+            let p = Filename.dirname d in
+            if p = d then None else up p)
         in
-        List.mapi
-          (fun i src ->
-             let obj = Filename.concat bdir (Stdlib.Printf.sprintf "foreign_%d.o" i) in
-             sh
-               "clang -c foreign"
-               (Stdlib.Printf.sprintf
-                  "clang -c %s %s -I%s %s -o %s 2>%s"
-                  (Native_link.opt_cflags ())
-                  (Native_link.section_cflags ())
-                  (Filename.quote inc)
-                  (Filename.quote src)
-                  (Filename.quote obj)
-                  (Filename.quote
-                     (Filename.concat bdir (Stdlib.Printf.sprintf "foreign_%d.log" i))));
-             obj)
-          cfiles)
+        match up (Sys.getcwd ()) with
+        | Some r -> r
+        | None ->
+          Stdlib.prerr_endline
+            "error: runtime/ crate not found for the Rust foreign bundle. Run from the \
+             repo, or install a distribution that ships the runtime sources.";
+          Stdlib.exit 1
+      in
+      let a =
+        bundle_ok
+          (Native_link.Bundle.build_bundle
+             ~dir:bdir
+             ~runtime_dir:(Filename.concat root "runtime")
+             ~debug
+             ~crates:(List.map abspath crates))
+      in
+      bundle_ok
+        (Native_link.Bundle.audit_bundle
+           ~dir:bdir
+           ~bundle_a:a
+           (List.map
+              (fun k -> k, Llvm_backend.Codegen_llvm.mangle_foreign k)
+              plan.Native_link.rust_keys));
+      a
   in
   let objs =
     List.mapi
@@ -430,11 +502,40 @@ let native_action
       arg
       value
       ulib
+      foreign_dirs
   =
   mkdir_p (build_dir output);
   let em = split_module entry_module in
   let modules = Link.load ?ulib_dir:ulib ~outdir:corefn_dir ~entry_module:em () in
-  let term0 = Link.link ~resolver:Ffi.resolver modules ~entry_module:em ~entry in
+  (* Extend the FFI ladder with the manifest-carried native foreigns (ADR-0073 §3: boot's
+     native-foreign support IS the packaged/overlay providers): a key some manifest dir maps —
+     the ulib overlay or a --native-foreign project dir — resolves to a native [Foreign] leaf
+     (arity/effect from boot's registry defaults, the ADR-0080 expedient), so a packaged `.c`
+     or Rust-crate foreign lowers without a hand-added boot registry entry. *)
+  (* An explicitly named --native-foreign dir without a manifest is a user mistake (e.g. the
+     crate dir instead of the dir holding ulib.json) — fail loudly; the tolerant no-mapping
+     degradation is for the presence-driven ulib overlay only (ADR-0038). *)
+  List.iter
+    (fun dir ->
+       if not (Sys.file_exists (Filename.concat dir "ulib.json"))
+       then (
+         Stdlib.Printf.eprintf
+           "error: --native-foreign %s has no ulib.json (pass the directory containing \
+            the manifest, not the crate/source directory)\n"
+           dir;
+         Stdlib.exit 1))
+    foreign_dirs;
+  let manifest_keys =
+    List.concat_map
+      (fun dir -> List.map fst (Native_link.manifest_providers ~ulib_dir:dir))
+      (Option.to_list ulib @ foreign_dirs)
+  in
+  let resolver key =
+    match Ffi.resolver key with
+    | Some t -> Some t
+    | None -> if List.mem key manifest_keys then Some (Ast.Foreign key) else None
+  in
+  let term0 = Link.link ~resolver modules ~entry_module:em ~entry in
   (* The program's export surface, key → call fact (ADR-0077 §2): derived from the SAME code
      that writes each module's `.pmi` (`compile_module` → `interface_of`), so what native
      codegen bakes into a caller's `.o` is exactly the fact the `.pmi` hash cascade guards —
@@ -479,6 +580,7 @@ let native_action
       ~runtime_lib
       ~debug
       ~ulib
+      ~foreign_dirs
       ~heap_words
       ~surface
       anf
@@ -623,6 +725,21 @@ let native_cmd =
             "A ulib corefn dir of registry-package patches, overlaid over --corefn-dir \
              (ADR-0038).")
   in
+  let foreign_dirs =
+    Arg.(
+      value
+      & opt_all string []
+      & info
+          [ "native-foreign" ]
+          ~docv:"DIR"
+          ~doc:
+            "A directory whose ulib.json maps this project's own foreign keys to native \
+             sources (.c or a Rust crate, ADR-0078). Repeatable. The boot escape-hatch \
+             form of the project-source foreign channel (ADR-0073). NB: boot reads no \
+             signatures, so an unregistered key is assumed ARITY-1 (one value parameter; \
+             an effectful leaf is the arity-1 `a -> Effect b` shape) and pure for the \
+             effect analysis — signature-driven shapes arrive with Level 2 (ADR-0080).")
+  in
   let backend =
     Arg.(
       value
@@ -692,7 +809,8 @@ let native_cmd =
       $ e
       $ arg
       $ value
-      $ ulib)
+      $ ulib
+      $ foreign_dirs)
 
 let compile_cmd =
   let open Cmdliner in
