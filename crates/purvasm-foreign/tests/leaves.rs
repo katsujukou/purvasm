@@ -72,6 +72,14 @@ fn read_string(ctx: *mut PVContext, w: PVWord) -> String {
 
 /* ── tests ─────────────────────────────────────────────────────────────────────────────────── */
 
+/// The sys crate's mirrored `PV_CTX_HEADER_VERSION` must be the version this runtime accepts —
+/// the in-process form of the ADR-0078 §5 / ADR-0079 §1 version agreement (`pv_abi_check`
+/// aborts on mismatch, so this test passing IS the agreement).
+#[test]
+fn sys_header_version_agrees_with_runtime() {
+    unsafe { purvasm_sys::pv_abi_check(purvasm_sys::PV_CTX_HEADER_VERSION) }
+}
+
 #[test]
 fn pure_scalar_leaf_roundtrips() {
     with_rt(1 << 16, |ctx| unsafe {
