@@ -8,7 +8,6 @@ import Control.Monad.Reader (class MonadAsk, ReaderT, ask, runReaderT)
 import Control.Monad.State (class MonadState, StateT, get, put, runStateT)
 import Data.Either (Either)
 import Data.Tuple (Tuple)
-import Data.Tuple.Nested ((/\))
 import Effect (Effect)
 import Effect.Class (class MonadEffect)
 import Effect.Class.Console as Console
