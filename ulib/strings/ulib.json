@@ -1,19 +1,41 @@
 {
-  "dependencies": ["purvasm-regex"],
+  "dependencies": [
+    "purvasm-regex"
+  ],
   "test": {
     "repo": "https://github.com/purescript/purescript-strings",
     "ref": "v6.0.1",
     "testMain": "Test.Main",
-    "testDeps": ["assert", "console"],
+    "testDeps": [
+      "assert",
+      "console"
+    ],
     "fidelity": "bespoke",
     "xfail": [
-      "Data.String.CodeUnits / Unsafe / CodePoints: purvasm strings are UTF-8, code-point-semantic (ADR-0006); the upstream suite asserts the JS UTF-16 code-unit contract, so this package is the representation-divergent seam (ADR-0040 / ADR-0043 §5) — a JS run is a false signal, hence bespoke, not js",
-      "Data.String.Regex replace / replace': not implemented natively (ADR-0081 §2 ledger — undemanded; crashes loudly if reached)",
-      "Data.String.Regex search: not implemented natively (ADR-0081 §2 ledger — undemanded)",
-      "Data.String.Regex split: not implemented natively (ADR-0081 §2 ledger — undemanded)",
-      "Data.String.Regex flags g / i / m / s (global, ignoreCase, dotAll, and parseFlags \"g\"): rejected at construction — only the u flag (or none) is implemented (ADR-0081 §1)",
-      "Data.String.Regex named groups (?<name>...): outside the ADR-0081 floor — rejected at construction",
-      "Data.String.Regex class escapes \\w \\d \\s (and boundaries \\b): outside the ADR-0081 floor — rejected at construction"
+      "Data.String.CodeUnits / Unsafe / CodePoints: purvasm strings are UTF-8, code-point-semantic (ADR-0006); the upstream suite asserts the JS UTF-16 code-unit contract, so this package is the representation-divergent seam (ADR-0040 / ADR-0043 \u00a75) \u2014 a JS run is a false signal, hence bespoke, not js",
+      "Data.String.Regex replace / replace': not implemented natively (ADR-0081 \u00a72 ledger \u2014 undemanded; crashes loudly if reached)",
+      "Data.String.Regex search: not implemented natively (ADR-0081 \u00a72 ledger \u2014 undemanded)",
+      "Data.String.Regex split: not implemented natively (ADR-0081 \u00a72 ledger \u2014 undemanded)",
+      "Data.String.Regex flags g / i / m / s (global, ignoreCase, dotAll, and parseFlags \"g\"): rejected at construction \u2014 only the u flag (or none) is implemented (ADR-0081 \u00a71)",
+      "Data.String.Regex named groups (?<name>...): outside the ADR-0081 floor \u2014 rejected at construction",
+      "Data.String.Regex class escapes \\w \\d \\s (and boundaries \\b): outside the ADR-0081 floor \u2014 rejected at construction"
     ]
+  },
+  "foreignSigs": {
+    "Data.String.Common._localeCompare": {
+      "arity": 5,
+      "vsat": false,
+      "retVsat": false
+    },
+    "Data.String.Common.toLower": {
+      "arity": 1,
+      "vsat": false,
+      "retVsat": false
+    },
+    "Data.String.Common.toUpper": {
+      "arity": 1,
+      "vsat": false,
+      "retVsat": false
+    }
   }
 }

@@ -1,5 +1,8 @@
 {
   "foreign": {
     "Data.Show.showNumberImpl": "Data.Show.c"
+  },
+  "foreignSigs": {
+    "Data.Show.showNumberImpl": { "arity": 1, "vsat": false, "retVsat": false }
   }
 }
