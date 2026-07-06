@@ -17,6 +17,7 @@ import Test.Unit.Purvasm.Compiler.Compile as Compile
 import Test.Unit.Purvasm.Compiler.Ffi as Ffi
 import Test.Unit.Purvasm.Compiler.ForeignSig as ForeignSig
 import Test.Unit.Purvasm.Compiler.Link as Link
+import Test.Unit.Purvasm.Compiler.MiddleEnd.MatchCompile as MiddleEnd.MatchCompile
 import Test.Unit.Purvasm.Compiler.MiddleEnd.Normalize as MiddleEnd.Normalize
 import Test.Unit.Purvasm.Compiler.Util.Int64Decimal as Util.Int64Decimal
 import Test.Unit.Purvasm.Compiler.Util.MD5 as Util.MD5
@@ -24,6 +25,7 @@ import Test.Unit.Purvasm.Compiler.Util.MD5 as Util.MD5
 main :: Effect Unit
 main = runSpecAndExitProcess [ consoleReporter ] do
   MiddleEnd.Normalize.spec
+  MiddleEnd.MatchCompile.spec
   CESK.Translate.spec
   Bytecode.Lower.spec
   Bytecode.Lower.Match.spec

@@ -1,4 +1,4 @@
-# 0083. Match compilation to a shared ANF middle-end pass, and a byte-identity re-baseline
+# 0083. Match compilation to a shared ANF middle end, and a byte-identity cross-check
 
 - Status: Accepted
 - Date: 2026-07-07
@@ -45,77 +45,117 @@ call, not codegen-feature creep.
 
 ## Decision
 
-### 1. A shared ANF→ANF match-compilation pass, in both compilers
+### 1. One shared match compiler — a middle-end `CCase → dtree` builder, in both compilers
 
 Introduce one match compiler — a Maranget-style decision tree, generalising/relocating
-[0031](0031-decision-tree-matching.md) — as an **ANF→ANF pass**, written in boot (the reference)
-and faithfully ported to Level 2. ANF gains a **decision-tree construct**; the pass rewrites `CCase`
-into it, and **all three backends lower the decision tree, not `CCase`**:
-
-- `Vm.Codegen` drops its `Match_compile` call and emits the bytecode `switch`/branch ops from the
-  tree;
-- `codegen_ml` drops the `case_decision`/`emit_match` hybrid and emits from the tree uniformly
-  (a tag `match`/`if` chain — `ocamlopt` still switches the leaf integer test);
-- `codegen_llvm` drops the CPS cascade and emits an LLVM `switch` (tag/immediate) or equality-test
-  branch chain (boxed).
-
-`CCase` becomes a pass-*input* construct only — **no backend compiles it**.
-
-**The decision-tree IR must cover the full current binder vocabulary**, not just a tag switch —
-`Match_compile`, `codegen_ml`, and `codegen_llvm` today collectively handle `BCtor`, `BLit`
-(Int/Char/**Number/String**), `BArray`, `BRecord`, and **guarded** alternatives, and the new IR is
-the union. Pin the node kinds:
-
-- **`SwitchTag` / `SwitchImmediate`** — a multi-way branch on a constructor tag or an Int/Char
-  immediate at a scrutinee position (→ bytecode `switch`, LLVM `switch`, OCaml integer `match`).
-- **`TestLit` (equality-test tree, *not* a switch)** — for **boxed** `Number`/`String` literals,
-  which LLVM cannot `switch` on; lowered to an equality-call (`pv_eq_*`) branch chain. This node is
-  explicitly a *tree of eq-tests*, distinct from `SwitchImmediate`, so the boxed case is not forced
-  through a switch it cannot express.
-- **`TestArrayLength`** — an array length probe with an element-**bind** continuation (`BArray`).
-- **`GetField` / `GetElem` bindings** — record-field / array-element / ctor-argument **get-or-fail**
-  projections that bind a name for the subtree (the `BRecord`/`BArray`/`BCtor` field binders).
-- **`Guard` with a failure continuation** — a boolean guard whose *false* edge threads to the **next
-  alternative's** continuation, not to the shared default (preserving guarded fall-through
-  semantics).
-- **a `Fail`/default edge** — the "no alternative matched" continuation that every non-exhaustive
-  switch and every guard-failure ultimately flows to.
-
-The pass is the union of these; the whole-binder (`b @ _` as-pattern) and nested cases fall out of
-the standard Maranget construction over this node set.
-
-### 2. Position: late — after the optimiser, before codegen
-
-The pass runs **after the optimiser and immediately before codegen**, so pattern matches stay
-**structured (`CCase`) through optimisation**:
+[0031](0031-decision-tree-matching.md) — written in boot (the reference) and faithfully ported to
+Level 2. It is a **backend-agnostic middle-end function** producing an explicit decision-tree
+intermediate:
 
 ```
-CESK → Normalize → DictElim → [ Simplify / NbE inliner / Dbe ]  →  MatchCompile → codegen
-                              (--opt only)                          (required lowering, always last)
+Middle_end.Match_compile.compile : atom list -> alt list -> dtree
+```
+
+**Realisation note (implementation choice, 2026-07-07).** `dtree` is a **shared middle-end
+intermediate type, not a new `Anf.cexpr` constructor.** The ANF `cexpr`/`CCase` type is *unchanged*;
+each backend, at its existing `CCase` site, calls the shared `compile` to get a `dtree` and then
+lowers that:
+
+- `Vm.Codegen` splits today's `Match_compile` at the tree boundary — the Maranget tree-build moves
+  into `Middle_end.Match_compile`, the `pseudo`/`resolve`/back-patch **emission** stays in
+  `Vm.Codegen` as `lower_dtree` → bytecode `switch`/branch ops. A faithful split preserves the
+  fresh-occurrence order, so the bytecode is **byte-identical by construction**;
+- `codegen_ml` drops the `case_decision`/`case_cascade`/`emit_match` hybrid and lowers the `dtree`
+  uniformly (a tag `match`/`if` chain — `ocamlopt` still switches the leaf integer test);
+- `codegen_llvm` drops the CPS cascade and lowers the `dtree` to an LLVM `switch` (tag/immediate) or
+  equality-call branch chain (boxed), reproducing the cascade's rooting/safepoint discipline and
+  boxed-literal hoisting per tree node.
+
+This realises the accepted intent — one shared matcher; the optimiser still sees structured `CCase`
+(§2); every backend lowers the *same* tree, none runs its own matcher — while containing the blast
+radius: **`Anf.cexpr`, `transl`/`rev_transl`, and the four optimiser passes are untouched** (they
+never see a compiled tree, since `compile` is called at codegen entry, after them). `compile` is a
+pure `(scruts, alts) -> dtree` function, so the matcher is unit-testable in isolation on its tree
+output. (The originally-recorded form — a new `CMatch` `cexpr` node rewritten by an `expr -> expr`
+pass — was rejected during implementation for a larger blast radius and higher byte-identity risk
+with no present consumer of a post-match ANF.)
+
+**The `dtree` type must cover the full current binder vocabulary**, not just a tag switch —
+`Match_compile`, `codegen_ml`, and `codegen_llvm` today collectively handle `BCtor`, `BLit`
+(`LInt`/`LBool`/`LNumber`/`LString` — note there is **no `Char` literal**), `BArray`, `BRecord`, and
+**guarded** alternatives, and the `dtree` is the union. Node kinds (mirroring the existing bytecode
+matcher so the split stays byte-identical):
+
+- **`Switch_ctor`** — a multi-way branch on a constructor tag, each arm extracting its fields
+  (bytecode `Proj`, LLVM `pv_read_field`, OCaml `f.(i)`) before its subtree.
+- **`Switch_lit`** — a single multi-way branch keyed by literal, covering **all** of
+  `LInt`/`LBool`/`LNumber`/`LString` uniformly (exactly as today's bytecode `Switch_lit`). Each
+  backend chooses the discriminant: bytecode emits one `Switch_lit` op; OCaml a `match`; LLVM an
+  `icmp`-switch for the immediate `LInt`/`LBool` subset and a `pv_prim_eq_number`/`pv_prim_eq_string`
+  **equality chain** for the boxed `LNumber`/`LString` subset (which LLVM cannot `switch` on). The
+  "boxed literals must not be forced through a switch LLVM can't express" requirement is thus met at
+  **lowering** time, keeping the shared node a single `Switch_lit`.
+- **`Switch_len`** — an array-length branch, each arm extracting elements (`Proj_arr` /
+  `pv_prim_index_array` / `a.(i)`) before its subtree.
+- **record expansion** — records impose no discriminant (row-polymorphic; labels present by typing):
+  extract each label (`Get_field` / `pv_record_get` / `SMap.find`) into a sub-occurrence and widen
+  the column, no switch.
+- **guard fall-through** — a `Guarded` leaf tests each guard in order; all-false threads to the
+  **next rows' continuation** (recompiled remaining matrix), not the shared default, preserving
+  guarded fall-through ([0013](0013-adt-pattern-matching.md)).
+- **`Fail`** — the "no alternative matched / every guard fell through" leaf (bytecode `Fail`, LLVM
+  `pv_case_fail`, OCaml `stuck`).
+
+Var/as-pattern binders (`BVar`/`BNamed`) and nested cases fall out of the standard Maranget
+construction over this node set (leaf variable binds are `name := occurrence`).
+
+### 2. Position: late — at codegen entry, after the optimiser
+
+`compile` runs **at each code generator's entry, after all optimiser passes**, so pattern matches
+stay **structured (`CCase`) through optimisation**:
+
+```
+CESK → Transl → [ DictElim / Simplify / NbE inliner / Dbe ]  →  { Match_compile → lower } per backend
+                (native path only, today)                         (required lowering at codegen entry)
 ```
 
 This is the GHC placement, and it is load-bearing for the [0082](0082-native-codegen-port-to-level-2.md)
 optimiser track: the **NbE general inliner** wants structured matches for `case`-of-known-constructor
 and `case`-of-`case` — reductions that are natural on a `CCase` scrutinee and brittle-to-impossible on
 an already-lowered tag-`switch`. (Folding match compilation into `CESK → ANF` linearisation, the
-Grain placement, is rejected in Alternatives for exactly this reason.) `MatchCompile` is **required
-lowering**, so it runs in `--no-opt` too — `--no-opt` = `Normalize + DictElim + MatchCompile`; `--opt`
-inserts the optimiser before it.
+Grain placement, is rejected in Alternatives for exactly this reason.)
+
+Two facts pinned by reconnaissance shape *where* `compile` is called. (a) Boot's **bytecode path runs
+no optimiser at all** — it is `Transl.transl` → codegen (`pvm/compile.ml`, `pvm/image.ml`,
+`pvm/plink.ml`); only the **native** path runs `DictElim → Simplify → Dbe` (`bin/main.ml`). (b) There
+is **no `--opt`/`--no-opt` flag yet** — that split is [0082](0082-native-codegen-port-to-level-2.md)'s,
+still deferred. So this record adds no flag: `compile` is simply invoked at each backend's `CCase`
+site (bytecode `Vm.Codegen`, `codegen_ml`, `codegen_llvm`), which for the native path is already
+after the optimiser and for the bytecode path is right after `Transl`. When
+[0082](0082-native-codegen-port-to-level-2.md) later adds `--no-opt`, match compilation is unaffected
+— it already sits at codegen entry, after whatever optimiser ran. The direct ANF interpreters (the
+CESK oracle; boot's `Vm.eval_anf`) keep consuming `CCase` and never match-compile — they stay
+independent behavioural references.
 
 ### 3. Re-baseline byte-identity; behaviour by the differential
 
 Because boot and Level 2 change **together**, the gates stay live and become the refactor's proof:
 
-- **Bytecode `.pmo`/`.pmi` byte-identity** is re-run (Level 2 vs boot). Both sides now decision-tree
-  in the ANF pass and lower identically, so they stay byte-identical — at a **new absolute baseline**
-  (the bytes change; the old golden reference is replaced). Checked-in fixtures that pin bytecode
-  bytes are regenerated (the compiler `refPmo`/`refPmi` tests, any `.pmo` e2e fixtures).
-- **The four-way differential** (VM / OCaml-native / LLVM-native / JS, oracle-checked) is the
-  behaviour gate — it re-confirms every backend still computes the right values, in particular the
-  two boot native paths whose lowering changes most: `codegen_ml` (record-binder cascade → uniform
-  tree) and `codegen_llvm` (CPS cascade → decision tree). The OCaml-source path has **no**
-  byte-identity partner — the differential is its only gate — so it is exercised across the full
-  binder vocabulary (`BLit` Number/String, `BArray`, `BRecord`, guards) deliberately.
+- **Bytecode `.pmo`/`.pmi` byte-identity** is re-run (Level 2 vs boot). Both sides build the same
+  `dtree` from the same (post-`Transl`) `CCase` and lower it identically, so they stay byte-identical.
+  *Should* a faithful split perturb the bytes on both sides, that is a new absolute baseline and the
+  golden reference is replaced — the pins are **inline string literals** (`refPmo`/`refPmi`/
+  `refPmoDiaA`/`refPmiDiaA`) in the Level-2 test modules (`compiler/test/{Unit,E2E}/...`), regenerated
+  by re-running boot's `purvm compile` on the checked-in fixture corefn and pasting the emitted bytes
+  (no auto-regen script). In the event the split perturbed nothing and the golden was unchanged (see
+  Progress) — but the re-baseline path is kept here because a split *could* have moved the bytes.
+- **The differential** is the behaviour gate. Boot's e2e harness is four independent implementations
+  — **CESK oracle + VM-bytecode + OCaml-native + LLVM-native** (no JS leg lives in boot; the JS
+  backend is Level-2-side). It re-confirms every backend still computes the right values, in
+  particular the two boot native paths whose lowering changes most: `codegen_ml` (record-binder
+  cascade → uniform tree) and `codegen_llvm` (CPS cascade → decision tree). The OCaml-source path has
+  **no** byte-identity partner — the differential is its only gate — so it is exercised across the
+  full binder vocabulary (`BLit` Number/String, `BArray`, `BRecord`, guards) deliberately.
 
 ### 4. The native-codegen port is deferred to after this
 
@@ -171,9 +211,10 @@ checklist above.
   the shared ANF pass (and generalised to serve native too); its algorithm is unchanged in spirit.
 - A one-time, deliberate exception to [boot-freeze], scoped to this foundation fix; boot re-freezes
   after, now a *complete* reference (all three boot backends decision-tree).
-- Cost: a large refactor across boot (ANF type, the new pass, all three backends) and Level 2 (the
-  pass, bytecode lowering), plus a fixture re-baseline — but incrementally checked by the two live
-  gates.
+- Cost: a large refactor across boot (the shared builder + all three backends) and Level 2 (the
+  builder + bytecode lowering) — but incrementally checked by the two live gates at every step. (The
+  faithful split left the bytecode golden unchanged, so in the event no fixture re-baseline was
+  needed; §3 kept it as a possibility only because a split *could* have perturbed the bytes.)
 
 ## Alternatives considered
 
@@ -192,3 +233,36 @@ checklist above.
   the whole value of *now* is that boot can move with us and cross-check.
 - **Defer to after boot retires.** Then the refactor has no byte-identity cross-check at all (boot is
   gone) — exactly the safety this record buys by acting while the reference is alive. Rejected.
+
+## Progress
+
+- **2026-07-07 — Implemented (Option C), all gates green.** Shared matcher landed as a middle-end
+  intermediate (§1 realisation note): boot `Middle_end.Match_compile` (`middle_end/match_compile.ml`,
+  `compile : atom list -> alt list -> scrut_binds * dtree`) and its faithful Level-2 mirror
+  `Purvasm.Compiler.MiddleEnd.MatchCompile`. `Anf.cexpr`/`CCase`, `transl`/`rev_transl`, and the four
+  optimiser passes were untouched.
+  - **Bytecode (byte-identity):** boot `vm/match_compile.ml` split at the tree boundary — build moved
+    out, `lower_dtree` (pseudo/resolve/back-patch) stayed. All **292** fixture `.pvmo`/`.pvmi`
+    byte-for-byte identical to pre-refactor boot; Level-2 `.pmo`/`.pmi` still byte-identical to boot
+    (`refPmo`/`refPmi`/`refPmoDiaA` unit + e2e). **The faithful split perturbed nothing, so the golden
+    reference is unchanged — no fixture re-baseline was needed.**
+  - **Native (differential):** `codegen_ml` dropped its `friendly`/`case_decision`/`case_cascade`/
+    `emit_match` hybrid; `codegen_llvm` dropped its CPS cascade + `match_binder`. Both now lower the
+    shared `dtree`. The LLVM lowering roots **every** occurrence (scrutinees *and* extracted
+    sub-values), reading via `get_current` — the tree shares sub-occurrences across rows, and a guard
+    body may safepoint before its row's fall-through reuses them (the old per-alt cascade re-derived
+    them instead). Boxed `Number`/`String` literals are hoisted+rooted once at case entry; the boxed
+    `Switch_lit` subset lowers to a `pv_prim_eq_*` equality chain (LLVM cannot `switch` boxed), the
+    immediate subset to an LLVM `switch`. Ctor dispatch splits **by representation first** — one
+    `switch` over the immediate (nullary) arms, a separate one over the pointer (field-carrying) arms
+    — preserving the old cascade's kind guard (a field arm never `pv_read_field`s an immediate; a
+    `ctor_tag` hash collision between a nullary and a field ctor stays disambiguated by kind, as in
+    `codegen_ml`'s real-string-tag + arity match).
+  - **Gates:** boot e2e differential **218/218** (VM + OCaml-native + LLVM-native vs CESK oracle),
+    covering the tricky paths — `case_guard_fallthrough`, `string_lit_binder(_nested)`,
+    `number_lit_binder`, `array_binder_fallthrough/nested`, `record_binder`, `case_nested`,
+    `case_aspat`. Level-2 **99/99** unit (incl. byte-identity + a new `MatchCompile` `DTree`-structure
+    spec) and **3/3** e2e. `dune fmt` / `purs-tidy` clean.
+  - **Follow-ups:** ADR-0082 native-codegen port stays deferred (it now lowers the shared tree, no
+    per-backend matcher); `--no-opt` is 0082's to add (post-0083 it ends in the required
+    `MatchCompile`). `codegen_ml` retirement remains gated on §5's checklist.

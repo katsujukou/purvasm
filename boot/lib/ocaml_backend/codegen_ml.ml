@@ -12,6 +12,7 @@
 
 module A = Middle_end.Anf
 module C = Cesk.Ast
+module MC = Middle_end.Match_compile
 module SS = Set.Make (String)
 module IM = Map.Make (String) (* name → arity, for known-arity functions (hybrid calls) *)
 
@@ -383,98 +384,6 @@ let fresh =
     incr c;
     Printf.sprintf "%s%d" p !c
 
-(* The matcher, emitted in continuation-passing style: code that matches binder [b]
-   against the value-expression [scrut], runs [succ] on success and [fail] on failure.
-   This handles every binder kind — records via `SMap.find`, number/string literals via
-   structural equality — which OCaml patterns alone cannot. (A naive linear cascade; a
-   decision-tree lowering is a later perf slice, cf. ADR-0036.) *)
-let rec emit_match (b : C.binder) (scrut : string) (succ : string) (fail : string)
-  : string
-  =
-  match b with
-  | C.BNull -> succ
-  | C.BVar x -> Printf.sprintf "(let %s = %s in %s)" (mangle x) scrut succ
-  | C.BNamed (x, inner) ->
-    Printf.sprintf
-      "(let %s = %s in %s)"
-      (mangle x)
-      scrut
-      (emit_match inner scrut succ fail)
-  | C.BLit l -> Printf.sprintf "(if %s = %s then %s else %s)" scrut (lit l) succ fail
-  | C.BCtor (tag, subs) ->
-    let f = fresh "_f" in
-    let rec nest i = function
-      | [] -> succ
-      | s :: r -> emit_match s (Printf.sprintf "%s.(%d)" f i) (nest (i + 1) r) fail
-    in
-    Printf.sprintf
-      "(match %s with VData (%s, %s) when Array.length %s = %d -> %s | _ -> %s)"
-      scrut
-      (ocaml_string tag)
-      f
-      f
-      (List.length subs)
-      (nest 0 subs)
-      fail
-  | C.BArray subs ->
-    let f = fresh "_a" in
-    let rec nest i = function
-      | [] -> succ
-      | s :: r -> emit_match s (Printf.sprintf "%s.(%d)" f i) (nest (i + 1) r) fail
-    in
-    Printf.sprintf
-      "(match %s with VArray %s when Array.length %s = %d -> %s | _ -> %s)"
-      scrut
-      f
-      f
-      (List.length subs)
-      (nest 0 subs)
-      fail
-  | C.BRecord fields ->
-    let m = fresh "_m" in
-    let rec nest = function
-      | [] -> succ
-      | (l, s) :: r ->
-        emit_match s (Printf.sprintf "(SMap.find %s %s)" (ocaml_string l) m) (nest r) fail
-    in
-    Printf.sprintf "(match %s with VRecord %s -> %s | _ -> %s)" scrut m (nest fields) fail
-
-(* A binder is "friendly" (compilable to an OCaml pattern, so a case can use OCaml's
-   `match` and inherit `ocamlopt`'s decision tree) iff it contains no record binder — a
-   record is an `SMap`, not key-matchable in a pattern. A number literal is friendly:
-   bound as `VNumber v` with a `when v = f` guard (OCaml forbids only float literal
-   patterns, not bindings). *)
-let rec friendly (b : C.binder) : bool =
-  match b with
-  | C.BRecord _ -> false
-  | C.BNamed (_, i) -> friendly i
-  | C.BCtor (_, subs) | C.BArray subs -> List.for_all friendly subs
-  | _ -> true
-
-(* A friendly binder → an OCaml pattern plus the side guard conditions it needs (number
-   equalities), combined with `&&` at the arm. *)
-let rec ocaml_pat (b : C.binder) : string * string list =
-  match b with
-  | C.BNull -> "_", []
-  | C.BVar x -> mangle x, []
-  | C.BNamed (x, inner) ->
-    let p, g = ocaml_pat inner in
-    Printf.sprintf "(%s as %s)" p (mangle x), g
-  | C.BLit (C.LInt n) -> Printf.sprintf "(VInt %d)" n, []
-  | C.BLit (C.LBool b) -> Printf.sprintf "(VBool %b)" b, []
-  | C.BLit (C.LString s) -> Printf.sprintf "(VString %s)" (ocaml_string s), []
-  | C.BLit (C.LNumber f) ->
-    let v = fresh "_n" in
-    Printf.sprintf "(VNumber %s)" v, [ Printf.sprintf "(%s = %h)" v f ]
-  | C.BCtor (tag, subs) ->
-    let ps, gs = List.split (List.map ocaml_pat subs) in
-    ( Printf.sprintf "(VData (%s, [| %s |]))" (ocaml_string tag) (String.concat "; " ps)
-    , List.concat gs )
-  | C.BArray subs ->
-    let ps, gs = List.split (List.map ocaml_pat subs) in
-    Printf.sprintf "(VArray [| %s |])" (String.concat "; " ps), List.concat gs
-  | C.BRecord _ -> failwith "ocaml_pat: record binder is not friendly"
-
 (* [ae] maps a known-arity function's name to its arity; [lz] the lazily-bound names.
    The two are disjoint (a lazy member is never a direct lambda) given unique names. *)
 let rec expr (ae : int IM.t) (lz : SS.t) (e : A.expr) : string =
@@ -615,96 +524,119 @@ and cexpr (ae : int IM.t) (lz : SS.t) (c : A.cexpr) : string =
       (atom a)
       (expr ae lz t)
       (expr ae lz e)
-  | A.CCase (scruts, alts) -> case ae lz scruts alts
+  | A.CCase (scruts, alts) -> lower_dtree_ml ae lz scruts alts
 
-(* A case whose every binder is friendly compiles to an OCaml `match` — `ocamlopt` turns
-   that into a decision tree (each scrutinee examined once, tags switched), far better
-   than re-testing per alternative. A case containing a record binder falls back to the
-   CPS cascade ([case_cascade]). *)
-and case (ae : int IM.t) (lz : SS.t) (scruts : A.atom list) (alts : A.alt list) : string =
-  if List.for_all (fun (a : A.alt) -> List.for_all friendly a.binders) alts
-  then case_decision ae lz scruts alts
-  else case_cascade ae lz scruts alts
-
-and case_decision (ae : int IM.t) (lz : SS.t) (scruts : A.atom list) (alts : A.alt list)
+(* Lower a `case` via the shared decision tree ([Middle_end.Match_compile], ADR-0083):
+   one [match]/[if] chain per discriminant, occurrences ($dt<n>) bound as OCaml locals.
+   The tree fixes structure (heads, extraction order, guard fall-through); this only
+   turns each node into OCaml source, using [expr] for leaf bodies and guards. Records
+   ([Dexpand_record]) are `SMap.find`; boxed literals ride structural `=`; a number head
+   binds `VNumber v` with a `when v = f` guard (OCaml forbids only float literal
+   patterns). *)
+and lower_dtree_ml (ae : int IM.t) (lz : SS.t) (scruts : A.atom list) (alts : A.alt list)
   : string
   =
-  let scrut =
-    match scruts with
-    | [ s ] -> atom lz s
-    | ss -> "(" ^ String.concat ", " (List.map (atom lz) ss) ^ ")"
+  let scrut_binds, dt = MC.compile scruts alts in
+  (* An occurrence local ($dt<n>) → its OCaml ident; it holds a [value] like any bind. *)
+  let ov occ = mangle occ in
+  let bind_vars binds inner =
+    List.fold_right
+      (fun (v, occ) acc -> Printf.sprintf "(let %s = %s in %s)" (mangle v) (ov occ) acc)
+      binds
+      inner
   in
-  let n = List.length scruts in
-  let pat_of (a : A.alt) =
-    let ps, gs = List.split (List.map ocaml_pat a.binders) in
-    (if n = 1 then List.hd ps else "(" ^ String.concat ", " ps ^ ")"), List.concat gs
+  let extract_lets container proj_of extracts inner =
+    List.fold_right
+      (fun (so, pr) acc ->
+         Printf.sprintf "(let %s = %s in %s)" (ov so) (proj_of container pr) acc)
+      extracts
+      inner
   in
-  let arms (a : A.alt) =
-    let pat, pg = pat_of a in
-    let whenc (extra : string) =
-      match List.filter (fun s -> s <> "") (pg @ [ extra ]) with
-      | [] -> ""
-      | cs -> " when " ^ String.concat " && " cs
-    in
-    match a.result with
-    | A.Uncond e -> [ Printf.sprintf "  | %s%s -> %s" pat (whenc "") (expr ae lz e) ]
-    | A.Guarded gs ->
-      List.map
-        (fun (g, e) ->
-           Printf.sprintf
-             "  | %s%s -> %s"
-             pat
-             (whenc (Printf.sprintf "as_bool (%s)" (expr ae lz g)))
-             (expr ae lz e))
-        gs
-  in
-  Printf.sprintf
-    "(match %s with\n%s\n  | _ -> stuck \"no match\")"
-    scrut
-    (String.concat "\n" (List.concat_map arms alts))
-
-(* The general fallback: a CPS cascade. Scrutinees are bound once; each alt is tried in
-   order, its failure jumping to a shared thunk that runs the next alt (so the rest is
-   not duplicated). Handles every binder kind (records, etc.) via [emit_match]. *)
-and case_cascade (ae : int IM.t) (lz : SS.t) (scruts : A.atom list) (alts : A.alt list)
-  : string
-  =
-  let svars = List.map (fun _ -> fresh "_s") scruts in
-  let lets =
-    String.concat
-      ""
-      (List.map2 (fun v s -> Printf.sprintf "let %s = %s in " v (atom lz s)) svars scruts)
-  in
-  let alt_code (a : A.alt) (fail : string) : string =
-    let succ =
-      match a.result with
-      | A.Uncond e -> expr ae lz e
-      | A.Guarded gs ->
+  let rec lower : MC.dtree -> string = function
+    | MC.Dfail msg -> Printf.sprintf "(stuck %s)" (ocaml_string msg)
+    | MC.Dleaf (binds, e) -> bind_vars binds (expr ae lz e)
+    | MC.Dguard (binds, clauses, ft) ->
+      let inner =
         List.fold_right
-          (fun (g, e) acc ->
+          (fun (g, b) acc ->
              Printf.sprintf
                "(if as_bool (%s) then %s else %s)"
                (expr ae lz g)
-               (expr ae lz e)
+               (expr ae lz b)
                acc)
-          gs
-          fail
-    in
-    let rec nest bs vs =
-      match bs, vs with
-      | [], [] -> succ
-      | b :: bs, v :: vs -> emit_match b v (nest bs vs) fail
-      | _ -> failwith "codegen_ml: case binder/scrutinee arity mismatch"
-    in
-    nest a.binders svars
+          clauses
+          (lower ft)
+      in
+      bind_vars binds inner
+    | MC.Dswitch_ctor (occ, arms, default) ->
+      let f = fresh "_f" in
+      let proj_of c = function
+        | MC.Pfield j -> Printf.sprintf "%s.(%d)" c j
+        | _ -> assert false
+      in
+      let arm (tag, (a : MC.arm)) =
+        Printf.sprintf
+          "  | VData (%s, %s) when Array.length %s = %d -> %s"
+          (ocaml_string tag)
+          f
+          f
+          (List.length a.MC.extracts)
+          (extract_lets f proj_of a.MC.extracts (lower a.MC.sub))
+      in
+      Printf.sprintf
+        "(match %s with\n%s\n  | _ -> %s)"
+        (ov occ)
+        (String.concat "\n" (List.map arm arms))
+        (lower default)
+    | MC.Dswitch_lit (occ, arms, default) ->
+      let arm (l, sub) =
+        match l with
+        | C.LNumber fv ->
+          let n = fresh "_n" in
+          Printf.sprintf "  | VNumber %s when %s = %h -> %s" n n fv (lower sub)
+        | C.LInt _ | C.LBool _ | C.LString _ ->
+          Printf.sprintf "  | %s -> %s" (lit l) (lower sub)
+      in
+      Printf.sprintf
+        "(match %s with\n%s\n  | _ -> %s)"
+        (ov occ)
+        (String.concat "\n" (List.map arm arms))
+        (lower default)
+    | MC.Dswitch_len (occ, arms, default) ->
+      let a_arr = fresh "_a" in
+      let proj_of c = function
+        | MC.Pelem j -> Printf.sprintf "%s.(%d)" c j
+        | _ -> assert false
+      in
+      let arm (len, (a : MC.arm)) =
+        Printf.sprintf
+          "  | VArray %s when Array.length %s = %d -> %s"
+          a_arr
+          a_arr
+          len
+          (extract_lets a_arr proj_of a.MC.extracts (lower a.MC.sub))
+      in
+      Printf.sprintf
+        "(match %s with\n%s\n  | _ -> %s)"
+        (ov occ)
+        (String.concat "\n" (List.map arm arms))
+        (lower default)
+    | MC.Dexpand_record (occ, extracts, sub) ->
+      let m = fresh "_m" in
+      let proj_of c = function
+        | MC.Precord l -> Printf.sprintf "SMap.find %s %s" (ocaml_string l) c
+        | _ -> assert false
+      in
+      Printf.sprintf
+        "(match %s with VRecord %s -> %s | _ -> stuck \"case: not a record\")"
+        (ov occ)
+        m
+        (extract_lets m proj_of extracts (lower sub))
   in
-  let rec build = function
-    | [] -> "(stuck \"no match\")"
-    | a :: rest ->
-      let fk = fresh "_fk" in
-      Printf.sprintf "(let %s () = %s in %s)" fk (build rest) (alt_code a (fk ^ " ()"))
-  in
-  Printf.sprintf "(%s%s)" lets (build alts)
+  List.fold_right
+    (fun (occ, a) acc -> Printf.sprintf "(let %s = %s in %s)" (ov occ) (atom lz a) acc)
+    scrut_binds
+    (lower dt)
 
 (* Collect every bound name (see [bound_names]). *)
 

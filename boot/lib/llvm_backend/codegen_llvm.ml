@@ -4,8 +4,9 @@
       `if`, uncurried lambdas (lambda-lifted), and application through the eval/`apply` trampoline.
     - **Slice 2 — ADTs + `case`**: constructors (nullary → an immediate tag, saturated field-carrying →
       `pv_new_adt`, **unsaturated → a builder closure the runtime under-applies to a PAP**, ADR-0072 §5),
-      and the CPS-cascade matcher over `BNull`/`BVar`/`BNamed`/`BLit`(`Int`/`Bool`)/`BCtor` binders, with
-      guarded alternatives.
+      and `case` lowered from the shared decision tree (`Middle_end.Match_compile`, ADR-0083): a `switch`
+      per discriminant (ctor split by representation, then tag; boxed-literal equality chain for
+      `Number`/`String`), with guarded alternatives. Occurrences are rooted and reloaded per safepoint.
     - **Slice 3 — static records**: literals (`pv_new_record` over compile-time FNV-1a-64 label ids,
       sorted), the static `Accessor` and functional `Update` (id-keyed `pv_record_get`/`pv_record_set`),
       and the `BRecord` row-poly binder.
@@ -48,6 +49,7 @@
 
 module A = Middle_end.Anf
 module C = Cesk.Ast
+module MC = Middle_end.Match_compile
 module SS = Set.Make (String)
 module SM = Map.Make (String)
 
@@ -880,143 +882,6 @@ let rec binder_boxed_lits (b : C.binder) : C.lit list =
   | C.BCtor (_, subs) | C.BArray subs -> List.concat_map binder_boxed_lits subs
   | C.BRecord fields -> List.concat_map (fun (_, s) -> binder_boxed_lits s) fields
 
-(* Match [binder] against value operand [scrut] (ADR-0072 §5, the CPS cascade). On a mismatch, branch to
-   [fail]; on a match, fall through (in a new block) with the env extended by the binder's bindings. No
-   guest allocation happens inside a match, so [scrut] stays valid throughout (the body may allocate, but
-   its bound values are rooted on capture — root-on-create); a boxed literal's allocation is hoisted to
-   the alt entry and arrives through [lits] (root handles keyed by the literal, [binder_boxed_lits]). *)
-let rec match_binder
-          cx
-          (env : env)
-          ~(fail : string)
-          ~(lits : (C.lit * string) list)
-          (binder : C.binder)
-          (scrut : string)
-  : env
-  =
-  match binder with
-  | C.BNull -> env
-  | C.BVar x -> bind env x (root cx scrut)
-  | C.BNamed (x, inner) ->
-    let env = bind env x (root cx scrut) in
-    match_binder cx env ~fail ~lits inner scrut
-  | C.BLit ((C.LInt _ | C.LBool _) as l) ->
-    let lit =
-      match l with
-      | C.LInt n -> imm_int n
-      | C.LBool b -> imm_bool b
-      | _ -> assert false
-    in
-    let ok = fresh cx in
-    emit cx "  %s = icmp eq i64 %s, %s" ok scrut lit;
-    test_or_fail cx ok ~fail "lit_ok";
-    env
-  | C.BLit ((C.LNumber _ | C.LString _) as l) ->
-    (* Compare against the alt-entry-allocated literal via the runtime's `Eq` primop — the one tested
-       source of truth for IEEE (`NaN`/`±0.0`) and byte-equality semantics (ADR-0071 §6). The primop
-       reads, never allocates, so the invariant above holds. *)
-    let prim =
-      match l with
-      | C.LNumber _ -> "pv_prim_eq_number"
-      | _ -> "pv_prim_eq_string"
-    in
-    let h =
-      match List.find_opt (fun (k, _) -> compare k l = 0) lits with
-      | Some (_, h) -> h
-      | None -> failwith "codegen_llvm: boxed literal binder missing its hoisted value"
-    in
-    let eq = fresh cx in
-    emit
-      cx
-      "  %s = call i64 @%s(ptr %%ctx, i64 %s, i64 %s)"
-      eq
-      prim
-      scrut
-      (get_current cx h);
-    let pay = fresh cx in
-    emit cx "  %s = ashr i64 %s, 1" pay eq;
-    let ok = fresh cx in
-    emit cx "  %s = icmp ne i64 %s, 0" ok pay;
-    test_or_fail cx ok ~fail "lit_ok";
-    env
-  | C.BCtor (name, subs) ->
-    let idx = ctor_tag name in
-    let low = fresh cx in
-    emit cx "  %s = and i64 %s, 1" low scrut;
-    if subs = []
-    then (
-      (* Nullary → an immediate whose payload is the tag index (ADR-0064 §1). *)
-      let is_imm = fresh cx in
-      emit cx "  %s = icmp eq i64 %s, 1" is_imm low;
-      test_or_fail cx is_imm ~fail "nl_imm";
-      let pay = fresh cx in
-      emit cx "  %s = ashr i64 %s, 1" pay scrut;
-      let ok = fresh cx in
-      emit cx "  %s = icmp eq i64 %s, %d" ok pay idx;
-      test_or_fail cx ok ~fail "nl_tag";
-      env)
-    else (
-      (* Field-carrying → a pointer to an `Adt` (tag at raw word 0, field i at value slot 1+i). *)
-      let is_ptr = fresh cx in
-      emit cx "  %s = icmp eq i64 %s, 0" is_ptr low;
-      test_or_fail cx is_ptr ~fail "adt_ptr";
-      let tag = fresh cx in
-      emit cx "  %s = call i64 @pv_read_raw(ptr %%ctx, i64 %s, i64 0)" tag scrut;
-      let ok = fresh cx in
-      emit cx "  %s = icmp eq i64 %s, %d" ok tag idx;
-      test_or_fail cx ok ~fail "adt_tag";
-      List.fold_left
-        (fun env (i, sub) ->
-           let fld = fresh cx in
-           emit
-             cx
-             "  %s = call i64 @pv_read_field(ptr %%ctx, i64 %s, i64 %d)"
-             fld
-             scrut
-             (1 + i);
-           match_binder cx env ~fail ~lits sub fld)
-        env
-        (List.mapi (fun i s -> i, s) subs))
-  | C.BRecord fields ->
-    (* A row-polymorphic subset match (ADR-0012): the record *has* these labels by typing, so each field
-       read succeeds; only the sub-binders can fail. Reads are allocation-free, so [scrut] stays valid. *)
-    List.fold_left
-      (fun env (label, sub) ->
-         let fld = fresh cx in
-         emit
-           cx
-           "  %s = call i64 @pv_record_get(ptr %%ctx, i64 %s, i64 %s)"
-           fld
-           scrut
-           (label_id label);
-         match_binder cx env ~fail ~lits sub fld)
-      env
-      fields
-  | C.BArray subs ->
-    (* Exact-length element-wise match (ADR-0012): a wrong length is an ordinary fall-through; a
-       non-array scrutinee faults inside the primop (type-impossible → stuck). The empty array is
-       the immediate sentinel (ADR-0071 §6), which `LengthArray` reports as `0` — so `[]` matches
-       exactly the sentinel, and a heap `Array` (always non-empty) never matches it. Length and
-       element reads are allocation-free, so [scrut] stays valid. *)
-    let n = List.length subs in
-    let len = fresh cx in
-    emit cx "  %s = call i64 @pv_prim_length_array(ptr %%ctx, i64 %s)" len scrut;
-    let ok = fresh cx in
-    emit cx "  %s = icmp eq i64 %s, %s" ok len (imm_int n);
-    test_or_fail cx ok ~fail "arr_len";
-    List.fold_left
-      (fun env (i, sub) ->
-         let elt = fresh cx in
-         emit
-           cx
-           "  %s = call i64 @pv_prim_index_array(ptr %%ctx, i64 %s, i64 %s)"
-           elt
-           scrut
-           (imm_int i);
-         match_binder cx env ~fail ~lits sub elt)
-      env
-      (List.mapi (fun i s -> i, s) subs)
-
 (* Build a recursive group as **all-by-need `ByNeed` cells over one shared env** (ADR-0070 §4, mirroring
    the runtime `build_group`) and return [env] extended with each member bound to its (rooted) cell handle.
    Each member is a cell; its suspension is a nullary thunk over the shared env, whose body is the member's
@@ -1447,12 +1312,29 @@ and cexpr cx (env : env) ~(tail : bool) (c : A.cexpr) : string option =
       emit cx "  %s = call i64 @pv_new_adt(ptr %%ctx, i32 %d, ptr %s, i64 %d)" t idx p n;
       finish t)
   | A.CCase (scruts, alts) ->
-    (* The CPS cascade (ADR-0072 §5): try each alt in order; a binder mismatch jumps to the next alt;
-       an exhausted tail is `pv_case_fail`. Scrutinees are rooted and re-read per alt (`get_current`). *)
-    (* matching dereferences the scrutinee's structure, so force a by-need scrutinee. *)
-    let scrut_handles = List.map (fun a -> root cx (force_atom cx env a)) scruts in
-    let n = List.length alts in
-    let try_labels = List.init n (fun _ -> fresh_label cx "alt") in
+    (* The shared Maranget decision tree ([Middle_end.Match_compile], ADR-0083), lowered to LLVM.
+       Occurrences — scrutinees and every extracted sub-value — are **rooted** and re-read via
+       [get_current]: unlike the old per-alt cascade (which re-derived sub-values per alt from the
+       rooted scrutinees), the tree *shares* sub-occurrences across rows, and a guarded row's
+       fall-through reuses them after its guard body may have safepointed — so each must survive a
+       safepoint (root-reload, ADR-0064). Rooting is allocation-free, so it may sit between a raw
+       read and its use. Boxed `Number`/`String` literals are pre-allocated and rooted once at case
+       entry ([binder_boxed_lits]) so the tree walk itself never allocates. *)
+    let scrut_binds, dt = MC.compile scruts alts in
+    (* Root each scrutinee (forced — matching dereferences its structure). *)
+    let occ_env =
+      List.map (fun (occ, a) -> occ, root cx (force_atom cx env a)) scrut_binds
+    in
+    (* Hoist + root every boxed literal any arm compares against (NaN-safe key: [compare]). *)
+    let lit_env =
+      List.concat_map
+        (fun (alt : A.alt) -> List.concat_map binder_boxed_lits alt.binders)
+        alts
+      |> List.sort_uniq compare
+      |> List.map (fun l -> l, root cx (atom cx env (A.ALit l)))
+    in
+    let boxed_handle l = snd (List.find (fun (k, _) -> compare k l = 0) lit_env) in
+    let cur occ_env occ = get_current cx (List.assoc occ occ_env) in
     let fail_label = fresh_label cx "nomatch" in
     let merge = if tail then "" else fresh_label cx "casejoin" in
     let results = ref [] in
@@ -1468,49 +1350,219 @@ and cexpr cx (env : env) ~(tail : bool) (c : A.cexpr) : string option =
         emit cx "  br label %%%s" merge;
         results := (v, vb) :: !results)
     in
-    emit cx "  br label %%%s" (List.hd try_labels);
-    List.iteri
-      (fun i (alt : A.alt) ->
-         emit cx "%s:" (List.nth try_labels i);
-         let next_fail = if i + 1 < n then List.nth try_labels (i + 1) else fail_label in
-         (* Pre-allocate + root this alt's boxed literal binders (`Number`/`String`) before any
-            binder test runs, so the match itself stays allocation-free ([binder_boxed_lits]). *)
-         let lits =
-           List.concat_map binder_boxed_lits alt.binders
-           |> List.sort_uniq compare
-           |> List.map (fun l -> l, root cx (atom cx env (A.ALit l)))
-         in
-         let env' =
-           List.fold_left2
-             (fun env b h ->
-                match_binder cx env ~fail:next_fail ~lits b (get_current cx h))
-             env
-             alt.binders
-             scrut_handles
-         in
-         match alt.result with
-         | A.Uncond e -> run_body env' e
-         | A.Guarded gs ->
-           (* Test guards in order; the first true runs its body, all-false falls to the next alt. *)
-           let rec guards = function
-             | [] -> emit cx "  br label %%%s" next_fail
-             | (g, body) :: rest ->
-               (* A Boolean demand site: force a by-need guard result before reading its bit. *)
-               let gv = force_value cx (Option.get (expr cx env' ~tail:false g)) in
-               let pay = fresh cx in
-               emit cx "  %s = ashr i64 %s, 1" pay gv;
-               let bb = fresh cx in
-               emit cx "  %s = icmp ne i64 %s, 0" bb pay;
-               let yes = fresh_label cx "gyes"
-               and no = fresh_label cx "gno" in
-               emit cx "  br i1 %s, label %%%s, label %%%s" bb yes no;
-               emit cx "%s:" yes;
-               run_body env' body;
-               emit cx "%s:" no;
-               guards rest
+    (* Read a sub-value raw (allocation-free), then root it — extending [occ_env]. *)
+    let extract occ_env parent (sub_occ, pr) =
+      let raw = fresh cx in
+      (match pr with
+       | MC.Pfield j ->
+         emit
+           cx
+           "  %s = call i64 @pv_read_field(ptr %%ctx, i64 %s, i64 %d)"
+           raw
+           (cur occ_env parent)
+           (1 + j)
+       | MC.Pelem j ->
+         emit
+           cx
+           "  %s = call i64 @pv_prim_index_array(ptr %%ctx, i64 %s, i64 %s)"
+           raw
+           (cur occ_env parent)
+           (imm_int j)
+       | MC.Precord l ->
+         emit
+           cx
+           "  %s = call i64 @pv_record_get(ptr %%ctx, i64 %s, i64 %s)"
+           raw
+           (cur occ_env parent)
+           (label_id l));
+      (sub_occ, root cx raw) :: occ_env
+    in
+    let bind_leaf occ_env binds =
+      List.fold_left (fun env (v, occ) -> bind env v (List.assoc occ occ_env)) env binds
+    in
+    let switch_arms arms case_const =
+      let default_lbl = fresh_label cx "swdef" in
+      let arm_lbls = List.map (fun _ -> fresh_label cx "swarm") arms in
+      let cases =
+        List.map2
+          (fun a l -> Printf.sprintf "%s, label %%%s" (case_const a) l)
+          arms
+          arm_lbls
+      in
+      default_lbl, arm_lbls, cases
+    in
+    let rec lower occ_env (dt : MC.dtree) : unit =
+      match dt with
+      | MC.Dfail _ -> emit cx "  br label %%%s" fail_label
+      | MC.Dleaf (binds, e) -> run_body (bind_leaf occ_env binds) e
+      | MC.Dguard (binds, clauses, ft) ->
+        let env' = bind_leaf occ_env binds in
+        let rec guards = function
+          | [] -> lower occ_env ft
+          | (g, body) :: rest ->
+            (* A Boolean demand site: force a by-need guard result before reading its bit. *)
+            let gv = force_value cx (Option.get (expr cx env' ~tail:false g)) in
+            let pay = fresh cx in
+            emit cx "  %s = ashr i64 %s, 1" pay gv;
+            let bb = fresh cx in
+            emit cx "  %s = icmp ne i64 %s, 0" bb pay;
+            let yes = fresh_label cx "gyes"
+            and no = fresh_label cx "gno" in
+            emit cx "  br i1 %s, label %%%s, label %%%s" bb yes no;
+            emit cx "%s:" yes;
+            run_body env' body;
+            emit cx "%s:" no;
+            guards rest
+        in
+        guards clauses
+      | MC.Dswitch_ctor (occ, arms, default) ->
+        (* Dispatch by *representation first*, then by tag within each — mirroring the old
+           per-binder cascade's kind guard (ADR-0064 §1): a nullary ctor is an immediate carrying
+           its tag in the payload, a field-carrying ctor a pointer with its tag at raw word 0.
+           Keeping the two apart means a field arm never reads a field out of an immediate, and a
+           `ctor_tag` hash collision between a nullary and a field ctor stays disambiguated by kind
+           — parity with `codegen_ml` (which matches the real string tag + arity). *)
+        let scrut = cur occ_env occ in
+        let low = fresh cx in
+        emit cx "  %s = and i64 %s, 1" low scrut;
+        let is_imm = fresh cx in
+        emit cx "  %s = icmp eq i64 %s, 1" is_imm low;
+        let imm_blk = fresh_label cx "ctimm"
+        and ptr_blk = fresh_label cx "ctptr" in
+        emit cx "  br i1 %s, label %%%s, label %%%s" is_imm imm_blk ptr_blk;
+        let default_lbl = fresh_label cx "ctdef" in
+        let arm_lbls =
+          List.map (fun (tag, arm) -> tag, arm, fresh_label cx "ctarm") arms
+        in
+        let cases_for keep =
+          arm_lbls
+          |> List.filter (fun (_, (arm : MC.arm), _) -> keep arm.MC.extracts)
+          |> List.map (fun (tag, _, l) ->
+            Printf.sprintf "i64 %d, label %%%s" (ctor_tag tag) l)
+          |> String.concat " "
+        in
+        (* immediates → the nullary (no-extract) arms, keyed by payload tag *)
+        emit cx "%s:" imm_blk;
+        let itag = fresh cx in
+        emit cx "  %s = ashr i64 %s, 1" itag scrut;
+        emit
+          cx
+          "  switch i64 %s, label %%%s [ %s ]"
+          itag
+          default_lbl
+          (cases_for (fun e -> e = []));
+        (* pointers → the field-carrying arms, keyed by the tag at raw word 0 *)
+        emit cx "%s:" ptr_blk;
+        let ptag = fresh cx in
+        emit cx "  %s = call i64 @pv_read_raw(ptr %%ctx, i64 %s, i64 0)" ptag scrut;
+        emit
+          cx
+          "  switch i64 %s, label %%%s [ %s ]"
+          ptag
+          default_lbl
+          (cases_for (fun e -> e <> []));
+        List.iter
+          (fun (_, (arm : MC.arm), l) ->
+             emit cx "%s:" l;
+             let occ_env' =
+               List.fold_left (fun oe ex -> extract oe occ ex) occ_env arm.MC.extracts
+             in
+             lower occ_env' arm.MC.sub)
+          arm_lbls;
+        emit cx "%s:" default_lbl;
+        lower occ_env default
+      | MC.Dswitch_lit (occ, arms, default) ->
+        (match arms with
+         | [] -> lower occ_env default
+         | ((C.LInt _ | C.LBool _), _) :: _ ->
+           (* Immediate literals → a direct LLVM switch on the tagged word. *)
+           let scrut = cur occ_env occ in
+           let imm_of = function
+             | C.LInt n -> imm_int n
+             | C.LBool b -> imm_bool b
+             | _ -> assert false
            in
-           guards gs)
-      alts;
+           let default_lbl, arm_lbls, cases =
+             switch_arms arms (fun (l, _) -> Printf.sprintf "i64 %s" (imm_of l))
+           in
+           emit
+             cx
+             "  switch i64 %s, label %%%s [ %s ]"
+             scrut
+             default_lbl
+             (String.concat " " cases);
+           List.iter2
+             (fun (_, sub) l ->
+                emit cx "%s:" l;
+                lower occ_env sub)
+             arms
+             arm_lbls;
+           emit cx "%s:" default_lbl;
+           lower occ_env default
+         | ((C.LNumber _ | C.LString _), _) :: _ ->
+           (* Boxed literals cannot be `switch`ed — an equality chain against the hoisted rooted
+              handles, via the runtime `Eq` primop (the tested source of truth for IEEE / bytes). *)
+           let rec chain = function
+             | [] -> lower occ_env default
+             | (l, sub) :: rest ->
+               let prim =
+                 match l with
+                 | C.LNumber _ -> "pv_prim_eq_number"
+                 | _ -> "pv_prim_eq_string"
+               in
+               let eq = fresh cx in
+               emit
+                 cx
+                 "  %s = call i64 @%s(ptr %%ctx, i64 %s, i64 %s)"
+                 eq
+                 prim
+                 (cur occ_env occ)
+                 (get_current cx (boxed_handle l));
+               let pay = fresh cx in
+               emit cx "  %s = ashr i64 %s, 1" pay eq;
+               let ok = fresh cx in
+               emit cx "  %s = icmp ne i64 %s, 0" ok pay;
+               let arm_lbl = fresh_label cx "ltarm"
+               and next = fresh_label cx "ltnext" in
+               emit cx "  br i1 %s, label %%%s, label %%%s" ok arm_lbl next;
+               emit cx "%s:" arm_lbl;
+               lower occ_env sub;
+               emit cx "%s:" next;
+               chain rest
+           in
+           chain arms)
+      | MC.Dswitch_len (occ, arms, default) ->
+        let len = fresh cx in
+        emit
+          cx
+          "  %s = call i64 @pv_prim_length_array(ptr %%ctx, i64 %s)"
+          len
+          (cur occ_env occ);
+        let default_lbl, arm_lbls, cases =
+          switch_arms arms (fun (n, _) -> Printf.sprintf "i64 %s" (imm_int n))
+        in
+        emit
+          cx
+          "  switch i64 %s, label %%%s [ %s ]"
+          len
+          default_lbl
+          (String.concat " " cases);
+        List.iter2
+          (fun (_, (arm : MC.arm)) l ->
+             emit cx "%s:" l;
+             let occ_env' =
+               List.fold_left (fun oe ex -> extract oe occ ex) occ_env arm.MC.extracts
+             in
+             lower occ_env' arm.MC.sub)
+          arms
+          arm_lbls;
+        emit cx "%s:" default_lbl;
+        lower occ_env default
+      | MC.Dexpand_record (occ, extracts, sub) ->
+        let occ_env' = List.fold_left (fun oe ex -> extract oe occ ex) occ_env extracts in
+        lower occ_env' sub
+    in
+    lower occ_env dt;
     emit cx "%s:" fail_label;
     emit cx "  call void @pv_case_fail()";
     emit cx "  unreachable";
