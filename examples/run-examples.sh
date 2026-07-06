@@ -53,6 +53,7 @@ recursion-scheme Example.RecursionScheme.Main
 recursive-value  Example.RecursiveValue.Main
 transformer      Example.Transformer.Main
 rust-ffi         Example.RustFFI.Main LLVM-ONLY
+regex-demo       Example.RegexDemo.Main
 "
 
 if [ ! -x "$PURVM" ]; then

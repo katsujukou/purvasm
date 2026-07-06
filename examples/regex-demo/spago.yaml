@@ -1,0 +1,10 @@
+package:
+  name: ex-regex-demo
+  dependencies:
+    - arrays
+    - console
+    - effect
+    - either
+    - maybe
+    - prelude
+    - strings

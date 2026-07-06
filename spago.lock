@@ -258,6 +258,23 @@
           "dependencies": []
         }
       },
+      "ex-regex-demo": {
+        "path": "examples/regex-demo",
+        "core": {
+          "dependencies": [
+            "arrays",
+            "console",
+            "effect",
+            "either",
+            "maybe",
+            "prelude",
+            "strings"
+          ]
+        },
+        "test": {
+          "dependencies": []
+        }
+      },
       "ex-rust-ffi": {
         "path": "examples/rust-ffi",
         "core": {
