@@ -10,6 +10,8 @@
 module Regex.Core.Utf8
   ( toCodePoints
   , fromCodePoints
+  , cpAt
+  , sliceBytes
   ) where
 
 import Prelude
@@ -22,6 +24,43 @@ import Purvasm.String (byteAt, byteLength, unsafeNew, unsafeSetByte)
 -- The backend probe: "Å" (U+00C5) is two UTF-8 bytes but one UTF-16 unit.
 isUtf8 :: Boolean
 isUtf8 = byteLength "Å" == 2
+
+-- | The code point at byte/unit index `i` and its width — the matcher's inline decode
+-- | (ADR-0081 §1 byte-oriented scanning): no whole-input conversion. `i` must be in range
+-- | and on a code-point boundary (the matcher only advances by returned widths).
+cpAt :: String -> Int -> { cp :: Int, width :: Int }
+cpAt s i =
+  if isUtf8 then do
+    let b = byteAt s i
+    if b < 0x80 then { cp: b, width: 1 }
+    else if b < 0xE0 then { cp: (b - 0xC0) * 0x40 + (byteAt s (i + 1) - 0x80), width: 2 }
+    else if b < 0xF0 then
+      { cp:
+          (b - 0xE0) * 0x1000 + (byteAt s (i + 1) - 0x80) * 0x40
+            + (byteAt s (i + 2) - 0x80)
+      , width: 3
+      }
+    else
+      { cp:
+          (b - 0xF0) * 0x40000 + (byteAt s (i + 1) - 0x80) * 0x1000
+            + (byteAt s (i + 2) - 0x80) * 0x40
+            + (byteAt s (i + 3) - 0x80)
+      , width: 4
+      }
+  else do
+    let u = byteAt s i
+    if u >= 0xD800 && u < 0xDC00 && i + 1 < byteLength s then
+      { cp: (u - 0xD800) * 0x400 + (byteAt s (i + 1) - 0xDC00) + 0x10000, width: 2 }
+    else { cp: u, width: 1 }
+
+-- | Copy bytes/units `[lo, hi)` out into a fresh string (the ADR-0052 linear build) —
+-- | representation-agnostic: units in, units out, both modes verbatim.
+sliceBytes :: String -> Int -> Int -> String
+sliceBytes s lo hi = go (unsafeNew (hi - lo)) lo
+  where
+  go buf i =
+    if i >= hi then buf
+    else go (unsafeSetByte buf (i - lo) (byteAt s i)) (i + 1)
 
 -- | Decode a string into its code points (input valid by the runtime contract, ADR-0067 §5).
 toCodePoints :: String -> Array Int

@@ -11,13 +11,15 @@ module Regex.Core
 
 import Prelude
 
-import Data.Array (index, length, mapWithIndex, slice)
+import Data.Array (index, mapWithIndex)
+import Data.Array as Array
 import Data.Either (Either)
 import Data.Maybe (Maybe(..), isJust)
-import Regex.Core.Ast (Node)
+import Purvasm.String (byteLength)
+import Regex.Core.Ast (Node(..))
 import Regex.Core.Match (matchAt)
 import Regex.Core.Parser (parse)
-import Regex.Core.Utf8 (fromCodePoints, toCodePoints)
+import Regex.Core.Utf8 (cpAt, sliceBytes)
 
 -- | A compiled pattern. Abstract: consumers construct via `compile` only, so every `Regex`
 -- | in existence is inside the ADR-0081 floor.
@@ -38,24 +40,41 @@ source (Regex r) = r.source
 match :: Regex -> String -> Maybe (Array (Maybe String))
 match (Regex r) s = go 0
   where
-  cps = toCodePoints s
-  n = length cps
+  n = byteLength s
+
+  -- A pattern that can only match at the start (a leading `^`) is tried at position 0 only —
+  -- the search loop would otherwise cost O(|input|) even though every later start fails
+  -- immediately (the measured Lexer tax).
+  anchored = startsAnchored r.node
 
   go pos =
     if pos > n then Nothing
-    else case matchAt r.node cps pos r.ngroups of
+    else case matchAt r.node s pos r.ngroups of
       Just m -> Just (render pos m)
-      Nothing -> go (pos + 1)
+      Nothing ->
+        if anchored || pos >= n then Nothing
+        -- Advance by a whole code point: a byte inside a multi-byte sequence is not a
+        -- legal start position (it would mis-decode).
+        else go (pos + (cpAt s pos).width)
 
   render start m =
     mapWithIndex
       ( \i _ ->
-          if i == 0 then Just (sliceStr start m.end)
-          else index m.caps i # join <#> \sp -> sliceStr sp.start sp.end
+          if i == 0 then Just (sliceBytes s start m.end)
+          else index m.caps i # join <#> \sp -> sliceBytes s sp.start sp.end
       )
       m.caps
 
-  sliceStr lo hi = fromCodePoints (slice lo hi cps)
+-- Whether every path into the pattern begins with `^` (conservative syntactic check).
+startsAnchored :: Node -> Boolean
+startsAnchored = case _ of
+  AnchorStart -> true
+  Seq ns -> case index ns 0 of
+    Just h -> startsAnchored h
+    Nothing -> false
+  Group _ sub -> startsAnchored sub
+  Alt ns -> not (Array.null ns) && Array.all startsAnchored ns
+  _ -> false
 
 -- | Whether the pattern matches anywhere in the string.
 test :: Regex -> String -> Boolean

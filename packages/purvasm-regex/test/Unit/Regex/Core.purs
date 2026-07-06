@@ -54,20 +54,183 @@ main = runSpecAndExitProcess [ consoleReporter ] do
       test (compile' "^\\p{Lu}$") "Å" `shouldEqual` true
       test (compile' "^\\p{Lu}$") "å" `shouldEqual` false
       test (compile' "^[\\p{L}0-9_']+$") "año_3'" `shouldEqual` true
-
-  describe "the demanding Lexer patterns (JS oracle expectations)" do
-    it "line comment" do
-      match (compile' "^(?:--[^\\r\\n]*)") "-- hi\nrest"
-        `shouldEqual` Just [ Just "-- hi" ]
-    it "block comment (negative lookahead)" do
-      match (compile' "^(?:\\{-(-(?!\\})|[^-]+)*(-\\}|$))") "{- a - b -} tail"
-        `shouldEqual` Just [ Just "{- a - b -}", Just " b ", Just "-}" ]
-    it "int part" do
-      match (compile' "^(?:(0|[1-9][0-9_]*))") "1_000x"
-        `shouldEqual` Just [ Just "1_000", Just "1_000" ]
-    it "proper name" do
-      match (compile' "^(?:\\p{Lu}[\\p{L}0-9_']*)") "Über.rest"
-        `shouldEqual` Just [ Just "Über" ]
-    it "crlf runs" do
-      match (compile' "^(?:(?:\\r\\n)+)") "\r\n\r\nx"
-        `shouldEqual` Just [ Just "\r\n\r\n" ]
+  -- GENERATED from a live node `RegExp` oracle (gate 2, ADR-0081 §3) — the authoritative
+  -- ES semantics. Regenerate: node test/gen-oracle.mjs (script committed). Every one of
+  -- PureScript.CST.Lexer's demanding patterns, wrapped `^(?:…)` as the Lexer does.
+  describe "CST Lexer patterns vs the JS RegExp oracle" do
+    describe "block comment" do
+      it "case 1" do
+        match (compile' "^(?:\\{-(-(?!\\})|[^-]+)*(-\\}|$))") "{- a - b -} tail"
+          `shouldEqual` Just [ Just "{- a - b -}", Just " b ", Just "-}" ]
+      it "case 2" do
+        match (compile' "^(?:\\{-(-(?!\\})|[^-]+)*(-\\}|$))") "{- x"
+          `shouldEqual` Just [ Just "{- x", Just " x", Just "" ]
+      it "case 3" do
+        match (compile' "^(?:\\{-(-(?!\\})|[^-]+)*(-\\}|$))") "no comment"
+          `shouldEqual` Nothing
+    describe "line comment" do
+      it "case 1" do
+        match (compile' "^(?:--[^\\r\\n]*)") "-- hi\nrest"
+          `shouldEqual` Just [ Just "-- hi" ]
+      it "case 2" do
+        match (compile' "^(?:--[^\\r\\n]*)") "--\nx"
+          `shouldEqual` Just [ Just "--" ]
+      it "case 3" do
+        match (compile' "^(?:--[^\\r\\n]*)") "code"
+          `shouldEqual` Nothing
+    describe "shebang" do
+      it "case 1" do
+        match (compile' "^(?:#![^\\r\\n]*)") "#!/usr/bin/env x\nrest"
+          `shouldEqual` Just [ Just "#!/usr/bin/env x" ]
+      it "case 2" do
+        match (compile' "^(?:#![^\\r\\n]*)") "#!"
+          `shouldEqual` Just [ Just "#!" ]
+      it "case 3" do
+        match (compile' "^(?:#![^\\r\\n]*)") "x"
+          `shouldEqual` Nothing
+    describe "spaces" do
+      it "case 1" do
+        match (compile' "^(?: +)") "   x"
+          `shouldEqual` Just [ Just "   " ]
+      it "case 2" do
+        match (compile' "^(?: +)") " "
+          `shouldEqual` Just [ Just " " ]
+      it "case 3" do
+        match (compile' "^(?: +)") "x"
+          `shouldEqual` Nothing
+    describe "newline LF" do
+      it "case 1" do
+        match (compile' "^(?:\\n+)") "\n\nx"
+          `shouldEqual` Just [ Just "\n\n" ]
+      it "case 2" do
+        match (compile' "^(?:\\n+)") "\n"
+          `shouldEqual` Just [ Just "\n" ]
+      it "case 3" do
+        match (compile' "^(?:\\n+)") "x"
+          `shouldEqual` Nothing
+    describe "newline CRLF" do
+      it "case 1" do
+        match (compile' "^(?:(?:\\r\\n)+)") "\r\n\r\nx"
+          `shouldEqual` Just [ Just "\r\n\r\n" ]
+      it "case 2" do
+        match (compile' "^(?:(?:\\r\\n)+)") "\r\n"
+          `shouldEqual` Just [ Just "\r\n" ]
+      it "case 3" do
+        match (compile' "^(?:(?:\\r\\n)+)") "\rx"
+          `shouldEqual` Nothing
+    describe "module name" do
+      it "case 1" do
+        match (compile' "^(?:(?:(?:\\p{Lu}[\\p{L}0-9_']*)\\.)*)") "Data.List.rest"
+          `shouldEqual` Just [ Just "Data.List." ]
+      it "case 2" do
+        match (compile' "^(?:(?:(?:\\p{Lu}[\\p{L}0-9_']*)\\.)*)") "Foo."
+          `shouldEqual` Just [ Just "Foo." ]
+      it "case 3" do
+        match (compile' "^(?:(?:(?:\\p{Lu}[\\p{L}0-9_']*)\\.)*)") "x"
+          `shouldEqual` Just [ Just "" ]
+      it "case 4" do
+        match (compile' "^(?:(?:(?:\\p{Lu}[\\p{L}0-9_']*)\\.)*)") ""
+          `shouldEqual` Just [ Just "" ]
+    describe "proper name" do
+      it "case 1" do
+        match (compile' "^(?:\\p{Lu}[\\p{L}0-9_']*)") "Über.rest"
+          `shouldEqual` Just [ Just "Über" ]
+      it "case 2" do
+        match (compile' "^(?:\\p{Lu}[\\p{L}0-9_']*)") "Foo9_'x"
+          `shouldEqual` Just [ Just "Foo9_'x" ]
+      it "case 3" do
+        match (compile' "^(?:\\p{Lu}[\\p{L}0-9_']*)") "lower"
+          `shouldEqual` Nothing
+    describe "ident" do
+      it "case 1" do
+        match (compile' "^(?:[\\p{Ll}_][\\p{L}0-9_']*)") "año_3'"
+          `shouldEqual` Just [ Just "año_3'" ]
+      it "case 2" do
+        match (compile' "^(?:[\\p{Ll}_][\\p{L}0-9_']*)") "_x"
+          `shouldEqual` Just [ Just "_x" ]
+      it "case 3" do
+        match (compile' "^(?:[\\p{Ll}_][\\p{L}0-9_']*)") "Upper"
+          `shouldEqual` Nothing
+    describe "symbol" do
+      it "case 1" do
+        match (compile' "^(?:(?:[:!#$%&*+./<=>?@\\^|~-]|(?!\\p{P})\\p{S})+)") "<=>rest"
+          `shouldEqual` Just [ Just "<=>" ]
+      it "case 2" do
+        match (compile' "^(?:(?:[:!#$%&*+./<=>?@\\^|~-]|(?!\\p{P})\\p{S})+)") "+"
+          `shouldEqual` Just [ Just "+" ]
+      it "case 3" do
+        match (compile' "^(?:(?:[:!#$%&*+./<=>?@\\^|~-]|(?!\\p{P})\\p{S})+)") "±§rest"
+          `shouldEqual` Just [ Just "±" ]
+      it "case 4" do
+        match (compile' "^(?:(?:[:!#$%&*+./<=>?@\\^|~-]|(?!\\p{P})\\p{S})+)") "a"
+          `shouldEqual` Nothing
+    describe "hex" do
+      it "case 1" do
+        match (compile' "^(?:[a-fA-F0-9]{1,6})") "deadBEEF12"
+          `shouldEqual` Just [ Just "deadBE" ]
+      it "case 2" do
+        match (compile' "^(?:[a-fA-F0-9]{1,6})") "0"
+          `shouldEqual` Just [ Just "0" ]
+      it "case 3" do
+        match (compile' "^(?:[a-fA-F0-9]{1,6})") "xyz"
+          `shouldEqual` Nothing
+    describe "whitespace escape" do
+      it "case 1" do
+        match (compile' "^(?:\\\\[ \\r\\n]+\\\\)") "\\  \n \\rest"
+          `shouldEqual` Just [ Just "\\  \n \\" ]
+      it "case 2" do
+        match (compile' "^(?:\\\\[ \\r\\n]+\\\\)") "\\x"
+          `shouldEqual` Nothing
+    describe "string characters" do
+      it "case 1" do
+        match (compile' "^(?:[^\"\\\\]+)") "abc\"x"
+          `shouldEqual` Just [ Just "abc" ]
+      it "case 2" do
+        match (compile' "^(?:[^\"\\\\]+)") "a\\b"
+          `shouldEqual` Just [ Just "a" ]
+      it "case 3" do
+        match (compile' "^(?:[^\"\\\\]+)") "\""
+          `shouldEqual` Nothing
+    describe "raw string chars" do
+      it "case 1" do
+        match (compile' "^(?:\"\"\"\"{0,2}([^\"]+\"{1,2})*[^\"]*\"\"\")") "\"\"\"hi\"\"\"x"
+          `shouldEqual` Just [ Just "\"\"\"hi\"\"\"", Nothing ]
+      it "case 2" do
+        match (compile' "^(?:\"\"\"\"{0,2}([^\"]+\"{1,2})*[^\"]*\"\"\")") "\"\"\"a\"b\"\"\""
+          `shouldEqual` Just [ Just "\"\"\"a\"b\"\"\"", Just "a\"" ]
+      it "case 3" do
+        match (compile' "^(?:\"\"\"\"{0,2}([^\"]+\"{1,2})*[^\"]*\"\"\")") "\"\"\"\"\"\""
+          `shouldEqual` Just [ Just "\"\"\"\"\"\"", Nothing ]
+    describe "int part" do
+      it "case 1" do
+        match (compile' "^(?:(0|[1-9][0-9_]*))") "1_000x"
+          `shouldEqual` Just [ Just "1_000", Just "1_000" ]
+      it "case 2" do
+        match (compile' "^(?:(0|[1-9][0-9_]*))") "0"
+          `shouldEqual` Just [ Just "0", Just "0" ]
+      it "case 3" do
+        match (compile' "^(?:(0|[1-9][0-9_]*))") "0123"
+          `shouldEqual` Just [ Just "0", Just "0" ]
+      it "case 4" do
+        match (compile' "^(?:(0|[1-9][0-9_]*))") "x"
+          `shouldEqual` Nothing
+    describe "fraction part" do
+      it "case 1" do
+        match (compile' "^(?:[0-9_]+)") "0_5x"
+          `shouldEqual` Just [ Just "0_5" ]
+      it "case 2" do
+        match (compile' "^(?:[0-9_]+)") "9"
+          `shouldEqual` Just [ Just "9" ]
+      it "case 3" do
+        match (compile' "^(?:[0-9_]+)") "x"
+          `shouldEqual` Nothing
+    describe "hex int" do
+      it "case 1" do
+        match (compile' "^(?:[a-fA-F0-9]+)") "a1B2z"
+          `shouldEqual` Just [ Just "a1B2" ]
+      it "case 2" do
+        match (compile' "^(?:[a-fA-F0-9]+)") "0"
+          `shouldEqual` Just [ Just "0" ]
+      it "case 3" do
+        match (compile' "^(?:[a-fA-F0-9]+)") "g"
+          `shouldEqual` Nothing
