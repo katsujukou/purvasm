@@ -10,13 +10,11 @@ import Prelude
 
 import Data.Array (length, snoc, unsafeIndex)
 import Data.Either (Either(..))
-import Data.Enum (fromEnum, toEnum)
 import Data.Maybe (Maybe(..))
-import Data.String.CodePoints (toCodePointArray)
-import Data.String.CodePoints as CP
 import Partial.Unsafe (unsafePartial)
 import Regex.Core.Ast (ClsItem(..), Node(..))
 import Regex.Core.Unicode (Category(..))
+import Regex.Core.Utf8 (fromCodePoints, toCodePoints)
 
 -- | A parsed pattern and its capturing-group count (for the `match` result array width).
 type ParseResult = { node :: Node, ngroups :: Int }
@@ -25,7 +23,7 @@ type St = { cps :: Array Int, pos :: Int, ngroups :: Int }
 
 parse :: String -> Either String ParseResult
 parse src = do
-  let cps = map fromEnum (toCodePointArray src)
+  let cps = toCodePoints src
   r <- alternation { cps, pos: 0, ngroups: 0 }
   if r.st.pos < length r.st.cps then
     Left ("regex: unbalanced `)` at " <> show r.st.pos)
@@ -61,9 +59,7 @@ advance :: St -> St
 advance st = st { pos = st.pos + 1 }
 
 showCp :: Int -> String
-showCp cp = case (toEnum cp :: Maybe CP.CodePoint) of
-  Just c -> "`" <> CP.singleton c <> "`"
-  Nothing -> show cp
+showCp cp = "`" <> fromCodePoints [ cp ] <> "`"
 
 -- Alternation: sequence ('|' sequence)*
 alternation :: St -> Either String { node :: Node, st :: St }

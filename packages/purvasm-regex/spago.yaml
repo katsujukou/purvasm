@@ -3,11 +3,12 @@ package:
   dependencies:
     - arrays
     - either
-    - enums
+    - foldable-traversable
+    - lists
     - maybe
     - partial
     - prelude
-    - strings
+    - purvasm-base
   test:
     main: Test.Unit.Regex.Core
     dependencies:

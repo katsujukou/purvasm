@@ -13,14 +13,11 @@ import Prelude
 
 import Data.Array (index, length, mapWithIndex, slice)
 import Data.Either (Either)
-import Data.Enum (fromEnum, toEnum)
 import Data.Maybe (Maybe(..), isJust)
-import Data.String.CodePoints (toCodePointArray)
-import Data.String.CodePoints as CP
-import Partial.Unsafe (unsafePartial)
 import Regex.Core.Ast (Node)
 import Regex.Core.Match (matchAt)
 import Regex.Core.Parser (parse)
+import Regex.Core.Utf8 (fromCodePoints, toCodePoints)
 
 -- | A compiled pattern. Abstract: consumers construct via `compile` only, so every `Regex`
 -- | in existence is inside the ADR-0081 floor.
@@ -41,7 +38,7 @@ source (Regex r) = r.source
 match :: Regex -> String -> Maybe (Array (Maybe String))
 match (Regex r) s = go 0
   where
-  cps = map fromEnum (toCodePointArray s)
+  cps = toCodePoints s
   n = length cps
 
   go pos =
@@ -58,13 +55,7 @@ match (Regex r) s = go 0
       )
       m.caps
 
-  sliceStr lo hi =
-    CP.fromCodePointArray
-      (unsafePartial (map (\cp -> unsafeToCp cp) (slice lo hi cps)))
-
-  unsafeToCp :: Partial => Int -> CP.CodePoint
-  unsafeToCp cp = case toEnum cp of
-    Just c -> c
+  sliceStr lo hi = fromCodePoints (slice lo hi cps)
 
 -- | Whether the pattern matches anywhere in the string.
 test :: Regex -> String -> Boolean
