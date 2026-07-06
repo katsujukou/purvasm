@@ -1,0 +1,16 @@
+package:
+  name: purvasm-regex
+  dependencies:
+    - arrays
+    - either
+    - enums
+    - maybe
+    - partial
+    - prelude
+    - strings
+  test:
+    main: Test.Unit.Regex.Core
+    dependencies:
+      - effect
+      - spec
+      - spec-node
