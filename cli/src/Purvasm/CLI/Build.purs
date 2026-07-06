@@ -23,6 +23,7 @@ import Purvasm.CLI.Effect.Filesystem (FS, FilePath)
 import Purvasm.CLI.Effect.Filesystem as FS
 import Purvasm.CLI.Effect.Log (LOG)
 import Purvasm.CLI.Effect.Log as Log
+import Purvasm.CLI.ForeignSigs as ForeignSigs
 import Purvasm.CLI.Ulib (corefnPathFor, requireUlibDir)
 import Purvasm.Compiler.Bytecode.Artifact (interfaceOf, interfaceToString, moduleToString)
 import Purvasm.Compiler.Bytecode.Image (imageToString)
@@ -40,6 +41,7 @@ type Options =
   { corefnDir :: FilePath
   , outDir :: FilePath
   , entryModule :: String
+  , checkForeignSigs :: Boolean
   }
 
 options :: ArgParser Options
@@ -59,6 +61,13 @@ options = fromRecord
         "Name of the entry module which contains `main`,\n\
         \the entry point of the whole program. Defaults to `Main`."
         # ArgParser.default "Main"
+  , checkForeignSigs:
+      ArgParser.flag [ "--check-foreign-sigs" ]
+        "Reconstruct and check foreign signatures during the build (ADR-0080).\n\
+        \Off by default until a build-time consumer lands: source-channel lexing is\n\
+        \expensive on the native backend, and the standing checks are the\n\
+        \`foreign-sigs` command and tools/foreign-sigs-diff.sh."
+        # ArgParser.boolean
   }
 
 importNames :: Module -> Array String
@@ -108,7 +117,21 @@ cmd opts = do
   ulibDir <- requireUlibDir
   Log.debug $ Fmt.fmt @"Overlaying patched ulib from {dir}" { dir: ulibDir }
   mods <- loadClosure ulibDir opts.corefnDir opts.entryModule
-  let artifacts = map compileModule (depOrder mods)
+  -- The ADR-0080 source channel, opt-in until a build-time consumer lands (the native-codegen
+  -- port, §3 — which will also want the §4 `.pmi` shape caching): CST-lexing the foreign
+  -- frontier through the pure-PS regex engine is minutes on the native backend, so the
+  -- standing checks are the `foreign-sigs` command and the boot-registry differential, and
+  -- `--check-foreign-sigs` runs the hard diagnostics here on demand.
+  let ordered = depOrder mods
+  when opts.checkForeignSigs do
+    env <- ForeignSigs.loadEnv { ulibDir, corefnDir: opts.corefnDir }
+    -- Per-module (ADR-0033): resolve each module's shapes independently — no closure sweep.
+    total <- foldM
+      (\n m -> (n + _) <<< Map.size <$> ForeignSigs.moduleForeignSigs env m)
+      0
+      ordered
+    Log.debug $ Fmt.fmt @"foreign-sigs: {n} signatures resolved" { n: show total }
+  let artifacts = map compileModule ordered
   buildDir <- FS.joinPath [ opts.outDir, "_build" ]
   FS.mkdirP buildDir
   for_ artifacts \artifact -> do

@@ -6,11 +6,13 @@ import ArgParse.Basic as ArgParser
 import Data.Either (Either)
 import Purvasm.CLI.Build as Build
 import Purvasm.CLI.Compile as Compile
+import Purvasm.CLI.ForeignSigsCmd as ForeignSigsCmd
 import Purvasm.CLI.Version as Version
 
 data Command
   = Compile Compile.Options
   | Build Build.Options
+  | ForeignSigs ForeignSigsCmd.Options
 
 command :: ArgParser.ArgParser Command
 command =
@@ -21,6 +23,11 @@ command =
     , ArgParser.command [ "compile" ]
         "Compile a single module and emit pmi/pmo files"
         ((Compile <$> Compile.options) <* ArgParser.flagHelp)
+    , ArgParser.command [ "foreign-sigs" ]
+        "Dump the closure's reconstructed foreign signatures as JSON (ADR-0080). \
+        \Transitional: the Level-2 half of the boot-vs-Lv2 consistency differential, \
+        \removed once the native-codegen port retires boot."
+        ((ForeignSigs <$> ForeignSigsCmd.options) <* ArgParser.flagHelp)
     ]
     <* ArgParser.flagHelp
     <* ArgParser.flagInfo [ "--version", "-v" ] "Show version" Version.versionString

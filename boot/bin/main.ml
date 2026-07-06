@@ -812,6 +812,47 @@ let native_cmd =
       $ ulib
       $ foreign_dirs)
 
+(* The boot half of ADR-0080 §2's consistency differential (a frozen-boot exemption: the
+   validation mechanism the accepted record requires). Reads qualified foreign keys, one per
+   line, on stdin; prints a JSON object with the host registry's (arity, effectful) for every
+   key it implements — the intersection `tools/foreign-sigs-diff.sh` compares against the
+   Level-2 reconstruction. *)
+let foreign_sig_dump_action () =
+  let rec read_keys acc =
+    match In_channel.input_line In_channel.stdin with
+    | Some l when String.trim l <> "" -> read_keys (String.trim l :: acc)
+    | Some _ -> read_keys acc
+    | None -> List.rev acc
+  in
+  let entries =
+    read_keys []
+    |> List.filter_map (fun k ->
+      Option.map (fun (arity, _) -> k, arity, Ffi.effectful k) (Ffi.host k))
+    |> List.sort_uniq Stdlib.compare
+  in
+  (* Boot's host registry carries a single effectful bit; in the ADR-0034 dual summary a
+     boot perform leaf is [ret_vsat] (its saturation returns an `Effect` thunk), never [vsat]
+     (boot provides no uncurried `EffectFn` leaf). So emit [vsat=false, ret_vsat=eff]. *)
+  let line (k, arity, eff) =
+    Stdlib.Printf.sprintf
+      "  %S: {\"arity\": %d, \"vsat\": false, \"retVsat\": %b}"
+      k
+      arity
+      eff
+  in
+  Stdlib.print_string ("{\n" ^ String.concat ",\n" (List.map line entries) ^ "\n}\n")
+
+let foreign_sig_dump_cmd =
+  let open Cmdliner in
+  Cmd.v
+    (Cmd.info
+       "foreign-sig-dump"
+       ~doc:
+         "Print the host registry's (arity, effectful) as JSON for the foreign keys \
+          given on stdin (one per line) — the boot half of the ADR-0080 consistency \
+          differential.")
+    Term.(const foreign_sig_dump_action $ const ())
+
 let compile_cmd =
   let open Cmdliner in
   Cmd.v
@@ -842,7 +883,7 @@ let cmd =
   let open Cmdliner in
   Cmd.group
     (Cmd.info "purvm" ~version:"0.1.0" ~doc:"The PURVASM bytecode toolchain.")
-    [ build_cmd; native_cmd; compile_cmd; run_cmd; demo_cmd ]
+    [ build_cmd; native_cmd; compile_cmd; run_cmd; demo_cmd; foreign_sig_dump_cmd ]
 
 (* A toolchain error (a bad entry, a missing runtime lib, an unimplemented codegen path) is raised as
    [Failure]; surface it as a clean one-line CLI error rather than an uncaught-exception stack trace. *)

@@ -27,6 +27,7 @@ import Fmt as Fmt
 import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.CLI.Build as Build
 import Purvasm.CLI.Compile as Compile
+import Purvasm.CLI.ForeignSigsCmd as ForeignSigsCmd
 import Purvasm.CLI.Effect.Env (ENV, Env(..))
 import Purvasm.CLI.Effect.Env as Env
 import Purvasm.CLI.Effect.Filesystem (FS, FilesystemF(..))
@@ -51,6 +52,7 @@ main = do
     Right cmd -> runPvm case cmd of
       Options.Compile opts -> Compile.cmd opts
       Options.Build opts -> Build.cmd opts
+      Options.ForeignSigs opts -> ForeignSigsCmd.cmd opts
   where
   runPvm program = do
     res <- runPurvasmNative program
