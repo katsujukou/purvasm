@@ -15,6 +15,7 @@ import Test.Unit.Purvasm.Compiler.Bytecode.Lower.Match as Bytecode.Lower.Match
 import Test.Unit.Purvasm.Compiler.CESK.Translate as CESK.Translate
 import Test.Unit.Purvasm.Compiler.Compile as Compile
 import Test.Unit.Purvasm.Compiler.Ffi as Ffi
+import Test.Unit.Purvasm.Compiler.ForeignSig as ForeignSig
 import Test.Unit.Purvasm.Compiler.Link as Link
 import Test.Unit.Purvasm.Compiler.MiddleEnd.Normalize as MiddleEnd.Normalize
 import Test.Unit.Purvasm.Compiler.Util.Int64Decimal as Util.Int64Decimal
@@ -30,6 +31,7 @@ main = runSpecAndExitProcess [ consoleReporter ] do
   Bytecode.Artifact.spec
   Compile.spec
   Ffi.spec
+  ForeignSig.spec
   Link.spec
   Util.MD5.spec
   Util.Int64Decimal.spec
