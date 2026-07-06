@@ -18,12 +18,13 @@ module Purvasm.UlibTools.Stage
   , validate
   , stageDeclaredDeps
   , stageNativeForeign
+  , collectForeignSigs
   ) where
 
 import Prelude
 
 import Data.Array as Array
-import Data.Either (Either, either)
+import Data.Either (Either(..), either)
 import Data.Foldable (for_)
 import Data.Map as Map
 import Data.Maybe (Maybe(..), fromMaybe, maybe)
@@ -32,12 +33,13 @@ import Data.Set as Set
 import Data.String (Pattern(..))
 import Data.String as String
 import Data.Traversable (traverse)
-import Data.Tuple (Tuple(..))
+import Data.Tuple (Tuple(..), fst)
 import Fmt as Fmt
 import Purvasm.CLI.Effect.Filesystem (FS, FilePath)
 import Purvasm.CLI.Effect.Filesystem as FS
 import Purvasm.CLI.Effect.Process (PROC)
 import Purvasm.CLI.Effect.Process as Proc
+import Purvasm.Compiler.ForeignSig (ForeignShape, reconstructModule)
 import Purvasm.UlibTools.Manifest (Resolution(..))
 import Purvasm.UlibTools.Manifest as Manifest
 import Run (Run)
@@ -229,16 +231,20 @@ stageNativeForeign
   :: forall r
    . FilePath
   -> FilePath
+  -> Array (Tuple String ForeignShape)
   -> Run (FS + EXCEPT String + r) Unit
-stageNativeForeign ulibDir out = do
+stageNativeForeign ulibDir out foreignSigs = do
   ulibPkgs <- listDir ulibDir
   perPkg <- traverse readPkgForeign ulibPkgs
-  case Array.concat perPkg of
-    [] -> pure unit
-    entries -> do
-      staged <- traverse copyOne entries
+  let cFiles = Array.concat perPkg
+  -- Presence-driven (ADR-0038): write the aggregated manifest when there is *any* native `.c`
+  -- provider or *any* validated foreign shape to publish.
+  case cFiles, foreignSigs of
+    [], [] -> pure unit
+    _, _ -> do
+      staged <- traverse copyOne cFiles
       manifestPath <- FS.joinPath [ out, "ulib.json" ]
-      FS.writeText manifestPath (Manifest.renderForeignManifest staged)
+      FS.writeText manifestPath (Manifest.renderForeignManifest staged foreignSigs)
   where
   readPkgForeign pkg = do
     path <- FS.joinPath [ ulibDir, pkg, "ulib.json" ]
@@ -258,6 +264,68 @@ stageNativeForeign ulibDir out = do
     FS.writeText dest content
     relInOut <- FS.joinPath [ "native", pkg, srcRel ]
     pure (Tuple key relInOut)
+
+-- | The ADR-0080 §1 build-time validation: a ulib ships no source, so a consumer trusts the
+-- | `foreignSigs` declared in `ulib.json` for an overlaid module. `build` is where the source
+-- | still exists, so it validates that trust: for every patch module, reconstruct its foreign
+-- | shapes from the patch `.purs` and require the package's declared `foreignSigs` to match
+-- | **exactly** (same keys, same `(arity, vsat, retVsat)`) — a missing, extra, or divergent
+-- | declaration is a hard error naming the key. Returns the validated qualified `(key → shape)`
+-- | entries to aggregate into the staged manifest (the declared = reconstructed set).
+-- |
+-- | Only patch-bearing modules are validated: a `.c`-only package (`numbers`' `Data.Number`,
+-- | corefn kept verbatim, not overlaid) needs no `foreignSigs` — the consumer reconstructs it
+-- | from the registry source it holds (`.spago`), per the §1 provenance split.
+collectForeignSigs
+  :: forall r
+   . FilePath
+  -> Array Patch
+  -> Run (FS + EXCEPT String + r) (Array (Tuple String ForeignShape))
+collectForeignSigs ulibDir patches = do
+  -- declared foreignSigs per package (read each package's ulib.json once)
+  let pkgs = Set.toUnfoldable (Set.fromFoldable (map _.package patches)) :: Array String
+  declaredByPkg <- traverse readDeclared pkgs
+  let declared = Map.fromFoldable (Array.concat declaredByPkg)
+  -- reconstruct every patch module's foreigns from its source
+  reconstructedNested <- traverse reconstructPatch patches
+  let reconstructed = Array.concat reconstructedNested
+  -- exact cross-check, both directions
+  for_ reconstructed \(Tuple key shape) ->
+    case Map.lookup key declared of
+      Nothing -> throw $ Fmt.fmt
+        @"ulib: {key}: foreign reconstructs from source but is absent from ulib.json foreignSigs \
+        \(add it: {shape})"
+        { key, shape: show shape }
+      Just d
+        | d /= shape -> throw $ Fmt.fmt
+            @"ulib: {key}: ulib.json foreignSigs declares {d} but the source reconstructs {r}"
+            { key, d: show d, r: show shape }
+        | otherwise -> pure unit
+  let reconKeys = Set.fromFoldable (map fst reconstructed) :: Set.Set String
+  for_ (Map.keys declared) \key ->
+    when (not (Set.member key reconKeys)) $ throw $ Fmt.fmt
+      @"ulib: {key}: declared in ulib.json foreignSigs but no such foreign in the patch source"
+      { key }
+  pure reconstructed
+  where
+  readDeclared pkg = do
+    path <- FS.joinPath [ ulibDir, pkg, "ulib.json" ]
+    FS.readText path >>= case _ of
+      Nothing -> pure []
+      Just src -> either
+        (\e -> throw $ Fmt.fmt @"ulib: {pkg}/ulib.json: {e}" { pkg, e })
+        pure
+        (Manifest.parseForeignSigs src)
+
+  reconstructPatch { package, modName } = do
+    path <- FS.joinPath [ ulibDir, package, modName <> ".purs" ]
+    FS.readText path >>= case _ of
+      Nothing -> throw $ Fmt.fmt @"ulib: cannot read patch source {path}" { path }
+      Just src -> case reconstructModule src of
+        Left issue -> throw $ Fmt.fmt @"ulib: {modName}: {issue}"
+          { modName, issue: show issue }
+        Right rec -> pure
+          (map (\(Tuple ident shape) -> Tuple (rec.moduleName <> "." <> ident) shape) rec.sigs)
 
 -- | Directory entries via the FS effect (`Nothing`/absent → empty).
 listDir :: forall r. FilePath -> Run (FS + r) (Array String)

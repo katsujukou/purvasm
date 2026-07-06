@@ -8,6 +8,7 @@ module Purvasm.UlibTools.Manifest
   , TestSpec
   , parseDependencies
   , parseForeign
+  , parseForeignSigs
   , renderForeignManifest
   , parseTest
   , parseBowerDependencies
@@ -23,9 +24,12 @@ module Purvasm.UlibTools.Manifest
 
 import Prelude
 
+import Purvasm.Compiler.ForeignSig (ForeignShape, shapeFromJson, shapeToJson)
+
 import Data.Argonaut.Core (fromObject, fromString, stringify, toArray, toObject, toString)
 import Data.Argonaut.Parser (jsonParser)
 import Data.Array as Array
+import Data.Bifunctor (lmap)
 import Data.Either (Either(..), note)
 import Data.Map (Map)
 import Data.Map as Map
@@ -165,14 +169,38 @@ parseForeign src = do
   pair (Tuple k v) =
     Tuple k <$> note ("ulib.json: 'foreign." <> k <> "' must be a string") (toString v)
 
--- | Render the aggregated native-foreign manifest boot's native backend reads (ADR-0073 §3): a JSON
--- | object `{ "foreign": { <key>: <path>, … } }`, where each path is relative to the staged `ulib` dir.
--- | The inverse of [parseForeign] at the aggregation seam (staging writes it; boot reads it).
-renderForeignManifest :: Array (Tuple String String) -> String
-renderForeignManifest entries =
-  stringify (fromObject (Object.singleton "foreign" (fromObject inner)))
+-- | The `foreignSigs` object of a `ulib.json` (ADR-0080 §1): each foreign's qualified key → its
+-- | calling shape `{ arity, vsat, retVsat }`, author-declared and validated by `ulib-tools build`
+-- | against the source reconstruction. Mandatory for every foreign a ulib module's corefn retains
+-- | (the consumer trusts this, never the ulib source). Absent field ⇒ no declared shapes.
+parseForeignSigs :: String -> Either String (Array (Tuple String ForeignShape))
+parseForeignSigs src = do
+  json <- jsonParser src
+  obj <- note "ulib.json: top level is not an object" (toObject json)
+  case Object.lookup "foreignSigs" obj of
+    Nothing -> Right []
+    Just f -> do
+      fo <- note "ulib.json: 'foreignSigs' must be an object" (toObject f)
+      traverse pair (Object.toUnfoldable fo :: Array (Tuple String _))
   where
-  inner = Object.fromFoldable (map (\(Tuple k p) -> Tuple k (fromString p)) entries)
+  pair (Tuple k v) = Tuple k <$> lmap (\e -> "ulib.json: 'foreignSigs." <> k <> "': " <> e)
+    (shapeFromJson v)
+
+-- | Render the aggregated manifest boot's native backend + the compiler driver read: a JSON object
+-- | `{ "foreign": { <key>: <path>, … }, "foreignSigs": { <key>: <shape>, … } }`. The `foreign` map
+-- | (paths relative to the staged `ulib` dir) is boot's native-link input (ADR-0073 §3); the
+-- | `foreignSigs` map is the consumer's shape source for a ulib-overlaid module (ADR-0080 §1). The
+-- | inverse of [parseForeign]/[parseForeignSigs] at the aggregation seam.
+renderForeignManifest
+  :: Array (Tuple String String) -> Array (Tuple String ForeignShape) -> String
+renderForeignManifest foreignEntries sigEntries =
+  stringify $ fromObject $ Object.fromFoldable
+    [ Tuple "foreign" (fromObject foreignInner)
+    , Tuple "foreignSigs" (fromObject sigsInner)
+    ]
+  where
+  foreignInner = Object.fromFoldable (map (\(Tuple k p) -> Tuple k (fromString p)) foreignEntries)
+  sigsInner = Object.fromFoldable (map (\(Tuple k s) -> Tuple k (shapeToJson s)) sigEntries)
 
 -- | The package names of a `spago.yaml`'s first `dependencies:` block (its `package.dependencies`,
 -- | which precedes any `test.dependencies`). Block list form only — the form the in-repo packages

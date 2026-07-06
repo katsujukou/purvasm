@@ -7,7 +7,7 @@ import Data.Map as Map
 import Data.Maybe (Maybe(..))
 import Data.Set as Set
 import Data.Tuple (Tuple(..))
-import Purvasm.UlibTools.Manifest (Fidelity(..), Resolution(..), classifyDep, findCycle, inRepoClosure, parseBowerDependencies, parseDependencies, parseForeign, parsePackageSet, parseRegistryVersion, parseSpagoDependencies, parseTest, renderForeignManifest, repoSlug, stripVersion)
+import Purvasm.UlibTools.Manifest (Fidelity(..), Resolution(..), classifyDep, findCycle, inRepoClosure, parseBowerDependencies, parseDependencies, parseForeign, parseForeignSigs, parsePackageSet, parseRegistryVersion, parseSpagoDependencies, parseTest, renderForeignManifest, repoSlug, stripVersion)
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
 
@@ -39,12 +39,21 @@ spec = do
         isLeft (parseForeign "[]") `shouldEqual` true
 
     describe "renderForeignManifest" do
-      it "round-trips through parseForeign" do
+      it "round-trips the foreign map through parseForeign" do
         let entries = [ Tuple "A.f" "native/p/A.foreign.c", Tuple "B.g" "native/q/B.foreign.c" ]
-        map Map.fromFoldable (parseForeign (renderForeignManifest entries))
+        map Map.fromFoldable (parseForeign (renderForeignManifest entries []))
           `shouldEqual` Right (Map.fromFoldable entries)
-      it "renders an empty map as an empty foreign object" do
-        parseForeign (renderForeignManifest []) `shouldEqual` Right []
+      it "round-trips the foreignSigs map through parseForeignSigs" do
+        let
+          sigs =
+            [ Tuple "A.f" { arity: 2, vsat: true, retVsat: false }
+            , Tuple "B.g" { arity: 0, vsat: false, retVsat: true }
+            ]
+        map Map.fromFoldable (parseForeignSigs (renderForeignManifest [] sigs))
+          `shouldEqual` Right (Map.fromFoldable sigs)
+      it "renders empty maps as empty objects" do
+        parseForeign (renderForeignManifest [] []) `shouldEqual` Right []
+        parseForeignSigs (renderForeignManifest [] []) `shouldEqual` Right []
 
     describe "parseTest" do
       it "treats a missing test block as not-yet-tested" do

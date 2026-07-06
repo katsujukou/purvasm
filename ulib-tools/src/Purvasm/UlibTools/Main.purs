@@ -32,7 +32,7 @@ main :: Effect Unit
 main = do
   cliArgs <- Array.drop 2 <$> Process.argv
   case Options.parse cliArgs of
-    Left err -> Console.error (ArgParser.printArgError err)
+    Left err -> Console.error (ArgParser.printArgError err) *> Process.exit' 1
     Right cmd -> run case cmd of
       Options.Build opts -> Build.cmd opts
       Options.Verify opts -> Verify.cmd opts
@@ -43,7 +43,9 @@ main = do
     res <- runNode program
     case res of
       Right _ -> pure unit
-      Left err -> Console.error $ Fmt.fmt @"ulib-tools: {err}" { err }
+      -- A command failure (e.g. an ADR-0080 foreignSigs mismatch) must exit non-zero so CI
+      -- and the release pipeline actually gate on it.
+      Left err -> Console.error (Fmt.fmt @"ulib-tools: {err}" { err }) *> Process.exit' 1
 
 -- | Discharge the full effect row against the synchronous Node backend (cli-lib handlers).
 runNode

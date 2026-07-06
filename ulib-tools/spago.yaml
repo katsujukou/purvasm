@@ -5,6 +5,7 @@ package:
     - argparse-basic
     - arrays
     - cli-lib
+    - compiler
     - console
     - effect
     - either

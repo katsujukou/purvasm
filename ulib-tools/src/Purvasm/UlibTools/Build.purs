@@ -93,9 +93,14 @@ cmd opts = do
 
   FS.mkdirP out
   for_ patches (extractCorefn outputDir out)
-  -- ADR-0073: stage any native `foreign` `.c` + the aggregated manifest beside the corefn (all ulib
-  -- dirs, patch-bearing or `.c`-only).
-  Stage.stageNativeForeign opts.ulibDir out
+  -- ADR-0080 §1: reconstruct each patch module's foreign shapes from source and require the
+  -- packages' declared `foreignSigs` to match exactly (hard error otherwise) — the consumer
+  -- ships no ulib source, so this build-time check is what makes trusting the declared shapes
+  -- sound. The validated set is aggregated into the staged manifest.
+  foreignSigs <- Stage.collectForeignSigs opts.ulibDir patches
+  -- ADR-0073 + ADR-0080: stage any native `foreign` `.c` and write the aggregated manifest
+  -- (`foreign` provider map + validated `foreignSigs`) beside the corefn.
+  Stage.stageNativeForeign opts.ulibDir out foreignSigs
 
   _ <- Proc.exec "rm" [ "-rf", work ]
   Log.info $ Fmt.fmt @"ulib: wrote patched corefn to {out}" { out }
@@ -109,7 +114,9 @@ resolveOut opts = case opts.out of
     | opts.prepareRelease -> fromMaybe "dist/ulib" <$> Env.lookupEnv "PURVASM_LIB"
     | otherwise -> throw "ulib-tools build: one of --out or --prepare-release is required."
 
--- | Copy one patched module's compiled corefn into the flat output layout.
+-- | Copy one patched module's compiled corefn into the flat output layout. The overlay ships
+-- | corefn (+ any native `.c`) only — no source: foreign shapes travel via the manifest's
+-- | validated `foreignSigs` (ADR-0080 §1), not a staged copy of the patch source.
 extractCorefn :: forall r. FilePath -> FilePath -> Patch -> Run (FS + LOG + EXCEPT String + r) Unit
 extractCorefn outputDir out { modName } = do
   from <- FS.joinPath [ outputDir, modName, "corefn.json" ]
