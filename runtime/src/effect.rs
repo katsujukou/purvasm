@@ -76,12 +76,28 @@ impl Heap {
     /// library leaf and the runtime forgets this name (the eventual `extern "C"` entry is
     /// `purvasm_stdio_write_line`).
     ///
-    /// Reads the `Str` into an owned line (host memory, no GC allocation), so no rooting is needed. A
-    /// sink-write failure is a fatal abort — the capture `Vec` cannot fail short of host OOM (aborts).
+    /// Reads the `Str` into an owned line (host memory, no GC allocation), so no rooting is needed.
+    ///
+    /// **Two destinations by heap kind.** On a **native** heap (`new_native`, the compiled binary)
+    /// the line is written to real `stdout` and flushed **per call** — progressive output, correct
+    /// interleaving with the live-flushing `stderr` leaf, and no loss of buffered stdout when `exit`
+    /// skips the drain (ADR-0074 §5); this mirrors `writeErrLine`. On a **lib/test** heap
+    /// (`new`, the Miri/differential path) the line is appended to the capture sink the Rust unit
+    /// tests read via [`output`](Heap::output) — testability unchanged. (The native binary's stdout
+    /// is captured by the shell in the boot e2e differential, not by the sink, so that gate is
+    /// unaffected either way.) A write failure is a fatal abort, as for `pv_drain_output`.
     pub fn stdio_write_line(&mut self, s: Value) -> Value {
         // SAFETY: `s` is a `Str` pointer; `str_read` validates the object header / kind.
         let line = self.str_read(unsafe { HeapPtr::from_word(s) });
-        self.push_output(line);
+        if self.code_is_address() {
+            use std::io::Write;
+            let out = std::io::stdout();
+            let mut lock = out.lock();
+            writeln!(lock, "{line}").expect("stdio_write_line: stdout write failed");
+            lock.flush().expect("stdio_write_line: stdout flush failed");
+        } else {
+            self.push_output(line);
+        }
         Value::unit()
     }
 }

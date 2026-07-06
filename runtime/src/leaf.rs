@@ -419,21 +419,31 @@ mod tests {
     }
 
     #[test]
-    fn write_line_leaf_appends_to_the_sink_when_forced() {
+    fn write_line_leaf_two_stage_thunk_and_native_writes_live() {
+        // `pv_runtime_new` builds a NATIVE heap, which writes the line to real `stdout` per call
+        // (progressive output) rather than the capture sink — so this test verifies the ADR-0068
+        // `\s -> thunk` two-stage shape and that the native path does NOT touch the sink. The
+        // sink-append contract is tested on a lib heap by
+        // `effect::tests::stdio_write_line_preserves_program_order`.
         let ctx = pv_runtime_new(1 << 12);
         unsafe {
-            // `writeLine "hi"` returns the thunk (nothing written yet); forcing it (apply to unit) writes.
             let wl = leaf(ctx, leaf_write_line, 1);
             let s = heap(ctx).new_str(b"hi").as_word().to_bits();
             let sarg = [s];
             let thunk = pv_apply(ctx, wl, sarg.as_ptr(), sarg.len());
+            // stage 1: applying the string yields a thunk, and nothing has been written or sunk yet.
             assert!(
                 heap(ctx).output().is_empty(),
                 "no write before forcing the thunk"
             );
+            // stage 2: forcing the thunk returns unit; the native heap wrote live, so the sink stays empty.
             let unit = [TaggedWord::unit().to_bits()];
-            let _ = pv_apply(ctx, thunk, unit.as_ptr(), unit.len());
-            assert_eq!(heap(ctx).output(), ["hi".to_string()]);
+            let r = pv_apply(ctx, thunk, unit.as_ptr(), unit.len());
+            assert_eq!(TaggedWord::from_bits(r), TaggedWord::unit());
+            assert!(
+                heap(ctx).output().is_empty(),
+                "native writeLine goes live to stdout, never the capture sink"
+            );
             pv_runtime_free(ctx);
         }
     }
