@@ -334,6 +334,28 @@
           ]
         }
       },
+      "purvasm-regex": {
+        "path": "packages/purvasm-regex",
+        "core": {
+          "dependencies": [
+            "arrays",
+            "either",
+            "foldable-traversable",
+            "lists",
+            "maybe",
+            "partial",
+            "prelude",
+            "purvasm-base"
+          ]
+        },
+        "test": {
+          "dependencies": [
+            "effect",
+            "spec",
+            "spec-node"
+          ]
+        }
+      },
       "purvasm-stdio": {
         "path": "packages/purvasm-stdio",
         "core": {
