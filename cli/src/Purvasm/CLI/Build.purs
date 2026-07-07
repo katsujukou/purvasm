@@ -29,7 +29,9 @@ import Purvasm.CLI.Effect.Filesystem (FS, FilePath)
 import Purvasm.CLI.Effect.Filesystem as FS
 import Purvasm.CLI.Effect.Log (LOG)
 import Purvasm.CLI.Effect.Log as Log
+import Purvasm.CLI.Effect.Process (PROC)
 import Purvasm.CLI.ForeignSigs as ForeignSigs
+import Purvasm.CLI.NativeLink as NativeLink
 import Purvasm.CLI.Ulib (corefnPathFor, requireUlibDir)
 import Purvasm.Compiler.Backend.LLVM.Abi (defaultHeapWords)
 import Purvasm.Compiler.Backend.LLVM.Driver (nativeSplit)
@@ -53,6 +55,8 @@ type Options =
   , value :: Boolean
   , checkForeignSigs :: Boolean
   , noOpt :: Boolean
+  , emitLlvm :: Boolean
+  , runtimeLib :: Maybe FilePath
   }
 
 options :: ArgParser Options
@@ -95,6 +99,16 @@ options = fromRecord
         \`.ll` byte-identity reference for the boot port (ADR-0082 §2), and a bisection aid\n\
         \separating a codegen bug from an optimiser bug."
         # ArgParser.boolean
+  , emitLlvm:
+      ArgParser.flag [ "--emit-llvm" ]
+        "Stop after emitting the `.ll` objects (no clang/link). Useful for the byte-identity\n\
+        \differential against boot; a full build otherwise links a native executable."
+        # ArgParser.boolean
+  , runtimeLib:
+      ArgParser.argument [ "--runtime-lib" ]
+        "Path to the runtime staticlib (libpurvasm_rt.a). Defaults to $PURVASM_RT_A or\n\
+        \runtime/target/release/libpurvasm_rt.a."
+        # ArgParser.optional
   }
 
 importNames :: Module -> Array String
@@ -161,7 +175,7 @@ entryExprOf opts =
 
 -- | Compile the program natively: load the closure, emit each module's `.ll` object and the init/entry
 -- | object under `<outDir>/_build` (B2 separate compilation).
-cmd :: forall r. Options -> Run (ENV + LOG + FS + EXCEPT String + EFFECT + r) Unit
+cmd :: forall r. Options -> Run (ENV + LOG + FS + PROC + EXCEPT String + EFFECT + r) Unit
 cmd opts = do
   Log.info $ Fmt.fmt @"Building (native) from entry {mod}.{name}"
     { mod: opts.entryModule, name: opts.entryName }
@@ -193,4 +207,14 @@ cmd opts = do
     Log.info $ Fmt.fmt @"  emitted {name} → mod_{i}.ll" { name, i: show i }
   entryPath <- FS.joinPath [ buildDir, "entry.ll" ]
   FS.writeText entryPath out.entry
-  Log.info $ Fmt.fmt @"✓ Native build finished → {dir}" { dir: buildDir }
+  Log.info $ Fmt.fmt @"✓ Emitted {n} object(s) → {dir}"
+    { n: show (Array.length out.modules + 1), dir: buildDir }
+  -- Link the objects into a native executable, unless `--emit-llvm` stops at the IR (e.g. for the
+  -- byte-identity differential, which needs no runtime staticlib).
+  unless opts.emitLlvm do
+    NativeLink.link
+      { output: opts.outDir
+      , buildDir
+      , moduleCount: Array.length out.modules
+      , runtimeLib: opts.runtimeLib
+      }

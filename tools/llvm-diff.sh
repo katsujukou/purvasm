@@ -26,10 +26,11 @@ boot_value=""; [ "$VALUE_FLAG" = "--value" ] && boot_value="--value"
 "$BOOT" native --backend llvm --no-opt $boot_value \
   --corefn-dir "$COREFN_DIR" -m "$ENTRY_MODULE" -e "$ENTRY_NAME" -o "$BOOT_OUT" >/dev/null
 
-# Level-2 side (B2: per-module `.ll`). PURVASM_LIB satisfies the ulib overlay resolution.
+# Level-2 side (B2: per-module `.ll`). `--emit-llvm` stops at the IR (no clang/link — the diff needs
+# only the `.ll`). PURVASM_LIB satisfies the ulib overlay resolution.
 : "${PURVASM_LIB:=$ROOT/purvasm_lib}"
 l2_value=""; [ "$VALUE_FLAG" = "--value" ] && l2_value="--value"
-PURVASM_LIB="$PURVASM_LIB" node "$ROOT/cli/index.node.js" build --no-opt $l2_value \
+PURVASM_LIB="$PURVASM_LIB" node "$ROOT/cli/index.node.js" build --no-opt --emit-llvm $l2_value \
   --entry "$ENTRY_MODULE" --entry-name "$ENTRY_NAME" \
   --corefn-dir "$COREFN_DIR" --outdir "$L2_OUT" >/dev/null
 

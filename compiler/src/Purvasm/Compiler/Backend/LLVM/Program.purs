@@ -1,24 +1,21 @@
--- | Whole-program assembly (ADR-0072 §1/§3): classify the linked spine into `Gdef`s, emit each as a
--- | root-handle global + `$init`, drive the lifted code via `emitPending`, and assemble the per-module
--- | objects + the init/entry object. A faithful transcription of boot's `codegen_llvm.ml`
--- | (`gdef_keys`/`classify_nonrec`/`uniquify_toplevel`/`split_spine`/`reachable_gdefs`/`store_root_global`/
--- | `emit_init_fn`/`emit_gdef`/`emit_gdefs`/`emit_init_all`/`emit_entry_stub`/`module_ll`/`entry_ll`/
--- | `program_split`), byte-identical to boot's `.ll` (ADR-0082 §2).
+-- | The ANF → `.ll` emitters and `Gdef` machinery the native backend's per-module (B2) driver
+-- | (`Backend.LLVM.Driver`) assembles: classify a binding into a `Gdef`, emit each as a root-handle
+-- | global + `$init` (plus lifted code via `emitPending`), and build a module object (`moduleLl`) or the
+-- | init/entry object (`entryLl`). A faithful transcription of boot's `codegen_llvm.ml`
+-- | (`gdef_keys`/`classify_nonrec`/`reachable_gdefs`/`store_root_global`/`emit_init_fn`/`emit_gdef`/
+-- | `emit_gdefs`/`emit_init_all`/`emit_entry_stub`/`module_ll`/`entry_ll`), byte-identical to boot's
+-- | `.ll` (ADR-0082 §2).
 -- |
--- | Slice-1a cut: `Gfun`/`Gcaf` and the entry stub; `Grec` (recursive groups) and the cross-module
--- | export surface are later slices and crash with a labelled `unsafeCrashWith`.
+-- | Slice-1a cut: `Gfun`/`Gcaf` and the entry stub; `Grec` (recursive groups) is a later slice and
+-- | crashes with a labelled `unsafeCrashWith`.
 module Purvasm.Compiler.Backend.LLVM.Program
   ( gdefKeys
   , gdefInitKey
   , classifyNonrec
-  , uniquifyToplevel
-  , splitSpine
   , reachableGdefs
-  , moduleOfKey
   , moduleLl
   , entryLl
   , surfaceFn
-  , programSplit
   , foreignKeysOf
   ) where
 
@@ -27,24 +24,23 @@ import Prelude
 import Control.Monad.Rec.Class (Step(..), tailRec)
 import Control.Monad.State.Class (gets, modify_)
 import Data.Array as Array
-import Data.Foldable (foldl, foldr, traverse_)
+import Data.Foldable (foldl, traverse_)
 import Data.List (List(..), (:))
 import Data.Map (Map)
 import Data.Map as Map
-import Data.Maybe (Maybe(..), fromMaybe, maybe)
+import Data.Maybe (Maybe(..), maybe)
 import Data.Set (Set)
 import Data.Set as Set
-import Data.String (Pattern(..), joinWith)
-import Data.String as String
+import Data.String (joinWith)
 import Data.Tuple (Tuple(..), fst, snd)
 import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.Compiler.Backend.LLVM.Abi (abiFrameOpen, abiPopFrame, abiRoot, abiStamp, ctxHeaderVersion, declarations, forceValue)
 import Purvasm.Compiler.Backend.LLVM.Emit (emitPending, expr)
-import Purvasm.Compiler.Backend.LLVM.FreeVars (binderVars, cfExpr, fvExpr)
+import Purvasm.Compiler.Backend.LLVM.FreeVars (fvExpr)
 import Purvasm.Compiler.Backend.LLVM.Mangle (immUnit, mangle, mangleForeign)
 import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, MakeCxOptions, beginFn, emit, emitModule, fresh, makeCx, renderChunks, runCodegen, takeFn)
 import Purvasm.Compiler.Backend.LLVM.Types (CallFact(..), EnvSrc(..), FnInfo, Gdef(..), Lifted(..), LiftedBody(..), SplitOutput)
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.MiddleEnd.ANF (CExpr(..), Expr(..))
 
 -- | The root-handle-global keys a gdef defines.
 gdefKeys :: Gdef -> Array String
@@ -65,132 +61,6 @@ classifyNonrec :: String -> Expr -> Gdef
 classifyNonrec key = case _ of
   Ret (CLam ps b) -> Gfun key ps b
   e -> Gcaf key e
-
--- --- top-level key uniquification (ADR-0072 §2) ------------------------------------------------------
-
--- | Capture-avoiding rename of *free* variable occurrences per `ren` (a name → replacement map). A local
--- | binder shadowing a renamed name removes it from `ren` within that scope.
-renAtom :: Map String String -> Atom -> Atom
-renAtom ren = case _ of
-  AtomVar x -> case Map.lookup x ren of
-    Just x' -> AtomVar x'
-    Nothing -> AtomVar x
-  a -> a
-
-renExpr :: Map String String -> Expr -> Expr
-renExpr ren = case _ of
-  Ret c -> Ret (renCexpr ren c)
-  Let x c body -> Let x (renCexpr ren c) (renExpr (Map.delete x ren) body)
-  LetRec binds body ->
-    let
-      ren' = foldl (\r b -> Map.delete b.var r) ren binds
-    in
-      LetRec (map (\b -> { var: b.var, rhs: renExpr ren' b.rhs }) binds) (renExpr ren' body)
-
-renCexpr :: Map String String -> CExpr -> CExpr
-renCexpr ren = case _ of
-  CAtom a -> CAtom (renAtom ren a)
-  CLam ps b -> CLam ps (renExpr (foldl (\r p -> Map.delete p r) ren ps) b)
-  CApp f args -> CApp (renAtom ren f) (map (renAtom ren) args)
-  CPrim op args -> CPrim op (map (renAtom ren) args)
-  CArray args -> CArray (map (renAtom ren) args)
-  CCtor n ar args -> CCtor n ar (map (renAtom ren) args)
-  CRecord fs -> CRecord (map (\f -> { prop: f.prop, val: renAtom ren f.val }) fs)
-  CAccessor a l -> CAccessor (renAtom ren a) l
-  CUpdate a fs -> CUpdate (renAtom ren a) (map (\f -> { prop: f.prop, val: renAtom ren f.val }) fs)
-  CIf a t e -> CIf (renAtom ren a) (renExpr ren t) (renExpr ren e)
-  CCase scruts alts -> CCase (map (renAtom ren) scruts) (map (renAltRhs ren) alts)
-  where
-  renAltRhs r alt =
-    let
-      bvs = foldl (\a b -> Set.union a (binderVars b)) Set.empty alt.binders
-      r' = foldr Map.delete r bvs
-    in
-      { binders: alt.binders
-      , result: case alt.result of
-          Uncond e -> Uncond (renExpr r' e)
-          Guarded gs -> Guarded (map (\g -> { guard: renExpr r' g.guard, rhs: renExpr r' g.rhs }) gs)
-      }
-
--- | Make every top-level binding key unique (ADR-0072 §2): walk the spine and, on a re-bound key,
--- | rename the shadowing (later) binding and capture-avoidingly rewrite its references in scope. A no-op
--- | when no key repeats. The spine walk is `tailRec` (stack-safe over a deep `Let` chain); the shared
--- | counter is threaded explicitly.
-uniquifyToplevel :: Expr -> Expr
-uniquifyToplevel e0 = res.expr
-  where
-  res = tailRec step { ren: Map.empty, seen: Set.empty, counter: 0, acc: Nil, e: e0 }
-
-  freshKey base counter = base <> "$sh" <> show (counter + 1)
-
-  -- `acc` accumulates the rebuilt spine prefix (reversed); on the terminal node we rewrite it and
-  -- rebuild the whole expression from the prefix.
-  step st = case st.e of
-    Let k c rest ->
-      let
-        c' = renCexpr st.ren c
-      in
-        if Set.member k st.seen then
-          let
-            k' = freshKey k st.counter
-          in
-            Loop st
-              { ren = Map.insert k k' st.ren
-              , counter = st.counter + 1
-              , acc = SLet k' c' : st.acc
-              , e = rest
-              }
-        else
-          Loop st { seen = Set.insert k st.seen, acc = SLet k c' : st.acc, e = rest }
-    LetRec binds rest ->
-      let
-        folded = foldl
-          ( \{ seen, ren, counter, renamed } b ->
-              if Set.member b.var seen then
-                { seen
-                , ren: Map.insert b.var (freshKey b.var counter) ren
-                , counter: counter + 1
-                , renamed: { var: freshKey b.var counter, rhs: b.rhs } : renamed
-                }
-              else
-                { seen: Set.insert b.var seen
-                , ren
-                , counter
-                , renamed: { var: b.var, rhs: b.rhs } : renamed
-                }
-          )
-          { seen: st.seen, ren: st.ren, counter: st.counter, renamed: Nil }
-          binds
-        binds' = Array.reverse (Array.fromFoldable (map (\b -> { var: b.var, rhs: renExpr folded.ren b.rhs }) folded.renamed))
-      in
-        Loop st
-          { seen = folded.seen
-          , ren = folded.ren
-          , counter = folded.counter
-          , acc = SRec binds' : st.acc
-          , e = rest
-          }
-    main -> Done { expr: rebuild st.acc (renExpr st.ren main) }
-
-  rebuild acc tailExpr = foldl (\body node -> wrap node body) tailExpr acc
-  wrap node body = case node of
-    SLet k c -> Let k c body
-    SRec binds -> LetRec binds body
-
--- A rebuilt spine node (the reversed prefix `uniquifyToplevel` accumulates).
-data SpineNode
-  = SLet String CExpr
-  | SRec (Array { var :: String, rhs :: Expr })
-
--- | Split a linked top-level spine into its global definitions (in spine = dependency order) and the
--- | entry expression (the first non-binding node). `tailRec` keeps a deep spine stack-safe.
-splitSpine :: Expr -> Tuple (Array Gdef) Expr
-splitSpine e0 = tailRec step (Tuple Nil e0)
-  where
-  step (Tuple acc e) = case e of
-    Let k c rest -> Loop (Tuple (classifyNonrec k (Ret c) : acc) rest)
-    LetRec binds rest -> Loop (Tuple (Grec (map (\b -> Tuple b.var b.rhs) binds) : acc) rest)
-    main -> Done (Tuple (Array.reverse (Array.fromFoldable acc)) main)
 
 -- | The top-level keys a gdef references (in its bodies), for reachability: `fv ∩ gkeys`, minus its own
 -- | keys (params/locals are bare and never in `gkeys`).
@@ -372,13 +242,6 @@ xfnDecls = do
         (Map.toUnfoldable xdecls)
     )
 
--- | The module a qualified key belongs to: everything before its last `.` (a key without a `.` is its
--- | own module).
-moduleOfKey :: String -> String
-moduleOfKey k = case String.lastIndexOf (Pattern ".") k of
-  Just i -> String.take i k
-  Nothing -> k
-
 -- | Emit one module object's `.ll`: its own root-handle globals + inits + internal code, plus `external`
 -- | decls for other modules' globals and cross-module `$d` externs. No `pv_init_all`/`@main`.
 moduleLl :: MakeCxOptions -> Set String -> Array Gdef -> String
@@ -442,39 +305,8 @@ entryLl opts isEffect heapWords gdefs entry =
       <> parts.entryBody
       <> "}\n"
 
--- | Options `programSplit` takes (mirrors boot's optional args).
-type ProgramSplitOptions =
-  { isEffect :: Boolean
-  , heapWords :: Int
-  , surface :: Map String CallFact
-  , debug :: Boolean
-  }
-
--- | Lower a linked program to separate module objects + one init/entry object (ADR-0072 §1/§3). Top-level
--- | bindings are partitioned by owning module, preserving first-appearance module order and per-module
--- | spine order.
-programSplit :: ProgramSplitOptions -> Expr -> SplitOutput
-programSplit opts e =
-  let
-    inlineAbi = not opts.debug
-    Tuple gdefs entry = splitSpine (uniquifyToplevel e)
-    gkeys = Set.fromFoldable (Array.concatMap gdefKeys gdefs)
-    xfns = foldl (surfaceFn opts.surface) Map.empty gdefs
-    cxOpts = { gkeys, xfns, inlineAbi }
-    parts = partitionByModule gdefs
-    modules = map
-      ( \(Tuple m gs) ->
-          Tuple m (moduleLl cxOpts (Set.fromFoldable (Array.concatMap gdefKeys gs)) gs)
-      )
-      parts
-  in
-    { modules
-    , entry: entryLl cxOpts opts.isEffect opts.heapWords gdefs entry
-    , foreigns: cfExpr e
-    }
-
--- Build the cross-module export surface (`xfns`) from the published call facts (`surface`): an exported
--- top-level function whose natively-lowered shape agrees with the `.pmi` fact becomes direct-callable.
+-- | Build the cross-module export surface (`xfns`) from the published call facts (`surface`): an exported
+-- | top-level function whose natively-lowered shape agrees with the `.pmi` fact becomes direct-callable.
 surfaceFn :: Map String CallFact -> Map String FnInfo -> Gdef -> Map String FnInfo
 surfaceFn surface acc = case _ of
   Gfun k ps _ -> case Map.lookup k surface of
@@ -488,27 +320,6 @@ surfaceFn surface acc = case _ of
     )
     acc
     ms
-
--- Partition gdefs by owning module, preserving first-appearance module order and per-module spine order.
-partitionByModule :: Array Gdef -> Array (Tuple String (Array Gdef))
-partitionByModule gdefs =
-  let
-    result = foldl
-      ( \st g ->
-          let
-            m = moduleOfKey (gdefInitKey g)
-          in
-            case Map.lookup m st.buckets of
-              Just gs -> st { buckets = Map.insert m (g : gs) st.buckets }
-              Nothing -> st { order = m : st.order, buckets = Map.insert m (g : Nil) st.buckets }
-      )
-      { order: Nil, buckets: Map.empty }
-      gdefs
-  in
-    map
-      ( \m -> Tuple m (Array.reverse (Array.fromFoldable (fromMaybe Nil (Map.lookup m result.buckets))))
-      )
-      (Array.reverse (Array.fromFoldable result.order))
 
 -- | The native foreign keys a `SplitOutput` references, as a sorted list.
 foreignKeysOf :: SplitOutput -> Array String

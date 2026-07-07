@@ -104,8 +104,8 @@ type SelfCtx =
   , fnInfo :: FnInfo
   }
 
--- | The result of `programSplit` (ADR-0072 §1/§3): the per-module `.ll` objects, the init/entry object
--- | `.ll`, and the native foreign keys the program references (ADR-0073 §3).
+-- | The result of the native backend split (`Driver.nativeSplit`, ADR-0072 §1/§3): the per-module `.ll`
+-- | objects, the init/entry object `.ll`, and the native foreign keys the program references (ADR-0073 §3).
 type SplitOutput =
   { modules :: Array (Tuple String String) -- ^ (module name, its `.ll`)
   , entry :: String -- ^ the init/entry object `.ll`

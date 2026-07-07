@@ -33,6 +33,8 @@ import Purvasm.CLI.Effect.Filesystem (FS, FilesystemF(..))
 import Purvasm.CLI.Effect.Filesystem as FS
 import Purvasm.CLI.Effect.Log (LOG)
 import Purvasm.CLI.Effect.Log as Log
+import Purvasm.CLI.Effect.Process (PROC, ProcF(..))
+import Purvasm.CLI.Effect.Process as Proc
 import Purvasm.CLI.ForeignSigsCmd as ForeignSigsCmd
 import Purvasm.CLI.Options as Options
 import Purvasm.CLI.Run as Run
@@ -65,13 +67,25 @@ main = do
 -- | Run a CLI program against the purvasm-native backend: the same effect row as `runNode`, with
 -- | `ENV`/`FS`/`LOG` discharged to the host-system packages. `ENV` is read only to resolve
 -- | `PURVASM_LIB` for the `ulib` overlay (ADR-0055 refines ADR-0045, which had dropped `ENV`).
-runPurvasmNative :: forall a. Run (ENV + FS + LOG + EFFECT + EXCEPT String + ()) a -> Effect (Either String a)
+runPurvasmNative :: forall a. Run (ENV + FS + LOG + PROC + EFFECT + EXCEPT String + ()) a -> Effect (Either String a)
 runPurvasmNative m = m
   # Env.interpret nativeEnvHandler
   # FS.interpret nativeFsHandler
   # Log.interpret (Log.terminalHandler { minLevel: Log.Info, color: true, strict: false })
+  # Proc.interpret nativeProcHandler
   # Except.runExcept
   # runBaseEffect
+
+-- | `PROC` (external-tool exec) is not yet available on the purvasm-native CLI: a native process-exec
+-- | leaf is a later increment (ADR-0045), so `purvasm build`'s clang/link step crashes clearly here
+-- | rather than silently no-op. The Node CLI (`runNode`) discharges `PROC` to `node:child_process`.
+nativeProcHandler :: forall r. ProcF ~> Run (EFFECT + r)
+nativeProcHandler = case _ of
+  Exec _ _ _ -> unsafeCrashWith notYet
+  ExecCapture _ _ _ -> unsafeCrashWith notYet
+  ExecInput _ _ _ _ -> unsafeCrashWith notYet
+  where
+  notYet = "Process: exec not yet available on the purvasm-native CLI (ADR-0045); use the Node CLI for `build`."
 
 -- | Discharge `Env` to `Purvasm.System.Env` (an unset/empty variable is `Nothing`).
 nativeEnvHandler :: forall r. Env ~> Run (EFFECT + r)

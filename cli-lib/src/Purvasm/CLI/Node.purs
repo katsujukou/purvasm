@@ -25,7 +25,8 @@ import Purvasm.CLI.Effect.Filesystem (FS, FilesystemF(..))
 import Purvasm.CLI.Effect.Filesystem as FS
 import Purvasm.CLI.Effect.Log (LOG, LogLevel(..), LoggerConfig)
 import Purvasm.CLI.Effect.Log as Log
-import Purvasm.CLI.Effect.Process (ProcF(..))
+import Purvasm.CLI.Effect.Process (PROC, ProcF(..))
+import Purvasm.CLI.Effect.Process as Proc
 import Run (EFFECT, Run, liftEffect, runBaseEffect)
 import Run.Except (EXCEPT)
 import Run.Except as Except
@@ -34,11 +35,12 @@ import Type.Row (type (+))
 -- | Run a CLI program (its effect row fully closed) against the synchronous Node backend, with the
 -- | global options (e.g. `--verbose`) applied to the logger. `REGISTRY` is interpreted first, into
 -- | `PROC` (it asks `spago`), so it must be peeled before `PROC` is.
-runNode :: forall a. Run (ENV + FS + LOG + EFFECT + EXCEPT String + ()) a -> Effect (Either String a)
+runNode :: forall a. Run (ENV + FS + LOG + PROC + EFFECT + EXCEPT String + ()) a -> Effect (Either String a)
 runNode m = m
   # Env.interpret nodeEnvHandler
   # FS.interpret nodeFsHandler
   # Log.interpret (Log.terminalHandler (defaultLoggerConfig { minLevel = Log.Info }))
+  # Proc.interpret nodeProcHandler
   # Except.runExcept
   # runBaseEffect
 
