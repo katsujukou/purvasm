@@ -487,7 +487,8 @@ let emit_native_llvm
   Stdlib.Printf.printf "wrote %s\n" exe
 
 (* Compile a program to a *native* executable (ADR-0035/0036 OCaml backend, or ADR-0071/0072 LLVM backend):
-   link the CoreFn closure to one term, normalise to optimised ANF, then emit via the chosen [backend]. The
+   link the CoreFn closure to one term, normalise to ANF (optimised unless [--no-opt], ADR-0082 §2),
+   then emit via the chosen [backend]. The
    entry is treated as an `Effect` by default (the runner forces it to unit); `--arg N` applies an
    `Int -> Int` entry and `--value` takes a bare value. *)
 let native_action
@@ -503,6 +504,7 @@ let native_action
       value
       ulib
       foreign_dirs
+      no_opt
   =
   mkdir_p (build_dir output);
   let em = split_module entry_module in
@@ -563,12 +565,21 @@ let native_action
     | false, Some n -> App (term0, Lit (LInt n)), false
     | false, None -> term0, true
   in
+  (* The [--no-opt] split (ADR-0082 §2): required lowering (Normalize + DictElim) always runs —
+     without DictElim dict access is wrong-shape and stuck ([dicts-are-newtypes]) — while the
+     optimiser (Simplify + Dbe/EffectAnalysis) is gated off. [--no-opt] is the freeze's
+     Level-2-blocking exception: it exists to emit the un-optimised native reference the Level-2
+     port's `.ll` byte-identity gate targets, and as a bisection aid separating a codegen bug from
+     an optimiser bug. *)
+  let lowered = Middle_end.Passes.Dict_elim.run (Middle_end.Transl.transl main_term) in
   let anf =
-    Middle_end.Passes.Dbe.run
-      ~effectful_leaf:Ffi.effectful
-      ~foreign_arity:Ffi.foreign_arity
-      (Middle_end.Passes.Simplify.run
-         (Middle_end.Passes.Dict_elim.run (Middle_end.Transl.transl main_term)))
+    if no_opt
+    then lowered
+    else
+      Middle_end.Passes.Dbe.run
+        ~effectful_leaf:Ffi.effectful
+        ~foreign_arity:Ffi.foreign_arity
+        (Middle_end.Passes.Simplify.run lowered)
   in
   let bdir = build_dir output in
   match backend with
@@ -791,6 +802,19 @@ let native_cmd =
              program whose live set exceeds a semi-space aborts with a heap OOM and \
              needs a larger value here.")
   in
+  let no_opt =
+    Arg.(
+      value
+      & flag
+      & info
+          [ "no-opt" ]
+          ~doc:
+            "Disable the optimiser (Simplify + Dbe/EffectAnalysis); keep only the \
+             required lowering (Normalize + DictElim). Emits the un-optimised native \
+             reference the Level-2 native-backend port's `.ll` byte-identity gate \
+             targets (ADR-0082 §2), and serves as a bisection aid separating a codegen \
+             bug from an optimiser bug. Default runs the full optimiser.")
+  in
   Cmd.v
     (Cmd.info
        "native"
@@ -810,7 +834,8 @@ let native_cmd =
       $ arg
       $ value
       $ ulib
-      $ foreign_dirs)
+      $ foreign_dirs
+      $ no_opt)
 
 (* The boot half of ADR-0080 §2's consistency differential (a frozen-boot exemption: the
    validation mechanism the accepted record requires). Reads qualified foreign keys, one per

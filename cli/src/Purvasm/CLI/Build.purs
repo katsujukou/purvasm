@@ -42,6 +42,7 @@ type Options =
   , outDir :: FilePath
   , entryModule :: String
   , checkForeignSigs :: Boolean
+  , noOpt :: Boolean
   }
 
 options :: ArgParser Options
@@ -67,6 +68,15 @@ options = fromRecord
         \Off by default until a build-time consumer lands: source-channel lexing is\n\
         \expensive on the native backend, and the standing checks are the\n\
         \`foreign-sigs` command and tools/foreign-sigs-diff.sh."
+        # ArgParser.boolean
+  , noOpt:
+      ArgParser.flag [ "--no-opt" ]
+        "Disable the optimiser (Simplify/Dbe/EffectAnalysis + the NbE inliner); keep only\n\
+        \the required lowering (Normalize + DictElim). The un-optimised native path is the\n\
+        \`.ll` byte-identity reference for the boot port (ADR-0082 §2), and a bisection aid\n\
+        \separating a codegen bug from an optimiser bug. Parsed but inert for now: the\n\
+        \optimiser and native backend are not yet ported — wired ahead for the optimiser\n\
+        \track to read (`opts.noOpt`)."
         # ArgParser.boolean
   }
 
