@@ -16,3 +16,5 @@ package:
     dependencies:
       - spec
       - spec-node
+      - node-fs
+      - node-buffer
