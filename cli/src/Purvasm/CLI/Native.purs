@@ -27,14 +27,15 @@ import Fmt as Fmt
 import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.CLI.Build as Build
 import Purvasm.CLI.Compile as Compile
-import Purvasm.CLI.ForeignSigsCmd as ForeignSigsCmd
 import Purvasm.CLI.Effect.Env (ENV, Env(..))
 import Purvasm.CLI.Effect.Env as Env
 import Purvasm.CLI.Effect.Filesystem (FS, FilesystemF(..))
 import Purvasm.CLI.Effect.Filesystem as FS
 import Purvasm.CLI.Effect.Log (LOG)
 import Purvasm.CLI.Effect.Log as Log
+import Purvasm.CLI.ForeignSigsCmd as ForeignSigsCmd
 import Purvasm.CLI.Options as Options
+import Purvasm.CLI.Run as Run
 import Purvasm.FS as File
 import Purvasm.System.Env (lookupEnv) as Sys
 import Purvasm.System.Process (argv, exit) as Sys
@@ -52,6 +53,7 @@ main = do
     Right cmd -> runPvm case cmd of
       Options.Compile opts -> Compile.cmd opts
       Options.Build opts -> Build.cmd opts
+      Options.Run opts -> Run.cmd opts
       Options.ForeignSigs opts -> ForeignSigsCmd.cmd opts
   where
   runPvm program = do

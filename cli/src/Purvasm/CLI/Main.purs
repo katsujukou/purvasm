@@ -10,6 +10,7 @@ import Effect.Console as Console
 import Fmt as Fmt
 import Node.Process as Process
 import Purvasm.CLI.Build as Build
+import Purvasm.CLI.Run as Run
 import Purvasm.CLI.Compile as Compile
 import Purvasm.CLI.ForeignSigsCmd as ForeignSigsCmd
 import Purvasm.CLI.Node as Node
@@ -23,6 +24,7 @@ main = do
     Right cmd -> runNode case cmd of
       Options.Compile opts -> Compile.cmd opts
       Options.Build opts -> Build.cmd opts
+      Options.Run opts -> Run.cmd opts
       Options.ForeignSigs opts -> ForeignSigsCmd.cmd opts
 
   where

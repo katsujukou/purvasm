@@ -1,9 +1,4 @@
--- | `purvasm build`: the native (LLVM) backend (ADR-0082). Loads the entry module's import closure,
--- | compiles each module **independently** to its own `.ll` object (B2 separate compilation — no
--- | whole-program term), and writes the per-module objects + the init/entry object under
--- | `<outDir>/_build`. Linking the objects into a native binary (clang + `lld --gc-sections` + the
--- | runtime staticlib) is `Backend.NativeLink`, a later step. The bytecode/VM path is `purvasm run`.
-module Purvasm.CLI.Build where
+module Purvasm.CLI.Run where
 
 import Prelude
 
@@ -11,15 +6,14 @@ import ArgParse.Basic (ArgParser, fromRecord)
 import ArgParse.Basic as ArgParser
 import Data.Array as Array
 import Data.Either (Either(..))
-import Data.Foldable (foldM, foldl)
-import Data.FoldableWithIndex (forWithIndex_)
+import Data.Foldable (foldM, foldl, for_)
 import Data.List (List(..), (:))
 import Data.List as List
 import Data.Map (Map)
 import Data.Map as Map
 import Data.Maybe (Maybe(..))
 import Data.Set as Set
-import Data.Tuple (Tuple(..), fst, snd)
+import Data.Tuple (fst, snd)
 import Data.Tuple.Nested (type (/\), (/\))
 import Fmt as Fmt
 import PureScript.CoreFn.Module (Module)
@@ -31,16 +25,14 @@ import Purvasm.CLI.Effect.Log (LOG)
 import Purvasm.CLI.Effect.Log as Log
 import Purvasm.CLI.ForeignSigs as ForeignSigs
 import Purvasm.CLI.Ulib (corefnPathFor, requireUlibDir)
-import Purvasm.Compiler.Backend.LLVM.Abi (defaultHeapWords)
-import Purvasm.Compiler.Backend.LLVM.Driver (nativeSplit)
-import Purvasm.Compiler.Backend.LLVM.Types (CallFact(..))
-import Purvasm.Compiler.Bytecode.Artifact (ExportKind(..), interfaceOf)
+import Purvasm.Compiler.Bytecode.Artifact (interfaceOf, interfaceToString, moduleToString)
+import Purvasm.Compiler.Bytecode.Image (imageToString)
 import Purvasm.Compiler.CESK.AST (Term(..))
 import Purvasm.Compiler.CESK.Translate (nameKey)
 import Purvasm.Compiler.Compile (compileModule)
+import Purvasm.Compiler.Ffi as Ffi
+import Purvasm.Compiler.Link (link)
 import Purvasm.Compiler.Literal (Literal(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Expr)
-import Purvasm.Compiler.MiddleEnd.Normalize (normalize)
 import Run (EFFECT, Run)
 import Run.Except (EXCEPT, throw)
 import Type.Row (type (+))
@@ -49,8 +41,6 @@ type Options =
   { corefnDir :: FilePath
   , outDir :: FilePath
   , entryModule :: String
-  , entryName :: String
-  , value :: Boolean
   , checkForeignSigs :: Boolean
   , noOpt :: Boolean
   }
@@ -69,18 +59,9 @@ options = fromRecord
         # ArgParser.default "output-pvm"
   , entryModule:
       ArgParser.argument [ "--entry" ]
-        "Name of the entry module which contains the entry binding,\n\
+        "Name of the entry module which contains `main`,\n\
         \the entry point of the whole program. Defaults to `Main`."
         # ArgParser.default "Main"
-  , entryName:
-      ArgParser.argument [ "--entry-name" ]
-        "Name of the entry binding within the entry module. Defaults to `main`."
-        # ArgParser.default "main"
-  , value:
-      ArgParser.flag [ "--value" ]
-        "Treat the entry as a bare value (print its Int result) rather than an `Effect`\n\
-        \to run. Default treats it as `Effect` (apply to unit, perform)."
-        # ArgParser.boolean
   , checkForeignSigs:
       ArgParser.flag [ "--check-foreign-sigs" ]
         "Reconstruct and check foreign signatures during the build (ADR-0080).\n\
@@ -93,7 +74,9 @@ options = fromRecord
         "Disable the optimiser (Simplify/Dbe/EffectAnalysis + the NbE inliner); keep only\n\
         \the required lowering (Normalize + DictElim). The un-optimised native path is the\n\
         \`.ll` byte-identity reference for the boot port (ADR-0082 §2), and a bisection aid\n\
-        \separating a codegen bug from an optimiser bug."
+        \separating a codegen bug from an optimiser bug. Parsed but inert for now: the\n\
+        \optimiser and native backend are not yet ported — wired ahead for the optimiser\n\
+        \track to read (`opts.noOpt`)."
         # ArgParser.boolean
   }
 
@@ -136,61 +119,47 @@ depOrder mods = Array.fromFoldable (List.reverse (snd (foldl visit (Set.empty /\
 
   localDeps m = Array.filter (\n -> Map.member n mods) (importNames m)
 
--- | The cross-module export surface (ADR-0077 §2): each module's public exports, mapped from its
--- | interface `ExportKind` to a native `CallFact` (`Efn`→`Cfn`, `Erecfn`→`Crecfn`; value exports carry
--- | no call fact). This is the same fact each module's `.pmi` publishes — derived here from the same
--- | `interfaceOf` that writes it, pending the binary-artifact record (ADR-0084).
-surfaceOf :: Array Module -> Map String CallFact
-surfaceOf = foldl overModule Map.empty
-  where
-  overModule acc m = foldl overExport acc (interfaceOf (compileModule m)).exports
-  overExport acc (Tuple key kind) = case kind of
-    Efn n -> Map.insert key (Cfn n) acc
-    Erecfn n -> Map.insert key (Crecfn n) acc
-    _ -> acc
-
--- | The entry expression fed to the backend: a bare value (`--value`, printed) is the entry read
--- | directly; an `Effect` (default) is the entry applied to unit (the `0` convention), run for effects.
-entryExprOf :: Options -> Expr
-entryExprOf opts =
-  let
-    key = opts.entryModule <> "." <> opts.entryName
-  in
-    if opts.value then normalize (TmVar key)
-    else normalize (TmApp (TmVar key) (TmLit (LInt 0)))
-
--- | Compile the program natively: load the closure, emit each module's `.ll` object and the init/entry
--- | object under `<outDir>/_build` (B2 separate compilation).
+-- | Compile every module reachable from the entry to its `.pmo`/`.pmi`, in dependency
+-- | order. (Linking the closure into a single `app.pvm` is a later step.)
 cmd :: forall r. Options -> Run (ENV + LOG + FS + EXCEPT String + EFFECT + r) Unit
 cmd opts = do
-  Log.info $ Fmt.fmt @"Building (native) from entry {mod}.{name}"
-    { mod: opts.entryModule, name: opts.entryName }
+  Log.info $ Fmt.fmt @"Building from entry {entry}" { entry: opts.entryModule }
   ulibDir <- requireUlibDir
   Log.debug $ Fmt.fmt @"Overlaying patched ulib from {dir}" { dir: ulibDir }
   mods <- loadClosure ulibDir opts.corefnDir opts.entryModule
+  -- The ADR-0080 source channel, opt-in until a build-time consumer lands (the native-codegen
+  -- port, §3 — which will also want the §4 `.pmi` shape caching): CST-lexing the foreign
+  -- frontier through the pure-PS regex engine is minutes on the native backend, so the
+  -- standing checks are the `foreign-sigs` command and the boot-registry differential, and
+  -- `--check-foreign-sigs` runs the hard diagnostics here on demand.
   let ordered = depOrder mods
   when opts.checkForeignSigs do
     env <- ForeignSigs.loadEnv { ulibDir, corefnDir: opts.corefnDir }
+    -- Per-module (ADR-0033): resolve each module's shapes independently — no closure sweep.
     total <- foldM
       (\n m -> (n + _) <<< Map.size <$> ForeignSigs.moduleForeignSigs env m)
       0
       ordered
     Log.debug $ Fmt.fmt @"foreign-sigs: {n} signatures resolved" { n: show total }
-  let
-    out = nativeSplit
-      { isEffect: not opts.value
-      , heapWords: defaultHeapWords
-      , surface: surfaceOf ordered
-      , debug: false
-      }
-      ordered
-      (entryExprOf opts)
+  let artifacts = map compileModule ordered
   buildDir <- FS.joinPath [ opts.outDir, "_build" ]
   FS.mkdirP buildDir
-  forWithIndex_ out.modules \i (Tuple name ll) -> do
-    modPath <- FS.joinPath [ buildDir, "mod_" <> show i <> ".ll" ]
-    FS.writeText modPath ll
-    Log.info $ Fmt.fmt @"  emitted {name} → mod_{i}.ll" { name, i: show i }
-  entryPath <- FS.joinPath [ buildDir, "entry.ll" ]
-  FS.writeText entryPath out.entry
-  Log.info $ Fmt.fmt @"✓ Native build finished → {dir}" { dir: buildDir }
+  for_ artifacts \artifact -> do
+    pmoPath <- FS.joinPath [ buildDir, artifact.name <> ".pmo" ]
+    pmiPath <- FS.joinPath [ buildDir, artifact.name <> ".pmi" ]
+    FS.writeText pmoPath (moduleToString artifact)
+    -- ADR-0084 §3/§4: the optimiser summary is `--opt`-only and must be absent under `--no-opt`
+    -- (byte-identity with boot). It stays `Nothing` in both modes until the optimiser publishes
+    -- per-module-optimised ANF (§1; §4's conservative-unknown start); `opts.noOpt` is threaded now so
+    -- the suppression is in place the moment a summary exists (the `else` gains `Just (summarize …)`).
+    let iface = (interfaceOf artifact) { summary = if opts.noOpt then Nothing else Nothing }
+    FS.writeText pmiPath (interfaceToString iface)
+    Log.info $ Fmt.fmt @"  compiled {name}" { name: artifact.name }
+  -- link the closure into a runnable app.pvm; the entry `<module>.main` is an Effect,
+  -- forced by applying it to unit (the `0` convention) at run.
+  let
+    mainTerm = TmApp (TmVar (opts.entryModule <> ".main")) (TmLit (LInt 0))
+    image = (link artifacts Ffi.resolver mainTerm) { isEffect = true }
+  appPath <- FS.joinPath [ opts.outDir, "app.pvm" ]
+  FS.writeText appPath (imageToString image)
+  Log.info $ Fmt.fmt @"✓ Build finished → {app}" { app: appPath }
