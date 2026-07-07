@@ -18,7 +18,6 @@ import Test.Unit.Purvasm.Compiler.Backend.LLVM.Emit as Backend.LLVM.Emit
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.FreeVars as Backend.LLVM.FreeVars
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Mangle as Backend.LLVM.Mangle
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Monad as Backend.LLVM.Monad
-import Test.Unit.Purvasm.Compiler.Backend.LLVM.Program as Backend.LLVM.Program
 import Test.Unit.Purvasm.Compiler.CESK.Translate as CESK.Translate
 import Test.Unit.Purvasm.Compiler.Compile as Compile
 import Test.Unit.Purvasm.Compiler.Ffi as Ffi
@@ -26,6 +25,7 @@ import Test.Unit.Purvasm.Compiler.ForeignSig as ForeignSig
 import Test.Unit.Purvasm.Compiler.Link as Link
 import Test.Unit.Purvasm.Compiler.MiddleEnd.MatchCompile as MiddleEnd.MatchCompile
 import Test.Unit.Purvasm.Compiler.MiddleEnd.Normalize as MiddleEnd.Normalize
+import Test.Unit.Purvasm.Compiler.MiddleEnd.Optimizer.Simplify as MiddleEnd.Optimizer.Simplify
 import Test.Unit.Purvasm.Compiler.Util.Int64Decimal as Util.Int64Decimal
 import Test.Unit.Purvasm.Compiler.Util.MD5 as Util.MD5
 
@@ -33,6 +33,7 @@ main :: Effect Unit
 main = runSpecAndExitProcess [ consoleReporter ] do
   MiddleEnd.Normalize.spec
   MiddleEnd.MatchCompile.spec
+  MiddleEnd.Optimizer.Simplify.spec
   CESK.Translate.spec
   Bytecode.Lower.spec
   Bytecode.Lower.Match.spec
@@ -41,7 +42,6 @@ main = runSpecAndExitProcess [ consoleReporter ] do
   Backend.LLVM.Abi.spec
   Backend.LLVM.FreeVars.spec
   Backend.LLVM.Emit.spec
-  Backend.LLVM.Program.spec
   Backend.LLVM.Driver.spec
   Bytecode.Image.spec
   Bytecode.Artifact.spec

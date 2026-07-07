@@ -12,7 +12,7 @@ import Prelude
 
 import Control.Alt ((<|>))
 import Data.Array ((..))
-import Data.Foldable (foldr)
+import Data.Foldable (foldl, foldr)
 import Data.Map (Map)
 import Data.Map as Map
 import Data.Maybe (Maybe)
@@ -244,26 +244,108 @@ refModify = lams [ "f", "ref", "$u" ]
       )
   )
 
+-- boot's `st_map`/`st_run`/`st_write` (ADR-0023/0039): the `ST` thunk analogues of the Effect
+-- combinators. `map_ f a = \_ -> f (a unit)`; `run f = f unit`; `write` returns the written value.
+stMap :: Term
+stMap = lams [ "f", "a", "$u" ] (TmApp (v "f") (runEff (v "a")))
+
+stRun :: Term
+stRun = lams [ "f" ] (runEff (v "f"))
+
+stWrite :: Term
+stWrite = lams [ "val", "ref", "$u" ]
+  (TmLet "$_" (TmPrim SetArray [ v "ref", intLit 0, v "val" ]) (v "val"))
+
+-- `Record.Builder.unsafeModify l f r = RecordSet l (f (RecordGet l r)) r` (higher-order, ADR-0020).
+recordModify :: Term
+recordModify = lams [ "l", "f", "r" ]
+  (TmPrim RecordSet [ v "l", TmApp (v "f") (TmPrim RecordGet [ v "l", v "r" ]), v "r" ])
+
+recordRename :: Term
+recordRename = lams [ "o", "n", "r" ]
+  (TmPrim RecordSet [ v "n", TmPrim RecordGet [ v "o", v "r" ], TmPrim RecordDelete [ v "o", v "r" ] ])
+
+-- `Data.Number.fromStringImpl` (ADR-0046): parse via the first-order `parseFloatImpl` leaf, then
+-- apply the caller's `isFinite`/`Just`/`Nothing`, so a NaN/non-finite parse becomes `Nothing`.
+numberFromStringImpl :: Term
+numberFromStringImpl = lams [ "str", "isFin", "just", "nothing" ]
+  ( TmLet "n" (TmApp (TmForeign "Data.Number.parseFloatImpl") (v "str"))
+      (TmIf (TmApp (v "isFin") (v "n")) (TmApp (v "just") (v "n")) (v "nothing"))
+  )
+
+-- Saturated left-application of `f` to the argument variables `xs` (`((f x0) x1) …`).
+appArgs :: Term -> Array String -> Term
+appArgs f xs = foldl (\acc x -> TmApp acc (v x)) f xs
+
+argNames :: Int -> Array String
+argNames n = map (\i -> "x" <> show i) (0 .. (n - 1))
+
+-- `Data.Function.Uncurried` (ADR-0039): boot is all-curried, so `mkFnN = identity` and
+-- `runFnN = saturated apply`. `Fn0 a` is the `Unit -> a` thunk (`mkFn0`/`runFn0` introduce/force it).
+fnUncurried :: Array (String /\ Term)
+fnUncurried =
+  [ "Data.Function.Uncurried.mkFn0" /\ lams [ "fn", "$u" ] (TmApp (v "fn") unitLit)
+  , "Data.Function.Uncurried.runFn0" /\ lams [ "f" ] (TmApp (v "f") unitLit)
+  ] <> ([ 2, 3, 4, 5, 6, 7, 8, 9, 10 ] >>= nary)
+  where
+  nary n =
+    let
+      xs = argNames n
+    in
+      [ ("Data.Function.Uncurried.mkFn" <> show n) /\ lams [ "f" ] (v "f")
+      , ("Data.Function.Uncurried.runFn" <> show n) /\ lams ([ "f" ] <> xs) (appArgs (v "f") xs)
+      ]
+
+-- `Control.Monad.ST.Uncurried` (ADR-0039): the `ST` analogue — `mkSTFnN f = \xs -> run (f xs)`
+-- forces the thunk after applying; `runSTFnN g xs = \_ -> g xs` rebuilds it.
+stUncurried :: Array (String /\ Term)
+stUncurried = [ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 ] >>= \n ->
+  let
+    xs = argNames n
+  in
+    [ ("Control.Monad.ST.Uncurried.mkSTFn" <> show n) /\ lams ([ "f" ] <> xs) (runEff (appArgs (v "f") xs))
+    , ("Control.Monad.ST.Uncurried.runSTFn" <> show n) /\ lams ([ "g" ] <> xs <> [ "$u" ]) (appArgs (v "g") xs)
+    ]
+
 structural :: Map String Term
 structural = Map.fromFoldable
-  [ "Data.Functor.arrayMap" /\ arrayMap
-  , "Data.Eq.eqArrayImpl" /\ eqArray
-  , "Data.Ord.ordIntImpl" /\ ordCmp LtInt EqInt
-  , "Data.Ord.ordNumberImpl" /\ ordCmp LtNumber EqNumber
-  , "Data.Ord.ordStringImpl" /\ ordCmp LtString EqString
-  , "Data.Ord.ordCharImpl" /\ ordCmp LtInt EqInt
-  , "Data.Ord.ordBooleanImpl" /\ ordBoolean
-  , "Effect.pureE" /\ effPure
-  , "Effect.bindE" /\ effBind
-  , "Effect.untilE" /\ effUntil
-  , "Effect.whileE" /\ effWhile
-  , "Effect.forE" /\ effFor
-  , "Effect.foreachE" /\ effForeach
-  , "Effect.Ref._new" /\ refNew
-  , "Effect.Ref.read" /\ refRead
-  , "Effect.Ref.write" /\ refWrite
-  , "Effect.Ref.modifyImpl" /\ refModify
-  ]
+  ( [ "Data.Functor.arrayMap" /\ arrayMap
+    , "Data.Number.fromStringImpl" /\ numberFromStringImpl
+    , "Record.Builder.unsafeModify" /\ recordModify
+    , "Record.Builder.unsafeRename" /\ recordRename
+    , "Data.Eq.eqArrayImpl" /\ eqArray
+    , "Data.Ord.ordIntImpl" /\ ordCmp LtInt EqInt
+    , "Data.Ord.ordNumberImpl" /\ ordCmp LtNumber EqNumber
+    , "Data.Ord.ordStringImpl" /\ ordCmp LtString EqString
+    , "Data.Ord.ordCharImpl" /\ ordCmp LtInt EqInt
+    , "Data.Ord.ordBooleanImpl" /\ ordBoolean
+    , "Effect.pureE" /\ effPure
+    , "Effect.bindE" /\ effBind
+    , "Effect.untilE" /\ effUntil
+    , "Effect.whileE" /\ effWhile
+    , "Effect.forE" /\ effFor
+    , "Effect.foreachE" /\ effForeach
+    , "Effect.Ref._new" /\ refNew
+    , "Effect.Ref.read" /\ refRead
+    , "Effect.Ref.write" /\ refWrite
+    , "Effect.Ref.modifyImpl" /\ refModify
+    -- `_unsafePartial f = f unit`: discharge the phantom `Partial` constraint (no methods) by
+    -- applying the partial computation to the immediate-0 dummy dictionary.
+    , "Partial.Unsafe._unsafePartial" /\ lams [ "f" ] (TmApp (v "f") unitLit)
+    -- `Control.Monad.ST.Internal`: the same thunk/cell model as `Effect` (ADR-0023).
+    , "Control.Monad.ST.Internal.map_" /\ stMap
+    , "Control.Monad.ST.Internal.pure_" /\ effPure
+    , "Control.Monad.ST.Internal.bind_" /\ effBind
+    , "Control.Monad.ST.Internal.run" /\ stRun
+    , "Control.Monad.ST.Internal.while" /\ effWhile
+    , "Control.Monad.ST.Internal.for" /\ effFor
+    , "Control.Monad.ST.Internal.foreach" /\ effForeach
+    , "Control.Monad.ST.Internal.new" /\ refNew
+    , "Control.Monad.ST.Internal.read" /\ refRead
+    , "Control.Monad.ST.Internal.write" /\ stWrite
+    , "Control.Monad.ST.Internal.modifyImpl" /\ refModify
+    ] <> stUncurried <> fnUncurried
+  )
 
 -- | The link resolver: intrinsic rung, then structural rung (first match).
 resolver :: String -> Maybe Term

@@ -29,7 +29,7 @@ import Purvasm.Compiler.Bytecode.Artifact (interfaceOf, interfaceToString, modul
 import Purvasm.Compiler.Bytecode.Image (imageToString)
 import Purvasm.Compiler.CESK.AST (Term(..))
 import Purvasm.Compiler.CESK.Translate (nameKey)
-import Purvasm.Compiler.Compile (compileModule)
+import Purvasm.Compiler.Compile (compileModuleWith)
 import Purvasm.Compiler.Ffi as Ffi
 import Purvasm.Compiler.Link (link)
 import Purvasm.Compiler.Literal (Literal(..))
@@ -141,7 +141,9 @@ cmd opts = do
       0
       ordered
     Log.debug $ Fmt.fmt @"foreign-sigs: {n} signatures resolved" { n: show total }
-  let artifacts = map compileModule ordered
+  -- ADR-0082 §2: `--opt` runs the optimiser over the ANF; `--no-opt` keeps only required
+  -- lowering (byte-identical to boot). Threaded per-module (the optimiser is module-local).
+  let artifacts = map (compileModuleWith (not opts.noOpt)) ordered
   buildDir <- FS.joinPath [ opts.outDir, "_build" ]
   FS.mkdirP buildDir
   for_ artifacts \artifact -> do
