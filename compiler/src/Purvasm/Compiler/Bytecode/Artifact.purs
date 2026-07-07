@@ -14,6 +14,7 @@ import Prelude
 
 import Data.Array (concatMap, length, mapMaybe, sortWith)
 import Data.Map as Map
+import Data.Maybe (Maybe(..))
 import Data.String.Common (joinWith)
 import Data.Tuple.Nested (type (/\), (/\))
 import Purvasm.Compiler.Bytecode.Codegen (Gdef(..))
@@ -45,11 +46,22 @@ type ModuleArtifact =
 -- | a recursive-group value.
 data ExportKind = Efn Int | Erecfn Int | Ecaf | Erec
 
+-- | The `--opt`-only cross-module optimiser summary (ADR-0084 §1/§5): a pruned, per-module-optimised
+-- | `M.Module` a dependent's optimiser reads instead of re-deriving. Carried as opaque, pre-encoded
+-- | JSON until the optimiser and its optimised-ANF IR land (ADR-0084 §4's conservative-unknown start) —
+-- | this module owns only the *additive-field* mechanism that keeps the `--no-opt` core byte-identical
+-- | to boot, not the summary's internal shape.
+newtype Summary = Summary Json
+
 type Interface =
   { ifaceName :: String
   , exports :: Array (String /\ ExportKind) -- sorted by key
   , ifaceImports :: Array String
   , hash :: String
+  -- | ADR-0084 §5: `--opt`-only. `Nothing` ⇒ the field is absent from the serialised `.pmi`, keeping
+  -- | the five-key core byte-for-byte boot's `.pvmi` (the `--no-opt` invariant); `Just` ⇒ appended
+  -- | after `hash`.
+  , summary :: Maybe Summary
   }
 
 kindOfGdef :: Boolean -> Gdef -> ExportKind
@@ -83,6 +95,9 @@ interfaceOf a =
     , exports
     , ifaceImports: a.imports
     , hash: md5Hex (joinWith "\n" surface)
+    -- ADR-0084 §4: the summary is derived from the *optimised ANF* (not this bytecode artifact) and
+    -- attached only on the `--opt` path; the interface-of-a-bytecode-artifact carries none.
+    , summary: Nothing
     }
 
 -- --- serialization (.pmo / .pmi) ----------------------------------------------------
@@ -112,13 +127,20 @@ kindToJson = case _ of
   Erec -> JStr "rec"
 
 interfaceToJson :: Interface -> Json
-interfaceToJson i = JObj
-  [ "version" /\ JInt formatVersion
-  , "name" /\ JStr i.ifaceName
-  , "exports" /\ JArr (map (\(k /\ kd) -> JArr [ JStr k, kindToJson kd ]) i.exports)
-  , "imports" /\ strs i.ifaceImports
-  , "hash" /\ JStr i.hash
-  ]
+interfaceToJson i = JObj (core <> summaryField)
+  where
+  core =
+    [ "version" /\ JInt formatVersion
+    , "name" /\ JStr i.ifaceName
+    , "exports" /\ JArr (map (\(k /\ kd) -> JArr [ JStr k, kindToJson kd ]) i.exports)
+    , "imports" /\ strs i.ifaceImports
+    , "hash" /\ JStr i.hash
+    ]
+  -- ADR-0084 §5: appended *after* the five-key core and *entirely absent* under `--no-opt`
+  -- (`Nothing`, never `"summary":null`), so the core stays byte-for-byte boot's `.pvmi`.
+  summaryField = case i.summary of
+    Nothing -> []
+    Just (Summary j) -> [ "summary" /\ j ]
 
 moduleToString :: ModuleArtifact -> String
 moduleToString = stringify <<< moduleToJson

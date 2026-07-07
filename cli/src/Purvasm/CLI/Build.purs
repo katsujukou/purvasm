@@ -148,7 +148,12 @@ cmd opts = do
     pmoPath <- FS.joinPath [ buildDir, artifact.name <> ".pmo" ]
     pmiPath <- FS.joinPath [ buildDir, artifact.name <> ".pmi" ]
     FS.writeText pmoPath (moduleToString artifact)
-    FS.writeText pmiPath (interfaceToString (interfaceOf artifact))
+    -- ADR-0084 §3/§4: the optimiser summary is `--opt`-only and must be absent under `--no-opt`
+    -- (byte-identity with boot). It stays `Nothing` in both modes until the optimiser publishes
+    -- per-module-optimised ANF (§1; §4's conservative-unknown start); `opts.noOpt` is threaded now so
+    -- the suppression is in place the moment a summary exists (the `else` gains `Just (summarize …)`).
+    let iface = (interfaceOf artifact) { summary = if opts.noOpt then Nothing else Nothing }
+    FS.writeText pmiPath (interfaceToString iface)
     Log.info $ Fmt.fmt @"  compiled {name}" { name: artifact.name }
   -- link the closure into a runnable app.pvm; the entry `<module>.main` is an Effect,
   -- forced by applying it to unit (the `0` convention) at run.

@@ -5,9 +5,11 @@ module Test.Unit.Purvasm.Compiler.Bytecode.Artifact where
 
 import Prelude
 
+import Data.Maybe (Maybe(..))
 import Data.Tuple.Nested ((/\))
-import Purvasm.Compiler.Bytecode.Artifact (ModuleArtifact, interfaceOf, interfaceToString, moduleToString)
+import Purvasm.Compiler.Bytecode.Artifact (ModuleArtifact, Summary(..), interfaceOf, interfaceToString, moduleToString)
 import Purvasm.Compiler.Bytecode.Codegen (Gdef(..))
+import Purvasm.Compiler.Bytecode.Image (Json(..))
 import Purvasm.Compiler.Bytecode.Instruction (Instruction(..))
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
@@ -39,6 +41,11 @@ refPmo = """{"version":3,"name":"DiaA","imports":["DiaA","DiaB","DiaC","Prim"],"
 refPmi :: String
 refPmi = """{"version":3,"name":"DiaA","exports":[["DiaA.Two","caf"],["DiaA.both","caf"]],"imports":["DiaA","DiaB","DiaC","Prim"],"hash":"abfec547bb4356605e4c57f967084fce"}"""
 
+-- `refPmi` with the `--opt`-only summary appended after `hash` — the five-key core is byte-for-byte
+-- identical (ADR-0084 §5).
+refPmiWithSummary :: String
+refPmiWithSummary = """{"version":3,"name":"DiaA","exports":[["DiaA.Two","caf"],["DiaA.both","caf"]],"imports":["DiaA","DiaB","DiaC","Prim"],"hash":"abfec547bb4356605e4c57f967084fce","summary":{"v":1}}"""
+
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.Bytecode.Artifact" do
   it "serialises a module to byte-identical .pmo (== boot's .pvmo)" do
@@ -46,3 +53,13 @@ spec = describe "Purvasm.Compiler.Bytecode.Artifact" do
 
   it "serialises an interface to byte-identical .pmi (== boot's .pvmi, MD5 hash incl.)" do
     interfaceToString (interfaceOf diaA) `shouldEqual` refPmi
+
+  -- ADR-0084 §5: the `--opt`-only summary field must be *entirely absent* when `Nothing` (the
+  -- `--no-opt`/boot byte-identity invariant), and appended *after* `hash` when `Just`, leaving the
+  -- five-key core byte-for-byte unchanged.
+  it "omits the summary field when Nothing (five-key core == boot's .pvmi)" do
+    interfaceToString ((interfaceOf diaA) { summary = Nothing }) `shouldEqual` refPmi
+
+  it "appends the --opt summary after hash, core bytes unchanged" do
+    interfaceToString ((interfaceOf diaA) { summary = Just (Summary (JObj [ "v" /\ JInt 1 ])) })
+      `shouldEqual` refPmiWithSummary
