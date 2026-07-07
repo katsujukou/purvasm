@@ -5,7 +5,7 @@ import Prelude
 import Data.Array (sort)
 import Effect (Effect)
 import Effect.Console (log)
-import Lib (rand, shuffle)
+import Example.RustFFI.Lib (rand, shuffle)
 
 -- The output is PROPERTIES of the random results, not the results themselves, so it is
 -- deterministic across runs and backends — the example stays diffable in the sweep even

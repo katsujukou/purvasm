@@ -6,7 +6,7 @@
 -- |
 -- | Randomness is a genuine effect, so the foreigns are `Effect`-typed: the Rust side marks
 -- | them `effect` (the ADR-0067 thunk shape), the JS side is the usual curried thunk.
-module Lib (rand, shuffle) where
+module Example.RustFFI.Lib (rand, shuffle) where
 
 import Effect (Effect)
 

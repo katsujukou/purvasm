@@ -6,12 +6,12 @@
 use purvasm_foreign::pv_foreign;
 use rand::seq::SliceRandom;
 
-#[pv_foreign(module = "Lib", name = "rand", effect)]
+#[pv_foreign(module = "Example.RustFFI.Lib", name = "rand", effect)]
 fn rand_upto(max: i32) -> i32 {
     rand::random_range(1..=max)
 }
 
-#[pv_foreign(module = "Lib", name = "shuffle", effect)]
+#[pv_foreign(module = "Example.RustFFI.Lib", name = "shuffle", effect)]
 fn shuffle(arr: &[i32]) -> Vec<i32> {
     let mut rng = rand::rng();
     let mut vec = arr.to_vec();
