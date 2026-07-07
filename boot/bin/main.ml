@@ -626,13 +626,24 @@ let compile_action corefn output =
 
 (* Run the image. An `Effect` entry is performed for its effects and its `Unit`
    result is suppressed; a value entry's result is printed. *)
-let run_action image args =
+let run_action count image args =
   (* Guest argv (ADR-0075 §4): `[image] ++ trailing args`, the same drop-one shape a native
      binary or Node script presents, so a `.pvm` program reads its inputs uniformly. *)
   Ffi.set_guest_argv (Array.of_list (image :: args));
   let img = Pvm.Image.read_file image in
-  let v = Pvm.Image.run ~host:Ffi.host img in
-  if not img.Pvm.Image.is_effect then Stdlib.print_endline (Vm.Value.to_string v)
+  if count
+  then (
+    (* Deterministic instruction count + wall time for the ADR-0075 optimiser measurement
+       (VM leg): the stats go to stderr, so the guest's stdout — the benchmark self-check —
+       is untouched. *)
+    let t0 = Unix.gettimeofday () in
+    let v, instrs = Pvm.Image.run_counted ~host:Ffi.host img in
+    let ms = (Unix.gettimeofday () -. t0) *. 1000.0 in
+    if not img.Pvm.Image.is_effect then Stdlib.print_endline (Vm.Value.to_string v);
+    Stdlib.Printf.eprintf "instructions %d\ntime_ms %.4f\n" instrs ms)
+  else (
+    let v = Pvm.Image.run ~host:Ffi.host img in
+    if not img.Pvm.Image.is_effect then Stdlib.print_endline (Vm.Value.to_string v))
 
 (* --- command-line surface ------------------------------------------------- *)
 
@@ -889,10 +900,22 @@ let compile_cmd =
 
 let run_cmd =
   let open Cmdliner in
+  let count =
+    Arg.(
+      value
+      & flag
+      & info
+          [ "count" ]
+          ~doc:
+            "After the run, print the deterministic instruction count and wall time to \
+             stderr (ADR-0030 VM cost metric; the ADR-0075 optimiser-measurement leg). \
+             The guest's stdout is unaffected.")
+  in
   Cmd.v
     (Cmd.info "run" ~doc:"Run a linked .pvm image.")
     Term.(
       const run_action
+      $ count
       $ Arg.(required & pos 0 (some string) None & info [] ~docv:"IMAGE")
       $ Arg.(
           value

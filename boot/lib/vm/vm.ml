@@ -71,6 +71,20 @@ let run_image
     gdefs;
   Machine.run_chunk ~foreigns globals main Value.SMap.empty
 
+(** Like [run_image], but also returns the number of bytecode instructions executed —
+    the deterministic VM cost metric (ADR-0030) the benchmark harness reads via
+    [purvm run --count]. Resets the shared [Machine.executed] counter, so it is not
+    re-entrant; the single-shot CLI runner is the only caller. *)
+let run_image_counted
+      ?(host = Cesk.Machine.no_host)
+      (gdefs : (string * Codegen.gdef) list)
+      (main : Bytecode.chunk)
+  : Value.t * int
+  =
+  Machine.executed := 0;
+  let v = run_image ~host gdefs main in
+  v, !Machine.executed
+
 (** Run a lower-IR (ANF) program to a value, resolving native foreigns through [host]
     (default: none, for the pure core). *)
 let eval_anf ?(host = Cesk.Machine.no_host) (program : Middle_end.Anf.expr) : Value.t =

@@ -322,3 +322,8 @@ let of_term ?(is_effect = false) (t : C.term) : t =
 (** Run an image to a value, resolving native foreigns through [host]. *)
 let run ?(host = Cesk.Machine.no_host) (img : t) : Vm.Value.t =
   Vm.run_image ~host img.gdefs img.main
+
+(** Run an image and also return the deterministic instruction count (the [--count]
+    runner behind the ADR-0075 VM optimiser-measurement leg). *)
+let run_counted ?(host = Cesk.Machine.no_host) (img : t) : Vm.Value.t * int =
+  Vm.run_image_counted ~host img.gdefs img.main
