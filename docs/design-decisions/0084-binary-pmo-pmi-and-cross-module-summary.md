@@ -1,6 +1,6 @@
 # 0084. The cross-module optimiser summary — an `--opt`-only `.pmi` extension
 
-- Status: Proposed
+- Status: ~~Proposed~~ **Accepted** _(2026-07-07: accepted by maintainer; JSON additive-field summary + `hash`-untouched/always-recompile invalidation per the revised §4/§5)_
 - Date: 2026-07-07
 
 ## Context
@@ -98,13 +98,13 @@ So the **backend track and optimiser track stay parallel**: the backend consumes
 `--no-opt` core; the optimiser owns and consumes the `--opt` summary. **Binarising the `.pmi` *core*
 is out of scope** and deferred to *after boot retires* (when byte-identity is no longer the gate) — a
 future format record ([lv2-native-build]'s "binary `.pmo` = future ADR"). The **summary section itself
-has no boot counterpart**, so it may be binary from the start (§5).
+has no boot counterpart**, so it rides the existing JSON `.pmi` as an additive, `--opt`-only field (§5).
 
 **Mode-keyed cache — the two modes never cross-serve.** Because the same module has two artifact shapes
 (`--no-opt`: summary-absent; `--opt`: summary-present), the build cache **keys the artifact by
 optimisation mode** so they are *distinct entries* that never clobber or substitute for one another.
-A build carries its mode into the cache key (a namespace / an explicit `mode` tag in the artifact
-header, §5); an `--opt` compile that finds a dependency cached in `--no-opt` mode (no summary) treats
+A build carries its mode into the cache key (a namespace / an explicit `mode` tag in the build cache
+key); an `--opt` compile that finds a dependency cached in `--no-opt` mode (no summary) treats
 it as a **cache miss** and rebuilds that dependency `--opt`, rather than silently degrading to
 conservative-unknown against a summary-less artifact or reusing a stale one — and symmetrically a
 `--no-opt` build never reads an `--opt` artifact. (This keeps the boot byte-identity check honest: the
@@ -175,9 +175,10 @@ a summary one ([0082](0082-native-codegen-port-to-level-2.md) §4).
   one `--opt`-only channel; the `--no-opt` backend `.ll` track does **not** depend on it (boot-identical
   core, no summary read), so the two proceed in parallel and this record is a dependency but **not an
   acceptance blocker** for [0082](0082-native-codegen-port-to-level-2.md).
-- A dependency's summary now carries bodies, so a summarised body change invalidates the dependents
-  that consumed it — the recompilation cost the [0033](0033-separate-compilation.md) cascade must bound
-  via the §4 fingerprints; the `summarize` prune keeps it off the *large-pure* mass that dominates MIR.
+- A dependency's summary now carries bodies, so a summarised body change must reach the dependents that
+  consumed it — for now via §4's *always-recompile* on `--opt` (the precise fingerprint-based
+  [0033](0033-separate-compilation.md) cascade invalidation is deferred); the `summarize` prune keeps
+  the rebuilt mass off the *large-pure* bodies that dominate MIR.
 - Retires the per-build reconstruction tax for shapes on the optimiser path (read, don't re-derive) —
   the [0080](0080-foreign-signature-reconstruction-cst.md) Progress owed item — while leaving the
   backend's `--no-opt` byte-identity untouched.
@@ -186,8 +187,16 @@ a summary one ([0082](0082-native-codegen-port-to-level-2.md) §4).
 
 - **Binarise the whole `.pmi` (core + summary) now.** Rejected for the port: the `.pmi` core is
   byte-identical to boot's JSON `.pvmi` and that identity is the port's forcing function (`refPmi`).
-  Binarising the core would forfeit that gate mid-port. The core stays as-is; only the additive
-  `--opt` summary is binary. Core binarisation is a post-boot-retirement format record.
+  Binarising the core would forfeit that gate mid-port. The core stays as-is, JSON; the additive
+  `--opt` summary is a JSON field on it (§5), not binary. Core binarisation is a post-boot-retirement
+  format record.
+- **A binary envelope for the summary section alone** (magic + its own `formatVersion` + a varint body —
+  this record's earlier §5). Rejected for the port: the summary reuses the existing `Json` / `gdefToJson`
+  encoders (its bodies are already JSON-encodable), so a binary envelope adds a second encoder/decoder
+  and a second version axis for **no** byte-identity benefit (the core stays JSON regardless), and the
+  §4 always-recompile decision removes the cross-build schema-skew the envelope's versioning existed to
+  guard. Compactness / parse-speed of an `--opt`-only section is a later lever, not a port concern — a
+  plain additive JSON field (§5) is simpler and reuses the pipeline the port already has.
 - **Keep the thin `(ExportKind, hash)` interface; re-derive bodies from `corefn.json` on demand (or at
   a release-only whole-program step).** `corefn.json` *is* available, so this is possible — but it
   re-pays `transl`/`normalize` + re-optimisation for every dependency body drawn, **every build** (the
