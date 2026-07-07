@@ -9,8 +9,8 @@ import Prelude
 import Data.List (List(..))
 import Data.Map as Map
 import Data.Set as Set
-import Data.Tuple (Tuple, fst, snd)
-import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, Ctx, beginFn, emit, emitGlobal, flushFn, fresh, freshFn, freshLabel, makeCx, renderBuffer, runCodegen)
+import Data.Tuple (Tuple(..), fst, snd)
+import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, Ctx, beginFn, emit, emitGlobal, emitModule, fresh, freshFn, freshLabel, makeCx, renderBuffer, renderChunks, runCodegen, takeFn)
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
 
@@ -68,18 +68,24 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Monad" do
       renderBuffer (Nil :: List String) `shouldEqual` ""
 
     it "keeps the globals buffer independent of the function buffer" do
-      let ctx = snd $ run (emit "fn0" *> emitGlobal "glob0" *> emit "fn1")
+      let ctx = snd $ run (emit "fn0" *> emitGlobal "glob0\n" *> emit "fn1")
       renderBuffer ctx.fn `shouldEqual` "fn0\nfn1\n"
-      renderBuffer ctx.globals `shouldEqual` "glob0\n"
+      renderChunks ctx.globals `shouldEqual` "glob0\n"
 
-  describe "flushFn" do
-    it "moves the current function into the module buffer in order, then clears it" do
+  describe "takeFn / emitModule / renderChunks" do
+    it "takes the rendered function body and clears the line buffer" do
       let
-        ctx = snd $ run do
+        Tuple body ctx = run do
           emit "f1 line1"
           emit "f1 line2"
-          flushFn
-          emit "f2 line1"
-          flushFn
-      renderBuffer ctx.md `shouldEqual` "f1 line1\nf1 line2\nf2 line1\n"
+          takeFn
+      body `shouldEqual` "f1 line1\nf1 line2\n"
       ctx.fn `shouldEqual` (Nil :: List String)
+
+    it "concatenates module chunks verbatim, preserving their own newlines" do
+      let
+        ctx = snd $ run do
+          emitModule "define @a {\nentry:\n  ret\n}\n\n"
+          emitModule "define @b {\nentry:\n  ret\n}\n\n"
+      renderChunks ctx.md
+        `shouldEqual` "define @a {\nentry:\n  ret\n}\n\ndefine @b {\nentry:\n  ret\n}\n\n"

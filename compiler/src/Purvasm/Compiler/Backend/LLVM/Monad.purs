@@ -22,12 +22,14 @@ module Purvasm.Compiler.Backend.LLVM.Monad
   , freshLabel
   , freshFn
   , emit
+  , emitModule
   , emitGlobal
   , beginFn
-  , flushFn
+  , takeFn
   , getFrame
   , setFrame
   , renderBuffer
+  , renderChunks
   ) where
 
 import Prelude
@@ -45,14 +47,16 @@ import Data.String (joinWith)
 import Data.Tuple (Tuple(..))
 import Purvasm.Compiler.Backend.LLVM.Types (FnInfo, Lifted, SelfCtx)
 
--- | The emitter state (boot's `ctx`). `md`/`globals`/`fn` are reversed line buffers (see the module
--- | header); the counters and the reference/foreign/cross-module sets are the byte-identity-relevant
--- | state; `inlineAbi` selects the release inline ABI fast paths vs the `--debug` entry-call IR
--- | (ADR-0079).
+-- | The emitter state (boot's `ctx`). `fn` is a reversed **line** buffer (each `emit` is one line);
+-- | `md`/`globals` are reversed **chunk** buffers (each write is a pre-formatted raw string carrying
+-- | its own newlines — a whole `define` block or a `@…` global line), matching boot's `emit` (→ `fn`)
+-- | vs `Buffer.add_string` (→ `md`/`globals`). The counters and reference/foreign/cross-module sets are
+-- | the byte-identity-relevant state; `inlineAbi` selects the release inline ABI fast paths vs the
+-- | `--debug` entry-call IR (ADR-0079).
 type Ctx =
-  { md :: List String -- ^ the whole module (reversed)
-  , globals :: List String -- ^ module-level byte constants (reversed)
-  , fn :: List String -- ^ the current function body (reversed)
+  { md :: List String -- ^ the whole module: raw chunks (reversed)
+  , globals :: List String -- ^ module-level byte constants: raw chunks (reversed)
+  , fn :: List String -- ^ the current function body: lines (reversed)
   , ssa :: Int
   , lbl :: Int
   , fns :: Int -- ^ lifted-function counter
@@ -131,20 +135,26 @@ freshFn prefix = state \c -> let n = c.fns + 1 in Tuple (prefix <> show n) c { f
 emit :: String -> Codegen Unit
 emit line = modify_ \c -> c { fn = line : c.fn }
 
--- | Emit one line into the module-level globals buffer.
-emitGlobal :: String -> Codegen Unit
-emitGlobal line = modify_ \c -> c { globals = line : c.globals }
+-- | Append a pre-formatted raw chunk (a whole `define` block, carrying its own newlines) to the module
+-- | buffer (boot's `Buffer.add_string cx.md`).
+emitModule :: String -> Codegen Unit
+emitModule chunk = modify_ \c -> c { md = chunk : c.md }
 
--- | Start a new function body: reset the SSA counter and clear the current-function buffer. `lbl`/`fns`/
--- | `strs` are deliberately untouched (module-global).
+-- | Append a pre-formatted raw chunk (a `@…` global line, carrying its own newline) to the module-level
+-- | globals buffer (boot's `Buffer.add_string cx.globals`).
+emitGlobal :: String -> Codegen Unit
+emitGlobal chunk = modify_ \c -> c { globals = chunk : c.globals }
+
+-- | Start a new function body: reset the SSA counter and clear the current-function line buffer.
+-- | `lbl`/`fns`/`strs` are deliberately untouched (module-global).
 beginFn :: Codegen Unit
 beginFn = modify_ \c -> c { ssa = 0, fn = Nil }
 
--- | Flush the current function body into the module buffer, preserving order (boot's
--- | `Buffer.add_buffer cx.md cx.fn`), and clear it. Both buffers are reversed, so appending the
--- | reversed current-function lines in front of the reversed module lines yields the right final order.
-flushFn :: Codegen Unit
-flushFn = modify_ \c -> c { md = c.fn <> c.md, fn = Nil }
+-- | Take the current function body as rendered text and clear the line buffer (boot reads
+-- | `Buffer.contents cx.fn` into a `define` template). The counters are left alone; `beginFn` resets
+-- | `ssa` at the next function.
+takeFn :: Codegen String
+takeFn = state \c -> Tuple (renderBuffer c.fn) c { fn = Nil }
 
 -- | The current function's shadow-stack frame handle operand (boot's `cx.frame`).
 getFrame :: Codegen String
@@ -154,11 +164,16 @@ getFrame = state \c -> Tuple c.frame c
 setFrame :: String -> Codegen Unit
 setFrame f = modify_ \c -> c { frame = f }
 
--- | Render a reversed line buffer to text: every line followed by `"\n"`, byte-for-byte with boot's
--- | `Buffer.contents` (an empty buffer renders `""`). A single `joinWith` keeps it O(n).
+-- | Render a reversed **line** buffer (the `fn` body): every line followed by `"\n"`, byte-for-byte
+-- | with boot's `Buffer.contents` (an empty buffer renders `""`). A single `joinWith` keeps it O(n).
 renderBuffer :: List String -> String
 renderBuffer revLines =
   let
     lines = Array.reverse (Array.fromFoldable revLines)
   in
     if Array.null lines then "" else joinWith "\n" lines <> "\n"
+
+-- | Render a reversed **chunk** buffer (`md`/`globals`): raw concatenation, since each chunk carries
+-- | its own newlines.
+renderChunks :: List String -> String
+renderChunks revChunks = joinWith "" (Array.reverse (Array.fromFoldable revChunks))

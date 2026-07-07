@@ -13,6 +13,8 @@ import Test.Unit.Purvasm.Compiler.Bytecode.Image as Bytecode.Image
 import Test.Unit.Purvasm.Compiler.Bytecode.Lower as Bytecode.Lower
 import Test.Unit.Purvasm.Compiler.Bytecode.Lower.Match as Bytecode.Lower.Match
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Abi as Backend.LLVM.Abi
+import Test.Unit.Purvasm.Compiler.Backend.LLVM.Emit as Backend.LLVM.Emit
+import Test.Unit.Purvasm.Compiler.Backend.LLVM.FreeVars as Backend.LLVM.FreeVars
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Mangle as Backend.LLVM.Mangle
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Monad as Backend.LLVM.Monad
 import Test.Unit.Purvasm.Compiler.CESK.Translate as CESK.Translate
@@ -35,6 +37,8 @@ main = runSpecAndExitProcess [ consoleReporter ] do
   Backend.LLVM.Mangle.spec
   Backend.LLVM.Monad.spec
   Backend.LLVM.Abi.spec
+  Backend.LLVM.FreeVars.spec
+  Backend.LLVM.Emit.spec
   Bytecode.Image.spec
   Bytecode.Artifact.spec
   Compile.spec
