@@ -12,6 +12,7 @@ import Test.Unit.Purvasm.Compiler.Bytecode.Artifact as Bytecode.Artifact
 import Test.Unit.Purvasm.Compiler.Bytecode.Image as Bytecode.Image
 import Test.Unit.Purvasm.Compiler.Bytecode.Lower as Bytecode.Lower
 import Test.Unit.Purvasm.Compiler.Bytecode.Lower.Match as Bytecode.Lower.Match
+import Test.Unit.Purvasm.Compiler.Backend.LLVM.Mangle as Backend.LLVM.Mangle
 import Test.Unit.Purvasm.Compiler.CESK.Translate as CESK.Translate
 import Test.Unit.Purvasm.Compiler.Compile as Compile
 import Test.Unit.Purvasm.Compiler.Ffi as Ffi
@@ -29,6 +30,7 @@ main = runSpecAndExitProcess [ consoleReporter ] do
   CESK.Translate.spec
   Bytecode.Lower.spec
   Bytecode.Lower.Match.spec
+  Backend.LLVM.Mangle.spec
   Bytecode.Image.spec
   Bytecode.Artifact.spec
   Compile.spec
