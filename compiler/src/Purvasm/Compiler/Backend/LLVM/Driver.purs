@@ -22,22 +22,22 @@ import Data.Map (Map)
 import Data.Map as Map
 import Data.Set (Set)
 import Data.Set as Set
-import Data.Tuple (Tuple(..), snd)
+import Data.Tuple (Tuple(..))
 import PureScript.CoreFn.Expr (Bind(..)) as CF
 import PureScript.CoreFn.Module (Module) as CF
 import Purvasm.Compiler.Backend.LLVM.FreeVars (cfExpr)
 import Purvasm.Compiler.Backend.LLVM.Program (classifyNonrec, entryLl, gdefKeys, moduleLl, surfaceFn)
-import Purvasm.Compiler.Backend.LLVM.Types (CallFact, Gdef(..), SplitOutput)
+import Purvasm.Compiler.Backend.LLVM.Types (CallFact(..), Gdef(..), SplitOutput)
 import Purvasm.Compiler.CESK.Translate (nameKey, qualifiedKey, translExpr)
-import Purvasm.Compiler.MiddleEnd.ANF (Expr)
+import Purvasm.Compiler.MiddleEnd.ANF (CExpr(..), Expr(..))
 import Purvasm.Compiler.MiddleEnd.Normalize (normalize)
 
--- | Native-build knobs (mirrors boot's `program_split` optionals). `surface` is the cross-module export
--- | fact map derived from each dependency's `.pmi` (`Efn`→`Cfn`, `Erecfn`→`Crecfn`).
+-- | Native-build knobs (mirrors boot's `program_split` optionals). The cross-module export surface is
+-- | now derived from each module's own gdefs (ADR-0085): a module's compile produces both its `.ll` and
+-- | its export facts, so no redundant bytecode `compileModule` is needed to read them.
 type NativeOptions =
   { isEffect :: Boolean
   , heapWords :: Int
-  , surface :: Map String CallFact
   , debug :: Boolean
   }
 
@@ -61,21 +61,43 @@ cfGdef = case _ of
   Gcaf _ b -> cfExpr b
   Grec ms -> foldl (\s (Tuple _ b) -> Set.union s (cfExpr b)) Set.empty ms
 
+-- | A module's cross-module export surface (ADR-0077 §2, ADR-0085): its **public** exports (CoreFn
+-- | `exports`, qualified) mapped from their native gdef shape to a `CallFact` (`Gfun`→`Cfn`, a recursive
+-- | `Grec` function member→`Crecfn`). Derived from the module's own gdefs — the same facts boot read from
+-- | `interfaceOf`, without the redundant bytecode compile.
+deriveSurface :: CF.Module -> Array Gdef -> Map String CallFact
+deriveSurface m gdefs = foldl over Map.empty gdefs
+  where
+  exports = Set.fromFoldable (map (qualifiedKey m.name) m.exports)
+
+  over acc = case _ of
+    Gfun k ps _
+      | Set.member k exports -> Map.insert k (Cfn (Array.length ps)) acc
+      | otherwise -> acc
+    Grec ms -> foldl overMember acc ms
+    Gcaf _ _ -> acc
+
+  overMember acc (Tuple mk rhs) = case rhs of
+    Ret (CLam ps _) | Set.member mk exports -> Map.insert mk (Crecfn (Array.length ps)) acc
+    _ -> acc
+
 -- | Lower a whole program to per-module `.ll` objects + one init/entry object (B2). Each module is
--- | compiled independently; the entry object's `pv_init_all` runs only the entry-reachable inits
+-- | compiled independently to its own gdefs; the surface is derived from those gdefs (ADR-0085, no
+-- | redundant `compileModule`); the entry object's `pv_init_all` runs only the entry-reachable inits
 -- | (`entryLl` → `reachableGdefs` over the combined gdefs' reference graph).
 nativeSplit :: NativeOptions -> Array CF.Module -> Expr -> SplitOutput
 nativeSplit opts modules entry =
   let
     inlineAbi = not opts.debug
-    perModule = map (\m -> Tuple (nameKey m.name) (gdefsOfModule m)) modules
-    allGdefs = Array.concatMap snd perModule
+    compiled = map (\m -> { name: nameKey m.name, mod: m, gdefs: gdefsOfModule m }) modules
+    allGdefs = Array.concatMap _.gdefs compiled
     gkeys = Set.fromFoldable (Array.concatMap gdefKeys allGdefs)
-    xfns = foldl (surfaceFn opts.surface) Map.empty allGdefs
+    surface = foldl (\acc c -> Map.union (deriveSurface c.mod c.gdefs) acc) Map.empty compiled
+    xfns = foldl (surfaceFn surface) Map.empty allGdefs
     cxOpts = { gkeys, xfns, inlineAbi }
     moduleObjs = map
-      (\(Tuple name gs) -> Tuple name (moduleLl cxOpts (Set.fromFoldable (Array.concatMap gdefKeys gs)) gs))
-      perModule
+      (\c -> Tuple c.name (moduleLl cxOpts (Set.fromFoldable (Array.concatMap gdefKeys c.gdefs)) c.gdefs))
+      compiled
   in
     { modules: moduleObjs
     , entry: entryLl cxOpts opts.isEffect opts.heapWords allGdefs entry

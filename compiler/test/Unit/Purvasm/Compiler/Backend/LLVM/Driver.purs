@@ -11,15 +11,13 @@ import Data.Argonaut.Decode (printJsonDecodeError)
 import Data.Argonaut.Parser (jsonParser)
 import Data.Bifunctor (lmap)
 import Data.Either (Either(..))
-import Data.Map as Map
-import Data.Tuple (Tuple(..), snd)
+import Data.Tuple (snd)
 import Effect.Class (liftEffect)
 import Node.Encoding (Encoding(..))
 import Node.FS.Sync (readTextFile)
 import PureScript.CoreFn.Decode (decodeModule)
 import PureScript.CoreFn.Module (Module)
 import Purvasm.Compiler.Backend.LLVM.Driver (nativeSplit)
-import Purvasm.Compiler.Backend.LLVM.Types (CallFact(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..))
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (fail, shouldEqual)
@@ -42,10 +40,11 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Driver" do
         Left err -> fail ("CoreFn decode failed: " <> err)
         Right mod -> do
           let
+            -- The surface (`identInt` is a public export of arity 1 → `Cfn 1`, so its `$d` is the
+            -- exported `define tailcc`) is now derived from the module's own gdefs + exports.
             out = nativeSplit
               { isEffect: false
               , heapWords: 1048576
-              , surface: Map.fromFoldable [ Tuple "Slice1.identInt" (Cfn 1) ]
               , debug: false
               }
               [ mod ]

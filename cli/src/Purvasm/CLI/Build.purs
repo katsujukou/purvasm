@@ -35,11 +35,8 @@ import Purvasm.CLI.NativeLink as NativeLink
 import Purvasm.CLI.Ulib (corefnPathFor, requireUlibDir)
 import Purvasm.Compiler.Backend.LLVM.Abi (defaultHeapWords)
 import Purvasm.Compiler.Backend.LLVM.Driver (nativeSplit)
-import Purvasm.Compiler.Backend.LLVM.Types (CallFact(..))
-import Purvasm.Compiler.Bytecode.Artifact (ExportKind(..), interfaceOf)
 import Purvasm.Compiler.CESK.AST (Term(..))
 import Purvasm.Compiler.CESK.Translate (nameKey)
-import Purvasm.Compiler.Compile (compileModule)
 import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Expr)
 import Purvasm.Compiler.MiddleEnd.Normalize (normalize)
@@ -150,19 +147,6 @@ depOrder mods = Array.fromFoldable (List.reverse (snd (foldl visit (Set.empty /\
 
   localDeps m = Array.filter (\n -> Map.member n mods) (importNames m)
 
--- | The cross-module export surface (ADR-0077 §2): each module's public exports, mapped from its
--- | interface `ExportKind` to a native `CallFact` (`Efn`→`Cfn`, `Erecfn`→`Crecfn`; value exports carry
--- | no call fact). This is the same fact each module's `.pmi` publishes — derived here from the same
--- | `interfaceOf` that writes it, pending the binary-artifact record (ADR-0084).
-surfaceOf :: Array Module -> Map String CallFact
-surfaceOf = foldl overModule Map.empty
-  where
-  overModule acc m = foldl overExport acc (interfaceOf (compileModule m)).exports
-  overExport acc (Tuple key kind) = case kind of
-    Efn n -> Map.insert key (Cfn n) acc
-    Erecfn n -> Map.insert key (Crecfn n) acc
-    _ -> acc
-
 -- | The entry expression fed to the backend: a bare value (`--value`, printed) is the entry read
 -- | directly; an `Effect` (default) is the entry applied to unit (the `0` convention), run for effects.
 entryExprOf :: Options -> Expr
@@ -194,7 +178,6 @@ cmd opts = do
     out = nativeSplit
       { isEffect: not opts.value
       , heapWords: defaultHeapWords
-      , surface: surfaceOf ordered
       , debug: false
       }
       ordered
