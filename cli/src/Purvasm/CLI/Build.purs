@@ -182,7 +182,12 @@ cmd opts = do
       ordered
     Log.debug $ Fmt.fmt @"foreign-sigs: {n} signatures resolved" { n: show total }
   let
-    nativeOpts = { isEffect: not opts.value, heapWords: defaultHeapWords, debug: false }
+    nativeOpts =
+      { isEffect: not opts.value
+      , heapWords: defaultHeapWords
+      , debug: false
+      , opt: not opts.noOpt
+      }
     entry = entryExprOf opts
   buildDir <- FS.joinPath [ opts.outDir, "_build" ]
   FS.mkdirP buildDir

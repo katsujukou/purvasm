@@ -46,6 +46,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Driver" do
               { isEffect: false
               , heapWords: 1048576
               , debug: false
+              , opt: false
               }
               [ mod ]
               slice1Entry

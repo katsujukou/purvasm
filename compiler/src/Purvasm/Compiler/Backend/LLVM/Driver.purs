@@ -29,14 +29,16 @@ import Data.Tuple (Tuple(..))
 import PureScript.CoreFn.Expr (Bind(..)) as CF
 import PureScript.CoreFn.Module (Module) as CF
 import Purvasm.Compiler.Backend.LLVM.FreeVars (cfExpr)
+import Purvasm.Compiler.Backend.LLVM.Interface (interfaceOfAnf)
 import Purvasm.Compiler.Backend.LLVM.Monad (MakeCxOptions)
 import Purvasm.Compiler.Backend.LLVM.Program (classifyNonrec, entryLl, gdefKeys, moduleLl, surfaceFn)
 import Purvasm.Compiler.Backend.LLVM.Types (CallFact(..), Gdef(..), SplitOutput)
 import Purvasm.Compiler.CESK.Translate (nameKey, qualifiedKey, translExpr)
 import Purvasm.Compiler.MiddleEnd.ANF (CExpr(..), Expr(..))
 import Purvasm.Compiler.MiddleEnd.ANF.Pretty (Decl, printExpr, printModuleAnf)
-import Purvasm.Compiler.MiddleEnd.DictElim (DictMachinery, dictElimExpr, emptyMachinery, machineryOf, mergeMachinery)
+import Purvasm.Compiler.MiddleEnd.DictElim (dictElimExpr, emptyMachinery, machineryOf, mergeMachinery)
 import Purvasm.Compiler.MiddleEnd.Normalize (normalize)
+import Purvasm.Compiler.MiddleEnd.Optimizer (applySummary, emptyBuildEnv, optimize)
 
 -- | Native-build knobs (mirrors boot's `program_split` optionals). The cross-module export surface is
 -- | now derived from each module's own gdefs (ADR-0085): a module's compile produces both its `.ll` and
@@ -45,6 +47,10 @@ type NativeOptions =
   { isEffect :: Boolean
   , heapWords :: Int
   , debug :: Boolean
+  -- | `true` on the `--opt` path: run the `(optimize)` seam and grow the cross-module `BuildEnv`.
+  -- | `false` (`--no-opt`) skips both — only the required lowering (`DictElim`) runs, byte-identical to
+  -- | boot.
+  , opt :: Boolean
   }
 
 -- | One CoreFn module → its native `Gdef`s, each binding compiled independently (CoreFn → CESK term
@@ -118,12 +124,14 @@ type Compiled =
   }
 
 -- | The shared per-module pipeline (ADR-0085): compile each module independently to its gdefs, then
--- | **fold over the modules in dependency order threading an in-memory `DictMachinery` env** — so
--- | `DictElim` (required lowering) resolves an imported accessor/instance from the env just as a local
--- | one. `gdefs0` (pre-`DictElim`) fixes the program-wide key set and export surface (both stable under
--- | `DictElim`, which rewrites bodies not top-level keys/arities). The `(optimize)` seam (ADR-0085 §1)
--- | sits here, between `DictElim` and the consumers, receiving the same env; it is a no-op until the
--- | optimiser track fills it. Both `nativeSplit` (`.ll`) and `nativeIr` (pretty ANF) consume this.
+-- | **fold over the modules in dependency order threading two in-memory envs** — a `DictMachinery` (for
+-- | `DictElim`, required lowering) and the optimiser's `BuildEnv`. For each module: run `DictElim`
+-- | (resolving imported accessors/instances from the machinery env just like local ones), then — on the
+-- | `--opt` path only — run the `(optimize)` seam over each body under the `BuildEnv`, and fold this
+-- | module's interface (computed straight from its ANF, `ANF → Pmi` — never via the `.pmo`)
+-- | into the `BuildEnv` for its dependents. `gdefs0` (pre-`DictElim`) fixes the program-wide key set and
+-- | export surface (both stable under `DictElim`, which rewrites bodies not top-level keys/arities). Both
+-- | `nativeSplit` (`.ll`) and `nativeIr` (pretty ANF) consume this.
 compileModules :: NativeOptions -> Array CF.Module -> Expr -> Compiled
 compileModules opts modules entry =
   let
@@ -134,20 +142,27 @@ compileModules opts modules entry =
     surface = foldl (\acc c -> Map.union (deriveSurface c.mod c.gdefs0) acc) Map.empty compiled0
     xfns = foldl (surfaceFn surface) Map.empty allGdefs0
 
-    compileOne env c =
+    optimizeBody build = if opts.opt then optimize build else identity
+
+    compileOne acc c =
       let
         own = machineryOf (spineBindings c.gdefs0)
-        full = mergeMachinery own env
+        full = mergeMachinery own acc.dict
+        elimd = map (mapGdefBody (dictElimExpr gkeys full)) c.gdefs0
+        gdefs = map (mapGdefBody (optimizeBody acc.build)) elimd
+        -- Grow the optimiser env for dependents (`--opt` only): the interface is derived from this
+        -- module's optimised ANF, so an arity-changing optimisation moves the `.pmi` hash as it should.
+        build' = if opts.opt then applySummary acc.build (interfaceOfAnf c.mod gdefs) else acc.build
       in
-        { accum: mergeMachinery env own
-        , value: { name: c.name, gdefs: map (mapGdefBody (dictElimExpr gkeys full)) c.gdefs0 }
+        { accum: { dict: mergeMachinery acc.dict own, build: build' }
+        , value: { name: c.name, gdefs }
         }
 
-    compiled = mapAccumL compileOne emptyMachinery compiled0
+    compiled = mapAccumL compileOne { dict: emptyMachinery, build: emptyBuildEnv } compiled0
   in
     { perModule: compiled.value
     , allGdefs: Array.concatMap _.gdefs compiled.value
-    , entry: dictElimExpr gkeys compiled.accum entry
+    , entry: optimizeBody compiled.accum.build (dictElimExpr gkeys compiled.accum.dict entry)
     , cxOpts: { gkeys, xfns, inlineAbi }
     }
 

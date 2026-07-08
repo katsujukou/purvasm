@@ -16,6 +16,7 @@ import Test.Unit.Purvasm.Compiler.Backend.LLVM.Abi as Backend.LLVM.Abi
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Driver as Backend.LLVM.Driver
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Emit as Backend.LLVM.Emit
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.FreeVars as Backend.LLVM.FreeVars
+import Test.Unit.Purvasm.Compiler.Backend.LLVM.Interface as Backend.LLVM.Interface
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Mangle as Backend.LLVM.Mangle
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Monad as Backend.LLVM.Monad
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Prim as Backend.LLVM.Prim
@@ -47,6 +48,7 @@ main = runSpecAndExitProcess [ consoleReporter ] do
   Backend.LLVM.Abi.spec
   Backend.LLVM.Prim.spec
   Backend.LLVM.FreeVars.spec
+  Backend.LLVM.Interface.spec
   Backend.LLVM.Emit.spec
   Backend.LLVM.Driver.spec
   Bytecode.Image.spec

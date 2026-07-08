@@ -77,28 +77,41 @@ kindToTag = case _ of
   Ecaf -> "caf"
   Erec -> "rec"
 
--- | The interface of a compiled module: its *public* exports paired with each one's kind,
--- | sorted by key, and an MD5 hash over `name:kind` lines so a dependent-observable change
--- | (e.g. an exported function's arity) moves the hash while a private edit does not.
+-- | Build an `Interface` from a module's already-derived **export surface** (its public exports paired
+-- | with each one's `ExportKind`): sort by key, then MD5-hash the `name:kind` lines so a
+-- | dependent-observable change (e.g. an exported function's arity) moves the hash while a private edit
+-- | does not. This is the single source of the `.pmi` hash formula — it depends only on the export
+-- | surface, **not on the `.pmo`** — so both the bytecode deriver (`interfaceOf`, from a `ModuleArtifact`)
+-- | and the native ANF deriver (`Backend.LLVM.Interface.interfaceOfAnf`, from the module's ANF gdefs)
+-- | route through here and stay byte-identical: the `.pmi` is a sibling of the `.pmo`/`.ll` off the ANF
+-- | (`ANF → {Pmo, Pmi, LLVM}`), never an `ANF → Pmo → Pmi` detour. `summary` is `Nothing`; the `--opt`
+-- | summary is attached by the caller from the optimised ANF.
+interfaceFromExports
+  :: { name :: String, imports :: Array String, exports :: Array (String /\ ExportKind) }
+  -> Interface
+interfaceFromExports r =
+  let
+    exports = sortWith (\(k /\ _) -> k) r.exports
+    surface = map (\(k /\ kd) -> k <> ":" <> kindToTag kd) exports
+  in
+    { ifaceName: r.name
+    , exports
+    , ifaceImports: r.imports
+    , hash: md5Hex (joinWith "\n" surface)
+    , summary: Nothing
+    }
+
+-- | The interface of a compiled bytecode module: derive each public export's `ExportKind` from the
+-- | object's groups, then hash the surface via `interfaceFromExports`.
 interfaceOf :: ModuleArtifact -> Interface
 interfaceOf a =
   let
     defs = Map.fromFoldable
       (concatMap (\g -> map (\(k /\ gd) -> k /\ (g.recursive /\ gd)) g.members) a.groups)
-    exports = sortWith (\(k /\ _) -> k)
-      ( mapMaybe (\k -> map (\(r /\ gd) -> k /\ kindOfGdef r gd) (Map.lookup k defs))
-          a.exports
-      )
-    surface = map (\(k /\ kd) -> k <> ":" <> kindToTag kd) exports
+    exports = mapMaybe (\k -> map (\(r /\ gd) -> k /\ kindOfGdef r gd) (Map.lookup k defs))
+      a.exports
   in
-    { ifaceName: a.name
-    , exports
-    , ifaceImports: a.imports
-    , hash: md5Hex (joinWith "\n" surface)
-    -- ADR-0084 §4: the summary is derived from the *optimised ANF* (not this bytecode artifact) and
-    -- attached only on the `--opt` path; the interface-of-a-bytecode-artifact carries none.
-    , summary: Nothing
-    }
+    interfaceFromExports { name: a.name, imports: a.imports, exports }
 
 -- --- serialization (.pmo / .pmi) ----------------------------------------------------
 
