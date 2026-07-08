@@ -18,6 +18,7 @@ import Test.Unit.Purvasm.Compiler.Backend.LLVM.Emit as Backend.LLVM.Emit
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.FreeVars as Backend.LLVM.FreeVars
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Mangle as Backend.LLVM.Mangle
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Monad as Backend.LLVM.Monad
+import Test.Unit.Purvasm.Compiler.Backend.LLVM.Prim as Backend.LLVM.Prim
 import Test.Unit.Purvasm.Compiler.CESK.Translate as CESK.Translate
 import Test.Unit.Purvasm.Compiler.Compile as Compile
 import Test.Unit.Purvasm.Compiler.Ffi as Ffi
@@ -44,6 +45,7 @@ main = runSpecAndExitProcess [ consoleReporter ] do
   Backend.LLVM.Mangle.spec
   Backend.LLVM.Monad.spec
   Backend.LLVM.Abi.spec
+  Backend.LLVM.Prim.spec
   Backend.LLVM.FreeVars.spec
   Backend.LLVM.Emit.spec
   Backend.LLVM.Driver.spec
