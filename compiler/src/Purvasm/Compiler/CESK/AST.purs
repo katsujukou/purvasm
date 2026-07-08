@@ -26,6 +26,11 @@ data Term
   | TmForeign String
   | TmCase (Array Term) (Array Alternative)
 
+derive instance Eq Term
+derive instance Generic Term _
+instance Show Term where
+  show t = genericShow t
+
 type Alternative =
   { binders :: Array Binder
   , result :: Rhs
@@ -34,11 +39,6 @@ type Alternative =
 data Rhs
   = Unconditional Term
   | Guarded (Array { guard :: Term, rhs :: Term })
-
-derive instance Eq Term
-derive instance Generic Term _
-instance Show Term where
-  show t = genericShow t
 
 derive instance Eq Rhs
 derive instance Generic Rhs _

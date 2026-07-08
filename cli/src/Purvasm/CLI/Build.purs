@@ -11,7 +11,7 @@ import ArgParse.Basic (ArgParser, fromRecord)
 import ArgParse.Basic as ArgParser
 import Data.Array as Array
 import Data.Either (Either(..))
-import Data.Foldable (foldM, foldl)
+import Data.Foldable (foldM, foldl, for_)
 import Data.FoldableWithIndex (forWithIndex_)
 import Data.List (List(..), (:))
 import Data.List as List
@@ -34,7 +34,7 @@ import Purvasm.CLI.ForeignSigs as ForeignSigs
 import Purvasm.CLI.NativeLink as NativeLink
 import Purvasm.CLI.Ulib (corefnPathFor, requireUlibDir)
 import Purvasm.Compiler.Backend.LLVM.Abi (defaultHeapWords)
-import Purvasm.Compiler.Backend.LLVM.Driver (nativeSplit)
+import Purvasm.Compiler.Backend.LLVM.Driver (nativeIr, nativeSplit)
 import Purvasm.Compiler.CESK.AST (Term(..))
 import Purvasm.Compiler.CESK.Translate (nameKey)
 import Purvasm.Compiler.Literal (Literal(..))
@@ -53,6 +53,7 @@ type Options =
   , checkForeignSigs :: Boolean
   , noOpt :: Boolean
   , emitLlvm :: Boolean
+  , emitIr :: Boolean
   , runtimeLib :: Maybe FilePath
   }
 
@@ -100,6 +101,12 @@ options = fromRecord
       ArgParser.flag [ "--emit-llvm" ]
         "Stop after emitting the `.ll` objects (no clang/link). Useful for the byte-identity\n\
         \differential against boot; a full build otherwise links a native executable."
+        # ArgParser.boolean
+  , emitIr:
+      ArgParser.flag [ "--emit-ir" ]
+        "Emit each module's optimised ANF (post-DictElim and the optimiser) as pretty-printed\n\
+        \`<module>.ir` under _build, and stop (no codegen/link). For inspecting the middle-end\n\
+        \output (ADR-0085)."
         # ArgParser.boolean
   , runtimeLib:
       ArgParser.argument [ "--runtime-lib" ]
@@ -175,29 +182,32 @@ cmd opts = do
       ordered
     Log.debug $ Fmt.fmt @"foreign-sigs: {n} signatures resolved" { n: show total }
   let
-    out = nativeSplit
-      { isEffect: not opts.value
-      , heapWords: defaultHeapWords
-      , debug: false
-      }
-      ordered
-      (entryExprOf opts)
+    nativeOpts = { isEffect: not opts.value, heapWords: defaultHeapWords, debug: false }
+    entry = entryExprOf opts
   buildDir <- FS.joinPath [ opts.outDir, "_build" ]
   FS.mkdirP buildDir
-  forWithIndex_ out.modules \i (Tuple name ll) -> do
-    modPath <- FS.joinPath [ buildDir, "mod_" <> show i <> ".ll" ]
-    FS.writeText modPath ll
-    Log.info $ Fmt.fmt @"  emitted {name} → mod_{i}.ll" { name, i: show i }
-  entryPath <- FS.joinPath [ buildDir, "entry.ll" ]
-  FS.writeText entryPath out.entry
-  Log.info $ Fmt.fmt @"✓ Emitted {n} object(s) → {dir}"
-    { n: show (Array.length out.modules + 1), dir: buildDir }
-  -- Link the objects into a native executable, unless `--emit-llvm` stops at the IR (e.g. for the
-  -- byte-identity differential, which needs no runtime staticlib).
-  unless opts.emitLlvm do
-    NativeLink.link
-      { output: opts.outDir
-      , buildDir
-      , moduleCount: Array.length out.modules
-      , runtimeLib: opts.runtimeLib
-      }
+  if opts.emitIr then
+    -- `--emit-ir`: dump each module's optimised ANF (post-DictElim / optimiser) and stop.
+    for_ (nativeIr nativeOpts ordered entry) \(Tuple name ir) -> do
+      irPath <- FS.joinPath [ buildDir, name <> ".ir" ]
+      FS.writeText irPath ir
+      Log.info $ Fmt.fmt @"  emitted ANF IR → {name}.ir" { name }
+  else do
+    let out = nativeSplit nativeOpts ordered entry
+    forWithIndex_ out.modules \i (Tuple name ll) -> do
+      modPath <- FS.joinPath [ buildDir, "mod_" <> show i <> ".ll" ]
+      FS.writeText modPath ll
+      Log.info $ Fmt.fmt @"  emitted {name} → mod_{i}.ll" { name, i: show i }
+    entryPath <- FS.joinPath [ buildDir, "entry.ll" ]
+    FS.writeText entryPath out.entry
+    Log.info $ Fmt.fmt @"✓ Emitted {n} object(s) → {dir}"
+      { n: show (Array.length out.modules + 1), dir: buildDir }
+    -- Link the objects into a native executable, unless `--emit-llvm` stops at the IR (e.g. for the
+    -- byte-identity differential, which needs no runtime staticlib).
+    unless opts.emitLlvm do
+      NativeLink.link
+        { output: opts.outDir
+        , buildDir
+        , moduleCount: Array.length out.modules
+        , runtimeLib: opts.runtimeLib
+        }
