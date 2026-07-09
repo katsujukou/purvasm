@@ -1,8 +1,14 @@
--- | `purvasm build`: the native (LLVM) backend (ADR-0082). Loads the entry module's import closure,
--- | compiles each module **independently** to its own `.ll` object (B2 separate compilation — no
--- | whole-program term), and writes the per-module objects + the init/entry object under
--- | `<outDir>/_build`. Linking the objects into a native binary (clang + `lld --gc-sections` + the
--- | runtime staticlib) is `Backend.NativeLink`, a later step. The bytecode/VM path is `purvasm run`.
+-- | `purvasm build`: the native (LLVM) backend (ADR-0082/0087). Drives the backend-neutral
+-- | `Purvasm.Compiler.build` driver with the LLVM `Backend` (`llvmBackend`) and a CLI-provided
+-- | `CompilerAction` over the `Run` effect stack: `loadModule` reads a module's `corefn.json` (through the
+-- | `ulib` overlay, ADR-0055), `emitFile`/`emitEntry` write the per-module `mod_<i>.ll`/`.pmi` and the
+-- | `entry.ll` under `<outDir>/_build`, and the inspection hooks realise `--emit-ir` (§ below). Linking the
+-- | objects into a native binary is `NativeLink`. The bytecode/VM path is `purvasm run`.
+-- |
+-- | `--emit-ir <module>` (ADR-0087 §3.1) is a *trace*, not a stop: the build runs to completion, and for
+-- | the named module the driver's optimiser-iteration hooks append each round's pretty-printed ANF to a
+-- | `Ref` buffer (a `purs-backend-es --trace-rewrite` analogue), flushed to `<module>.ir` when the module
+-- | finishes. `--opt-max-iter <N>` bounds the fixpoint loop (clamped to `[1, optMaxIterCap]`).
 module Purvasm.CLI.Build where
 
 import Prelude
@@ -11,16 +17,18 @@ import ArgParse.Basic (ArgParser, fromRecord)
 import ArgParse.Basic as ArgParser
 import Data.Array as Array
 import Data.Either (Either(..))
-import Data.Foldable (foldM, foldl, for_)
-import Data.FoldableWithIndex (forWithIndex_)
+import Data.Foldable (foldM, foldl)
 import Data.List (List(..), (:))
 import Data.List as List
 import Data.Map (Map)
 import Data.Map as Map
 import Data.Maybe (Maybe(..))
 import Data.Set as Set
-import Data.Tuple (Tuple(..), fst, snd)
+import Data.String.Common (joinWith)
+import Data.Tuple (fst, snd)
 import Data.Tuple.Nested (type (/\), (/\))
+import Effect.Ref (Ref)
+import Effect.Ref as Ref
 import Fmt as Fmt
 import PureScript.CoreFn.Module (Module)
 import Purvasm.CLI.Compile (parseModule)
@@ -33,14 +41,13 @@ import Purvasm.CLI.Effect.Process (PROC)
 import Purvasm.CLI.ForeignSigs as ForeignSigs
 import Purvasm.CLI.NativeLink as NativeLink
 import Purvasm.CLI.Ulib (corefnPathFor, requireUlibDir)
+import Purvasm.Compiler (Backend, BuildError(..), CompilerAction, CompilerActionHooks, LoadResult(..), build, defaultHooks)
 import Purvasm.Compiler.Backend.LLVM.Abi (defaultHeapWords)
-import Purvasm.Compiler.Backend.LLVM.Driver (nativeIr, nativeSplit)
-import Purvasm.Compiler.CESK.AST (Term(..))
+import Purvasm.Compiler.Backend.LLVM.Driver (LlvmContext, llvmBackend)
+import Purvasm.Compiler.Bytecode.Artifact (interfaceToString)
 import Purvasm.Compiler.CESK.Translate (nameKey)
-import Purvasm.Compiler.Literal (Literal(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Expr)
-import Purvasm.Compiler.MiddleEnd.Normalize (normalize)
-import Run (EFFECT, Run)
+import Purvasm.Compiler.MiddleEnd.ANF.Pretty (printModuleAnf)
+import Run (EFFECT, Run, liftEffect)
 import Run.Except (EXCEPT, throw)
 import Type.Row (type (+))
 
@@ -53,9 +60,18 @@ type Options =
   , checkForeignSigs :: Boolean
   , noOpt :: Boolean
   , emitLlvm :: Boolean
-  , emitIr :: Boolean
+  -- | `--emit-ir <module>`: trace the named module's per-round ANF to `<module>.ir` (the build still runs
+  -- | to completion). `Nothing` ⇒ no tracing.
+  , emitIr :: Maybe String
+  -- | `--opt-max-iter <N>`: the optimiser fixpoint round cap, clamped to `[1, optMaxIterCap]`.
+  , optMaxIter :: Int
   , runtimeLib :: Maybe FilePath
   }
+
+-- | The heuristic hard cap on optimiser fixpoint rounds (ADR-0087 §3.1) — the outer-round analogue of
+-- | ADR-0082's inner `rewriteLimit` fuel, a non-termination backstop.
+optMaxIterCap :: Int
+optMaxIterCap = 10
 
 options :: ArgParser Options
 options = fromRecord
@@ -103,11 +119,16 @@ options = fromRecord
         \differential against boot; a full build otherwise links a native executable."
         # ArgParser.boolean
   , emitIr:
-      ArgParser.flag [ "--emit-ir" ]
-        "Emit each module's optimised ANF (post-DictElim and the optimiser) as pretty-printed\n\
-        \`<module>.ir` under _build, and stop (no codegen/link). For inspecting the middle-end\n\
-        \output (ADR-0085)."
-        # ArgParser.boolean
+      ArgParser.argument [ "--emit-ir" ]
+        "Trace a module's optimiser output: for the named module, append each optimiser round's\n\
+        \pretty-printed ANF to `<module>.ir` under _build (a --trace-rewrite analogue). The build\n\
+        \still runs to completion (codegen + link); this only turns on tracing (ADR-0087 §3.1)."
+        # ArgParser.optional
+  , optMaxIter:
+      ArgParser.argument [ "--opt-max-iter" ]
+        "Maximum optimiser fixpoint rounds per module (clamped to [1, 10]). Defaults to the cap."
+        # ArgParser.int
+        # ArgParser.default optMaxIterCap
   , runtimeLib:
       ArgParser.argument [ "--runtime-lib" ]
         "Path to the runtime staticlib (libpurvasm_rt.a). Defaults to $PURVASM_RT_A or\n\
@@ -118,10 +139,10 @@ options = fromRecord
 importNames :: Module -> Array String
 importNames m = map (nameKey <<< _.moduleName) m.imports
 
--- | Load the entry module and the transitive closure of its imports (boot's `Link.load`):
--- | a module whose `corefn.json` is absent (e.g. `Prim`) is simply skipped. Each module is
--- | resolved through the `ulib` overlay first (the patched module wins, ADR-0055), falling back
--- | to `corefnDir`.
+-- | Load the entry module and the transitive closure of its imports (the `Map`-based CLI helper used by
+-- | `--check-foreign-sigs` and the `foreign-sigs` command). The library `Purvasm.Compiler.loadClosure`
+-- | drives the actual native build; this is retained for the closure-sweep commands that want a plain
+-- | `Array Module`. A module whose `corefn.json` is absent (e.g. `Prim`) is skipped.
 loadClosure :: forall r. FilePath -> FilePath -> String -> Run (FS + EXCEPT String + r) (Map String Module)
 loadClosure ulibDir corefnDir = go Map.empty
   where
@@ -141,7 +162,6 @@ depOrder mods = Array.fromFoldable (List.reverse (snd (foldl visit (Set.empty /\
   where
   names = map fst (Map.toUnfoldable mods :: Array (String /\ Module))
 
-  -- post-order accumulated in reverse (cons is O(1), ADR-0049), reversed once above.
   visit acc@(seen /\ done) name
     | Set.member name seen = acc
     | otherwise = case Map.lookup name mods of
@@ -154,65 +174,121 @@ depOrder mods = Array.fromFoldable (List.reverse (snd (foldl visit (Set.empty /\
 
   localDeps m = Array.filter (\n -> Map.member n mods) (importNames m)
 
--- | The entry expression fed to the backend: a bare value (`--value`, printed) is the entry read
--- | directly; an `Effect` (default) is the entry applied to unit (the `0` convention), run for effects.
-entryExprOf :: Options -> Expr
-entryExprOf opts =
-  let
-    key = opts.entryModule <> "." <> opts.entryName
-  in
-    if opts.value then normalize (TmVar key)
-    else normalize (TmApp (TmVar key) (TmLit (LInt 0)))
+-- | The CLI's effect row for the native build.
+type BuildM r = Run (ENV + LOG + FS + PROC + EXCEPT String + EFFECT + r)
 
--- | Compile the program natively: load the closure, emit each module's `.ll` object and the init/entry
--- | object under `<outDir>/_build` (B2 separate compilation).
+-- | Render a `BuildError` as the CLI's `EXCEPT String` message.
+renderBuildError :: BuildError -> String
+renderBuildError = case _ of
+  EntryMissing name -> "entry module not found: " <> name
+  LoadFailed e -> Fmt.fmt @"{name}: {detail}" { name: e.moduleName, detail: e.detail }
+
+-- | The CLI `CompilerAction` over the `Run` stack: single-module CoreFn loading (through the `ulib`
+-- | overlay), per-module `mod_<i>.ll` + `.pmi` emission, the `entry.ll` emission, and the `--emit-ir`
+-- | trace hooks. `modIdx`/`irBuf` are the State-like buffers ADR-0087 §3.1 threads in the host's `m`.
+mkAction
+  :: forall r
+   . Options
+  -> FilePath
+  -> FilePath
+  -> Ref Int
+  -> Ref (Array String)
+  -> CompilerAction String (BuildM r)
+mkAction opts ulibDir buildDir modIdx irBuf =
+  { workdir: buildDir
+  , maxOptimizeIter: clamp 1 optMaxIterCap opts.optMaxIter
+  , loadModule: \name -> do
+      path <- corefnPathFor ulibDir opts.corefnDir name
+      FS.readText path >>= case _ of
+        Nothing -> pure Missing
+        Just src -> case parseModule src of
+          Left err -> pure (Failed { moduleName: name, detail: err })
+          Right mod -> pure (Loaded { path, mod })
+  , emitFile: \artifact -> do
+      i <- liftEffect (Ref.read modIdx)
+      liftEffect (Ref.modify_ (_ + 1) modIdx)
+      modPath <- FS.joinPath [ buildDir, "mod_" <> show i <> ".ll" ]
+      FS.writeText modPath artifact.backendIR
+      -- The `.pmi` sibling (ADR-0087 §2): the linker never reads it, but separate compilation wants it.
+      pmiPath <- FS.joinPath [ buildDir, artifact.interface.ifaceName <> ".pmi" ]
+      FS.writeText pmiPath (interfaceToString artifact.interface)
+      Log.info $ Fmt.fmt @"  emitted {name} → mod_{i}.ll" { name: artifact.interface.ifaceName, i: show i }
+      pure modPath
+  , emitEntry: \ll -> do
+      entryPath <- FS.joinPath [ buildDir, "entry.ll" ]
+      FS.writeText entryPath ll
+      pure entryPath
+  , hooks: irHooks opts buildDir irBuf
+  }
+
+-- | The `--emit-ir` trace hooks (ADR-0087 §3.1): for the target module, bracket the driver's optimiser
+-- | fixpoint with `onEnterOptimizeIter` (the pre-optimised fixpoint input) / `onContinueOptimizeIter` (each
+-- | round's result) / `onLeaveOptimizeIter` (the converged module), appending each round's pretty-printed
+-- | ANF to the buffer, then flush it to `<module>.ir` when the module finishes (`onCleanUp`). Under
+-- | `--no-opt` the fixpoint never runs, so the trace records that. Without `--emit-ir`, the no-op hooks.
+irHooks :: forall r. Options -> FilePath -> Ref (Array String) -> CompilerActionHooks (BuildM r)
+irHooks opts buildDir irBuf = case opts.emitIr of
+  Nothing -> defaultHooks
+  Just target -> defaultHooks
+    { onEnterOptimizeIter = \am -> appendFor target am "pre-optimised (fixpoint input)"
+    , onContinueOptimizeIter = \n am -> appendFor target am ("round " <> show n)
+    , onLeaveOptimizeIter = \am -> appendFor target am "converged"
+    , onCleanUp = \name -> when (name == target) (flush target)
+    }
+  where
+  appendFor target am label =
+    when (am.name == target) do
+      let chunk = "=== " <> label <> " ===\n" <> printModuleAnf am.name am.decls
+      liftEffect (Ref.modify_ (\cs -> Array.snoc cs chunk) irBuf)
+
+  flush target = do
+    chunks <- liftEffect (Ref.read irBuf)
+    liftEffect (Ref.write [] irBuf)
+    irPath <- FS.joinPath [ buildDir, target <> ".ir" ]
+    let body = if Array.null chunks then "(no optimiser rounds — built with --no-opt)\n" else joinWith "\n\n" chunks
+    FS.writeText irPath body
+    Log.info $ Fmt.fmt @"  traced ANF IR → {target}.ir" { target }
+
+-- | Compile the program natively: drive `Purvasm.Compiler.build` with the LLVM backend and the CLI action,
+-- | then (unless `--emit-llvm`) native-link the emitted objects.
 cmd :: forall r. Options -> Run (ENV + LOG + FS + PROC + EXCEPT String + EFFECT + r) Unit
 cmd opts = do
   Log.info $ Fmt.fmt @"Building (native) from entry {mod}.{name}"
     { mod: opts.entryModule, name: opts.entryName }
   ulibDir <- requireUlibDir
   Log.debug $ Fmt.fmt @"Overlaying patched ulib from {dir}" { dir: ulibDir }
-  mods <- loadClosure ulibDir opts.corefnDir opts.entryModule
-  let ordered = depOrder mods
-  when opts.checkForeignSigs do
-    env <- ForeignSigs.loadEnv { ulibDir, corefnDir: opts.corefnDir }
-    total <- foldM
-      (\n m -> (n + _) <<< Map.size <$> ForeignSigs.moduleForeignSigs env m)
-      0
-      ordered
-    Log.debug $ Fmt.fmt @"foreign-sigs: {n} signatures resolved" { n: show total }
-  let
-    nativeOpts =
-      { isEffect: not opts.value
-      , heapWords: defaultHeapWords
-      , debug: false
-      , opt: not opts.noOpt
-      }
-    entry = entryExprOf opts
   buildDir <- FS.joinPath [ opts.outDir, "_build" ]
   FS.mkdirP buildDir
-  if opts.emitIr then
-    -- `--emit-ir`: dump each module's optimised ANF (post-DictElim / optimiser) and stop.
-    for_ (nativeIr nativeOpts ordered entry) \(Tuple name ir) -> do
-      irPath <- FS.joinPath [ buildDir, name <> ".ir" ]
-      FS.writeText irPath ir
-      Log.info $ Fmt.fmt @"  emitted ANF IR → {name}.ir" { name }
-  else do
-    let out = nativeSplit nativeOpts ordered entry
-    forWithIndex_ out.modules \i (Tuple name ll) -> do
-      modPath <- FS.joinPath [ buildDir, "mod_" <> show i <> ".ll" ]
-      FS.writeText modPath ll
-      Log.info $ Fmt.fmt @"  emitted {name} → mod_{i}.ll" { name, i: show i }
-    entryPath <- FS.joinPath [ buildDir, "entry.ll" ]
-    FS.writeText entryPath out.entry
-    Log.info $ Fmt.fmt @"✓ Emitted {n} object(s) → {dir}"
-      { n: show (Array.length out.modules + 1), dir: buildDir }
-    -- Link the objects into a native executable, unless `--emit-llvm` stops at the IR (e.g. for the
-    -- byte-identity differential, which needs no runtime staticlib).
-    unless opts.emitLlvm do
-      NativeLink.link
-        { output: opts.outDir
-        , buildDir
-        , moduleCount: Array.length out.modules
-        , runtimeLib: opts.runtimeLib
-        }
+  modIdx <- liftEffect (Ref.new 0)
+  irBuf <- liftEffect (Ref.new [])
+  let
+    action = mkAction opts ulibDir buildDir modIdx irBuf
+
+    backend :: Backend LlvmContext String
+    backend = llvmBackend { isEffect: not opts.value, heapWords: defaultHeapWords, debug: false }
+    buildOpts =
+      { entryModule: opts.entryModule
+      , entryName: opts.entryName
+      , isEffect: not opts.value
+      , opt: not opts.noOpt
+      }
+  -- The ADR-0080 source channel, opt-in until a build-time consumer lands (§3/§4): CST-lexing the foreign
+  -- frontier is minutes on the native backend, so `--check-foreign-sigs` runs it on demand.
+  when opts.checkForeignSigs do
+    mods <- loadClosure ulibDir opts.corefnDir opts.entryModule
+    env <- ForeignSigs.loadEnv { ulibDir, corefnDir: opts.corefnDir }
+    total <- foldM (\n m -> (n + _) <<< Map.size <$> ForeignSigs.moduleForeignSigs env m) 0 (depOrder mods)
+    Log.debug $ Fmt.fmt @"foreign-sigs: {n} signatures resolved" { n: show total }
+  build backend action buildOpts >>= case _ of
+    Left err -> throw (renderBuildError err)
+    Right products -> do
+      let n = Array.length products.modules
+      Log.info $ Fmt.fmt @"✓ Emitted {n} object(s) → {dir}" { n: show (n + 1), dir: buildDir }
+      -- Link the objects into a native executable, unless `--emit-llvm` stops at the IR.
+      unless opts.emitLlvm do
+        NativeLink.link
+          { output: opts.outDir
+          , buildDir
+          , moduleCount: n
+          , runtimeLib: opts.runtimeLib
+          }

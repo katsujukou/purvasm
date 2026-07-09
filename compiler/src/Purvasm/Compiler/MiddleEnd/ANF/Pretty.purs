@@ -9,8 +9,7 @@
 -- |
 -- | The primary entry is `printModuleAnf`; `printExpr` renders a single binding's term.
 module Purvasm.Compiler.MiddleEnd.ANF.Pretty
-  ( Decl
-  , printModuleAnf
+  ( printModuleAnf
   , printExpr
   ) where
 
@@ -19,17 +18,11 @@ import Prelude
 import Data.Array (null)
 import Data.Monoid (power)
 import Data.String.Common (joinWith)
-import Data.Tuple.Nested (type (/\), (/\))
+import Data.Tuple.Nested ((/\))
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr(..), Expr(..), Rhs(..))
-
--- | A top-level binding group to render: its members as `key = term` (a recursive group is emitted
--- | under a `rec` header, its members atomic).
-type Decl =
-  { recursive :: Boolean
-  , members :: Array (String /\ Expr)
-  }
+import Purvasm.Compiler.MiddleEnd.Module (Decl)
 
 -- | Render a whole module's ANF: `module <name> where` then a blank-line-separated binding per decl.
 printModuleAnf :: String -> Array Decl -> String

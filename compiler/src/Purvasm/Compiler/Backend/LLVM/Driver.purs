@@ -10,9 +10,11 @@
 -- | symbols are dead-stripped by the linker (`--gc-sections`).
 module Purvasm.Compiler.Backend.LLVM.Driver
   ( NativeOptions
+  , LlvmBackendOptions
+  , LlvmContext
   , gdefsOfModule
+  , llvmBackend
   , nativeSplit
-  , nativeIr
   ) where
 
 import Prelude
@@ -21,24 +23,21 @@ import Data.Array as Array
 import Data.Foldable (foldl)
 import Data.Map (Map)
 import Data.Map as Map
-import Data.Maybe (Maybe(..))
 import Data.Set (Set)
 import Data.Set as Set
 import Data.Traversable (mapAccumL)
 import Data.Tuple (Tuple(..))
-import PureScript.CoreFn.Expr (Bind(..)) as CF
 import PureScript.CoreFn.Module (Module) as CF
+import Purvasm.Compiler (Backend)
 import Purvasm.Compiler.Backend.LLVM.FreeVars (cfExpr)
 import Purvasm.Compiler.Backend.LLVM.Interface (interfaceOfAnf)
 import Purvasm.Compiler.Backend.LLVM.Monad (MakeCxOptions)
-import Purvasm.Compiler.Backend.LLVM.Program (classifyNonrec, entryLl, gdefKeys, moduleLl, surfaceFn)
+import Purvasm.Compiler.Backend.LLVM.Program (classifyDecl, entryLl, gdefKeys, moduleLl, surfaceFn)
 import Purvasm.Compiler.Backend.LLVM.Types (CallFact(..), Gdef(..), SplitOutput)
-import Purvasm.Compiler.CESK.Translate (nameKey, qualifiedKey, translExpr)
+import Purvasm.Compiler.CESK.Translate (qualifiedKey)
 import Purvasm.Compiler.MiddleEnd.ANF (CExpr(..), Expr(..))
-import Purvasm.Compiler.MiddleEnd.ANF.Pretty (Decl, printExpr, printModuleAnf)
-import Purvasm.Compiler.MiddleEnd.DictElim (dictElimExpr, emptyMachinery, machineryOf, mergeMachinery)
-import Purvasm.Compiler.MiddleEnd.Normalize (normalize)
-import Purvasm.Compiler.MiddleEnd.Optimizer (applySummary, emptyBuildEnv, optimize)
+import Purvasm.Compiler.MiddleEnd.Module (AnfModule, declsOfModule)
+import Purvasm.Compiler.MiddleEnd.Optimizer (BuildEnv, emptyBuildEnv, extendSummary, optimizeModule, preOptimizeEntry, preOptimizeModule, summaryOfLocal)
 
 -- | Native-build knobs (mirrors boot's `program_split` optionals). The cross-module export surface is
 -- | now derived from each module's own gdefs (ADR-0085): a module's compile produces both its `.ll` and
@@ -53,18 +52,12 @@ type NativeOptions =
   , opt :: Boolean
   }
 
--- | One CoreFn module → its native `Gdef`s, each binding compiled independently (CoreFn → CESK term
--- | → ANF → classified `Gdef`). Mirrors `Compile.groupOfBind`, but produces native gdefs (ANF-carrying)
--- | rather than bytecode groups. Every binding is emitted (program-level reachability is the linker's
--- | job), so a module's object is a pure function of its own source.
+-- | One CoreFn module → its native `Gdef`s: lower to the neutral `AnfModule` (`declsOfModule`, shared
+-- | middle-end) then classify each `Decl` (`classifyDecl`, ADR-0086 §4 — a backend concern that runs after
+-- | the seam). Used for the pre-optimisation program facts (cross-module surface / `gkeys`), which are
+-- | stable under the seam's body rewrites, and by the interface differential test.
 gdefsOfModule :: CF.Module -> Array Gdef
-gdefsOfModule m = Array.concatMap gdefsOfBind m.decls
-  where
-  key = qualifiedKey m.name
-
-  gdefsOfBind = case _ of
-    CF.NonRec _ id e -> [ classifyNonrec (key id) (normalize (translExpr e)) ]
-    CF.Rec rbs -> [ Grec (rbs <#> \rb -> Tuple (key rb.ident) (normalize (translExpr rb.expr))) ]
+gdefsOfModule = map classifyDecl <<< _.decls <<< declsOfModule
 
 -- | The native foreign keys a gdef's bodies reference.
 cfGdef :: Gdef -> Set String
@@ -72,27 +65,6 @@ cfGdef = case _ of
   Gfun _ _ b -> cfExpr b
   Gcaf _ b -> cfExpr b
   Grec ms -> foldl (\s (Tuple _ b) -> Set.union s (cfExpr b)) Set.empty ms
-
--- | A module's top-level bindings as `(key, defining CExpr)` spine pairs, for `DictElim`'s machinery
--- | collection (ADR-0085): a `Gfun` is its lambda `CLam`; a `Gcaf`/`Grec` member is its `CExpr` only
--- | when its body is a single `Ret c` (a complex CAF is not dictionary machinery and is skipped).
-spineBindings :: Array Gdef -> Array (Tuple String CExpr)
-spineBindings = Array.concatMap case _ of
-  Gfun key ps body -> [ Tuple key (CLam ps body) ]
-  Gcaf key (Ret c) -> [ Tuple key c ]
-  Gcaf _ _ -> []
-  Grec ms -> Array.mapMaybe grecPair ms
-  where
-  grecPair (Tuple k e) = case e of
-    Ret c -> Just (Tuple k c)
-    _ -> Nothing
-
--- | Apply an ANF-body rewrite to each of a gdef's bodies (used to run `DictElim` over a module's gdefs).
-mapGdefBody :: (Expr -> Expr) -> Gdef -> Gdef
-mapGdefBody f = case _ of
-  Gfun key ps body -> Gfun key ps (f body)
-  Gcaf key body -> Gcaf key (f body)
-  Grec ms -> Grec (map (\(Tuple k e) -> Tuple k (f e)) ms)
 
 -- | A module's cross-module export surface (ADR-0077 §2, ADR-0085): its **public** exports (CoreFn
 -- | `exports`, qualified) mapped from their native gdef shape to a `CallFact` (`Gfun`→`Cfn`, a recursive
@@ -114,55 +86,55 @@ deriveSurface m gdefs = foldl over Map.empty gdefs
     Ret (CLam ps _) | Set.member mk exports -> Map.insert mk (Crecfn (Array.length ps)) acc
     _ -> acc
 
--- | The compiled result of the shared per-module pipeline: each module's **post-`DictElim`** gdefs, the
--- | combined gdefs, the DictElim'd entry, and the codegen context options.
+-- | The compiled result of the shared per-module pipeline: each module's optimised `AnfModule` and its
+-- | classified gdefs, the combined gdefs, the `DictElim`'d entry, and the codegen context options.
 type Compiled =
-  { perModule :: Array { name :: String, gdefs :: Array Gdef }
+  { perModule :: Array { module :: AnfModule, gdefs :: Array Gdef }
   , allGdefs :: Array Gdef
   , entry :: Expr
   , cxOpts :: MakeCxOptions
   }
 
--- | The shared per-module pipeline (ADR-0085): compile each module independently to its gdefs, then
--- | **fold over the modules in dependency order threading two in-memory envs** — a `DictMachinery` (for
--- | `DictElim`, required lowering) and the optimiser's `BuildEnv`. For each module: run `DictElim`
--- | (resolving imported accessors/instances from the machinery env just like local ones), then — on the
--- | `--opt` path only — run the `(optimize)` seam over each body under the `BuildEnv`, and fold this
--- | module's interface (computed straight from its ANF, `ANF → Pmi` — never via the `.pmo`)
--- | into the `BuildEnv` for its dependents. `gdefs0` (pre-`DictElim`) fixes the program-wide key set and
--- | export surface (both stable under `DictElim`, which rewrites bodies not top-level keys/arities). Both
--- | `nativeSplit` (`.ll`) and `nativeIr` (pretty ANF) consume this.
+-- | The shared per-module pipeline over the ADR-0086 optimiser seam (ADR-0085/0087): lower each module to
+-- | its neutral `AnfModule` (`declsOfModule`), then **fold over the modules in dependency order threading
+-- | the in-memory `BuildEnv`** — `preOptimizeModule` (the byte-identity `DictElim` bridge) → (`--opt`)
+-- | `optimizeModule` → `extendSummary` — and classify each finished module's `Decl`s into gdefs
+-- | (`classifyDecl`, a backend concern after the seam). The pre-optimisation classification (`gdefsOfModule`)
+-- | fixes the program-wide key set and cross-module surface (both stable under the seam's body rewrites).
+-- | The entry expression is `DictElim`'d under the fully-accumulated env (`preOptimizeEntry`). `nativeSplit`
+-- | (`.ll`) consumes this; per-module ANF inspection is now the build driver's `--emit-ir` hooks (ADR-0087
+-- | §3.1), not a whole-module pretty dump.
 compileModules :: NativeOptions -> Array CF.Module -> Expr -> Compiled
 compileModules opts modules entry =
   let
     inlineAbi = not opts.debug
-    compiled0 = map (\m -> { name: nameKey m.name, mod: m, gdefs0: gdefsOfModule m }) modules
+    compiled0 = map (\m -> { mod: m, am: declsOfModule m, gdefs0: gdefsOfModule m }) modules
     allGdefs0 = Array.concatMap _.gdefs0 compiled0
     gkeys = Set.fromFoldable (Array.concatMap gdefKeys allGdefs0)
     surface = foldl (\acc c -> Map.union (deriveSurface c.mod c.gdefs0) acc) Map.empty compiled0
     xfns = foldl (surfaceFn surface) Map.empty allGdefs0
 
-    optimizeBody build = if opts.opt then optimize build else identity
-
-    compileOne acc c =
+    -- The legacy pure fold applies `optimizeModule` (a single seam pass, ADR-0086 §3) once. It is
+    -- idempotent over an already-`DictElim`'d body, so under `--opt` this is byte-identical to `--no-opt`
+    -- today; the *iterated* fixpoint lives in the effectful `Purvasm.Compiler.build` driver (ADR-0087),
+    -- which this path is being superseded by.
+    compileOne :: BuildEnv -> _ -> _
+    compileOne env c =
       let
-        own = machineryOf (spineBindings c.gdefs0)
-        full = mergeMachinery own acc.dict
-        elimd = map (mapGdefBody (dictElimExpr gkeys full)) c.gdefs0
-        gdefs = map (mapGdefBody (optimizeBody acc.build)) elimd
-        -- Grow the optimiser env for dependents (`--opt` only): the interface is derived from this
-        -- module's optimised ANF, so an arity-changing optimisation moves the `.pmi` hash as it should.
-        build' = if opts.opt then applySummary acc.build (interfaceOfAnf c.mod gdefs) else acc.build
+        pre = preOptimizeModule env c.am
+        opted =
+          if opts.opt then optimizeModule env pre.localFacts pre.module
+          else { module: pre.module, summary: summaryOfLocal pre.localFacts }
       in
-        { accum: { dict: mergeMachinery acc.dict own, build: build' }
-        , value: { name: c.name, gdefs }
+        { accum: extendSummary env opted.summary
+        , value: { module: opted.module, gdefs: map classifyDecl opted.module.decls }
         }
 
-    compiled = mapAccumL compileOne { dict: emptyMachinery, build: emptyBuildEnv } compiled0
+    compiled = mapAccumL compileOne emptyBuildEnv compiled0
   in
     { perModule: compiled.value
     , allGdefs: Array.concatMap _.gdefs compiled.value
-    , entry: optimizeBody compiled.accum.build (dictElimExpr gkeys compiled.accum.dict entry)
+    , entry: preOptimizeEntry compiled.accum entry
     , cxOpts: { gkeys, xfns, inlineAbi }
     }
 
@@ -174,26 +146,58 @@ nativeSplit opts modules entry =
   let
     c = compileModules opts modules entry
   in
-    { modules: map (\m -> Tuple m.name (moduleLl c.cxOpts (Set.fromFoldable (Array.concatMap gdefKeys m.gdefs)) m.gdefs)) c.perModule
+    { modules: map (\m -> Tuple m.module.name (moduleLl c.cxOpts (Set.fromFoldable (Array.concatMap gdefKeys m.gdefs)) m.gdefs)) c.perModule
     , entry: entryLl c.cxOpts opts.isEffect opts.heapWords c.allGdefs c.entry
     , foreigns: foldl (\s g -> Set.union s (cfGdef g)) (cfExpr c.entry) c.allGdefs
     }
 
--- | Pretty-print each module's post-`DictElim` (and `(optimize)`) ANF, plus the entry expression, via the
--- | shared `MiddleEnd.ANF.Pretty` (ADR-0085 `--emit-ir`) — for inspecting the required-lowering /
--- | optimiser output without going all the way to `.ll`.
-nativeIr :: NativeOptions -> Array CF.Module -> Expr -> Array (Tuple String String)
-nativeIr opts modules entry =
-  let
-    c = compileModules opts modules entry
-  in
-    map (\m -> Tuple m.name (printModuleAnf m.name (map gdefToDecl m.gdefs))) c.perModule
-      <> [ Tuple "entry" (printExpr c.entry) ]
+-- --- the ADR-0087 `Backend` value ------------------------------------------------------------------
 
--- | A native `Gdef` as a pretty-printer `Decl`: a non-recursive `Gfun`/`Gcaf` is a single member (a
--- | `Gfun`'s value is its lambda `Ret (CLam …)`); a `Grec` is the recursive group.
-gdefToDecl :: Gdef -> Decl
-gdefToDecl = case _ of
-  Gfun key ps body -> { recursive: false, members: [ Tuple key (Ret (CLam ps body)) ] }
-  Gcaf key body -> { recursive: false, members: [ Tuple key body ] }
-  Grec ms -> { recursive: true, members: ms }
+-- | The backend-specific knobs the CLI closes into the LLVM `Backend` (native heap size, effect-vs-value
+-- | entry, debug ABI) — everything `moduleLl`/`entryLl` need beyond the neutral module.
+type LlvmBackendOptions =
+  { isEffect :: Boolean
+  , heapWords :: Int
+  , debug :: Boolean
+  }
+
+-- | The whole-program context the LLVM backend derives once (ADR-0087 §2): the codegen options
+-- | (`gkeys`/`xfns`/inline-ABI) plus the entry knobs `lowerEntry` needs.
+type LlvmContext =
+  { cxOpts :: MakeCxOptions
+  , isEffect :: Boolean
+  , heapWords :: Int
+  }
+
+-- | The LLVM backend as an ADR-0087 `Backend` (the effectful `Purvasm.Compiler.build` driver's pure
+-- | codegen capability): per-module `.ll` (`lowerModule`), the whole-program init/entry `.ll`
+-- | (`lowerEntry`), the module `.pmi` (`interfaceOf`), and the cross-module `context` derived from the
+-- | pre-optimisation modules' surface. It calls the very same `moduleLl`/`entryLl`/`interfaceOfAnf` the
+-- | pure `nativeSplit` path (and its byte-identity gate) uses, so the emitted `.ll`/`.pmi` bytes are
+-- | identical — the driver only differs in *who* runs the seam fold (the library `build` vs `compileModules`).
+llvmBackend :: LlvmBackendOptions -> Backend LlvmContext String
+llvmBackend opts =
+  { context: \modules ->
+      let
+        gdefs0Of lm = map classifyDecl lm.module.decls
+        allGdefs0 = Array.concatMap gdefs0Of modules
+        gkeys = Set.fromFoldable (Array.concatMap gdefKeys allGdefs0)
+        surface = foldl (\acc lm -> Map.union (deriveSurface lm.source (gdefs0Of lm)) acc) Map.empty modules
+        xfns = foldl (surfaceFn surface) Map.empty allGdefs0
+      in
+        { cxOpts: { gkeys, xfns, inlineAbi: not opts.debug }
+        , isEffect: opts.isEffect
+        , heapWords: opts.heapWords
+        }
+  , interfaceOf: \_ lm -> interfaceOfAnf lm.source (map classifyDecl lm.module.decls)
+  , lowerModule: \ctx lm ->
+      let
+        gdefs = map classifyDecl lm.module.decls
+        defined = Set.fromFoldable (Array.concatMap gdefKeys gdefs)
+      in
+        moduleLl ctx.cxOpts defined gdefs
+  , lowerEntry: \ctx input ->
+      entryLl ctx.cxOpts ctx.isEffect ctx.heapWords
+        (Array.concatMap (\lm -> map classifyDecl lm.module.decls) input.modules)
+        input.entry
+  }

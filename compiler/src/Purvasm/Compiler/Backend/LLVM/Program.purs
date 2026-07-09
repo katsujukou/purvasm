@@ -12,6 +12,7 @@ module Purvasm.Compiler.Backend.LLVM.Program
   ( gdefKeys
   , gdefInitKey
   , classifyNonrec
+  , classifyDecl
   , reachableGdefs
   , moduleLl
   , entryLl
@@ -41,6 +42,7 @@ import Purvasm.Compiler.Backend.LLVM.Mangle (immUnit, mangle, mangleForeign)
 import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, MakeCxOptions, beginFn, emit, emitModule, fresh, makeCx, renderChunks, runCodegen, takeFn)
 import Purvasm.Compiler.Backend.LLVM.Types (CallFact(..), EnvSrc(..), FnInfo, Gdef(..), Lifted(..), LiftedBody(..), SplitOutput)
 import Purvasm.Compiler.MiddleEnd.ANF (CExpr(..), Expr(..))
+import Purvasm.Compiler.MiddleEnd.Module (Decl)
 
 -- | The root-handle-global keys a gdef defines.
 gdefKeys :: Gdef -> Array String
@@ -61,6 +63,17 @@ classifyNonrec :: String -> Expr -> Gdef
 classifyNonrec key = case _ of
   Ret (CLam ps b) -> Gfun key ps b
   e -> Gcaf key e
+
+-- | Classify a post-optimiser `Decl` into a `Gdef` (ADR-0086 §4: `Gdef` classification is a backend
+-- | concern that runs **after** the seam). Group-atomic: a recursive `Decl` is one `Grec`; a
+-- | non-recursive `Decl` (exactly one member, from a single CoreFn `NonRec` bind) is a `Gfun`/`Gcaf` via
+-- | `classifyNonrec`.
+classifyDecl :: Decl -> Gdef
+classifyDecl d
+  | d.recursive = Grec d.members
+  | otherwise = case Array.head d.members of
+      Just (Tuple key body) -> classifyNonrec key body
+      Nothing -> unsafeCrashWith "Program.classifyDecl: empty non-recursive Decl"
 
 -- | The top-level keys a gdef references (in its bodies), for reachability: `fv ∩ gkeys`, minus its own
 -- | keys (params/locals are bare and never in `gkeys`).
