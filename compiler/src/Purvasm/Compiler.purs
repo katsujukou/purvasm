@@ -51,7 +51,7 @@ import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Expr)
 import Purvasm.Compiler.MiddleEnd.Module (AnfModule, declsOfModule)
 import Purvasm.Compiler.MiddleEnd.Normalize (normalize)
-import Purvasm.Compiler.MiddleEnd.Optimizer (BuildEnv, emptyBuildEnv, extendSummary, preOptimizeEntry, preOptimizeModule, summaryOfLocal)
+import Purvasm.Compiler.MiddleEnd.Optimizer (BuildEnv, emptyBuildEnv, extendSummary, localFactsOf)
 import Purvasm.Compiler.MiddleEnd.Optimizer as Optimizer
 
 -- | A module's dotted name (the `loadModule` key).
@@ -269,12 +269,12 @@ type FoldState o =
   }
 
 -- | Build a whole program to per-module artifacts + the entry object (ADR-0087 §1), stopping at pure
--- | codegen: load the closure, fold the ADR-0086 seam in dependency order (`preOptimizeModule` → (`--opt`)
--- | **iterate `optimizeModule` to a fixpoint**, up to `action.maxOptimizeIter` rounds → `extendSummary`,
--- | dispatching the inspection hooks around each phase), emit each module via `emitFile`, then run the
--- | backend's whole-program `lowerEntry` over the reachable set and emit it via `emitEntry`. Returns
--- | `BuildProducts` for CLI finalization (link). Never links. The iteration lives here (not in the seam)
--- | so each pass is a host-inspectable step.
+-- | codegen. The driver is **neutral** (ADR-0086 Addendum): load the closure, and per module in dependency
+-- | order `CoreFn → normalise → AnfModule`, then `if --opt` **iterate `optimizeModule` to a fixpoint** (up
+-- | to `action.maxOptimizeIter` rounds) + `extendSummary`, `else` the identity — it runs **no `DictElim`
+-- | of its own** (a backend's `--no-opt` boot-parity need is its own private lowering). Emit each module via
+-- | `emitFile`, then run the backend's whole-program `lowerEntry` over the (raw) entry + reachable set and
+-- | emit it via `emitEntry`. Returns `BuildProducts` for CLI finalization (link). Never links.
 build
   :: forall c o m
    . Monad m
@@ -296,8 +296,9 @@ build backend action opts =
           }
       final <- foldM (stepModule ctx) initialState loaded
       let
-        entryExpr = preOptimizeEntry final.env (entryExprOf opts)
-        entryIr = backend.lowerEntry ctx { modules: final.lowered, entry: entryExpr }
+        -- The entry is handed to the backend **raw** (no seam `DictElim`); the native backend bridges it
+        -- privately in `lowerEntry`, the VM does not (ADR-0086 Addendum).
+        entryIr = backend.lowerEntry ctx { modules: final.lowered, entry: entryExprOf opts }
       entryPath <- action.emitEntry entryIr
       pure (Right { modules: final.emitted, entry: { ir: entryIr, path: entryPath } })
   where
@@ -306,41 +307,38 @@ build backend action opts =
     action.hooks.onStartCompile st.progress item.mod
     let am = declsOfModule item.mod
     action.hooks.onBeforeOptimize am
-    let pre = preOptimizeModule st.env am
-    opted <- do
-      if opts.opt then optimizeModule st.env pre
-      else pure { module: pre.module, summary: summaryOfLocal pre.localFacts }
-    action.hooks.onBeforeCodegen opted.module
+    optimised <-
+      if opts.opt then do
+        r <- runOptimizer st.env am
+        pure { module: r.module, env: extendSummary st.env r.summary }
+      else pure { module: am, env: st.env } -- --no-opt: identity, no summary, env unchanged
+    action.hooks.onBeforeCodegen optimised.module
     let
-      lm = { source: item.mod, module: opted.module }
+      lm = { source: item.mod, module: optimised.module }
       artifact = { interface: backend.interfaceOf ctx lm, backendIR: backend.lowerModule ctx lm }
     path <- action.emitFile artifact
     action.hooks.onCleanUp item.name
     pure
-      { env: extendSummary st.env opted.summary
+      { env: optimised.env
       , emitted: Array.snoc st.emitted { artifact, path }
       , lowered: Array.snoc st.lowered lm
       , progress: st.progress { current = st.progress.current + 1 }
       }
 
-  -- Iterate the seam's single `optimizeModule` pass to a fixpoint (ADR-0087 owns the iteration; the seam
-  -- stays a pure step returning `{ module, summary }`). Plain recursion — so `m` needs only `Monad`
-  -- (ADR-0087's boundary), no `MonadRec`: the depth is a small config cap, not the module count. It stops
-  -- **on convergence** (a round leaves the module unchanged — `AnfModule` has structural `Eq`) or, as a
-  -- non-termination backstop, at `maxOptimizeIter`. Today's only pass (`DictElim`) is idempotent, so the
-  -- first round always converges. Threads `.module`, keeps the last pass's `.summary`.
-  optimizeModule env step = do
-    action.hooks.onEnterOptimizeIter step.module
-    go 0 { module: step.module, summary: summaryOfLocal step.localFacts }
-    where
-    go n acc =
-      if n >= action.maxOptimizeIter then
-        action.hooks.onLeaveOptimizeIter acc.module $> acc
-      else do
-        let next = Optimizer.optimizeModule env step.localFacts acc.module
-        if next.module == acc.module then
-          -- Converged: this round changed nothing, so `next` is the fixpoint.
+  -- Iterate `optimizeModule` to a fixpoint (ADR-0087 owns the iteration; the seam is a pure step returning
+  -- `{ module, summary }`). Plain recursion — so `m` needs only `Monad` (ADR-0087's boundary), no
+  -- `MonadRec`: the depth is a small config cap, not the module count. It stops **on convergence** (a round
+  -- leaves the module unchanged — `AnfModule` has structural `Eq`) or, as a non-termination backstop, at
+  -- `maxOptimizeIter`. Today's only pass (`DictElim`) is idempotent, so a module with no static dispatch
+  -- converges in one round. Returns the last pass's `{ module, summary }`.
+  runOptimizer env am = do
+    let lf = localFactsOf am
+    action.hooks.onEnterOptimizeIter am
+    let
+      go n prev = do
+        let next = Optimizer.optimizeModule env lf prev
+        if next.module == prev || n + 1 >= action.maxOptimizeIter then
           action.hooks.onLeaveOptimizeIter next.module $> next
-        else do
-          action.hooks.onContinueOptimizeIter (n + 1) next.module
-          go (n + 1) next
+        else
+          action.hooks.onContinueOptimizeIter (n + 1) next.module *> go (n + 1) next.module
+    go 0 am

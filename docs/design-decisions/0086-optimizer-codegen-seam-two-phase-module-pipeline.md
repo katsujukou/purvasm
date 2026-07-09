@@ -1,9 +1,11 @@
 # 0086. The optimiser/codegen seam over a backend-neutral ANF module
 
-- Status: ~~Proposed~~ **Accepted** _(2026-07-09: accepted by the maintainer; supplemented with the two-`DictElim`-mandate note in §3)_
+- Status: ~~Proposed~~ **Accepted** _(2026-07-09: accepted by the maintainer; supplemented with the two-`DictElim`-mandate note in §3)_ — **Abstract/§1/§3 revised by the ~~Proposed~~ Accepted [Addendum (2026-07-10)](#addendum-2026-07-10-remove-always-on-dictelim-from-the-shared-build-driver-keep-the-native-byte-identity-bridge-backend-local)** (removes the always-on shared `DictElim` bridge → LLVM-backend-local; VM runs no `--no-opt` `DictElim`)
 - Date: 2026-07-09
 
 ## Abstract
+
+> **Partly superseded by the Proposed [Addendum (2026-07-10)](#addendum-2026-07-10-remove-always-on-dictelim-from-the-shared-build-driver-keep-the-native-byte-identity-bridge-backend-local).** The "`DictElim` … runs under `--no-opt` only as a temporary boot-parity bridge" and "`preOptimizeModule` (boot-parity shim — DictElim only, always)" claims below are revised: the always-on shared bridge is **removed**; under `--no-opt` `DictElim` runs **only in the LLVM backend** (privately), **never in the shared driver or the VM**. The `--opt` `optimizeModule` fixpoint is unchanged.
 
  **Optimiser/codegen seam** — refines ADR-0082 §1 / ADR-0085 §1/§3 (no behavioural reversal). Reframes **`DictElim` as an optimisation** (not "required lowering"): it belongs to the optimiser track and runs under `--no-opt` only as a **temporary boot-parity bridge** (byte-identity to boot's incomplete optimiser), **removed at wall-3 self-host**. The optimiser transforms a **backend-neutral `AnfModule` = {name, decls of normalised ANF `(key, Expr)`}** (the existing `ANF.Pretty` shape), never `Gdef` — so its output feeds the VM/LLVM/JS gate legs uniformly; **`classifyDecl :: Decl → Gdef`** moves to the backend *after* the optimiser (byte-identity-safe, **group-atomic**: a `recursive` `Decl` classifies to a single `Grec`, never per-member). **Two module-level phases**: `preOptimizeModule` (boot-parity shim — DictElim only, always, returns the ephemeral `LocalFacts` = **stable dict machinery only**, known bodies recomputed pass-internally) → `optimizeModule` (the `fix(DictElim∘Simplify∘Spec∘Inline∘…)` fixpoint, `--opt` only, returns a `BuildSummary`) → `extendSummary` folds a **finished** module's `BuildSummary` into `BuildEnv` for dependents. `BuildEnv` holds **dependencies only**; current-module facts thread as ephemeral `LocalFacts` — so ADR-0084's **self-pollution invariant is structural** (a module can't read its own summary by construction). The in-memory `BuildSummary` (**distinct from** the persisted `.pmi` `Artifact.Summary`) carries dict machinery (always/in-memory) + optimiser summary (`--opt`) split by lifetime; only the pinned projection `persistedSummary :: BuildSummary → Maybe Artifact.Summary` reaches the `.pmi` (`Nothing` under `--no-opt`, so machinery never breaks byte-identity). Draws the ownership line: optimiser owns the seam + `MiddleEnd.Optimizer.DictElim`; codegen owns `declsOfModule`/`classifyDecl`/emit and a thin fold. Kills the parallel `acc.dict` channel and the backend's `Gdef`↔`Expr` adapters; retypes the `optimize`-iteration hooks `Expr`→`AnfModule`
 
@@ -66,8 +68,11 @@ classification is a backend concern that belongs *after* the optimiser.
 
 This record refines [0082](0082-native-codegen-port-to-level-2.md) §1 and
 [0085](0085-native-build-orchestration-inmemory-summary-env.md) §1/§3. It does **not reverse** them:
-the observable behaviour is unchanged — `--no-opt` still runs `DictElim` and stays byte-identical to
-boot, `--opt` still runs the full optimiser, and the two-summary-lifetime split
+~~the observable behaviour is unchanged — `--no-opt` still runs `DictElim` and stays byte-identical to
+boot~~ (**revised by the [Addendum (2026-07-10)](#addendum-2026-07-10-remove-always-on-dictelim-from-the-shared-build-driver-keep-the-native-byte-identity-bridge-backend-local)**: `--no-opt` runs `DictElim`
+**only for the LLVM backend** and stays byte-identical to boot *there*; the **VM** runs no `DictElim`
+under `--no-opt`, so its `.pmo`/`.pmi` stay byte-identical to boot bytecode by construction), `--opt`
+still runs the full optimiser, and the two-summary-lifetime split
 ([0085](0085-native-build-orchestration-inmemory-summary-env.md) §3) is preserved. What changes is the
 **ownership line, the seam's type, and the vocabulary** — so the codegen and optimiser tracks can each
 proceed behind a stable interface instead of contending over `compileModules`.
@@ -75,6 +80,8 @@ proceed behind a stable interface instead of contending over `compileModules`.
 ## Decision
 
 ### 1. `DictElim` is an optimisation; the `--no-opt` run is a temporary boot-parity bridge
+
+> **Revised by the [Addendum (2026-07-10)](#addendum-2026-07-10-remove-always-on-dictelim-from-the-shared-build-driver-keep-the-native-byte-identity-bridge-backend-local).** This section's "`--no-opt` run" is **not** a shared bridge across backends: it is applied **only by the LLVM backend** (privately), and the **VM runs no `DictElim` under `--no-opt`** (dictionaries stay applied — that is what keeps the optimiser's elimination effect measurable on the VM). `DictElim` being an *optimisation* (not required lowering) is unchanged; what changes is that its `--no-opt` appearance is LLVM-backend-local, not a shared driver phase.
 
 Reframe [0082](0082-native-codegen-port-to-level-2.md) §1's *"required lowering, not an optimisation."*
 `DictElim` is an optimisation pass and belongs to the **optimiser track**. It runs under `--no-opt`
@@ -118,6 +125,8 @@ skipped, only the bridge `DictElim` runs on the neutral module, then classificat
 to today.
 
 ### 3. Two module-level phases; `BuildEnv` holds dependencies only, current-module facts thread separately
+
+> **Revised by the [Addendum (2026-07-10)](#addendum-2026-07-10-remove-always-on-dictelim-from-the-shared-build-driver-keep-the-native-byte-identity-bridge-backend-local) below.** `preOptimizeModule`/`preOptimizeEntry` — the always-on `DictElim` bridge described in this section — are **removed from the shared build driver**: the driver is neutral (`AnfModule → if --opt then fix(optimizeModule) else identity → Backend.lower{Module,Entry}`). The bridge moves **into the LLVM backend** as a private, transitional byte-identity lowering; the **VM never runs it** (so VM `--no-opt` keeps dictionary application, the optimiser's effect on it observable). The `--opt` `DictElim` stays in the `optimizeModule` fixpoint. The optimiser env threading (`localFactsOf`/`optimizeModule`/`summaryOfLocal`/`extendSummary`/`BuildEnv`) is unchanged. Read this section with that substitution.
 
 `BuildEnv` holds **only dependency-derived facts** — never the module currently being processed. The
 current module's **stable** facts are computed fresh as an **ephemeral `LocalFacts`** and threaded
@@ -301,3 +310,98 @@ consistent with the module-level seam.
   conflates the always-on boot-parity subset with the `--opt`-only fixpoint, so `--no-opt` would have
   to run (a truncated) `optimize`, and the bridge would have no clean deletion point at boot retirement.
   Two named phases keep the expiry explicit.
+
+## Addendum (2026-07-10): Remove always-on DictElim from the shared build driver; keep the native byte-identity bridge backend-local
+
+- Status: ~~Proposed~~ **Accepted** _(2026-07-10: accepted by the maintainer)_ — revises the **Abstract**,
+  **§1**, and **§3** of this record, everywhere they say the `--no-opt` `DictElim` bridge is
+  shared/always-on.
+
+**This Addendum supersedes the earlier `--no-opt` `DictElim` framing wherever it appears** — not only §3,
+but the Abstract's "runs under `--no-opt` only as a temporary boot-parity bridge" / "`preOptimizeModule`
+(boot-parity shim — DictElim only, always)", the Context's "the observable behaviour is unchanged —
+`--no-opt` still runs `DictElim`", and §1 in full. After this Addendum: **the shared driver runs no
+`DictElim`; the VM runs none under `--no-opt`; only the LLVM backend does, privately, as the transitional
+bridge below.** Where the older text and this Addendum conflict, this Addendum governs.
+
+Wiring the **VM (bytecode) backend** onto the ADR-0087 build driver exposed a flaw in §3's two-phase
+model: `preOptimizeModule`/`preOptimizeEntry` run `DictElim` **always** (`--no-opt` included) as a
+*shared* driver phase. That is wrong for the VM. The CESK VM dispatches dictionaries at runtime and boot's
+bytecode never runs `DictElim`, so a shared always-on bridge would (a) break the boot-bytecode
+byte-identity gate, and — the decisive reason — (b) **erase the optimiser's dictionary-elimination effect
+from the VM before it can be measured.** The VM is the intended field for measuring optimiser effect;
+`--no-opt` there must be genuinely un-optimised (dictionaries still applied), or the evaluation axis is
+muddied.
+
+`DictElim` is therefore **backend-relative**, and the shared driver must not run it:
+
+1. **The shared build driver is neutral.** Per module: `CoreFn → normalise → AnfModule`, then
+   `if --opt then fix(optimizeModule) else identity`, then `Backend.lowerModule` / `Backend.lowerEntry`.
+   It runs **no** `DictElim` of its own. `preOptimizeModule`/`preOptimizeEntry` are **removed** as shared
+   phases (their machinery-collection half survives as `localFactsOf`; their `DictElim` half becomes the
+   LLVM bridge of point 3).
+
+   The seam this section's §3 sketch is **replaced** by (the `--opt`-only optimiser threading is otherwise
+   unchanged):
+
+   ```
+   emptyBuildEnv    :: BuildEnv
+   localFactsOf     :: AnfModule -> LocalFacts          -- own stable dict machinery (no DictElim rewrite)
+   optimizeModule   :: BuildEnv -> LocalFacts -> AnfModule
+                    -> { module :: AnfModule, summary :: BuildSummary }   -- builds its own summary
+   extendSummary    :: BuildEnv -> BuildSummary -> BuildEnv
+   persistedSummary :: BuildSummary -> Maybe Artifact.Summary
+   -- preOptimizeModule / preOptimizeEntry: REMOVED (→ LLVM backend private bridge, point 3)
+   -- summaryOfLocal: no longer a driver seam function — it survives only as an internal helper of
+   --   optimizeModule (which returns the summary directly). --no-opt produces no summary at all.
+   ```
+
+   ```
+   -- --opt   : lf = localFactsOf m0
+   --           { module: m1, summary } = <driver fixpoint of> (optimizeModule env0 lf) m0
+   --           => { env: extendSummary env0 summary, module: m1 }
+   -- --no-opt: => { env: env0, module: m0 }   -- identity: no localFactsOf / optimize / extendSummary
+   ```
+
+2. **The real `DictElim` lives in the optimiser fixpoint.** Under `--opt`, both VM and LLVM run
+   `fix(DictElim ∘ Simplify ∘ Inline ∘ …)`; `DictElim` is an ordinary optimisation pass there (as §3
+   already argued — a later pass can expose a newly-static dispatch it then collapses).
+
+3. **LLVM alone keeps a byte-identity bridge, backend-*private*.** *While the boot byte-identity gate is
+   active*, the LLVM backend must not emit a runtime newtype-dict dispatch — boot's `--no-opt` `.ll`
+   collapses it, and the Level-2 `.ll` must match byte-for-byte. (This is a **gate obligation, not a
+   permanent representational limit** — the runtime can represent a dictionary value; the bridge exists to
+   reproduce boot's already-collapsed output.) So `llvmBackend` applies `DictElim` inside its own
+   lowering — **not** as an optimiser pass, but as a transitional *compatibility lowering*:
+
+   ```
+   llvmBackend.lowerModule = module → nativeByteIdentityBridgeDictElim → classifyDecl → moduleLl
+   llvmBackend.lowerEntry  = entry  → nativeByteIdentityBridgeDictElim → … → entryLl
+   ```
+
+   It resolves against the **whole-program dictionary machinery** the backend derives once in
+   `Backend.context` (over the pre-optimisation modules). This is byte-identical to §3's per-module
+   dependency-threaded resolution for any well-typed program — a module's dispatch only references
+   accessors/instances visible to it (own + imports), and keys are module-qualified (disjoint), so the
+   whole-program machinery is a no-collision superset that resolves identically. Under `--opt` the module
+   the bridge receives is already `DictElim`'d by the optimiser; the bridge re-runs it idempotently.
+
+4. **The VM backend has no bridge.** `--no-opt` VM keeps dictionary application (byte-identical to boot
+   bytecode by construction — normalise-only); `--opt` VM eliminates it via the optimiser's `DictElim`.
+   This is what makes the elimination effect observable on the VM.
+
+**Pinned scope of the LLVM bridge (so it is not mistaken for permanent design):**
+- It is **removed from the shared driver phase**, applied by the **LLVM backend only**, and **never**
+  applied to the VM.
+- Deriving whole-program machinery in `Backend.context` is a **native-only transitional** device for boot
+  byte-identity, **not** the permanent independent-compilation design (which is the per-module summary
+  threading of [0084](0084-binary-pmo-pmi-and-cross-module-summary.md)/§3).
+- It is scheduled for **removal once the LLVM codegen port off boot is complete** — the expiry the
+  original §1 named for the `--no-opt` bridge now attaches to this LLVM-backend-local bridge (the only
+  place the bridge survives).
+- The **real** `DictElim` — the one that stays — is the optimiser-fixpoint pass (point 2).
+
+This supersedes §3's "`preOptimizeModule` (boot-parity shim), runs always" and the two-`DictElim`-mandate
+note: there is **one** `DictElim` (the optimiser pass); the LLVM backend additionally invokes it as a
+private byte-identity lowering. The responsibility split sharpens — the shared driver is neutral, the
+optimiser owns the real optimisation, and LLVM's boot compatibility is LLVM's local, expiring concern.
