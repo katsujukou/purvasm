@@ -9,6 +9,13 @@
 #   ./benchmarks/run-benchmarks.sh [--legs vm,ml,llvm,js] [--programs fib,quicksort,...]
 #                                  [--reps K] [--budget SECONDS] [--max-points N]
 #
+#   ./benchmarks/run-benchmarks.sh --opt-effect [--programs fib,...]
+#       Optimiser-effect mode (ADR-0082 §2): compile the corpus with the *Level-2* CLI at --opt
+#       and --no-opt, run each on the VM with deterministic instruction counting (`purvm run
+#       --count`), and report the opt/no-opt instruction ratio. VM-only (the wall-clock legs
+#       stay the cross-backend story); instruction count is exact, so no reps/timing apply.
+#       Needs `spago build` (the Level-2 CLI JS) + boot + ulib — not the runtime staticlib.
+#
 # Prerequisites: workspace `spago build` (CoreFn + JS output), boot `dune build`, the runtime
 # staticlib (`cargo build --release` in runtime/ — the default lookup prefers release), clang,
 # node, gnuplot. Timing is external and whole-process (ADR-0075 §5; no guest clock leaf).
@@ -24,9 +31,13 @@ REPS=3
 BUDGET=2.0
 MAXPOINTS=12
 ONLY=""
+OPT_EFFECT=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --opt-effect)
+      OPT_EFFECT=1
+      ;;
     --legs)
       shift
       LEGS="${1//,/ }"
@@ -82,6 +93,71 @@ done
 [ $missing -eq 0 ] || exit 2
 
 mkdir -p "$OUT"
+
+# --- optimiser-effect mode (ADR-0082 §2) ------------------------------------------------
+# Compile each benchmark with the Level-2 CLI at --opt and --no-opt, run both on the VM with
+# deterministic instruction counting, and report the opt/no-opt ratio. The instruction count is
+# exact (a fired optimisation moves it, ADR-0030), so one size per benchmark suffices — no reps.
+if [ "$OPT_EFFECT" = "1" ]; then
+  L2_JS="output/Purvasm.CLI.Main/index.js"
+  if [ ! -f "$L2_JS" ]; then
+    echo "error: Level-2 CLI not built ($L2_JS) — run \`spago build\` first" >&2
+    exit 2
+  fi
+  ULIB="${PURVASM_LIB:-dist/ulib}"
+  if [ ! -d "$ULIB" ]; then
+    echo "error: ulib not found at '$ULIB' — run \`sh ulib-tools/prepare-release.sh\` or set PURVASM_LIB" >&2
+    exit 2
+  fi
+  # A stable entry into the freshly-built Level-2 CLI JS (Main drops argv[0..1] = node + script).
+  L2_ENTRY="$OUT/l2-cli.mjs"
+  printf 'import { main } from "%s/%s";\nmain();\n' "$PWD" "$L2_JS" >"$L2_ENTRY"
+
+  # Compile <module> to <outdir>/app.pvm at the given optimisation mode (opt|noopt).
+  l2_compile() {
+    local flag=""
+    [ "$3" = "noopt" ] && flag="--no-opt"
+    PURVASM_LIB="$ULIB" node "$L2_ENTRY" run --corefn-dir output --outdir "$2" --entry "$1" $flag \
+      >"$2/compile.log" 2>&1
+  }
+  # `purvm run --count` prints stats to stderr, the guest's result to stdout.
+  instr_count() { "$PURVM" run --count "$1" "$2" 2>&1 1>/dev/null | awk '/instructions/{print $2}'; }
+  guest_out() { "$PURVM" run "$1" "$2" 2>/dev/null; }
+
+  optsum="$OUT/opt-effect.txt"
+  printf '%-16s %-10s %14s %14s %8s %7s\n' bench n opt no-opt ratio 'red%' | tee "$optsum"
+  echo "$BENCH_TABLE" | while read -r name module start heap; do
+    [ -n "$name" ] || continue
+    if [ -n "$ONLY" ] && ! echo "$ONLY" | tr ' ' '\n' | grep -qx "$name"; then continue; fi
+    odir="$OUT/opt/$name/opt"
+    ndir="$OUT/opt/$name/noopt"
+    mkdir -p "$odir" "$ndir"
+    if ! l2_compile "$module" "$odir" opt || ! l2_compile "$module" "$ndir" noopt; then
+      printf '%-16s %-10s %14s\n' "$name" "$start" "COMPILE-FAILED" | tee -a "$optsum"
+      touch "$OUT/.opt-failed"
+      continue
+    fi
+    # Correctness: --opt must not change the observable output, and must equal --no-opt.
+    oo=$(guest_out "$odir/app.pvm" "$start")
+    no=$(guest_out "$ndir/app.pvm" "$start")
+    if [ -z "$oo" ] || [ "$oo" != "$no" ]; then
+      printf '%-16s %-10s %14s (opt=%s / noopt=%s)\n' "$name" "$start" "RUN-FAILED/DIVERGED" "$oo" "$no" | tee -a "$optsum"
+      touch "$OUT/.opt-failed"
+      continue
+    fi
+    oi=$(instr_count "$odir/app.pvm" "$start")
+    ni=$(instr_count "$ndir/app.pvm" "$start")
+    ratio=$(awk -v n="$ni" -v o="$oi" 'BEGIN { if (o > 0) printf "%.3f", n / o; else printf "n/a" }')
+    red=$(awk -v n="$ni" -v o="$oi" 'BEGIN { if (n > 0) printf "%.1f", (n - o) * 100 / n; else printf "n/a" }')
+    printf '%-16s %-10s %14s %14s %8s %7s\n' "$name" "$start" "$oi" "$ni" "$ratio" "$red" | tee -a "$optsum"
+  done
+  echo
+  echo "opt-effect summary → $optsum  (--opt vs --no-opt VM instruction counts; exact, ratio = noopt/opt)"
+  st=0
+  [ -f "$OUT/.opt-failed" ] && st=1
+  rm -f "$OUT/.opt-failed"
+  exit $st
+fi
 
 # min of $REPS timed runs of the argv command; empty output on any failed run.
 time_min() {
@@ -140,10 +216,13 @@ echo "$BENCH_TABLE" | while read -r name module start heap; do
   echo "== $name ($module)"
 
   # Build every leg, then a self-check differential at the smallest size: every leg must print
-  # the same output before any timing is trusted.
-  declare -A run=()
+  # the same output before any timing is trusted. Each passing leg's run-command is recorded in a
+  # per-leg marker file (`.timecmd`) rather than an associative array — portable to bash 3.2
+  # (macOS' default, which lacks `declare -A`), and the `while read` pipe already runs this body in
+  # a subshell, so a file is the natural carrier across the build/timing split anyway.
   ref=""
   for leg in $LEGS; do
+    rm -f "$OUT/build/$name/$leg/.timecmd" # clear any stale marker from a previous run
     if ! cmd=$(build_leg "$name" "$module" "$heap" "$leg"); then
       echo "   $leg: BUILD FAILED (see $OUT/build/$name/$leg/build.log)"
       touch "$OUT/.failed"
@@ -157,17 +236,19 @@ echo "$BENCH_TABLE" | while read -r name module start heap; do
       touch "$OUT/.failed"
       continue
     fi
-    run[$leg]=$cmd
+    printf '%s\n' "$cmd" >"$OUT/build/$name/$leg/.timecmd"
   done
 
   for leg in $LEGS; do
-    [ -n "${run[$leg]:-}" ] || continue
+    cmdfile="$OUT/build/$name/$leg/.timecmd"
+    [ -f "$cmdfile" ] || continue
+    cmd=$(cat "$cmdfile")
     csv="$OUT/$name.$leg.csv"
     : >"$csv"
     n=$start
     points=0
     while [ "$points" -lt "$MAXPOINTS" ]; do
-      t=$(time_min ${run[$leg]} "$n") || {
+      t=$(time_min $cmd "$n") || {
         echo "   $leg: run failed at n=$n — series truncated here"
         break
       }
