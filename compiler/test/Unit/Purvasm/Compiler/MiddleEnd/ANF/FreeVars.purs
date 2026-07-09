@@ -1,13 +1,13 @@
 -- | The free-variable analysis decides each lifted lambda's captures (ADR-0072 §4) and `cfExpr` the
 -- | native foreign keys to compile/link (ADR-0073 §3); both must respect scope. Sets are compared as
 -- | their sorted element arrays.
-module Test.Unit.Purvasm.Compiler.Backend.LLVM.FreeVars where
+module Test.Unit.Purvasm.Compiler.MiddleEnd.ANF.FreeVars where
 
 import Prelude
 
 import Data.Set (Set)
 import Data.Set as Set
-import Purvasm.Compiler.Backend.LLVM.FreeVars (binderVars, cfExpr, fvCexpr, fvExpr)
+import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (binderVars, cfExpr, fvCexpr, fvExpr)
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..))
@@ -18,7 +18,7 @@ elems :: Set String -> Array String
 elems = Set.toUnfoldable
 
 spec :: Spec Unit
-spec = describe "Purvasm.Compiler.Backend.LLVM.FreeVars" do
+spec = describe "Purvasm.Compiler.MiddleEnd.ANF.FreeVars" do
   describe "binderVars" do
     it "binds nothing for wildcards and literals" do
       elems (binderVars BNull) `shouldEqual` []

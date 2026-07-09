@@ -1,13 +1,14 @@
--- | Free-variable and referenced-foreign-key analyses over the ANF, for lambda-lifting (ADR-0072 §4)
--- | and native-foreign resolution (ADR-0073 §3). A faithful transcription of boot's `codegen_llvm.ml`
--- | (`binder_vars`, `fv_*`, `cf_*`).
+-- | Free-variable and referenced-foreign-key analyses over the backend-neutral ANF. Pure middle-end
+-- | analysis (no backend vocabulary), shared by every backend: lambda-lifting and native-foreign
+-- | resolution on the LLVM side (ADR-0072 §4 / ADR-0073 §3), and per-decl `deps`/foreign accumulation on
+-- | the bytecode side (ADR-0088 §2 — the reachability edges are the free **global** refs `fvExpr` returns;
+-- | the required foreigns are `cfExpr`). A faithful transcription of boot's `binder_vars`/`fv_*`/`cf_*`.
 -- |
 -- | Stack-safety note: the array folds are `foldl` (safe), but the `Expr` tree recursion is ordinary
 -- | structural recursion, so a very deep ANF `Let` spine recurses to its length. The values are pure
--- | `Set`s (no bearing on `.ll` byte-identity), so an iterative-spine rewrite is a result-preserving
--- | hardening deferred until real large modules exercise it; the emission path (`Emit.expr`) is where
--- | the stack-safe `tailRecM` spine walk lives.
-module Purvasm.Compiler.Backend.LLVM.FreeVars
+-- | `Set`s (no bearing on emitted-artifact bytes), so an iterative-spine rewrite is a result-preserving
+-- | hardening deferred until real large modules exercise it.
+module Purvasm.Compiler.MiddleEnd.ANF.FreeVars
   ( binderVars
   , fvAtom
   , fvAtoms
@@ -90,7 +91,7 @@ fvAlt bound alt =
           Set.empty
           gs
 
--- | Every native foreign key an expression references (a superset over dead bindings is harmless — the
+-- | Every foreign key an expression references (a superset over dead bindings is harmless — the
 -- | dead-strip link drops an unreferenced leaf, ADR-0073 §3).
 cfExpr :: Expr -> Set String
 cfExpr = case _ of

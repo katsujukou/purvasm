@@ -15,11 +15,12 @@ import Test.Unit.Purvasm.Compiler.Bytecode.Lower.Match as Bytecode.Lower.Match
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Abi as Backend.LLVM.Abi
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Driver as Backend.LLVM.Driver
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Emit as Backend.LLVM.Emit
-import Test.Unit.Purvasm.Compiler.Backend.LLVM.FreeVars as Backend.LLVM.FreeVars
+import Test.Unit.Purvasm.Compiler.MiddleEnd.ANF.FreeVars as MiddleEnd.ANF.FreeVars
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Interface as Backend.LLVM.Interface
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Mangle as Backend.LLVM.Mangle
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Monad as Backend.LLVM.Monad
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Prim as Backend.LLVM.Prim
+import Test.Unit.Purvasm.Compiler.Backend.Bytecode as Backend.Bytecode
 import Test.Unit.Purvasm.Compiler.Build as Build
 import Test.Unit.Purvasm.Compiler.CESK.Translate as CESK.Translate
 import Test.Unit.Purvasm.Compiler.Compile as Compile
@@ -48,10 +49,11 @@ main = runSpecAndExitProcess [ consoleReporter ] do
   Backend.LLVM.Monad.spec
   Backend.LLVM.Abi.spec
   Backend.LLVM.Prim.spec
-  Backend.LLVM.FreeVars.spec
+  MiddleEnd.ANF.FreeVars.spec
   Backend.LLVM.Interface.spec
   Backend.LLVM.Emit.spec
   Backend.LLVM.Driver.spec
+  Backend.Bytecode.spec
   Bytecode.Image.spec
   Bytecode.Artifact.spec
   Compile.spec
