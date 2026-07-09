@@ -8,9 +8,10 @@
 -- | neither grows the JS stack with binding/emission depth. Tree recursion (`if`/`case` branches) stays
 -- | ordinary, bounded by control-flow nesting.
 -- |
--- | This is the slice-1a cut (ADR-0082 §3): atoms (`AtomVar`/`Int`/`Bool`), `Ret`/`Let`, `CAtom`, and
--- | the function machinery. Arithmetic/`if`/`CApp`/closures/`case`/`Number`/`String`/foreign are later
--- | slices and currently crash with a labelled `unsafeCrashWith` rather than emit wrong IR.
+-- | This is the slice-1b cut (ADR-0082 §3): atoms (`AtomVar`/`Int`/`Bool`), `Ret`/`Let`, `CAtom`, the
+-- | function machinery, and now `CPrim` (inline `Int`/`Boolean` arithmetic + the `pv_prim_*` fallback)
+-- | and `CIf` (forced-condition branch + phi join). `CApp`/closures/`case`/`Number`/`String`/foreign are
+-- | later slices and currently crash with a labelled `unsafeCrashWith` rather than emit wrong IR.
 module Purvasm.Compiler.Backend.LLVM.Emit
   ( atom
   , readVar
@@ -30,11 +31,14 @@ import Control.Monad.Rec.Class (Step(..), tailRecM)
 import Control.Monad.State.Class (gets, modify_)
 import Data.Array (range, zip)
 import Data.Array as Array
-import Data.Foldable (foldMap, foldl)
+import Data.Either (Either(..))
+import Data.Foldable (any, foldMap, foldl)
 import Data.FoldableWithIndex (forWithIndex_)
 import Data.List (List(..))
+import Data.List as List
 import Data.Maybe (Maybe(..))
 import Data.Set as Set
+import Data.String.Common (joinWith)
 import Data.Traversable (traverse)
 import Data.TraversableWithIndex (traverseWithIndex)
 import Data.Tuple (Tuple(..), fst)
@@ -42,7 +46,8 @@ import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.Compiler.Backend.LLVM.Abi (abiFrameOpen, abiGet, abiPopFrame, abiRoot)
 import Purvasm.Compiler.Backend.LLVM.FreeVars (fvExpr)
 import Purvasm.Compiler.Backend.LLVM.Mangle (immBool, immInt, immUnit, mangle)
-import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, beginFn, emit, emitModule, fresh, freshFn, getFrame, setFrame, takeFn)
+import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, beginFn, emit, emitModule, fresh, freshFn, freshLabel, getFrame, setFrame, takeFn)
+import Purvasm.Compiler.Backend.LLVM.Prim (inlinePrim, primSym)
 import Purvasm.Compiler.Backend.LLVM.Types (Env, Lifted(..), LiftedBody(..), bindVar, lookupEnv)
 import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..))
@@ -84,6 +89,90 @@ readVar env x = case lookupEnv x env of
     else
       unsafeCrashWith ("Backend.LLVM.Emit.readVar: unbound variable " <> x <> " (unresolved foreign?)")
 
+-- | Read the current value of a rooted handle (post-safepoint).
+getCurrent :: String -> Codegen String
+getCurrent = abiGet
+
+-- | Force a value iff it is a by-need cell, with the immediate fast path inline (ADR-0072 §6): an
+-- | immediate word (LSB set) can never be a cell, so the extern crossing is paid only for pointer words.
+-- | The slow path (`pv_force_if_byneed`) is the only safepoint.
+forceValue :: String -> Codegen String
+forceValue v = do
+  chk <- freshLabel "fchk"
+  slow <- freshLabel "fslow"
+  done_ <- freshLabel "fdone"
+  emit ("  br label %" <> chk)
+  emit (chk <> ":")
+  bit <- fresh
+  emit ("  " <> bit <> " = and i64 " <> v <> ", 1")
+  imm <- fresh
+  emit ("  " <> imm <> " = icmp ne i64 " <> bit <> ", 0")
+  emit ("  br i1 " <> imm <> ", label %" <> done_ <> ", label %" <> slow)
+  emit (slow <> ":")
+  forced <- fresh
+  emit ("  " <> forced <> " = call i64 @pv_force_if_byneed(ptr %ctx, i64 " <> v <> ")")
+  emit ("  br label %" <> done_)
+  emit (done_ <> ":")
+  r <- fresh
+  emit ("  " <> r <> " = phi i64 [ " <> v <> ", %" <> chk <> " ], [ " <> forced <> ", %" <> slow <> " ]")
+  pure r
+
+-- | An atom to its forced value: a variable is forced (a demand site, e.g. an `if` condition or a primop
+-- | operand); a literal/foreign is passed through unforced (never a cell).
+forceAtom :: Env -> Atom -> Codegen String
+forceAtom env = case _ of
+  a@(AtomVar _) -> atom env a >>= forceValue
+  a -> atom env a
+
+-- | Evaluate a list of atoms to their **current** value operands, mutually protected against each
+-- | other's safepoints (ADR-0072 §6): an atom is rooted+reloaded only when a *later* atom can safepoint,
+-- | so the common all-vars/immediates list emits no `pv_root`/`pv_get`. `force` forces each variable
+-- | (a suspension may run guest code — itself a safepoint). Byte-identical to boot's `eval_atoms`: the
+-- | evaluation+root pass runs in list order, then the reload (`pv_get`) pass.
+evalAtoms :: Boolean -> Env -> Array Atom -> Codegen (Array String)
+evalAtoms force env atoms = do
+  slots <- go (List.fromFoldable atoms)
+  reloaded <- traverse reload slots
+  pure (Array.fromFoldable reloaded)
+  where
+  canSafepoint = case _ of
+    AtomLit (LInt _) -> false
+    AtomLit (LBool _) -> false
+    AtomLit (LNumber _) -> true
+    AtomLit (LString _) -> true
+    AtomForeign _ -> true
+    AtomVar _ -> force
+
+  isImmediate = case _ of
+    AtomLit (LInt _) -> true
+    AtomLit (LBool _) -> true
+    _ -> false
+
+  one = if force then forceAtom env else atom env
+
+  -- Evaluate+root in list order; `Left` = raw operand, `Right` = rooted handle (reloaded in a second
+  -- pass), mirroring boot's ``` `Raw / `Rooted ``` split.
+  go = case _ of
+    Nil -> pure Nil
+    Cons a rest -> do
+      slot <-
+        if isImmediate a then Left <$> one a
+        else do
+          v <- one a
+          if any canSafepoint rest then Right <$> root v else pure (Left v)
+      slots <- go rest
+      pure (Cons slot slots)
+
+  reload = case _ of
+    Left v -> pure v
+    Right h -> getCurrent h
+
+-- | Expect a produced value from a non-tail sub-expression (an `if`/`let` branch always yields one).
+requireValue :: Maybe String -> Codegen String
+requireValue = case _ of
+  Just v -> pure v
+  Nothing -> unsafeCrashWith "Backend.LLVM.Emit: non-tail expression produced no value"
+
 -- | Emit the current function's return: pop the shadow-stack frame, then `ret`.
 emitRet :: String -> Codegen Unit
 emitRet v = do
@@ -104,12 +193,57 @@ finish tail v =
 cexpr :: Env -> Boolean -> CExpr -> Codegen (Maybe String)
 cexpr env tail = case _ of
   CAtom a -> atom env a >>= finish tail
-  CPrim _ _ ->
-    unsafeCrashWith "Backend.LLVM.Emit.cexpr: CPrim not yet supported (slice 1b)"
-  CIf _ _ _ ->
-    unsafeCrashWith "Backend.LLVM.Emit.cexpr: CIf not yet supported (slice 1b)"
+  CPrim op args -> do
+    -- A primop consumes its operands' *values* (e.g. `RecordGet` on a by-need dict), so force them.
+    ops <- evalAtoms true env args
+    inlinePrim op ops >>= case _ of
+      Just t -> finish tail t
+      Nothing -> do
+        let
+          Tuple sym needsCtx = primSym op
+          argl = joinWith ", " (map (\o -> "i64 " <> o) ops)
+        t <- fresh
+        if needsCtx then emit ("  " <> t <> " = call i64 @" <> sym <> "(ptr %ctx, " <> argl <> ")")
+        else emit ("  " <> t <> " = call i64 @" <> sym <> "(" <> argl <> ")")
+        finish tail t
+  CIf a t e -> do
+    -- A Boolean demand site: force a by-need cell reaching the condition before reading its payload bit.
+    c <- forceAtom env a
+    -- payload != 0 ⇒ true (ADR-0064 §1).
+    p <- fresh
+    emit ("  " <> p <> " = ashr i64 " <> c <> ", 1")
+    b <- fresh
+    emit ("  " <> b <> " = icmp ne i64 " <> p <> ", 0")
+    lt <- freshLabel "then"
+    le <- freshLabel "else"
+    emit ("  br i1 " <> b <> ", label %" <> lt <> ", label %" <> le)
+    if tail then do
+      emit (lt <> ":")
+      void (expr env true t)
+      emit (le <> ":")
+      void (expr env true e)
+      pure Nothing
+    else do
+      lend <- freshLabel "endif"
+      emit (lt <> ":")
+      vt <- requireValue =<< expr env false t
+      -- the block a value flows from may differ from `lt` after nested control flow.
+      bt <- freshLabel "thenv"
+      emit ("  br label %" <> bt)
+      emit (bt <> ":")
+      emit ("  br label %" <> lend)
+      emit (le <> ":")
+      ve <- requireValue =<< expr env false e
+      be <- freshLabel "elsev"
+      emit ("  br label %" <> be)
+      emit (be <> ":")
+      emit ("  br label %" <> lend)
+      emit (lend <> ":")
+      r <- fresh
+      emit ("  " <> r <> " = phi i64 [ " <> vt <> ", %" <> bt <> " ], [ " <> ve <> ", %" <> be <> " ]")
+      pure (Just r)
   CApp _ _ ->
-    unsafeCrashWith "Backend.LLVM.Emit.cexpr: CApp not yet supported (slice 1b)"
+    unsafeCrashWith "Backend.LLVM.Emit.cexpr: CApp not yet supported (slice 1c: direct/apply calls)"
   CLam _ _ ->
     unsafeCrashWith "Backend.LLVM.Emit.cexpr: CLam not yet supported (slice 2)"
   CCtor _ _ _ ->
