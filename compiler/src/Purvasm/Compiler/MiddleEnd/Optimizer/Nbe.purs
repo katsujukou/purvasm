@@ -35,6 +35,7 @@ import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..))
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (cfExpr, fvExpr)
 import Purvasm.Compiler.MiddleEnd.Normalize (normalize)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Analysis (inlineMarks, sizeExpr)
+import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Distribute (distributeCases)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Eval (evalExpr)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Quote (quote)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (EvalEnv, ExternEntry, InlineCandidate, NbeEnv)
@@ -70,7 +71,9 @@ nbeBinding nbe key e0 = preserveOuterShape e0 (loop rewriteFuel Set.empty e0)
     | n <= 0 = unsafeCrashWith ("Nbe.nbeBinding: rewrite fuel exhausted at " <> key)
     | otherwise =
         let
-          e' = quote (evalExpr { locals: Map.empty, marks, nbe } e)
+          -- fold-guaranteed case-of-case distribution (slice 3) runs on the quoted term (unique
+          -- binders); the placed leaf cases fold in the next evaluation round.
+          e' = distributeCases (quote (evalExpr { locals: Map.empty, marks, nbe } e))
           marks' = inlineMarks e'
         in
           if e' == e && marks' == marks then e

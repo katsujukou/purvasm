@@ -363,6 +363,14 @@ comparison to a **single primop**.
    computations before its leaf keeps them (they run on that arm's path exactly as before —
    position preserved); guarded alternatives, both in the tree and in `alts`, block it (ADR-0013
    order, as in §5).
+
+   > **Correction (2026-07-11, review):** the fold-guarantee bounds how many alternatives *survive
+   > per leaf* (one), **not their size** — an irrefutable row with a large (or binder-consuming)
+   > right-hand side would still be duplicated once per leaf, breaking the strict-shrink claim. The
+   > rewrite therefore additionally requires **every outer alternative's right-hand side to be a
+   > bare atom** (`Ret (CAtom …)`, size one), which makes each surviving copy a single node and the
+   > claim true in fact. The motivating shapes (boolean/literal results) satisfy this; anything
+   > larger stays un-distributed pending a size-gated design if traces ever justify one.
 2. **Effect-soundness is inherited, not new.** The outer case scrutinises an atom (ANF), so no
    computation sits between the inner branch and the dispatch; the inner branch stays at its
    sequenced position — only the *continuation* moves into its arms, once per arm, and the binder
@@ -386,3 +394,85 @@ comparison to a **single primop**.
 - **Compile the comparison chains away earlier (match-compilation tricks).** Rejected: ADR-0083
   deliberately keeps `CCase` structured through the optimiser; this is precisely the reduction that
   placement was bought for.
+
+### Progress (2026-07-11): slice 3 landed; one auxiliary decision surfaced
+
+The distribution landed as specified (`Nbe.Distribute`, a syntactic pass on the quoted term inside
+`nbeBinding`'s loop; folding delegated to the next round's case-of-known — the decidability check
+mirrors `Eval.matchBinder`, and a disagreement costs only the fold, never correctness). The
+implementation surfaced one auxiliary decision: **constant-class extern forcing**. In real corefn a
+nullary constructor like `Data.Ordering.LT` is a **CAF binding** referenced by name (`AtomVar`), not
+a `CCtor` node — so the fold-guarantee check correctly (but uselessly) blocked on every real
+comparison tree until `Eval.refOf` learned to force an extern whose entry is constant-class
+(`arity: Nothing`, `size ≤ 2`, forcing to a nullary constructor or literal) eagerly to its value.
+Reifying such a value per use site duplicates nothing real — a nullary constructor is an unboxed
+immediate (ADR-0064). Measured on the **original landing, before the atom-RHS Correction** (outputs
+equal on all five benchmarks): fib 1.434 → **2.587**, quicksort 1.579 → **1.760**, json-parse
+2.123 → **2.792**. With the Correction applied, the committed baseline is fib **1.951**, quicksort
+**1.760** (unaffected), json-parse **2.573** — the gap to the original landing is the evidence
+behind the bounded-continuation-duplication extension below.
+
+### Proposed extension (2026-07-11): two residual boolean-case rules
+
+- Status: Proposed — awaits acceptance before implementation.
+
+The landed slice leaves fib's comparison as
+`case LtInt(a,b) of true -> true; _ -> (let q = EqInt(a,b) in case q of true -> false; _ -> false)`
+— two shapes a distribution cannot touch, each a one-clause reduction:
+
+1. **Boolean case-eta.** A case over a (Boolean-valued) scrutinee whose alternatives are exactly the
+   identity — `case b of true -> true; <irrefutable> -> false` — reduces to the scrutinee itself
+   (and the negated form, `true -> false; <irrefutable> -> true`, to `NotBool(b)`). The scrutinee is
+   an ANF atom (pure by construction), and no arm carries bindings, so nothing is dropped or moved.
+2. **Constant-arm collapse.** A case whose alternatives all return the **same literal** directly
+   (each rhs exactly `Ret <literal>`, no guards, no arm bindings), with an **irrefutable trailing
+   row** (so some arm is guaranteed to match — a potentially-stuck match must be preserved),
+   reduces to that literal. The scrutinee is an atom, so dropping the dispatch drops no
+   computation (any computation feeding it is a separately pinned `let`, untouched).
+
+Both live in `Eval` (`evalCase`'s neutral path — cheap shape checks before building the neutral) or
+as `Distribute`-style syntax rules — an implementation choice inside `Nbe`, as with slice 3. On
+fib's shape the two compose with the landed distribution to finish the comparison at a single
+`LtInt(a, b)`; quicksort's predicates follow the same path. Gates unchanged (behavioural + fixtures
++ `.pmi` mode-stability); a new fixture pins each rule's blocking condition (an arm with bindings /
+no irrefutable row).
+
+### Proposed extension (2026-07-11): bounded continuation duplication
+
+- Status: Proposed — awaits acceptance before implementation. The atom-RHS guard (the Correction
+  above) is the committed baseline; this extension relaxes it as a **separate slice**.
+
+The atom-RHS guard blocked distribution sites that are semantically safe and measurably profitable:
+fib's own body case (a 12-node recursive arm duplicated into two leaves) is worth ≈ +0.6 ratio
+(measured 1.951 → 2.587 with the guard off). The blocked copies sit on **disjoint branch paths** —
+dynamically exclusive, effects executed at most once per run — so the only cost is **static size**,
+which is a size-gate question, not a semantics one.
+
+1. **Firing conditions unchanged**: leaf-decidable (recursively, to the tree's leaves), guarded
+   alternatives block, `r` single-use as the immediate scrutinee.
+2. **Atom right-hand sides stay unconditionally allowed** — that tier remains a *strict shrink*.
+3. **Non-atom right-hand sides are allowed under a duplication budget**: the sum over leaves of the
+   *selected* outer alternative's quoted-ANF size must satisfy `Σ copiedRhsSize <= 16`. The bound
+   starts at 16; raising it (at most to 32) requires a measured justification. This tier is
+   honestly a **measured size tradeoff**, not a shrink — the ADR language keeps the two tiers
+   distinct.
+
+   Additionally (review, 2026-07-11), every bounded-tier outer alternative must be
+   **leaf-independent**: none of its binder variables may occur free in its right-hand side
+   (`binderVars ∩ fv(rhs) = ∅` — `BNull`/literal rows trivially; a `BVar`/sub-binder row only if
+   the bound name is unused). A binder-consuming row substitutes the **leaf value** into the copied
+   RHS on fold — duplication the RHS-size budget does not count (and which `quote` re-materialises
+   per occurrence). The measured motivating sites (fib's `true`-literal + wildcard rows) are
+   binder-free, so this costs nothing observed. The alternative — budgeting the *residual* size
+   after substituting leaf-bound variables (or an upper bound on it) — is the honest general
+   design but is deferred until a trace shows a binder-consuming site worth its complexity.
+4. **Effect posture is inherited**: a copied right-hand side (including one that `let`-binds
+   effectful computations) lands on exactly one branch path per copy and keeps its internal
+   sequencing — dynamically nothing runs more often than before.
+5. **Fixtures**: a large RHS is blocked (the budget); a small non-atom RHS distributes; an RHS
+   containing an effectful `let` is position-preserved per path (no dynamic duplication); a
+   **binder-consuming row is blocked** (leaf-independence — the uncounted substitution class). The
+   existing atom-tier fixtures stay.
+
+Evidence for the budget's value: fib 1.951 → ≈ 2.59, json-parse 2.573 → ≈ 2.79 (the pre-guard
+measurements); quicksort is unaffected either way.

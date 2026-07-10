@@ -392,6 +392,128 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
         consumer = Ret (CAccessor (var "D.bad") "f")
       nbeCross deps [] consumer `shouldEqual` consumer
 
+  describe "fold-guaranteed case-of-case (ADR-0089 Addendum, slice 3)" do
+    it "distributes through the nested comparison tree and folds every leaf (the fib shape)" do
+      -- let r = LtInt(a,b)
+      -- in let s = case r of true -> LT; _ -> (let q = EqInt(a,b) in case q of true -> EQ; _ -> GT)
+      -- in case s of LT -> true; _ -> false
+      let
+        ordering tag = CCtor tag 0 []
+        inner =
+          CCase [ var "r" ]
+            [ { binders: [ BLit (LBool true) ], result: Uncond (Ret (ordering "LT")) }
+            , { binders: [ BNull ]
+              , result: Uncond
+                  ( Let "q" (CPrim EqInt [ var "a", var "b" ])
+                      ( Ret
+                          ( CCase [ var "q" ]
+                              [ { binders: [ BLit (LBool true) ], result: Uncond (Ret (ordering "EQ")) }
+                              , { binders: [ BNull ], result: Uncond (Ret (ordering "GT")) }
+                              ]
+                          )
+                      )
+                  )
+              }
+            ]
+        outer =
+          [ { binders: [ BCtor "LT" [] ], result: Uncond (Ret (CAtom (AtomLit (LBool true)))) }
+          , { binders: [ BNull ], result: Uncond (Ret (CAtom (AtomLit (LBool false)))) }
+          ]
+        e =
+          Let "r" (CPrim LtInt [ var "a", var "b" ])
+            (Let "s" inner (Ret (CCase [ var "s" ] outer)))
+      nbe e `shouldEqual`
+        Let "$q1" (CPrim LtInt [ var "a", var "b" ])
+          ( Ret
+              ( CCase [ var "$q1" ]
+                  [ { binders: [ BLit (LBool true) ], result: Uncond (Ret (CAtom (AtomLit (LBool true)))) }
+                  , { binders: [ BNull ]
+                    , result: Uncond
+                        ( Let "$q2" (CPrim EqInt [ var "a", var "b" ])
+                            ( Ret
+                                ( CCase [ var "$q2" ]
+                                    [ { binders: [ BLit (LBool true) ], result: Uncond (Ret (CAtom (AtomLit (LBool false)))) }
+                                    , { binders: [ BNull ], result: Uncond (Ret (CAtom (AtomLit (LBool false)))) }
+                                    ]
+                                )
+                            )
+                        )
+                    }
+                  ]
+              )
+          )
+
+    it "blocks when any leaf is undecidable (an unknown value against a constructor row)" do
+      let
+        e =
+          Let "s"
+            ( CCase [ var "c" ]
+                [ { binders: [ BLit (LBool true) ], result: Uncond (Ret (CCtor "LT" 0 [])) }
+                , { binders: [ BNull ], result: Uncond (Ret (CAtom (var "unknown"))) }
+                ]
+            )
+            ( Ret
+                ( CCase [ var "s" ]
+                    [ { binders: [ BCtor "LT" [] ], result: Uncond (Ret (CAtom (AtomLit (LBool true)))) }
+                    , { binders: [ BNull ], result: Uncond (Ret (CAtom (AtomLit (LBool false)))) }
+                    ]
+                )
+            )
+        out = nbe e
+        stillNested = case out of
+          Let _ (CCase _ _) (Ret (CCase _ _)) -> true
+          _ -> false
+      stillNested `shouldEqual` true
+
+    it "blocks when an outer right-hand side is not a bare atom (per-leaf duplication guard)" do
+      -- a non-atom RHS would be duplicated once per leaf — the fold-guarantee bounds surviving
+      -- alternative *count*, not size, so this must not distribute.
+      let
+        e =
+          Let "s"
+            ( CCase [ var "c" ]
+                [ { binders: [ BLit (LBool true) ], result: Uncond (Ret (CCtor "LT" 0 [])) }
+                , { binders: [ BNull ], result: Uncond (Ret (CCtor "GT" 0 [])) }
+                ]
+            )
+            ( Ret
+                ( CCase [ var "s" ]
+                    [ { binders: [ BCtor "LT" [] ], result: Uncond (Ret (CAtom (AtomLit (LBool true)))) }
+                    , { binders: [ BNull ]
+                      , result: Uncond (Ret (CPrim AddInt [ var "a", var "big" ]))
+                      }
+                    ]
+                )
+            )
+        stillNested = case nbe e of
+          Let _ (CCase _ _) (Ret (CCase _ _)) -> true
+          _ -> false
+      stillNested `shouldEqual` true
+
+    it "blocks when the outer alternatives are guarded (ADR-0013 order)" do
+      let
+        e =
+          Let "s"
+            ( CCase [ var "c" ]
+                [ { binders: [ BLit (LBool true) ], result: Uncond (Ret (CCtor "LT" 0 [])) }
+                , { binders: [ BNull ], result: Uncond (Ret (CCtor "GT" 0 [])) }
+                ]
+            )
+            ( Ret
+                ( CCase [ var "s" ]
+                    [ { binders: [ BCtor "LT" [] ]
+                      , result: Guarded [ { guard: Ret (CAtom (var "g")), rhs: Ret (CAtom (AtomLit (LBool true))) } ]
+                      }
+                    , { binders: [ BNull ], result: Uncond (Ret (CAtom (AtomLit (LBool false)))) }
+                    ]
+                )
+            )
+        out = nbe e
+        stillNested = case out of
+          Let _ (CCase _ _) (Ret (CCase _ _)) -> true
+          _ -> false
+      stillNested `shouldEqual` true
+
   describe "determinism" do
     it "normalising twice is the identity on the normal form (stable $q numbering)" do
       let

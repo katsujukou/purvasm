@@ -99,16 +99,28 @@ evalAtom env = case _ of
 
 -- | A non-local name: a module sibling / dependency candidate (gate-A target), an intrinsic
 -- | foreign, a structural-rung guest term (also gate-A-target shaped), or an opaque global.
+-- |
+-- | A **constant-class** extern (a nullary-constructor CAF like `Data.Ordering.LT`, or a literal
+-- | builtin) is forced eagerly to its value: reifying it per use site duplicates nothing real (a
+-- | nullary constructor is an unboxed immediate, ADR-0064), and the syntactic value is what lets
+-- | the slice-3 distribution decide leaves that reference these CAFs.
 refOf :: EvalEnv -> Atom -> String -> Sem
 refOf env atom k = case Map.lookup k env.nbe.externs of
-  Just entry -> SRef { atom, target: TExtern entry, spine: [] }
+  Just entry -> constOr entry (SRef { atom, target: TExtern entry, spine: [] })
   Nothing -> case env.nbe.intrinsic k of
     Just ia -> SRef { atom, target: TIntrinsic ia, spine: [] }
     Nothing -> case env.nbe.structural k of
-      Just entry -> SRef { atom, target: TExtern entry, spine: [] }
+      Just entry -> constOr entry (SRef { atom, target: TExtern entry, spine: [] })
       Nothing -> case atom of
         AtomForeign _ -> SForeign k
         _ -> SVar k
+  where
+  constOr entry fallback
+    | isNothing entry.arity && entry.size <= 2 = case force entry.value of
+        v@(SCtor _ 0 []) -> v
+        v@(SLit _) -> v
+        _ -> fallback
+    | otherwise = fallback
 
 -- | Application. β fires on a known lambda; an `SRef` accumulates its spine and is judged at
 -- | saturation (gate site A); an application *of* a computation sequences it first; everything
