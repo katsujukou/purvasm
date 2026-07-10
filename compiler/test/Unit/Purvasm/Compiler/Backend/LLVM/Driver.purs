@@ -14,6 +14,7 @@ import Data.Argonaut.Parser (jsonParser)
 import Data.Array as Array
 import Data.Bifunctor (lmap)
 import Data.Either (Either(..))
+import Data.Map as Map
 import Data.Maybe (Maybe(..))
 import Effect.Class (liftEffect)
 import Effect.Ref as Ref
@@ -50,6 +51,8 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Driver" do
               { workdir: "."
               , maxOptimizeIter: 1
               , loadModule: \name -> pure (if name == "Slice1" then Loaded { path: "Slice1", mod } else Missing)
+              -- ADR-0090 stub: the fixture module declares no foreigns, so the driver never calls this.
+              , foreignSigsOf: \_ -> pure (Right Map.empty)
               , emitFile: \artifact -> Ref.modify_ (\a -> Array.snoc a artifact.backendIR) modBuf $> "mod.ll"
               , emitEntry: \o -> Ref.write (Just o) entryBuf $> "entry.ll"
               , hooks: defaultHooks

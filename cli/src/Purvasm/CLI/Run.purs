@@ -12,6 +12,7 @@ import Prelude
 
 import ArgParse.Basic (ArgParser, fromRecord)
 import ArgParse.Basic as ArgParser
+import Data.Bifunctor (lmap)
 import Data.Either (Either(..))
 import Data.Foldable (foldM)
 import Data.Map as Map
@@ -33,6 +34,7 @@ import Purvasm.Compiler.Backend.Bytecode (bytecodeBackend)
 import Purvasm.Compiler.Bytecode.Artifact (ModuleArtifact, interfaceToString, moduleToString)
 import Purvasm.Compiler.Bytecode.Image (imageToString)
 import Purvasm.Compiler.CESK.AST (Term(..))
+import Purvasm.Compiler.CESK.Translate (nameKey)
 import Purvasm.Compiler.Ffi as Ffi
 import Purvasm.Compiler.Link (link)
 import Purvasm.Compiler.Literal (Literal(..))
@@ -68,16 +70,18 @@ options = fromRecord
         # ArgParser.default "Main"
   , checkForeignSigs:
       ArgParser.flag [ "--check-foreign-sigs" ]
-        "Reconstruct and check foreign signatures during the build (ADR-0080).\n\
-        \Off by default until a build-time consumer lands: source-channel lexing is\n\
-        \expensive on the native backend, and the standing checks are the\n\
-        \`foreign-sigs` command and tools/foreign-sigs-diff.sh."
+        "Extra diagnostic: reconstruct every module's foreign signatures up front and\n\
+        \log the resolved count (ADR-0080). The build itself already reconstructs them\n\
+        \per module (ADR-0090); this is an eager whole-closure sweep for the standing\n\
+        \`foreign-sigs` command and tools/foreign-sigs-diff.sh. Off by default:\n\
+        \source-channel lexing is expensive on the native backend."
         # ArgParser.boolean
   , noOpt:
       ArgParser.flag [ "--no-opt" ]
-        "Disable the optimiser (Simplify/Dbe/EffectAnalysis + the NbE inliner); keep only\n\
-        \normalisation. `--opt` runs the real optimiser over the ANF — the VM is the optimiser's\n\
-        \effect-measurement field (ADR-0088); the emitted bytecode is no longer byte-identical to boot."
+        "Disable the optimiser (the DictElim + NbE-inliner fixpoint, ADR-0086/0089); keep only\n\
+        \normalisation (the VM has no bridge — dictionaries stay applied). `--opt` runs the real\n\
+        \optimiser over the ANF — the VM is the optimiser's effect-measurement field (ADR-0088);\n\
+        \the emitted bytecode is no longer byte-identical to boot."
         # ArgParser.boolean
   , emitIr:
       ArgParser.argument [ "--emit-ir" ]
@@ -95,6 +99,7 @@ renderBuildError :: BuildError -> String
 renderBuildError = case _ of
   EntryMissing name -> "entry module not found: " <> name
   LoadFailed e -> Fmt.fmt @"{name}: {detail}" { name: e.moduleName, detail: e.detail }
+  ForeignSigFailed e -> Fmt.fmt @"{name}: {detail}" { name: e.moduleName, detail: e.detail }
 
 -- | The CLI `CompilerAction` for the bytecode build over the `Run` stack: single-module CoreFn loading
 -- | (through the `ulib` overlay), per-module `.pmo`/`.pmi` emission, and the shared `--emit-ir` trace
@@ -104,9 +109,10 @@ mkAction
    . Options
   -> FilePath
   -> FilePath
+  -> ForeignSigs.Env
   -> Ref (Array String)
   -> CompilerAction ModuleArtifact (Run (ENV + LOG + FS + EXCEPT String + EFFECT + r))
-mkAction opts ulibDir buildDir irBuf =
+mkAction opts ulibDir buildDir fsEnv irBuf =
   { workdir: buildDir
   , maxOptimizeIter: optMaxIter
   , loadModule: \name -> do
@@ -116,6 +122,11 @@ mkAction opts ulibDir buildDir irBuf =
         Just src -> case parseModule src of
           Left err -> pure (Failed { moduleName: name, detail: err })
           Right mod -> pure (Loaded { path, mod })
+  -- ADR-0090 §2: reconstruct this module's foreign shapes (self-guarding — empty when foreign-free),
+  -- mapping a reconstruction failure to the driver's `ForeignSigError` so the build halts as data.
+  , foreignSigsOf: \mod ->
+      lmap (\detail -> { moduleName: nameKey mod.name, detail })
+        <$> ForeignSigs.moduleForeignSigsE fsEnv mod
   , emitFile: \artifact -> do
       let name = artifact.backendIR.name
       pmoPath <- FS.joinPath [ buildDir, name <> ".pmo" ]
@@ -138,21 +149,24 @@ cmd opts = do
   buildDir <- FS.joinPath [ opts.outDir, "_build" ]
   FS.mkdirP buildDir
   irBuf <- liftEffect (Ref.new [])
+  -- The FSR static inputs, read once and closed into the action's `foreignSigsOf` capability (ADR-0090 §2)
+  -- and reused by the `--check-foreign-sigs` diagnostic.
+  fsEnv <- ForeignSigs.loadEnv { ulibDir, corefnDir: opts.corefnDir }
   let
-    action = mkAction opts ulibDir buildDir irBuf
+    action = mkAction opts ulibDir buildDir fsEnv irBuf
     buildOpts =
       { entryModule: opts.entryModule
       , entryName: "main"
       , isEffect: true
       , opt: not opts.noOpt
       }
-  -- The ADR-0080 source channel, opt-in until a build-time consumer lands.
+  -- Eager whole-closure FSR sweep as a diagnostic (the build's own per-module `foreignSigsOf` already
+  -- consumes signatures, ADR-0090); opt-in via `--check-foreign-sigs`.
   when opts.checkForeignSigs do
     loadClosure action opts.entryModule >>= case _ of
       Left err -> throw (renderBuildError err)
       Right loaded -> do
-        env <- ForeignSigs.loadEnv { ulibDir, corefnDir: opts.corefnDir }
-        total <- foldM (\n m -> (n + _) <<< Map.size <$> ForeignSigs.moduleForeignSigs env m.mod) 0 loaded
+        total <- foldM (\n m -> (n + _) <<< Map.size <$> ForeignSigs.moduleForeignSigs fsEnv m.mod) 0 loaded
         Log.debug $ Fmt.fmt @"foreign-sigs: {n} signatures resolved" { n: show total }
   build bytecodeBackend action buildOpts >>= case _ of
     Left err -> throw (renderBuildError err)

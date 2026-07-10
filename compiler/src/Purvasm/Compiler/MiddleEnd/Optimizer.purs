@@ -60,6 +60,11 @@ newtype BuildEnv = BuildEnv
   { dict :: DictMachinery
   , gkeys :: Set String
   , inlines :: Map String InlineCandidate
+  -- | Dependencies' exported foreign shapes (ADR-0090), for effect analysis (ADR-0034). The **build
+  -- | driver** owns the primary `ForeignFacts` thread (every mode, feeding codegen via
+  -- | `LoweredModule.foreignSigs`); it injects the same deps here via `withForeignSigs` only under `--opt`,
+  -- | where the optimiser runs. No pass mutates it, so it is not folded by `extendSummary`.
+  , foreignSigs :: Map String ForeignShape
   }
 
 -- | The current module's **stable** facts produced by `localFactsOf` and handed to the `optimizeModule`
@@ -69,6 +74,9 @@ newtype BuildEnv = BuildEnv
 type LocalFacts =
   { dict :: DictMachinery
   , gkeys :: Set String
+  -- | The module's **own** foreign shapes (ADR-0090), injected by the driver under `--opt`; empty from
+  -- | `localFactsOf` (source-derived, not `AnfModule`-derived). For the optimiser's own-module effect analysis.
+  , foreignSigs :: Map String ForeignShape
   }
 
 -- | What a compiled module contributes to its dependents' `BuildEnv`. Distinct from the persisted
@@ -84,7 +92,7 @@ newtype BuildSummary = BuildSummary
 
 -- | The starting env, before any module has contributed.
 emptyBuildEnv :: BuildEnv
-emptyBuildEnv = BuildEnv { dict: emptyMachinery, gkeys: Set.empty, inlines: Map.empty }
+emptyBuildEnv = BuildEnv { dict: emptyMachinery, gkeys: Set.empty, inlines: Map.empty, foreignSigs: Map.empty }
 
 -- | A module's **stable** facts — its own dictionary machinery and top-level keys — computed once from its
 -- | `AnfModule` and handed to the `optimizeModule` fixpoint (they do not change across iterations). The
@@ -97,6 +105,7 @@ localFactsOf :: BuildEnv -> AnfModule -> LocalFacts
 localFactsOf (BuildEnv env) am =
   { dict: machineryOf env.dict (Array.concatMap _.members am.decls)
   , gkeys: Set.fromFoldable (Array.concatMap declKeys am.decls)
+  , foreignSigs: Map.empty -- source-derived; the driver injects the module's own shapes under --opt
   }
 
 -- | One pass of the real optimiser (ADR-0086 §3, the `--opt` leg): `Nbe ∘ DictElim` over the
@@ -135,7 +144,16 @@ extendSummary (BuildEnv env) (BuildSummary s) = BuildEnv
   { dict: mergeMachinery s.dict env.dict
   , gkeys: Set.union s.gkeys env.gkeys
   , inlines: Map.union s.inlines env.inlines
+  -- Foreign shapes are threaded by the driver's `ForeignFacts` (re-injected via `withForeignSigs` each
+  -- `--opt` step, ADR-0090), not folded through the summary; preserve whatever is set.
+  , foreignSigs: env.foreignSigs
   }
+
+-- | Inject the driver's dependency foreign shapes into the env for `optimizeModule` (ADR-0090). Called by
+-- | the build driver **under `--opt` only**, from its `ForeignFacts` thread — the env is otherwise
+-- | foreign-empty (the primary thread is driver-level, feeding codegen in every mode).
+withForeignSigs :: Map String ForeignShape -> BuildEnv -> BuildEnv
+withForeignSigs sigs (BuildEnv env) = BuildEnv (env { foreignSigs = sigs })
 
 -- | Project the in-memory summary onto the `.pmi`'s optional `Summary` (ADR-0084 §5). `Nothing` today —
 -- | so the `--no-opt` `.pmi` core is byte-for-byte boot's, and it stays `Nothing` until the optimiser

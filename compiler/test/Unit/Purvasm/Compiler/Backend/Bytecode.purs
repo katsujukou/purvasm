@@ -12,6 +12,7 @@ import Data.Argonaut.Parser (jsonParser)
 import Data.Array as Array
 import Data.Bifunctor (lmap)
 import Data.Either (Either(..))
+import Data.Map as Map
 import Data.Maybe (Maybe(..))
 import Effect (Effect)
 import Effect.Class (liftEffect)
@@ -41,6 +42,8 @@ buildArtifacts opt mod = do
       { workdir: "."
       , maxOptimizeIter: 5
       , loadModule: \name -> pure (if name == "Slice1" then Loaded { path: "Slice1", mod } else Missing)
+      -- ADR-0090 stub: the fixture module declares no foreigns, so the driver never calls this.
+      , foreignSigsOf: \_ -> pure (Right Map.empty)
       , emitFile: \artifact -> Ref.modify_ (\xs -> Array.snoc xs artifact.backendIR) modBuf $> "p.pmo"
       , emitEntry: \_ -> pure "e"
       , hooks: defaultHooks

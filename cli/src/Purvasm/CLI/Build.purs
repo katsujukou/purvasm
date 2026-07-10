@@ -16,6 +16,7 @@ import Prelude
 import ArgParse.Basic (ArgParser, fromRecord)
 import ArgParse.Basic as ArgParser
 import Data.Array as Array
+import Data.Bifunctor (lmap)
 import Data.Either (Either(..))
 import Data.Foldable (foldM, foldl)
 import Data.List (List(..), (:))
@@ -24,7 +25,6 @@ import Data.Map (Map)
 import Data.Map as Map
 import Data.Maybe (Maybe(..))
 import Data.Set as Set
-import Data.String.Common (joinWith)
 import Data.Tuple (fst, snd)
 import Data.Tuple.Nested (type (/\), (/\))
 import Effect.Ref (Ref)
@@ -38,15 +38,15 @@ import Purvasm.CLI.Effect.Filesystem as FS
 import Purvasm.CLI.Effect.Log (LOG)
 import Purvasm.CLI.Effect.Log as Log
 import Purvasm.CLI.Effect.Process (PROC)
+import Purvasm.CLI.EmitIr (irHooks)
 import Purvasm.CLI.ForeignSigs as ForeignSigs
 import Purvasm.CLI.NativeLink as NativeLink
 import Purvasm.CLI.Ulib (corefnPathFor, requireUlibDir)
-import Purvasm.Compiler (Backend, BuildError(..), CompilerAction, CompilerActionHooks, LoadResult(..), build, defaultHooks)
+import Purvasm.Compiler (Backend, BuildError(..), CompilerAction, LoadResult(..), build)
 import Purvasm.Compiler.Backend.LLVM.Abi (defaultHeapWords)
 import Purvasm.Compiler.Backend.LLVM.Driver (LlvmContext, llvmBackend)
 import Purvasm.Compiler.Bytecode.Artifact (interfaceToString)
 import Purvasm.Compiler.CESK.Translate (nameKey)
-import Purvasm.Compiler.MiddleEnd.ANF.Pretty (printModuleAnf)
 import Run (EFFECT, Run, liftEffect)
 import Run.Except (EXCEPT, throw)
 import Type.Row (type (+))
@@ -101,16 +101,18 @@ options = fromRecord
         # ArgParser.boolean
   , checkForeignSigs:
       ArgParser.flag [ "--check-foreign-sigs" ]
-        "Reconstruct and check foreign signatures during the build (ADR-0080).\n\
-        \Off by default until a build-time consumer lands: source-channel lexing is\n\
-        \expensive on the native backend, and the standing checks are the\n\
-        \`foreign-sigs` command and tools/foreign-sigs-diff.sh."
+        "Extra diagnostic: reconstruct every module's foreign signatures up front and\n\
+        \log the resolved count (ADR-0080). The build itself already reconstructs them\n\
+        \per module (ADR-0090); this is an eager whole-closure sweep for the standing\n\
+        \`foreign-sigs` command and tools/foreign-sigs-diff.sh. Off by default:\n\
+        \source-channel lexing is expensive on the native backend."
         # ArgParser.boolean
   , noOpt:
       ArgParser.flag [ "--no-opt" ]
-        "Disable the optimiser (Simplify/Dbe/EffectAnalysis + the NbE inliner); keep only\n\
-        \the required lowering (Normalize + DictElim). The un-optimised native path is the\n\
-        \`.ll` byte-identity reference for the boot port (ADR-0082 §2), and a bisection aid\n\
+        "Disable the optimiser (the DictElim + NbE-inliner fixpoint, ADR-0086/0089); the shared\n\
+        \driver is then the identity (normalise-only), and the LLVM backend privately applies its\n\
+        \transitional boot byte-identity bridge (ADR-0086 Addendum). The un-optimised native path\n\
+        \is the `.ll` byte-identity reference for the boot port (ADR-0082 §2), and a bisection aid\n\
         \separating a codegen bug from an optimiser bug."
         # ArgParser.boolean
   , emitLlvm:
@@ -120,9 +122,8 @@ options = fromRecord
         # ArgParser.boolean
   , emitIr:
       ArgParser.argument [ "--emit-ir" ]
-        "Trace a module's optimiser output: for the named module, append each optimiser round's\n\
-        \pretty-printed ANF to `<module>.ir` under _build (a --trace-rewrite analogue). The build\n\
-        \still runs to completion (codegen + link); this only turns on tracing (ADR-0087 §3.1)."
+        "Emit human-readable IR per optimiser iterations. Outputs results to \n\
+        \{OUTDIR}/_build/{MODULE_NAME}."
         # ArgParser.optional
   , optMaxIter:
       ArgParser.argument [ "--opt-max-iter" ]
@@ -182,6 +183,7 @@ renderBuildError :: BuildError -> String
 renderBuildError = case _ of
   EntryMissing name -> "entry module not found: " <> name
   LoadFailed e -> Fmt.fmt @"{name}: {detail}" { name: e.moduleName, detail: e.detail }
+  ForeignSigFailed e -> Fmt.fmt @"{name}: {detail}" { name: e.moduleName, detail: e.detail }
 
 -- | The CLI `CompilerAction` over the `Run` stack: single-module CoreFn loading (through the `ulib`
 -- | overlay), per-module `mod_<i>.ll` + `.pmi` emission, the `entry.ll` emission, and the `--emit-ir`
@@ -191,10 +193,11 @@ mkAction
    . Options
   -> FilePath
   -> FilePath
+  -> ForeignSigs.Env
   -> Ref Int
   -> Ref (Array String)
   -> CompilerAction String (BuildM r)
-mkAction opts ulibDir buildDir modIdx irBuf =
+mkAction opts ulibDir buildDir fsEnv modIdx irBuf =
   { workdir: buildDir
   , maxOptimizeIter: clamp 1 optMaxIterCap opts.optMaxIter
   , loadModule: \name -> do
@@ -204,6 +207,11 @@ mkAction opts ulibDir buildDir modIdx irBuf =
         Just src -> case parseModule src of
           Left err -> pure (Failed { moduleName: name, detail: err })
           Right mod -> pure (Loaded { path, mod })
+  -- ADR-0090 §2: reconstruct this module's foreign shapes (self-guarding — empty when foreign-free),
+  -- mapping a reconstruction failure to the driver's `ForeignSigError` so the build halts as data.
+  , foreignSigsOf: \mod ->
+      lmap (\detail -> { moduleName: nameKey mod.name, detail })
+        <$> ForeignSigs.moduleForeignSigsE fsEnv mod
   , emitFile: \artifact -> do
       i <- liftEffect (Ref.read modIdx)
       liftEffect (Ref.modify_ (_ + 1) modIdx)
@@ -218,36 +226,8 @@ mkAction opts ulibDir buildDir modIdx irBuf =
       entryPath <- FS.joinPath [ buildDir, "entry.ll" ]
       FS.writeText entryPath ll
       pure entryPath
-  , hooks: irHooks opts buildDir irBuf
+  , hooks: irHooks opts.emitIr buildDir irBuf
   }
-
--- | The `--emit-ir` trace hooks (ADR-0087 §3.1): for the target module, bracket the driver's optimiser
--- | fixpoint with `onEnterOptimizeIter` (the pre-optimised fixpoint input) / `onContinueOptimizeIter` (each
--- | round's result) / `onLeaveOptimizeIter` (the converged module), appending each round's pretty-printed
--- | ANF to the buffer, then flush it to `<module>.ir` when the module finishes (`onCleanUp`). Under
--- | `--no-opt` the fixpoint never runs, so the trace records that. Without `--emit-ir`, the no-op hooks.
-irHooks :: forall r. Options -> FilePath -> Ref (Array String) -> CompilerActionHooks (BuildM r)
-irHooks opts buildDir irBuf = case opts.emitIr of
-  Nothing -> defaultHooks
-  Just target -> defaultHooks
-    { onEnterOptimizeIter = \am -> appendFor target am "pre-optimised (fixpoint input)"
-    , onContinueOptimizeIter = \n am -> appendFor target am ("round " <> show n)
-    , onLeaveOptimizeIter = \am -> appendFor target am "converged"
-    , onCleanUp = \name -> when (name == target) (flush target)
-    }
-  where
-  appendFor target am label =
-    when (am.name == target) do
-      let chunk = "=== " <> label <> " ===\n" <> printModuleAnf am.name am.decls
-      liftEffect (Ref.modify_ (\cs -> Array.snoc cs chunk) irBuf)
-
-  flush target = do
-    chunks <- liftEffect (Ref.read irBuf)
-    liftEffect (Ref.write [] irBuf)
-    irPath <- FS.joinPath [ buildDir, target <> ".ir" ]
-    let body = if Array.null chunks then "(no optimiser rounds — built with --no-opt)\n" else joinWith "\n\n" chunks
-    FS.writeText irPath body
-    Log.info $ Fmt.fmt @"  traced ANF IR → {target}.ir" { target }
 
 -- | Compile the program natively: drive `Purvasm.Compiler.build` with the LLVM backend and the CLI action,
 -- | then (unless `--emit-llvm`) native-link the emitted objects.
@@ -261,8 +241,11 @@ cmd opts = do
   FS.mkdirP buildDir
   modIdx <- liftEffect (Ref.new 0)
   irBuf <- liftEffect (Ref.new [])
+  -- The FSR static inputs (ulib `foreignSigs` + spago cache-db), read once and closed into the action's
+  -- `foreignSigsOf` capability (ADR-0090 §2) and reused by the `--check-foreign-sigs` diagnostic.
+  fsEnv <- ForeignSigs.loadEnv { ulibDir, corefnDir: opts.corefnDir }
   let
-    action = mkAction opts ulibDir buildDir modIdx irBuf
+    action = mkAction opts ulibDir buildDir fsEnv modIdx irBuf
 
     backend :: Backend LlvmContext String
     backend = llvmBackend { isEffect: not opts.value, heapWords: defaultHeapWords, debug: false }
@@ -272,12 +255,12 @@ cmd opts = do
       , isEffect: not opts.value
       , opt: not opts.noOpt
       }
-  -- The ADR-0080 source channel, opt-in until a build-time consumer lands (§3/§4): CST-lexing the foreign
-  -- frontier is minutes on the native backend, so `--check-foreign-sigs` runs it on demand.
+  -- Eager whole-closure FSR sweep as a diagnostic (the build's own per-module `foreignSigsOf` already
+  -- consumes signatures, ADR-0090): CST-lexing the foreign frontier is minutes on the native backend, so
+  -- this up-front count check is opt-in via `--check-foreign-sigs`.
   when opts.checkForeignSigs do
     mods <- loadClosure ulibDir opts.corefnDir opts.entryModule
-    env <- ForeignSigs.loadEnv { ulibDir, corefnDir: opts.corefnDir }
-    total <- foldM (\n m -> (n + _) <<< Map.size <$> ForeignSigs.moduleForeignSigs env m) 0 (depOrder mods)
+    total <- foldM (\n m -> (n + _) <<< Map.size <$> ForeignSigs.moduleForeignSigs fsEnv m) 0 (depOrder mods)
     Log.debug $ Fmt.fmt @"foreign-sigs: {n} signatures resolved" { n: show total }
   build backend action buildOpts >>= case _ of
     Left err -> throw (renderBuildError err)

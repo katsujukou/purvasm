@@ -17,6 +17,7 @@ module Purvasm.CLI.ForeignSigs
   , Env
   , loadEnv
   , moduleForeignSigs
+  , moduleForeignSigsE
   ) where
 
 import Prelude
@@ -25,7 +26,7 @@ import Data.Argonaut.Core (Json, toObject)
 import Data.Argonaut.Parser (jsonParser)
 import Data.Array (filter)
 import Data.Array as Array
-import Data.Either (Either(..))
+import Data.Either (Either(..), either)
 import Data.Foldable (foldr, for_)
 import Data.Map (Map)
 import Data.Map as Map
@@ -42,26 +43,30 @@ import Purvasm.CLI.Effect.Filesystem as FS
 import Purvasm.Compiler.CESK.Translate (nameKey)
 import Purvasm.Compiler.ForeignSig (ForeignShape, reconstructModule, shapeFromJson)
 import Run (Run)
-import Run.Except (EXCEPT, throw)
+import Run.Except (EXCEPT, runExcept, throw)
 import Type.Row (type (+))
 
 -- | Qualified key (`Module.Name.ident`) → calling shape (ADR-0080 §2).
 type ForeignSigMap = Map String ForeignShape
 
 -- | The static inputs a per-module resolution reads: the aggregated ulib `foreignSigs` (for
--- | overlaid modules) and spago's module → `.purs` cache-db (for reconstructed ones).
+-- | overlaid modules) and spago's module → `.purs` cache-db (for reconstructed ones). Each is kept
+-- | as a **deferred decode** (`Either` parse error / value): a malformed manifest is not a build-time
+-- | throw but returned data, surfaced only when a module that actually consults that input reaches it —
+-- | so an FSR input failure becomes a per-module `Left` (→ `ForeignSigFailed`, ADR-0090 §2), never a
+-- | host-side abort before the driver runs.
 type Env =
   { ulibDir :: FilePath
-  , ulibSigs :: ForeignSigMap
-  , cacheDb :: Map String FilePath
+  , ulibSigs :: Either String ForeignSigMap
+  , cacheDb :: Either String (Map String FilePath)
   }
 
--- | Read the two static inputs once. Both are tolerated absent (empty) — a missing entry only
--- | matters when a specific module actually needs it, where it becomes a precise per-module error.
+-- | Read the two static inputs once. Non-fallible: absence ⇒ empty, and a decode failure is captured as
+-- | a `Left` in [Env] (forced per-module by the provenance branch that needs it), not thrown here.
 loadEnv
   :: forall r
    . { ulibDir :: FilePath, corefnDir :: FilePath }
-  -> Run (FS + EXCEPT String + r) Env
+  -> Run (FS + r) Env
 loadEnv dirs = do
   ulibSigs <- loadUlibSigs dirs.ulibDir
   cacheDb <- loadCacheDb dirs.corefnDir
@@ -84,6 +89,16 @@ moduleForeignSigs env m
         else fromSource env name m.foreignNames
       pure (Map.fromFoldable entries)
 
+-- | `moduleForeignSigs` with its `EXCEPT String` discharged to a returned `Either` — the shape the
+-- | build driver's `CompilerAction.foreignSigsOf` capability needs (ADR-0090 §2: FSR failure is
+-- | returned data, not a throw, so the driver can halt with `ForeignSigFailed`).
+moduleForeignSigsE
+  :: forall r
+   . Env
+  -> Module
+  -> Run (FS + r) (Either String ForeignSigMap)
+moduleForeignSigsE env m = runExcept (moduleForeignSigs env m)
+
 -- --- provenance branches --------------------------------------------------------------------
 
 -- | A ulib-overlaid module's shapes come from the validated `foreignSigs`; every corefn foreign
@@ -94,10 +109,11 @@ fromUlib
   -> String
   -> Array String
   -> Run (FS + EXCEPT String + r) (Array (String /\ ForeignShape))
-fromUlib env name foreigns =
+fromUlib env name foreigns = do
+  ulibSigs <- either throw pure env.ulibSigs
   for foreigns \fn -> do
     let key = name <> "." <> fn
-    case Map.lookup key env.ulibSigs of
+    case Map.lookup key ulibSigs of
       Just shape -> pure (key /\ shape)
       Nothing ->
         throw $ Fmt.fmt
@@ -113,7 +129,8 @@ fromSource
   -> Array String
   -> Run (FS + EXCEPT String + r) (Array (String /\ ForeignShape))
 fromSource env name foreigns = do
-  path <- case Map.lookup name env.cacheDb of
+  cacheDb <- either throw pure env.cacheDb
+  path <- case Map.lookup name cacheDb of
     Just p -> pure p
     Nothing ->
       throw $ Fmt.fmt
@@ -145,15 +162,16 @@ isUlibOverlaid :: forall r. FilePath -> String -> Run (FS + r) Boolean
 isUlibOverlaid ulibDir name =
   FS.joinPath [ ulibDir, name, "corefn.json" ] >>= FS.exists
 
--- | The aggregated `foreignSigs` of `<ulibDir>/ulib.json` (absent file / field ⇒ empty).
-loadUlibSigs :: forall r. FilePath -> Run (FS + EXCEPT String + r) ForeignSigMap
+-- | The aggregated `foreignSigs` of `<ulibDir>/ulib.json` (absent file / field ⇒ empty). A decode
+-- | failure is returned as `Left` (deferred, ADR-0090 §2), not thrown.
+loadUlibSigs :: forall r. FilePath -> Run (FS + r) (Either String ForeignSigMap)
 loadUlibSigs ulibDir = do
   path <- FS.joinPath [ ulibDir, "ulib.json" ]
   FS.readText path >>= case _ of
-    Nothing -> pure Map.empty
+    Nothing -> pure (Right Map.empty)
     Just raw -> case jsonParser raw >>= parseSigs of
-      Left err -> throw $ Fmt.fmt @"foreign-sigs: {path}: {err}" { path, err }
-      Right m -> pure m
+      Left err -> pure (Left (Fmt.fmt @"foreign-sigs: {path}: {err}" { path, err }))
+      Right m -> pure (Right m)
   where
   parseSigs json = do
     top <- note "ulib.json: top level is not an object" (toObject json)
@@ -168,15 +186,16 @@ loadUlibSigs ulibDir = do
     Just a -> Right a
     Nothing -> Left msg
 
--- | Parse `<corefnDir>/cache-db.json` to module → `.purs` path (absent ⇒ empty).
-loadCacheDb :: forall r. FilePath -> Run (FS + EXCEPT String + r) (Map String FilePath)
+-- | Parse `<corefnDir>/cache-db.json` to module → `.purs` path (absent ⇒ empty). A decode failure is
+-- | returned as `Left` (deferred, ADR-0090 §2), not thrown.
+loadCacheDb :: forall r. FilePath -> Run (FS + r) (Either String (Map String FilePath))
 loadCacheDb corefnDir = do
   path <- FS.joinPath [ corefnDir, "cache-db.json" ]
   FS.readText path >>= case _ of
-    Nothing -> pure Map.empty
+    Nothing -> pure (Right Map.empty)
     Just raw -> case jsonParser raw of
-      Left err -> throw $ Fmt.fmt @"foreign-sigs: {path}: {err}" { path, err }
-      Right json -> pure (projectCacheDb json)
+      Left err -> pure (Left (Fmt.fmt @"foreign-sigs: {path}: {err}" { path, err }))
+      Right json -> pure (Right (projectCacheDb json))
 
 projectCacheDb :: Json -> Map String FilePath
 projectCacheDb json = case toObject json of

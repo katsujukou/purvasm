@@ -63,6 +63,8 @@ mkAction table maxIter =
   { workdir: "."
   , maxOptimizeIter: maxIter
   , loadModule: \name -> tell [ "load:" <> name ] $> fromMaybe Missing (Map.lookup name table)
+  -- ADR-0090 stub: the table fixtures declare no foreigns, so the driver never calls this.
+  , foreignSigsOf: \_ -> tell [ "foreignSigs" ] $> Right Map.empty
   , emitFile: \art -> tell [ "emitFile:" <> art.backendIR ] $> ("out/" <> art.backendIR <> ".ll")
   , emitEntry: \o -> tell [ "emitEntry:" <> o ] $> "out/entry.ll"
   , hooks: recHooks
@@ -93,6 +95,7 @@ outcome :: forall o. Either BuildError (BuildProducts o) -> String
 outcome = case _ of
   Left (EntryMissing n) -> "EntryMissing:" <> n
   Left (LoadFailed e) -> "LoadFailed:" <> e.moduleName
+  Left (ForeignSigFailed e) -> "ForeignSigFailed:" <> e.moduleName
   Right _ -> "Right"
 
 -- A diamond: Main → {A, B} → C.
