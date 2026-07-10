@@ -30,6 +30,7 @@ module Purvasm.Compiler.MiddleEnd.Optimizer
   , optimizeModule
   , extendSummary
   , withForeignSigs
+  , publishedForeignSigs
   , persistedSummary
   ) where
 
@@ -44,6 +45,7 @@ import Data.Set as Set
 import Data.Tuple (Tuple(..))
 import Purvasm.Compiler.Bytecode.Artifact (Summary)
 import Purvasm.Compiler.ForeignSig (ForeignShape)
+import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (cfExpr, fvExpr)
 import Purvasm.Compiler.Ffi (intrinsicPrim)
 import Purvasm.Compiler.MiddleEnd.Module (AnfModule, declKeys, mapDeclBodies)
 import Purvasm.Compiler.MiddleEnd.Optimizer.DictElim (DictMachinery, dictElimExpr, emptyMachinery, intrinsicLift, machineryOf, mergeMachinery)
@@ -88,6 +90,12 @@ newtype BuildSummary = BuildSummary
   { dict :: DictMachinery
   , gkeys :: Set String
   , inlines :: Map String InlineCandidate
+  -- | The module's own foreign shapes **referenced by the published candidates** (the ADR-0090
+  -- | integration): an inlined wrapper body carries its (possibly non-exported) foreign reference
+  -- | into the consumer, so the consumer's visible shapes must carry those arity/effect facts too
+  -- | — the driver's exports-only `ForeignFacts` publication cannot see them. Read by the driver
+  -- | via `publishedForeignSigs` and folded into that thread.
+  , foreignSigs :: Map String ForeignShape
   }
 
 -- | The starting env, before any module has contributed.
@@ -131,11 +139,22 @@ optimizeModule (BuildEnv env) lf am =
       d { members = d.members <#> \(Tuple k e) -> Tuple k (nbeBinding nbe k e) }
   in
     { module: am { decls = optimised }
-    , summary: BuildSummary
-        { dict: lf.dict
-        , gkeys: lf.gkeys
-        , inlines: candidatesOf intrinsicPrim env.inlines optimised
-        }
+    , summary:
+        let
+          inlines = candidatesOf intrinsicPrim env.inlines optimised
+          -- own foreign shapes the candidate bodies reference — on either atom spelling (a foreign
+          -- key rides `AtomForeign` or a plain qualified `AtomVar`); see `BuildSummary.foreignSigs`.
+          referenced = Array.foldl
+            (\acc c -> Set.union acc (Set.union (fvExpr Set.empty c.body) (cfExpr c.body)))
+            Set.empty
+            (Array.fromFoldable (Map.values inlines))
+        in
+          BuildSummary
+            { dict: lf.dict
+            , gkeys: lf.gkeys
+            , inlines
+            , foreignSigs: Map.filterKeys (\k -> Set.member k referenced) lf.foreignSigs
+            }
     }
 
 -- | Fold a just-compiled module's summary into the build env, so its dependents' phases see it.
@@ -154,6 +173,12 @@ extendSummary (BuildEnv env) (BuildSummary s) = BuildEnv
 -- | foreign-empty (the primary thread is driver-level, feeding codegen in every mode).
 withForeignSigs :: Map String ForeignShape -> BuildEnv -> BuildEnv
 withForeignSigs sigs (BuildEnv env) = BuildEnv (env { foreignSigs = sigs })
+
+-- | The candidate-referenced foreign shapes a summary publishes (see `BuildSummary.foreignSigs`) —
+-- | the driver folds these into its `ForeignFacts` thread alongside the exported shapes, so a
+-- | consumer that inlined the candidate still sees the referenced foreign's arity/effect facts.
+publishedForeignSigs :: BuildSummary -> Map String ForeignShape
+publishedForeignSigs (BuildSummary s) = s.foreignSigs
 
 -- | Project the in-memory summary onto the `.pmi`'s optional `Summary` (ADR-0084 §5). `Nothing` today —
 -- | so the `--no-opt` `.pmi` core is byte-for-byte boot's, and it stays `Nothing` until the optimiser

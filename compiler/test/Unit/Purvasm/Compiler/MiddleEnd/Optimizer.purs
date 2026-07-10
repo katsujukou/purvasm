@@ -17,7 +17,8 @@ import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
 import Purvasm.Compiler.MiddleEnd.Module (AnfModule, Decl)
-import Purvasm.Compiler.MiddleEnd.Optimizer (emptyBuildEnv, extendSummary, localFactsOf, optimizeModule, persistedSummary)
+import Data.Map as Map
+import Purvasm.Compiler.MiddleEnd.Optimizer (emptyBuildEnv, extendSummary, localFactsOf, optimizeModule, persistedSummary, publishedForeignSigs)
 import Purvasm.Compiler.Primitive (PrimOp(..))
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
@@ -151,6 +152,29 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
         r = optimizeModule env (localFactsOf env user) user
       map _.members r.module.decls `shouldEqual`
         [ [ "Test.User.two" /\ Ret (CAtom (AtomLit (LInt 2))) ] ]
+
+    it "publishes the foreign shapes referenced by inline candidates (the private-foreign leak fix)" do
+      -- Test.Dep.wrap = \x -> privImpl(x): the wrapper is a published candidate, so its (possibly
+      -- non-exported) foreign's shape must travel to consumers; an unreferenced own foreign must not.
+      let
+        shape = { arity: 1, vsat: false, retVsat: false }
+
+        dep :: AnfModule
+        dep =
+          { name: "Test.Dep"
+          , decls:
+              [ nonrec "Test.Dep.wrap"
+                  (Ret (CLam [ "x" ] (Ret (CApp (AtomForeign "Test.Dep.privImpl") [ var "x" ]))))
+              ]
+          }
+        lf = (localFactsOf emptyBuildEnv dep)
+          { foreignSigs = Map.fromFoldable
+              [ "Test.Dep.privImpl" /\ shape
+              , "Test.Dep.unusedImpl" /\ { arity: 2, vsat: true, retVsat: false }
+              ]
+          }
+        r = optimizeModule emptyBuildEnv lf dep
+      publishedForeignSigs r.summary `shouldEqual` Map.singleton "Test.Dep.privImpl" shape
 
     it "never persists a summary today (the .pmi core stays boot's)" do
       let
