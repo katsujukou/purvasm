@@ -136,5 +136,6 @@ language and are kept out of version control.)
 | [0087](0087-backend-neutral-build-driver-compileraction.md) | A backend-neutral build driver over an injected `CompilerAction` | Accepted |
 | [0088](0088-vm-backend-lowers-like-native-release-boot-byte-identity.md) | The VM backend lowers the optimiser seam like native, released from boot byte-identity | Accepted |
 | [0089](0089-nbe-general-inliner.md) | The NbE general inliner on the optimiser seam | Accepted |
+Accepted |
 
 ## Scope
