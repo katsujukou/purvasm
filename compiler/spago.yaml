@@ -8,6 +8,7 @@ package:
     - fmt
     - foreign-object
     - language-cst-parser
+    - lazy
     - lists
     - prelude
     - purvasm-base

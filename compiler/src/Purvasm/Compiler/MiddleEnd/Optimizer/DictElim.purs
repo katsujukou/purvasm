@@ -9,8 +9,8 @@
 -- | dispatch collapsed, so Level-2's must match byte-for-byte; retired when the LLVM port off boot
 -- | completes). The two call sites share this transcription of boot's `dict_elim.ml`, diverging only
 -- | on the `ForeignLift` policy parameter (the split ADR-0086 §3 sanctions): the optimiser lifts
--- | intrinsic foreign keys (`intrinsicLift` — safe because `Simplify` runs next), the bridge lifts
--- | none (`noForeignLift` — nothing runs between it and codegen).
+-- | intrinsic foreign keys (`intrinsicLift` — safe because the NbE inliner's intrinsic saturation
+-- | runs next), the bridge lifts none (`noForeignLift` — nothing runs between it and codegen).
 -- |
 -- | A method call is `accessor dict args`, where the `accessor` is `\d -> case d of v -> v.φ` (the
 -- | newtype dict binder erased, ADR-0018) and an instance `dict` is the newtype-identity-wrapped record
@@ -182,8 +182,8 @@ machineryOf imported pairs =
 type ForeignLift = String -> Boolean
 
 -- | The **optimiser** policy: lift **intrinsic** foreign keys. Safe there — and only there — because
--- | `Simplify`'s intrinsic saturation runs right after in the same `optimizeModule` pass, collapsing a
--- | lifted saturated `Purvasm.Int.add` call to its primop (an unsaturated one stays an `AtomVar` the
+-- | the NbE inliner's intrinsic saturation runs right after in the same `optimizeModule` pass,
+-- | collapsing a lifted saturated `Purvasm.Int.add` call to its primop (an unsaturated one stays an `AtomVar` the
 -- | VM's link resolver materialises; the same class as the instance-record field references the raw
 -- | ANF already carries). The intrinsic arm is the B2 (pre-link, per-module) analogue of what boot's
 -- | whole-program `dict_elim.ml` gets from running *after* link (the resolver has materialised these

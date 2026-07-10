@@ -1,18 +1,21 @@
 -- | The NbE general inliner's seam entry (ADR-0089 §1): `nbeBinding` runs the per-binding
 -- | `quote ∘ eval` inner fixpoint — evaluate under the previous round's gate-B marks, quote,
 -- | re-analyse, repeat until the term and the marks are stable — bounded by a rewrite fuel whose
--- | exhaustion is a **loud crash**, never silent truncation. `nbeEnvOf` publishes a module's
--- | sibling bindings for gate-site-A unfolding.
+-- | exhaustion is a **loud crash**, never silent truncation. `candidatesOf` is the slice-2 publish
+-- | predicate; `nbeEnvOf` assembles the gate-site-A extern entries from the dependency candidates
+-- | (`BuildEnv.inlines`) plus the module's own siblings.
 -- |
--- | Sibling publication is deliberately **one binding deep**: a published body is evaluated under
--- | an intrinsic-only environment (its own sibling references stay opaque), so unfolding cannot
--- | chase chains within a single round — the driver's outer `optimizeModule` fixpoint (ADR-0087)
--- | resolves chains one link per round, and the construction stays acyclic (no knot to tie, and a
--- | multi-reference body is still evaluated at most once per round via its `Lazy`). Recursive
--- | decls are never published (a recursive reference stays a call — ADR-0089 §5), and a
+-- | Publication is deliberately **shallow**: published bodies evaluate a bounded number of levels
+-- | deep (the layered `nbeEnvOf` construction — dependencies see each other one link, locals see
+-- | dependencies), so unfolding cannot chase arbitrary chains within a single round — the driver's
+-- | outer `optimizeModule` fixpoint (ADR-0087) resolves local chains one link per round, deeper
+-- | cross-module chains degrade to neutral calls, and the construction stays acyclic (no knot to
+-- | tie, and a multi-reference body is still evaluated at most once per round via its `Lazy`).
+-- | Recursive decls are never published (a recursive reference stays a call — ADR-0089 §5), and a
 -- | non-recursive binding cannot reference itself, so no self-stop is needed.
 module Purvasm.Compiler.MiddleEnd.Optimizer.Nbe
-  ( nbeBinding
+  ( candidatesOf
+  , nbeBinding
   , nbeEnvOf
   ) where
 
@@ -20,6 +23,7 @@ import Prelude
 
 import Data.Array as Array
 import Data.Lazy (defer)
+import Data.Map (Map)
 import Data.Map as Map
 import Data.Maybe (Maybe(..))
 import Data.Set as Set
@@ -31,7 +35,7 @@ import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (cfExpr, fvExpr)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Analysis (inlineMarks, sizeExpr)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Eval (evalC, evalExpr)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Quote (quote)
-import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (NbeEnv)
+import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (EvalEnv, ExternEntry, InlineCandidate, NbeEnv)
 import Purvasm.Compiler.Primitive (PrimOp)
 
 -- | The inner rewrite-fuel cap (the reference's `rewriteLimit` analogue, sidenote 0012 §1).
@@ -80,41 +84,82 @@ preserveOuterShape input output = case input, output of
   _, Ret lam@(CLam _ _) -> Let "$q0" lam (Ret (CAtom (AtomVar "$q0")))
   _, _ -> output
 
--- | Publish a module's non-recursive sibling bindings as gate-site-A extern entries (ADR-0089 §4):
--- | a `Ret (CLam …)` body publishes with its arity (unfolded at saturation), a value body
--- | (alias / data CAF) with `arity: Nothing` (forced on demand, size-gated). Computation bodies
--- | (unresolved CAF applications) are not publishable — inlining one would duplicate the
--- | computation.
-nbeEnvOf
+-- | The spine-independent, conservative **publish predicate** (ADR-0089 §8 slice 2): which of a
+-- | module's bindings become `InlineCandidate`s for its dependents (and, reused locally, for its
+-- | own siblings). Deliberately a size-bounded superset — the consumer's gate site (A) makes the
+-- | final, spine-dependent call. Published shapes:
+-- |
+-- |   * a lambda body `Ret (CLam …)` (arity = parameter count);
+-- |   * the slice-1 binding-surface wrap `let $q0 = \… in $q0` (the inner lambda — constructing a
+-- |     closure is pure, so inlining it never re-executes the CAF's init);
+-- |   * a value body (alias / data CAF — `arity: Nothing`, forced on demand);
+-- |   * a **strictly under-applied** pure partial application `Ret (CApp t args)` where `t`'s
+-- |     arity is known (a dependency candidate, an intrinsic, or a local syntactic lambda) and
+-- |     `length args < arity` — the residual arity is published. A **saturated** (or
+-- |     unknown-arity) CAF application is a computation executed once at init and is **never**
+-- |     published: inlining it would re-execute it per use site.
+-- |
+-- | Recursive decls are never published (a recursive reference stays a call, ADR-0089 §5); the
+-- | bound (`< 64`, the gate's largest size threshold) keeps the in-memory summary small.
+candidatesOf
   :: (String -> Maybe { op :: PrimOp, arity :: Int })
+  -> Map String InlineCandidate
   -> Array { recursive :: Boolean, members :: Array (String /\ Expr) }
-  -> NbeEnv
-nbeEnvOf intrinsic decls =
-  { externs: Map.fromFoldable (Array.mapMaybe entryOf nonrecMembers)
-  , intrinsic
-  }
+  -> Map String InlineCandidate
+candidatesOf intrinsic deps decls =
+  Map.fromFoldable (Array.mapMaybe candidateOf nonrecMembers)
   where
   nonrecMembers = decls >>= \d -> if d.recursive then [] else d.members
 
-  -- published bodies evaluate one level deep: sibling references inside them stay opaque.
-  baseEnv = { locals: Map.empty, marks: Set.empty, nbe: { externs: Map.empty, intrinsic } }
+  publishBound = 64
 
-  entryOf (Tuple k e) = case e of
-    Ret c@(CLam ps body) -> Just $ Tuple k
+  -- a partial-application target's arity: dependency candidate, intrinsic, or local syntactic
+  -- lambda (local partial-CAF chains are conservatively not chased).
+  localArity = Map.fromFoldable
+    ( Array.mapMaybe
+        ( \(Tuple k e) -> case e of
+            Ret (CLam ps _) -> Just (Tuple k (Array.length ps))
+            _ -> Nothing
+        )
+        nonrecMembers
+    )
+
+  targetArity t = case Map.lookup t deps of
+    Just c -> c.arity
+    Nothing -> case intrinsic t of
+      Just ia -> Just ia.arity
+      Nothing -> Map.lookup t localArity
+
+  candidateOf (Tuple k e) = Tuple k <$> (bounded =<< shapeOf e)
+    where
+    bounded cand = if cand.size < publishBound then Just cand else Nothing
+
+  shapeOf e = case e of
+    Ret c@(CLam ps body) -> Just (lamCand c ps body)
+    Let x c@(CLam ps body) (Ret (CAtom (AtomVar x')))
+      | x == x' -> Just (lamCand c ps body)
+    Ret c | valueBody c -> Just
+      { arity: Nothing, size: sizeExpr e, cxLeqDeref: isAtomBody c, closed: false, body: c }
+    Ret c@(CApp h args)
+      | Just residual <- partialResidual h args -> Just
+          { arity: Just residual, size: sizeExpr e, cxLeqDeref: false, closed: false, body: c }
+    _ -> Nothing
+    where
+    lamCand c ps body =
       { arity: Just (Array.length ps)
       , size: sizeExpr e
       , cxLeqDeref: false
       , closed: Set.isEmpty (fvExpr (Set.fromFoldable ps) body) && Set.isEmpty (cfExpr body)
-      , value: defer \_ -> evalC baseEnv c
+      , body: c
       }
-    Ret c | valueBody c -> Just $ Tuple k
-      { arity: Nothing
-      , size: sizeExpr e
-      , cxLeqDeref: isAtomBody c
-      , closed: false
-      , value: defer \_ -> evalC baseEnv c
-      }
-    _ -> Nothing
+
+  partialResidual h args = do
+    a <- case h of
+      AtomVar t -> targetArity t
+      AtomForeign t -> targetArity t
+      AtomLit _ -> Nothing
+    let n = Array.length args
+    if n < a then Just (a - n) else Nothing
 
   valueBody = case _ of
     CAtom _ -> true
@@ -126,3 +171,45 @@ nbeEnvOf intrinsic decls =
   isAtomBody = case _ of
     CAtom _ -> true
     _ -> false
+
+-- | Build the evaluation facts for one module's `nbeBinding` runs: the dependency candidates (from
+-- | `BuildEnv`, ADR-0084/0089 slice 2) plus the module's own siblings (via the same publish
+-- | predicate). The construction is layered to stay knot-free (no recursive value groups — a JS
+-- | TDZ hazard in PS codegen):
+-- |
+-- |   * level 0 — dependency bodies evaluate under an intrinsic-only environment (they are
+-- |     post-optimisation normal forms already, so their internal reductions happened in their own
+-- |     module);
+-- |   * level 1 — dependency bodies re-evaluate seeing level-0 siblings (so a dependency's pure
+-- |     partial application resolves its target one link deep);
+-- |   * level 2 — local sibling bodies evaluate seeing the level-1 dependencies.
+-- |
+-- | Deeper cross-module chains degrade gracefully to neutral calls; local chains resolve one link
+-- | per driver round (ADR-0087's outer fixpoint).
+nbeEnvOf
+  :: (String -> Maybe { op :: PrimOp, arity :: Int })
+  -> Map String InlineCandidate
+  -> Array { recursive :: Boolean, members :: Array (String /\ Expr) }
+  -> NbeEnv
+nbeEnvOf intrinsic deps decls =
+  { externs: Map.union localExterns depExterns
+  , intrinsic
+  }
+  where
+  base = { locals: Map.empty, marks: Set.empty, nbe: { externs: Map.empty, intrinsic } }
+
+  depExterns0 = map (entryFromCandidate base) deps
+  envD = base { nbe = { externs: depExterns0, intrinsic } }
+  depExterns = map (entryFromCandidate envD) deps
+
+  envL = base { nbe = { externs: depExterns, intrinsic } }
+  localExterns = map (entryFromCandidate envL) (candidatesOf intrinsic deps decls)
+
+entryFromCandidate :: EvalEnv -> InlineCandidate -> ExternEntry
+entryFromCandidate env c =
+  { arity: c.arity
+  , size: c.size
+  , cxLeqDeref: c.cxLeqDeref
+  , closed: c.closed
+  , value: defer \_ -> evalC env c.body
+  }

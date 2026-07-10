@@ -18,6 +18,7 @@ import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
 import Purvasm.Compiler.MiddleEnd.Module (AnfModule, Decl)
 import Purvasm.Compiler.MiddleEnd.Optimizer (emptyBuildEnv, extendSummary, localFactsOf, optimizeModule, persistedSummary)
+import Purvasm.Compiler.Primitive (PrimOp(..))
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
 
@@ -126,6 +127,30 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
           }
         r = optimizeModule env (localFactsOf env user) user
       map _.members r.module.decls `shouldEqual` [ [ "Test.User.three" /\ collapsed ] ]
+
+    it "threads inline candidates to dependents (ADR-0089 slice 2: extendSummary → gate site A)" do
+      -- Test.Dep.inc = \x -> x + 1 (small: publishable); the user's saturated call inlines and
+      -- constant-folds across the module boundary.
+      let
+        dep :: AnfModule
+        dep =
+          { name: "Test.Dep"
+          , decls:
+              [ nonrec "Test.Dep.inc"
+                  (Ret (CLam [ "x" ] (Ret (CPrim AddInt [ var "x", AtomLit (LInt 1) ]))))
+              ]
+          }
+        depResult = optimizeModule emptyBuildEnv (localFactsOf emptyBuildEnv dep) dep
+        env = extendSummary emptyBuildEnv depResult.summary
+
+        user :: AnfModule
+        user =
+          { name: "Test.User"
+          , decls: [ nonrec "Test.User.two" (Ret (CApp (var "Test.Dep.inc") [ AtomLit (LInt 1) ])) ]
+          }
+        r = optimizeModule env (localFactsOf env user) user
+      map _.members r.module.decls `shouldEqual`
+        [ [ "Test.User.two" /\ Ret (CAtom (AtomLit (LInt 2))) ] ]
 
     it "never persists a summary today (the .pmi core stays boot's)" do
       let

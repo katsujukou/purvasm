@@ -7,13 +7,14 @@ module Test.Unit.Purvasm.Compiler.MiddleEnd.Optimizer.Nbe where
 
 import Prelude
 
+import Data.Map as Map
 import Data.Tuple.Nested ((/\))
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Ffi (intrinsicPrim)
 import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
 import Purvasm.Compiler.MiddleEnd.Module (Decl)
-import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe (nbeBinding, nbeEnvOf)
+import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe (candidatesOf, nbeBinding, nbeEnvOf)
 import Purvasm.Compiler.Primitive (PrimOp(..))
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
@@ -31,9 +32,15 @@ nonrec k e = { recursive: false, members: [ k /\ e ] }
 nbe :: Expr -> Expr
 nbe = nbeWith []
 
--- …or against the given sibling decls (the gate-site-A channel).
+-- …or against the given sibling decls (the gate-site-A channel)…
 nbeWith :: Array Decl -> Expr -> Expr
-nbeWith decls = nbeBinding (nbeEnvOf intrinsicPrim decls) "Test.binding"
+nbeWith decls = nbeBinding (nbeEnvOf intrinsicPrim Map.empty decls) "Test.binding"
+
+-- …or against dependency decls published through the slice-2 candidate channel, plus local
+-- sibling decls (mirrors `optimizeModule`'s wiring: deps ride `BuildEnv.inlines`).
+nbeCross :: Array Decl -> Array Decl -> Expr -> Expr
+nbeCross depDecls locals =
+  nbeBinding (nbeEnvOf intrinsicPrim (candidatesOf intrinsicPrim Map.empty depDecls) locals) "Test.binding"
 
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
@@ -295,6 +302,48 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
           _ -> false
       sharedLambda `shouldEqual` true
 
+  describe "cross-module candidates (ADR-0089 slice 2)" do
+    it "inlines a small dependency lambda at a saturated call" do
+      nbeCross [ nonrec "D.f" (Ret (CLam [ "a", "b" ] (Ret (CPrim AddInt [ var "a", var "b" ])))) ] []
+        (Ret (CApp (var "D.f") [ var "p", var "q" ]))
+        `shouldEqual` Ret (CPrim AddInt [ var "p", var "q" ])
+
+    it "publishes a strictly under-applied pure partial application with its residual arity" do
+      -- D.add1 = intAdd(1): residual arity 1; a saturated call through it constant-folds.
+      nbeCross [ nonrec "D.add1" (Ret (CApp (AtomForeign "Data.Semiring.intAdd") [ int 1 ])) ] []
+        (Ret (CApp (var "D.add1") [ int 41 ]))
+        `shouldEqual` Ret (CAtom (int 42))
+
+    it "never publishes a saturated CAF application (an init-once computation)" do
+      -- D.x = D.g(1, 2) executes at init; inlining it would re-execute it per use site.
+      let
+        deps =
+          [ nonrec "D.g" (Ret (CLam [ "a", "b" ] (Ret (CPrim AddInt [ var "a", var "b" ]))))
+          , nonrec "D.x" (Ret (CApp (var "D.g") [ int 1, int 2 ]))
+          ]
+        call = Ret (CApp (var "D.x") [ var "p" ])
+      nbeCross deps [] call `shouldEqual` call
+
+    it "publishes the lambda inside a slice-1 binding-surface wrap" do
+      nbeCross
+        [ nonrec "D.w"
+            ( Let "$q0" (CLam [ "x" ] (Ret (CPrim AddInt [ var "x", int 1 ])))
+                (Ret (CAtom (var "$q0")))
+            )
+        ]
+        []
+        (Ret (CApp (var "D.w") [ int 41 ]))
+        `shouldEqual` Ret (CAtom (int 42))
+
+    it "collapses a local partial-application CAF over a dependency target (the floated-wrapper shape)" do
+      -- dep: D.lt = \d a b -> d(a, b); local sibling: L.lt1 = D.lt(L.cmp); the call saturates
+      -- through both hops and lands on the (unknown) comparator.
+      let
+        deps = [ nonrec "D.lt" (Ret (CLam [ "d", "a", "b" ] (Ret (CApp (var "d") [ var "a", var "b" ])))) ]
+        locals = [ nonrec "L.lt1" (Ret (CApp (var "D.lt") [ var "L.cmp" ])) ]
+      nbeCross deps locals (Ret (CApp (var "L.lt1") [ var "p", var "q" ]))
+        `shouldEqual` Ret (CApp (var "L.cmp") [ var "p", var "q" ])
+
   describe "determinism" do
     it "normalising twice is the identity on the normal form (stable $q numbering)" do
       let
@@ -307,7 +356,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
   describe "nbeEnvOf" do
     it "publishes only non-recursive value/lambda bodies" do
       let
-        env = nbeEnvOf intrinsicPrim
+        env = nbeEnvOf intrinsicPrim Map.empty
           [ nonrec "M.lam" (Ret (CLam [ "x" ] (Ret (CAtom (var "x")))))
           , nonrec "M.alias" (Ret (CAtom (var "M.lam")))
           , nonrec "M.caf" (Ret (CApp (var "M.lam") [ int 1 ]))

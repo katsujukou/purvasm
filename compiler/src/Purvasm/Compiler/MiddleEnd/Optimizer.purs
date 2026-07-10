@@ -5,12 +5,13 @@
 -- |
 -- |   * `localFactsOf am` — the module's **stable** facts (its own dictionary machinery + top-level keys),
 -- |     computed once and handed to the fixpoint (they do not change across iterations).
--- |   * `optimizeModule env localFacts am` — **one pass** of the real optimiser
--- |     `DictElim ∘ Simplify ∘ Specialize ∘ Inlining ∘ …` over the module's bodies, returning
--- |     `{ module, summary }`. `DictElim` and `Simplify` (with the intrinsic-foreign saturation) are
--- |     wired today; the remaining passes are the optimiser track's. **Iterating this pass to a fixpoint
--- |     is the build driver's job** (ADR-0087) — the seam stays a pure single step the driver can bracket
--- |     with inspection hooks.
+-- |   * `optimizeModule env localFacts am` — **one pass** of the real optimiser, `Nbe ∘ DictElim`
+-- |     (ADR-0089: `DictElim`'s gate-free dispatch devirtualization, then the NbE general inliner —
+-- |     which absorbed `Simplify`, ADR-0089 §6/§8), over the module's bodies, returning
+-- |     `{ module, summary }` — the summary carrying the dict machinery **and** the slice-2 inline
+-- |     candidates for dependents. Dbe/EffectAnalysis/Specialize are the optimiser track's to add.
+-- |     **Iterating this pass to a fixpoint is the build driver's job** (ADR-0087) — the seam stays a
+-- |     pure single step the driver can bracket with inspection hooks.
 -- |
 -- | This is the `--opt` path only. Under `--no-opt` the driver is the identity (ADR-0086 Addendum): it runs
 -- | **no** `DictElim` here. `DictElim` is now purely an optimiser pass; the native backend's `--no-opt`
@@ -28,30 +29,37 @@ module Purvasm.Compiler.MiddleEnd.Optimizer
   , localFactsOf
   , optimizeModule
   , extendSummary
+  , withForeignSigs
   , persistedSummary
   ) where
 
 import Prelude
 
 import Data.Array as Array
+import Data.Map (Map)
+import Data.Map as Map
 import Data.Maybe (Maybe(..))
 import Data.Set (Set)
 import Data.Set as Set
 import Data.Tuple (Tuple(..))
 import Purvasm.Compiler.Bytecode.Artifact (Summary)
+import Purvasm.Compiler.ForeignSig (ForeignShape)
 import Purvasm.Compiler.Ffi (intrinsicPrim)
 import Purvasm.Compiler.MiddleEnd.Module (AnfModule, declKeys, mapDeclBodies)
 import Purvasm.Compiler.MiddleEnd.Optimizer.DictElim (DictMachinery, dictElimExpr, emptyMachinery, intrinsicLift, machineryOf, mergeMachinery)
-import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe (nbeBinding, nbeEnvOf)
+import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe (candidatesOf, nbeBinding, nbeEnvOf)
+import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (InlineCandidate)
 
 -- | The per-build, in-memory optimiser environment threaded through the module fold — carrying the facts
--- | a module's **dependencies** contributed (their dictionary machinery, so an imported accessor/instance
--- | resolves like a local one; and their top-level keys, for `DictElim`'s liftable check). It never holds
--- | the current module's own facts (ADR-0084 self-pollution). The optimiser track extends this record
--- | with whatever a dependent's passes consume (inline candidates, specialisable callees, purity facts, …).
+-- | a module's **dependencies** contributed: their dictionary machinery (so an imported
+-- | accessor/instance resolves like a local one), their top-level keys (for `DictElim`'s liftable
+-- | check), and their **inline candidates** (ADR-0089 slice 2 — post-optimisation bodies the NbE
+-- | gate site A may unfold). It never holds the current module's own facts (ADR-0084
+-- | self-pollution).
 newtype BuildEnv = BuildEnv
   { dict :: DictMachinery
   , gkeys :: Set String
+  , inlines :: Map String InlineCandidate
   }
 
 -- | The current module's **stable** facts produced by `localFactsOf` and handed to the `optimizeModule`
@@ -65,15 +73,18 @@ type LocalFacts =
 
 -- | What a compiled module contributes to its dependents' `BuildEnv`. Distinct from the persisted
 -- | `Artifact.Summary` (`.pmi`): this is the in-memory build fact; `persistedSummary` projects the subset
--- | that reaches disk. Its real payload is the optimiser track's to define; today it mirrors `LocalFacts`.
+-- | that reaches disk. The stable machinery/keys come from `LocalFacts`; the inline candidates are
+-- | derived from the **optimised** module (ADR-0086 §3 — a summary derived from the final module
+-- | reaches dependents), selected by the `candidatesOf` publish predicate (ADR-0089 §8 slice 2).
 newtype BuildSummary = BuildSummary
   { dict :: DictMachinery
   , gkeys :: Set String
+  , inlines :: Map String InlineCandidate
   }
 
 -- | The starting env, before any module has contributed.
 emptyBuildEnv :: BuildEnv
-emptyBuildEnv = BuildEnv { dict: emptyMachinery, gkeys: Set.empty }
+emptyBuildEnv = BuildEnv { dict: emptyMachinery, gkeys: Set.empty, inlines: Map.empty }
 
 -- | A module's **stable** facts — its own dictionary machinery and top-level keys — computed once from its
 -- | `AnfModule` and handed to the `optimizeModule` fixpoint (they do not change across iterations). The
@@ -106,26 +117,24 @@ optimizeModule (BuildEnv env) lf am =
     full = mergeMachinery lf.dict env.dict
     gkeys = Set.union lf.gkeys env.gkeys
     elimd = map (mapDeclBodies (dictElimExpr intrinsicLift gkeys full)) am.decls
-    nbe = nbeEnvOf intrinsicPrim elimd
+    nbe = nbeEnvOf intrinsicPrim env.inlines elimd
+    optimised = elimd <#> \d ->
+      d { members = d.members <#> \(Tuple k e) -> Tuple k (nbeBinding nbe k e) }
   in
-    { module: am
-        { decls = elimd <#> \d ->
-            d { members = d.members <#> \(Tuple k e) -> Tuple k (nbeBinding nbe k e) }
+    { module: am { decls = optimised }
+    , summary: BuildSummary
+        { dict: lf.dict
+        , gkeys: lf.gkeys
+        , inlines: candidatesOf intrinsicPrim env.inlines optimised
         }
-    , summary: summaryOfLocal lf
     }
-
--- | The summary a module contributes to dependents: its stable machinery. An **internal helper** of
--- | `optimizeModule` (which returns it) — not a driver-facing seam function (ADR-0086 Addendum): the
--- | neutral driver produces a summary only via `optimizeModule` under `--opt`; `--no-opt` produces none.
-summaryOfLocal :: LocalFacts -> BuildSummary
-summaryOfLocal lf = BuildSummary { dict: lf.dict, gkeys: lf.gkeys }
 
 -- | Fold a just-compiled module's summary into the build env, so its dependents' phases see it.
 extendSummary :: BuildEnv -> BuildSummary -> BuildEnv
 extendSummary (BuildEnv env) (BuildSummary s) = BuildEnv
   { dict: mergeMachinery s.dict env.dict
   , gkeys: Set.union s.gkeys env.gkeys
+  , inlines: Map.union s.inlines env.inlines
   }
 
 -- | Project the in-memory summary onto the `.pmi`'s optional `Summary` (ADR-0084 §5). `Nothing` today —
