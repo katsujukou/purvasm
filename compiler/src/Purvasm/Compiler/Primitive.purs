@@ -11,6 +11,16 @@ data PrimOp
   | MulInt
   | DivInt
   | ModInt
+  -- Bitwise ops on the signed 32-bit `Int` (the `Data.Int.Bits` / `Purvasm.Int` foreigns):
+  -- results re-wrapped to signed 32 bits, shift counts masked `& 31`, `ZshrInt` the logical
+  -- (zero-fill) right shift — JS `Data.Int.Bits` semantics, mirroring boot's `Cesk.Prim`.
+  | AndInt
+  | OrInt
+  | XorInt
+  | ShlInt
+  | ShrInt
+  | ZshrInt
+  | ComplementInt
   | AddNumber
   | SubNumber
   | MulNumber

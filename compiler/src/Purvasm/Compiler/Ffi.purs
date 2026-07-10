@@ -56,9 +56,6 @@ intrinsics = Map.fromFoldable
   -- The `purvasm-base` primitive layer (ADR-0038): `Purvasm.*` foreigns the backend recognises as
   -- intrinsics — the seam the `ulib` reimplementations build on. Mirrors boot's `Ffi`; without
   -- these the overlaid (patched-`ulib`) build's `Purvasm.Int.eq` etc. link to an unbound name.
-  -- NOTE: the `Int` bitwise family (`Purvasm.Int.{and,or,xor,shl,shr,zshr,complement}` and the
-  -- `Data.Int.Bits.*` foreigns) is deferred — it needs `PrimOp` constructors this compiler does not
-  -- yet have (boot's `AndInt`/`OrInt`/… ). Closures that use them are not yet faithfully linkable.
   [ "Purvasm.Int.add" /\ eta AddInt 2
   , "Purvasm.Int.sub" /\ eta SubInt 2
   , "Purvasm.Int.mul" /\ eta MulInt 2
@@ -66,6 +63,13 @@ intrinsics = Map.fromFoldable
   , "Purvasm.Int.lt" /\ eta LtInt 2
   , "Purvasm.Int.div" /\ eta DivInt 2
   , "Purvasm.Int.mod" /\ eta ModInt 2
+  , "Purvasm.Int.and" /\ eta AndInt 2
+  , "Purvasm.Int.or" /\ eta OrInt 2
+  , "Purvasm.Int.xor" /\ eta XorInt 2
+  , "Purvasm.Int.shl" /\ eta ShlInt 2
+  , "Purvasm.Int.shr" /\ eta ShrInt 2
+  , "Purvasm.Int.zshr" /\ eta ZshrInt 2
+  , "Purvasm.Int.complement" /\ eta ComplementInt 1
   -- Cross-representation conversions (ADR-0041): `Int`<->`Number` casts. `fromNumber` is `ToInt32`.
   , "Purvasm.Int.toNumber" /\ eta IntToNumber 1
   , "Purvasm.Int.fromNumber" /\ eta NumberToInt 1
@@ -102,6 +106,17 @@ intrinsics = Map.fromFoldable
   , "Data.HeytingAlgebra.boolDisj" /\ eta OrBool 2
   , "Data.HeytingAlgebra.boolNot" /\ eta NotBool 1
   , "Data.Semigroup.concatString" /\ eta Append 2
+  -- `Data.Int.Bits` 32-bit bitwise ops (the `integers` package foreigns): each a single `Int`
+  -- primop, like the `Data.Semiring`/`Data.Ring` scalar leaves above. The registry module is
+  -- kept verbatim; its foreigns resolve here, reusing the same primops the `Purvasm.Int.*`
+  -- base uses (mirrors boot's `Ffi`).
+  , "Data.Int.Bits.and" /\ eta AndInt 2
+  , "Data.Int.Bits.or" /\ eta OrInt 2
+  , "Data.Int.Bits.xor" /\ eta XorInt 2
+  , "Data.Int.Bits.shl" /\ eta ShlInt 2
+  , "Data.Int.Bits.shr" /\ eta ShrInt 2
+  , "Data.Int.Bits.zshr" /\ eta ZshrInt 2
+  , "Data.Int.Bits.complement" /\ eta ComplementInt 1
   , "Data.Unit.unit" /\ intLit 0
   , "Prim.undefined" /\ intLit 0
   ]

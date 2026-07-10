@@ -34,6 +34,15 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Prim" do
       primSym AddNumber `shouldEqual` Tuple "pv_prim_add_number" true
       primSym RecordGet `shouldEqual` Tuple "pv_prim_record_get" true
 
+    it "maps the Int bitwise family to pure helpers" do
+      primSym AndInt `shouldEqual` Tuple "pv_prim_and_int" false
+      primSym OrInt `shouldEqual` Tuple "pv_prim_or_int" false
+      primSym XorInt `shouldEqual` Tuple "pv_prim_xor_int" false
+      primSym ShlInt `shouldEqual` Tuple "pv_prim_shl_int" false
+      primSym ShrInt `shouldEqual` Tuple "pv_prim_shr_int" false
+      primSym ZshrInt `shouldEqual` Tuple "pv_prim_zshr_int" false
+      primSym ComplementInt `shouldEqual` Tuple "pv_prim_complement_int" false
+
   describe "inlinePrim" do
     it "emits a 32-bit add (untag, add, re-tag), trunc temp before its ashr" do
       let Tuple r body = run (inlinePrim AddInt [ "%a", "%b" ])
@@ -85,6 +94,62 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Prim" do
             <> "  %t1 = icmp ne i64 %t2, 0\n"
             <> "  %t3 = xor i1 %t1, true\n"
             <> "  %t4 = zext i1 %t3 to i64\n"
+            <> "  %t5 = shl i64 %t4, 1\n"
+            <> "  %t6 = or i64 %t5, 1\n"
+        )
+
+    it "emits a 32-bit bitwise and (the bin32 shape)" do
+      let Tuple r body = run (inlinePrim AndInt [ "%a", "%b" ])
+      r `shouldEqual` Just "%t8"
+      body `shouldEqual`
+        ( "  %t2 = ashr i64 %a, 1\n"
+            <> "  %t1 = trunc i64 %t2 to i32\n"
+            <> "  %t4 = ashr i64 %b, 1\n"
+            <> "  %t3 = trunc i64 %t4 to i32\n"
+            <> "  %t5 = and i32 %t1, %t3\n"
+            <> "  %t6 = sext i32 %t5 to i64\n"
+            <> "  %t7 = shl i64 %t6, 1\n"
+            <> "  %t8 = or i64 %t7, 1\n"
+        )
+
+    it "emits a left shift with the count masked & 31" do
+      let Tuple r body = run (inlinePrim ShlInt [ "%a", "%b" ])
+      r `shouldEqual` Just "%t9"
+      body `shouldEqual`
+        ( "  %t2 = ashr i64 %a, 1\n"
+            <> "  %t1 = trunc i64 %t2 to i32\n"
+            <> "  %t4 = ashr i64 %b, 1\n"
+            <> "  %t3 = trunc i64 %t4 to i32\n"
+            <> "  %t5 = and i32 %t3, 31\n"
+            <> "  %t6 = shl i32 %t1, %t5\n"
+            <> "  %t7 = sext i32 %t6 to i64\n"
+            <> "  %t8 = shl i64 %t7, 1\n"
+            <> "  %t9 = or i64 %t8, 1\n"
+        )
+
+    it "emits the zero-fill right shift as a masked lshr (signed 32 re-tag via sext)" do
+      let Tuple r body = run (inlinePrim ZshrInt [ "%a", "%b" ])
+      r `shouldEqual` Just "%t9"
+      body `shouldEqual`
+        ( "  %t2 = ashr i64 %a, 1\n"
+            <> "  %t1 = trunc i64 %t2 to i32\n"
+            <> "  %t4 = ashr i64 %b, 1\n"
+            <> "  %t3 = trunc i64 %t4 to i32\n"
+            <> "  %t5 = and i32 %t3, 31\n"
+            <> "  %t6 = lshr i32 %t1, %t5\n"
+            <> "  %t7 = sext i32 %t6 to i64\n"
+            <> "  %t8 = shl i64 %t7, 1\n"
+            <> "  %t9 = or i64 %t8, 1\n"
+        )
+
+    it "emits complement as xor -1" do
+      let Tuple r body = run (inlinePrim ComplementInt [ "%a" ])
+      r `shouldEqual` Just "%t6"
+      body `shouldEqual`
+        ( "  %t2 = ashr i64 %a, 1\n"
+            <> "  %t1 = trunc i64 %t2 to i32\n"
+            <> "  %t3 = xor i32 %t1, -1\n"
+            <> "  %t4 = sext i32 %t3 to i64\n"
             <> "  %t5 = shl i64 %t4, 1\n"
             <> "  %t6 = or i64 %t5, 1\n"
         )

@@ -21,6 +21,18 @@ spec = describe "Purvasm.Compiler.Ffi" do
     resolver "Data.Semiring.intAdd"
       `shouldEqual` Just (TmLam "$0" (TmLam "$1" (TmPrim AddInt [ TmVar "$0", TmVar "$1" ])))
 
+  it "eta-expands the Int bitwise family on both the Data.Int.Bits and Purvasm.Int names" do
+    resolver "Data.Int.Bits.and"
+      `shouldEqual` Just (TmLam "$0" (TmLam "$1" (TmPrim AndInt [ TmVar "$0", TmVar "$1" ])))
+    resolver "Data.Int.Bits.zshr"
+      `shouldEqual` Just (TmLam "$0" (TmLam "$1" (TmPrim ZshrInt [ TmVar "$0", TmVar "$1" ])))
+    resolver "Data.Int.Bits.complement"
+      `shouldEqual` Just (TmLam "$0" (TmPrim ComplementInt [ TmVar "$0" ]))
+    resolver "Purvasm.Int.shl"
+      `shouldEqual` Just (TmLam "$0" (TmLam "$1" (TmPrim ShlInt [ TmVar "$0", TmVar "$1" ])))
+    resolver "Purvasm.Int.complement"
+      `shouldEqual` Just (TmLam "$0" (TmPrim ComplementInt [ TmVar "$0" ]))
+
   it "resolves a foreign constant to a value" do
     resolver "Data.Unit.unit" `shouldEqual` Just (TmLit (LInt 0))
     resolver "Prim.undefined" `shouldEqual` Just (TmLit (LInt 0))
