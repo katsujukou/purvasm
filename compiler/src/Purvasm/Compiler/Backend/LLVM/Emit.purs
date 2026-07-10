@@ -51,7 +51,7 @@ import Data.Tuple (Tuple(..), fst, snd)
 import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.Compiler.Backend.LLVM.Abi (abiFrameOpen, abiGet, abiPopFrame, abiRoot, abiSettle)
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (fvExpr)
-import Purvasm.Compiler.Backend.LLVM.Mangle (ctorTag, escapeStringBytes, imm, immBool, immInt, immUnit, labelId, mangle, sortRecordFields)
+import Purvasm.Compiler.Backend.LLVM.Mangle (ctorTag, escapeStringBytes, imm, immBool, immInt, immUnit, labelId, mangle, mangleForeign, sortRecordFields)
 import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, beginFn, emit, emitGlobal, emitModule, fresh, freshFn, freshLabel, freshStrName, getFrame, setFrame, takeFn)
 import Purvasm.Compiler.Backend.LLVM.Prim (inlinePrim, primSym)
 import Purvasm.Compiler.Backend.LLVM.Types (Env, EnvSrc(..), FnInfo, Lifted(..), LiftedBody(..), bindFnVar, bindVar, lookupEnv)
@@ -120,8 +120,21 @@ atom env = case _ of
     t <- fresh
     emit ("  " <> t <> " = call i64 @pv_new_str(ptr %ctx, ptr " <> p <> ", i64 " <> show len <> ")")
     pure t
-  AtomForeign _ ->
-    unsafeCrashWith "Backend.LLVM.Emit.atom: foreign reference not yet supported (slice 4)"
+  AtomForeign k -> do
+    -- A native foreign leaf resolves by link-time symbol (ADR-0073 §3): reference its `AbiCodeFn`
+    -- `@pvf_<mangle key>` and wrap it in a no-capture closure of the leaf's arity. The arity is the
+    -- FSR-reconstructed shape (ADR-0090 makes the shape the single source of truth), so a missing entry
+    -- is a wiring bug — crash at compile time rather than default to a wrong closure arity (which would
+    -- link but under/over-apply at runtime).
+    modify_ \c -> c { foreigns = Set.insert k c.foreigns }
+    arity <- gets (Map.lookup k <<< _.foreignArity) >>= case _ of
+      Just a -> pure a
+      Nothing -> unsafeCrashWith ("Backend.LLVM.Emit.atom: missing native foreign arity for " <> k <> " (FSR must provide every native leaf's shape, ADR-0090)")
+    addr <- fresh
+    emit ("  " <> addr <> " = ptrtoint ptr @" <> mangleForeign k <> " to i64")
+    clo <- fresh
+    emit ("  " <> clo <> " = call i64 @pv_make_closure(ptr %ctx, i64 " <> addr <> ", i32 " <> show arity <> ", i64 " <> immUnit <> ")")
+    pure clo
 
 -- | Materialise a string literal as a module-level `@.str.N` byte constant (boot's `string_constant`),
 -- | returning the `getelementptr`-to-first-byte pointer operand and the byte length. An empty string is

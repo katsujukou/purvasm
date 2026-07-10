@@ -18,7 +18,9 @@ import Data.Maybe (Maybe(..), fromMaybe, isJust)
 import Data.String (Pattern(..), stripPrefix)
 import Data.Tuple (Tuple(..))
 import Foreign.Object as Object
+import PureScript.CoreFn.Expr (Bind(..), Expr(..)) as CFE
 import PureScript.CoreFn.Module (Module) as CF
+import PureScript.CoreFn.Names (Qualified(..)) as CFN
 import Purvasm.Compiler (Backend, BuildError(..), BuildProducts, CompilerAction, CompilerActionHooks, LoadResult(..), Options, build, defaultHooks)
 import Purvasm.Compiler.Bytecode.Artifact (interfaceFromExports)
 import Purvasm.Compiler.CESK.Translate (nameKey)
@@ -168,3 +170,42 @@ spec = describe "Purvasm.Compiler.build" do
         Tuple _ log = run table (baseOptions { opt = false }) 2
       withPrefix "enterOpt" log `shouldEqual` []
       withPrefix "contOpt" log `shouldEqual` []
+
+  describe "foreign shapes reach downstream codegen (ADR-0089 slice 2 × ADR-0090)" do
+    it "a candidate-referenced private foreign's shape is visible in the consumer's LoweredModule" do
+      -- Dep declares a *private* foreign `privImpl` and an exported wrapper `\x -> privImpl(x)` —
+      -- a publishable inline candidate. Inlining it lands the private reference in Main, so Main's
+      -- visible foreign shapes must carry `Dep.privImpl` (the exports-only publication cannot).
+      let
+        ann0 = { span: { start: { line: 0, column: 0 }, end: { line: 0, column: 0 } }, meta: Nothing }
+        wrapExpr = CFE.Abs ann0 "x"
+          ( CFE.App ann0
+              (CFE.Var ann0 (CFN.Qualified (Just [ "Dep" ]) "privImpl"))
+              (CFE.Var ann0 (CFN.Qualified Nothing "x"))
+          )
+        depMod = (modl "Dep" [])
+          { foreignNames = [ "privImpl" ]
+          , exports = [ "wrap" ]
+          , decls = [ CFE.NonRec ann0 "wrap" wrapExpr ]
+          }
+        table = Map.fromFoldable
+          [ Tuple "Main" (loaded (modl "Main" [ "Dep" ]))
+          , Tuple "Dep" (loaded depMod)
+          ]
+        -- a backend whose per-module IR lists the module's visible foreign-shape keys
+        sigBackend = testBackend
+          { lowerModule = \_ lm ->
+              "SIGS:" <> lm.module.name <> ":"
+                <> Array.intercalate "," (Array.fromFoldable (Map.keys lm.foreignSigs))
+          }
+        action = (mkAction table 3)
+          { foreignSigsOf = \m ->
+              tell [ "fsr:" <> nameKey m.name ]
+                $> Right (Map.singleton "Dep.privImpl" { arity: 1, vsat: false, retVsat: false })
+          }
+        Tuple result log = runWriter (build sigBackend action (baseOptions { opt = true }))
+      outcome result `shouldEqual` "Right"
+      -- FSR ran for the foreign-bearing module only…
+      withPrefix "fsr:" log `shouldEqual` [ "fsr:Dep" ]
+      -- …and the consumer's codegen sees the private foreign's shape.
+      withPrefix "emitFile:SIGS:Main" log `shouldEqual` [ "emitFile:SIGS:Main:Dep.privImpl" ]

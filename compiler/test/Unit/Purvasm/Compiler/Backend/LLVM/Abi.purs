@@ -19,7 +19,7 @@ import Test.Spec.Assertions (shouldEqual)
 
 -- Render the function-buffer text produced by an emitter run from a fresh release-mode context.
 emitted :: forall a. Codegen a -> String
-emitted m = renderBuffer (snd (runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, inlineAbi: true }) m)).fn
+emitted m = renderBuffer (snd (runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true }) m)).fn
 
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.Backend.LLVM.Abi" do

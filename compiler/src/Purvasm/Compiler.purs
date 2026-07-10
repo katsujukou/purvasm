@@ -16,8 +16,11 @@ module Purvasm.Compiler
   , BuildProducts
   , CompilerAction
   , CompilerActionHooks
+  , ContextModule
   , EmittedModule
   , EntryInput
+  , ForeignSigError
+  , ForeignSigMap
   , LoadError
   , LoadResult(..)
   , LoweredModule
@@ -46,12 +49,13 @@ import Data.Tuple.Nested (type (/\), (/\))
 import PureScript.CoreFn.Module (Module) as CF
 import Purvasm.Compiler.Bytecode.Artifact (Interface)
 import Purvasm.Compiler.CESK.AST (Term(..))
-import Purvasm.Compiler.CESK.Translate (nameKey)
+import Purvasm.Compiler.CESK.Translate (nameKey, qualifiedKey)
+import Purvasm.Compiler.ForeignSig (ForeignShape)
 import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Expr)
 import Purvasm.Compiler.MiddleEnd.Module (AnfModule, declsOfModule)
 import Purvasm.Compiler.MiddleEnd.Normalize (normalize)
-import Purvasm.Compiler.MiddleEnd.Optimizer (BuildEnv, emptyBuildEnv, extendSummary, localFactsOf)
+import Purvasm.Compiler.MiddleEnd.Optimizer (BuildEnv, emptyBuildEnv, extendSummary, localFactsOf, publishedForeignSigs, withForeignSigs)
 import Purvasm.Compiler.MiddleEnd.Optimizer as Optimizer
 
 -- | A module's dotted name (the `loadModule` key).
@@ -61,6 +65,14 @@ type ModuleName = String
 -- | stays host-side (the host logs it in its `loadModule`/`onLoadFailed` impl). Concrete, not a polymorphic
 -- | `e`, so `CompilerAction` stays at two type parameters.
 type LoadError = { moduleName :: String, detail :: String }
+
+-- | A qualified foreign key (`Module.Name.ident`) → its reconstructed calling shape (ADR-0080/0090).
+type ForeignSigMap = Map String ForeignShape
+
+-- | A foreign-signature reconstruction failure reduced to a library-neutral shape (ADR-0090), parallel to
+-- | `LoadError`: the host maps its richer FSR issue (parse error, missing provenance, manifest decode) into
+-- | it. FSR is a hard diagnostic (ADR-0080) — never collapsed to an empty map.
+type ForeignSigError = { moduleName :: String, detail :: String }
 
 -- | The result of loading **one** module (ADR-0087 §2). `Missing` is a benign absence (a `Prim`-like module
 -- | with no `corefn.json`) — distinct from a real `Failed`. Making failure *data* is what lets the driver
@@ -75,6 +87,7 @@ data LoadResult
 data BuildError
   = EntryMissing ModuleName
   | LoadFailed LoadError
+  | ForeignSigFailed ForeignSigError
 
 -- | The backend-neutral build knobs. Backend-specific knobs (native heap size, debug ABI, …) are closed
 -- | over in the `Backend` value the CLI constructs, so they never reach this record.
@@ -102,9 +115,27 @@ type BuildProducts o =
   , entry :: { ir :: o, path :: String }
   }
 
+-- | The **pre-optimisation, pre-FSR** view a backend's `context` reads: a module's CoreFn source and its
+-- | freshly-lowered `AnfModule`. It carries **no** `foreignSigs` — FSR has not run when `context` is
+-- | derived (it runs per module inside the fold), so a shape map here could only ever be empty. Kept
+-- | distinct from `LoweredModule` precisely so the whole-program surface derivation never reads an
+-- | empty-shape lie (ADR-0090): foreign shapes belong to the per-module lowering inputs, not the context.
+type ContextModule =
+  { source :: CF.Module
+  , module :: AnfModule
+  }
+
 -- | An optimised module paired with its CoreFn source (the backend reads `imports`/`exports` for the
--- | interface and reachability). The unit `Backend` codegen consumes.
-type LoweredModule = { source :: CF.Module, module :: AnfModule }
+-- | interface and reachability) and its **visible** foreign shapes. The unit `lowerModule`/`lowerEntry`
+-- | codegen consumes (distinct from `ContextModule`, the pre-FSR whole-program `context` input).
+type LoweredModule =
+  { source :: CF.Module
+  , module :: AnfModule
+  -- | The module's **visible** foreign shapes (ADR-0090) — its own ∪ its dependencies' exported — assembled
+  -- | by the driver's `ForeignFacts` thread and populated in **every** mode, so codegen reads `arity` /
+  -- | effect bits here under `--no-opt` and `--opt` alike.
+  , foreignSigs :: ForeignSigMap
+  }
 
 -- | The whole reachable program, for the entry/init codegen: every optimised module plus the (DictElim'd)
 -- | entry expression.
@@ -115,8 +146,9 @@ type EntryInput = { modules :: Array LoweredModule, entry :: Expr }
 -- | effectful, non-shareable step — is left to CLI finalization (§4), so this record is trivially testable.
 -- |
 -- |   * `context` — derive the whole-program facts (the native `gkeys`/cross-module surface, stable under
--- |     the seam) from the **pre-optimisation** modules (as `LoweredModule`s, so the surface can read each
--- |     module's CoreFn `exports`), once, before the fold.
+-- |     the seam) from the **pre-optimisation** modules (as `ContextModule`s — CoreFn source + lowered ANF,
+-- |     so the surface can read each module's `exports`, but **no** foreign shapes: FSR has not run yet),
+-- |     once, before the fold.
 -- |   * `interfaceOf` — the module's `.pmi` from its optimised ANF + CoreFn surface (backend-neutral in
 -- |     result — byte-identical to the bytecode deriver — but the `ExportKind` classification is the
 -- |     backend's).
@@ -124,7 +156,7 @@ type EntryInput = { modules :: Array LoweredModule, entry :: Expr }
 -- |   * `lowerEntry` — the **whole-program** entry/init object (reachability over the module set); pure
 -- |     codegen, run by the driver after the fold, *not* CLI link.
 type Backend c o =
-  { context :: Array LoweredModule -> c
+  { context :: Array ContextModule -> c
   , interfaceOf :: c -> LoweredModule -> Interface
   , lowerModule :: c -> LoweredModule -> o
   , lowerEntry :: c -> EntryInput -> o
@@ -139,6 +171,10 @@ type CompilerAction o m =
   { workdir :: String
   , maxOptimizeIter :: Int
   , loadModule :: ModuleName -> m LoadResult
+  -- | Reconstruct a module's foreign shapes (ADR-0090 §2): a host effect (reads `.purs` source / the ulib
+  -- | `foreignSigs`) that can fail, returned as data (`Left` halts the build with `ForeignSigFailed`, no
+  -- | throw — ADR-0087's boundary). The driver calls it only when the module declares foreigns.
+  , foreignSigsOf :: CF.Module -> m (Either ForeignSigError ForeignSigMap)
   , emitFile :: ModuleArtifacts o -> m String
   , emitEntry :: o -> m String
   , hooks :: CompilerActionHooks m
@@ -263,6 +299,9 @@ entryExprOf opts =
 -- | accumulated in dependency order.
 type FoldState o =
   { env :: BuildEnv
+  -- | ADR-0090's `ForeignFacts`: the accumulated **dependencies' exported** foreign shapes, threaded in
+  -- | every mode. Feeds `LoweredModule.foreignSigs` (codegen) and, under `--opt`, the optimiser env.
+  , foreignEnv :: ForeignSigMap
   , emitted :: Array (EmittedModule o)
   , lowered :: Array LoweredModule
   , progress :: Progress
@@ -287,43 +326,79 @@ build backend action opts =
     Left err -> pure (Left err)
     Right loaded -> do
       let
+        -- `ContextModule`: pre-FSR source + lowered ANF only. FSR runs per module inside the fold, so a
+        -- `foreignSigs` here would be uniformly empty — the type omits it rather than lie (ADR-0090).
         ctx = backend.context (map (\l -> { source: l.mod, module: declsOfModule l.mod }) loaded)
         initialState =
           { env: emptyBuildEnv
+          , foreignEnv: Map.empty
           , emitted: []
           , lowered: []
           , progress: { total: Array.length loaded, current: 1 }
           }
-      final <- foldM (stepModule ctx) initialState loaded
-      let
-        -- The entry is handed to the backend **raw** (no seam `DictElim`); the native backend bridges it
-        -- privately in `lowerEntry`, the VM does not (ADR-0086 Addendum).
-        entryIr = backend.lowerEntry ctx { modules: final.lowered, entry: entryExprOf opts }
-      entryPath <- action.emitEntry entryIr
-      pure (Right { modules: final.emitted, entry: { ir: entryIr, path: entryPath } })
+        -- An FSR failure short-circuits the fold with `Left` (ADR-0090 §2), like `loadClosure`.
+        step (Left e) _ = pure (Left e)
+        step (Right st) item = stepModule ctx st item
+      foldM step (Right initialState) loaded >>= case _ of
+        Left err -> pure (Left err)
+        Right final -> do
+          -- The entry is handed to the backend **raw** (no seam `DictElim`); the native backend bridges it
+          -- privately in `lowerEntry`, the VM does not (ADR-0086 Addendum).
+          let entryIr = backend.lowerEntry ctx { modules: final.lowered, entry: entryExprOf opts }
+          entryPath <- action.emitEntry entryIr
+          pure (Right { modules: final.emitted, entry: { ir: entryIr, path: entryPath } })
   where
-  stepModule :: c -> FoldState o -> { mod ∷ CF.Module, name ∷ String } -> m (FoldState o)
+  stepModule :: c -> FoldState o -> { mod ∷ CF.Module, name ∷ String } -> m (Either BuildError (FoldState o))
   stepModule ctx st item = do
     action.hooks.onStartCompile st.progress item.mod
-    let am = declsOfModule item.mod
-    action.hooks.onBeforeOptimize am
-    optimised <-
-      if opts.opt then do
-        r <- runOptimizer st.env am
-        pure { module: r.module, env: extendSummary st.env r.summary }
-      else pure { module: am, env: st.env } -- --no-opt: identity, no summary, env unchanged
-    action.hooks.onBeforeCodegen optimised.module
-    let
-      lm = { source: item.mod, module: optimised.module }
-      artifact = { interface: backend.interfaceOf ctx lm, backendIR: backend.lowerModule ctx lm }
-    path <- action.emitFile artifact
-    action.hooks.onCleanUp item.name
-    pure
-      { env: optimised.env
-      , emitted: Array.snoc st.emitted { artifact, path }
-      , lowered: Array.snoc st.lowered lm
-      , progress: st.progress { current = st.progress.current + 1 }
-      }
+    -- FSR (ADR-0090): the module's **own** shapes, only when it declares foreigns (`moduleForeignSigs` is
+    -- also self-guarding, so the check is a fast-path). A failure halts the build with `ForeignSigFailed`.
+    ownE <-
+      if Array.null item.mod.foreignNames then pure (Right Map.empty)
+      else action.foreignSigsOf item.mod
+    case ownE of
+      Left fe -> pure (Left (ForeignSigFailed fe))
+      Right ownSigs -> do
+        let
+          am = declsOfModule item.mod
+          visible = Map.union ownSigs st.foreignEnv -- own ∪ deps (keys module-qualified, disjoint)
+        action.hooks.onBeforeOptimize am
+        optimised <-
+          if opts.opt then do
+            -- Two-tier (ADR-0090 §3): surface own → `LocalFacts`, deps → `BuildEnv`, for effect analysis.
+            let
+              lf = (localFactsOf st.env am) { foreignSigs = ownSigs }
+              envF = withForeignSigs st.foreignEnv st.env
+            r <- runOptimizer envF lf am
+            pure
+              { module: r.module
+              , env: extendSummary st.env r.summary
+              -- own shapes the published inline candidates reference (possibly non-exported): an
+              -- inlined body carries the reference into consumers, so its shape must travel too.
+              , published: publishedForeignSigs r.summary
+              }
+          else pure { module: am, env: st.env, published: Map.empty } -- --no-opt: identity, no summary, env unchanged
+        action.hooks.onBeforeCodegen optimised.module
+        let
+          lm = { source: item.mod, module: optimised.module, foreignSigs: visible }
+          artifact = { interface: backend.interfaceOf ctx lm, backendIR: backend.lowerModule ctx lm }
+        path <- action.emitFile artifact
+        action.hooks.onCleanUp item.name
+        let
+          -- Publish this module's **exported** foreign shapes to dependents (ADR-0090 §3): own ∩ exports —
+          -- plus the shapes its published inline candidates reference (ADR-0089 slice 2 × ADR-0090:
+          -- an inlined wrapper's private foreign lands in consumers, shape and all).
+          exported = Set.fromFoldable (map (qualifiedKey item.mod.name) item.mod.exports)
+          exportedOwn = Map.filterKeys (\k -> Set.member k exported) ownSigs
+        pure
+          ( Right
+              { env: optimised.env
+              , foreignEnv: Map.union exportedOwn (Map.union optimised.published st.foreignEnv)
+              , emitted: Array.snoc st.emitted { artifact, path }
+              , lowered: Array.snoc st.lowered lm
+              , progress: st.progress { current = st.progress.current + 1 }
+              }
+          )
 
   -- Iterate `optimizeModule` to a fixpoint (ADR-0087 owns the iteration; the seam is a pure step returning
   -- `{ module, summary }`). Plain recursion — so `m` needs only `Monad` (ADR-0087's boundary), no
@@ -331,8 +406,9 @@ build backend action opts =
   -- leaves the module unchanged — `AnfModule` has structural `Eq`) or, as a non-termination backstop, at
   -- `maxOptimizeIter`. Today's only pass (`DictElim`) is idempotent, so a module with no static dispatch
   -- converges in one round. Returns the last pass's `{ module, summary }`.
-  runOptimizer env am = do
-    let lf = localFactsOf env am
+  -- `lf` is supplied by the caller (with the module's own foreign shapes injected, ADR-0090 §3), and
+  -- `env` carries the dependency dict machinery + foreign shapes.
+  runOptimizer env lf am = do
     action.hooks.onEnterOptimizeIter am
     let
       go n prev = do

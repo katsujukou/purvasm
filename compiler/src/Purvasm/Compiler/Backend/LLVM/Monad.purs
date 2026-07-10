@@ -65,6 +65,7 @@ type Ctx =
   , pending :: List Lifted -- ^ lambdas to emit (LIFO)
   , frame :: String -- ^ the current function's shadow-stack frame handle operand
   , gkeys :: Set String -- ^ top-level qualified keys (referenced as `@<mangle>$root`)
+  , foreignArity :: Map String Int -- ^ native-leaf key → closure arity (ADR-0073/0080, from FSR)
   , externs :: Set String -- ^ referenced globals not defined here
   , foreigns :: Set String -- ^ referenced native foreign keys
   , gfns :: Map String FnInfo -- ^ this module's own top-level function bindings
@@ -84,6 +85,7 @@ type Codegen = State Ctx
 type MakeCxOptions =
   { gkeys :: Set String
   , xfns :: Map String FnInfo
+  , foreignArity :: Map String Int
   , inlineAbi :: Boolean
   }
 
@@ -101,6 +103,7 @@ makeCx opts =
   , pending: Nil
   , frame: "%frame"
   , gkeys: opts.gkeys
+  , foreignArity: opts.foreignArity
   , externs: Set.empty
   , foreigns: Set.empty
   , gfns: Map.empty

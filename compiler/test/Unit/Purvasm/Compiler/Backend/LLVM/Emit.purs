@@ -34,7 +34,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Emit" do
   describe "emitFunction" do
     it "emits the tailcc $d entry and the generic wrapper for identInt" do
       let
-        ctx = snd $ runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, inlineAbi: true })
+        ctx = snd $ runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true })
           (emitFunction identIntLifted)
       renderChunks ctx.md `shouldEqual`
         ( "define tailcc i64 @pv_g_Slice1_2eidentInt$d(ptr %ctx, i64 %env, i64 %p0) {\n"

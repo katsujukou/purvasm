@@ -49,10 +49,10 @@ intDegree =
     (TmIf (TmPrim LtInt [ v "$0", intLit 0 ]) (TmPrim SubInt [ intLit 0, v "$0" ]) (v "$0"))
 
 -- | The identity function `\$0 -> $0` — a representation-preserving cast at runtime. Used for `Char`
--- | code conversions (`Char` is `Int`, ADR-0006) and for `Unsafe.Coerce.unsafeCoerce` (the one canonical
--- | coerce the compiler intrinsifies; libraries that ship their *own* private `unsafeCoerce` foreign —
--- | `Data.Symbol`, `Data.Reflectable` — are `ulib`-shadowed to delegate to this one, so the compiler
--- | never enumerates every copy).
+-- | code conversions (`Char` is `Int`, ADR-0006) and for `unsafeCoerce`: the canonical `Unsafe.Coerce`
+-- | plus the exact whitelisted private copies (`Data.Symbol`, `Data.Reflectable`), all intrinsified as the
+-- | identity below (see the `unsafeCoerce` note at the `intrinsics` entries for why exact-key, not
+-- | `ulib`-shadow-delegate).
 identityFn :: Term
 identityFn = TmLam "$0" (v "$0")
 

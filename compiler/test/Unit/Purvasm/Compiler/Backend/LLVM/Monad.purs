@@ -16,7 +16,7 @@ import Test.Spec.Assertions (shouldEqual)
 
 -- The default fresh state used across these cases.
 run :: forall a. Codegen a -> Tuple a Ctx
-run = runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, inlineAbi: true })
+run = runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true })
 
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.Backend.LLVM.Monad" do
