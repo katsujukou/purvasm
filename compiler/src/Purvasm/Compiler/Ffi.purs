@@ -6,7 +6,7 @@
 -- | native `TmForeign` exactly as it drops an unresolved name (host-resolved at run), so
 -- | for producing `app.pvm` the two are indistinguishable. Hand-written CESK terms; they
 -- | must match boot's verbatim for byte-identical linked images.
-module Purvasm.Compiler.Ffi (resolver, intrinsicPrim) where
+module Purvasm.Compiler.Ffi (resolver, intrinsicPrim, intrinsicTerm) where
 
 import Prelude
 
@@ -48,9 +48,16 @@ intDegree =
   TmLam "$0"
     (TmIf (TmPrim LtInt [ v "$0", intLit 0 ]) (TmPrim SubInt [ intLit 0, v "$0" ]) (v "$0"))
 
--- | `Char` is `Int` (ADR-0006), so the char-code conversions are the identity.
+-- | The identity function `\$0 -> $0` — a representation-preserving cast at runtime. Used for `Char`
+-- | code conversions (`Char` is `Int`, ADR-0006) and for `Unsafe.Coerce.unsafeCoerce` (the one canonical
+-- | coerce the compiler intrinsifies; libraries that ship their *own* private `unsafeCoerce` foreign —
+-- | `Data.Symbol`, `Data.Reflectable` — are `ulib`-shadowed to delegate to this one, so the compiler
+-- | never enumerates every copy).
+identityFn :: Term
+identityFn = TmLam "$0" (v "$0")
+
 charId :: Term
-charId = TmLam "$0" (v "$0")
+charId = identityFn
 
 intrinsics :: Map String Term
 intrinsics = Map.fromFoldable
@@ -85,6 +92,14 @@ intrinsics = Map.fromFoldable
   , "Purvasm.Array.unsafeNew" /\ eta NewArray 1
   , "Purvasm.Array.unsafeSet" /\ eta SetArray 3
   , "Purvasm.Boolean.not" /\ eta NotBool 1
+  -- `Record.Unsafe` dynamic record access by runtime label (ADR-0010 record-as-field-map): each a
+  -- single record primop, mirroring boot's `Ffi`. (`unsafeUnionFn` → `RecordUnion` is added below with
+  -- the primop.)
+  , "Record.Unsafe.unsafeGet" /\ eta RecordGet 2
+  , "Record.Unsafe.unsafeSet" /\ eta RecordSet 3
+  , "Record.Unsafe.unsafeHas" /\ eta RecordHas 2
+  , "Record.Unsafe.unsafeDelete" /\ eta RecordDelete 2
+  , "Record.Unsafe.Union.unsafeUnionFn" /\ eta RecordUnion 2
   , "Purvasm.Char.toCodePoint" /\ charId
   , "Purvasm.Char.fromCodePoint" /\ charId
   -- stock-registry scalar leaves (used when building against stock, no-overlay corefn) --------
@@ -120,6 +135,15 @@ intrinsics = Map.fromFoldable
   , "Data.Int.Bits.complement" /\ eta ComplementInt 1
   , "Data.Unit.unit" /\ intLit 0
   , "Prim.undefined" /\ intLit 0
+  -- `unsafeCoerce` is a representation-preserving cast — the identity on purvasm's type-erased tagged
+  -- words (ADR-0064), regardless of which module defines it. Its being a `foreign import` in PureScript
+  -- is only the type-system escape hatch; there is no code. So every library's copy is intrinsified as
+  -- the identity here (rather than `ulib`-shadowing each to delegate, which would add the very
+  -- `unsafe-coerce` dependency those low-level modules deliberately avoid). Canonical `Unsafe.Coerce`
+  -- plus the prelude/reflectable private copies; extend if another library ships its own.
+  , "Unsafe.Coerce.unsafeCoerce" /\ identityFn
+  , "Data.Symbol.unsafeCoerce" /\ identityFn
+  , "Data.Reflectable.unsafeCoerce" /\ identityFn
   ]
 
 -- structural / higher-order foreigns as guest terms ------------------------------------
@@ -367,14 +391,21 @@ structural = Map.fromFoldable
 resolver :: String -> Maybe Term
 resolver key = Map.lookup key intrinsics <|> Map.lookup key structural
 
+-- | The **intrinsic** rung only (not structural) — the compiler-kept foreigns (`Purvasm.*`/registry
+-- | primops, `charId`/`intDegree`, `unsafeCoerce`, the literal builtins) whose definition the native
+-- | backend materialises as a synthesised gdef (boot's link `runtimeMembers`). Structural higher-order
+-- | foreigns (category C) are deliberately excluded — they head for a `ulib` native `.c`.
+intrinsicTerm :: String -> Maybe Term
+intrinsicTerm key = Map.lookup key intrinsics
+
 -- | The compile-time view of the intrinsic rung: the primop (and its arity) a foreign key
 -- | eta-expands to, or `Nothing` for non-eta intrinsics (constants, `charId`, `intDegree`),
 -- | structural foreigns, and native leaves. Derived from the `intrinsics` terms themselves —
 -- | not a second table — so it can never drift from what the linker resolves. This is what
 -- | lets the optimiser collapse a saturated intrinsic-foreign call to its primop per-module
--- | (ADR-0027/0028: `DictElim` resolves a method to `intAdd`, `Simplify` turns it into the
--- | primitive) — under B2 separate compilation the eta body is a *link-time* binding the
--- | module-local pass would otherwise never see.
+-- | (ADR-0027/0028's story, carried today by `DictElim` + the NbE inliner's saturation) — under
+-- | B2 separate compilation the eta body is a *link-time* binding the module-local pass would
+-- | otherwise never see.
 intrinsicPrim :: String -> Maybe { op :: PrimOp, arity :: Int }
 intrinsicPrim key = Map.lookup key intrinsics >>= etaPrim []
   where

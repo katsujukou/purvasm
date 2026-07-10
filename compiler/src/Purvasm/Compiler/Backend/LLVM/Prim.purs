@@ -8,8 +8,8 @@
 -- | allocate a boxed value, so they take the ctx and go through the runtime call (`inlinePrim` returns
 -- | `Nothing`, the caller falls back to `primSym`).
 -- |
--- | Note: this compiler's `PrimOp` is missing boot's `RecordUnion` (the [adr-0055-native-side-done]
--- | gap); `inlinePrim`/`primSym` cover exactly the `PrimOp`s that exist and grow when it lands.
+-- | `primSym` covers every `PrimOp` (the boxed `Record`/`Number`/`String`/`Array` ops go through their
+-- | `pv_prim_*` runtime helper); `inlinePrim` handles only the scalar `Int`/`Boolean` ops inline.
 module Purvasm.Compiler.Backend.LLVM.Prim
   ( primSym
   , inlinePrim
@@ -62,6 +62,7 @@ primSym = case _ of
   RecordSet -> Tuple "pv_prim_record_set" true
   RecordHas -> Tuple "pv_prim_record_has" true
   RecordDelete -> Tuple "pv_prim_record_delete" true
+  RecordUnion -> Tuple "pv_prim_record_union" true
 
 -- The tagged-word payload `w >> 1` (arithmetic).
 payload :: String -> Codegen String

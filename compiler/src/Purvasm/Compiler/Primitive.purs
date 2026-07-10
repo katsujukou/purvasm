@@ -49,6 +49,7 @@ data PrimOp
   | RecordSet
   | RecordHas
   | RecordDelete
+  | RecordUnion
 
 derive instance Eq PrimOp
 derive instance Generic PrimOp _

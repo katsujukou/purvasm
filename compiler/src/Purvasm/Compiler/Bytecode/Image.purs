@@ -144,6 +144,7 @@ primTag = case _ of
   RecordSet -> "RecordSet"
   RecordHas -> "RecordHas"
   RecordDelete -> "RecordDelete"
+  RecordUnion -> "RecordUnion"
 
 -- --- instructions / chunks / gdefs --------------------------------------------------
 
