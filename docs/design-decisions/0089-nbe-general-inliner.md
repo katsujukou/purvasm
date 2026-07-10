@@ -1,6 +1,6 @@
 # 0089. The NbE general inliner on the optimiser seam
 
-- Status: Accepted
+- Status: Accepted — extended by the **Accepted** [Addendum (2026-07-11)](#addendum-2026-07-11-slice-3--fold-guaranteed-case-of-case-distribution) (slice 3: fold-guaranteed case-of-case)
 - Date: 2026-07-10
 
 ## Abstract
@@ -320,3 +320,69 @@ pass.)
   reference needs them *because* its dispatch elimination is heuristic; purvasm already has the
   deterministic pass. Directives stay a named deferral (§8) for forcing *non-dictionary* cases the gate
   declines.
+
+## Addendum (2026-07-11): Slice 3 — fold-guaranteed case-of-case distribution
+
+- Status: ~~Proposed~~ **Accepted** _(2026-07-11: accepted by the maintainer, with the leaf-recursive
+  decidability condition of the P1 review fix)_ — promotes one item of §8's named deferrals (the
+  case-of-case / branch-distribution entry of the §ref 6 catalogue) into a scoped slice 3; everything
+  else in that deferral list (record-ctor unpacking, directives, specialization, the codegen size
+  budget) stays deferred.
+
+### Measured motivation
+
+Slices 1–2 (+ the guest-term/value-chain levers) leave one shape on the hot paths. fib's `<` is now
+**call-free** but retains
+
+```
+let r = LtInt(a, b)
+in let s = case r of true -> LT
+                     _    -> (case EqInt(a, b) of true -> EQ; _ -> GT)
+in case s of LT -> true; _ -> false
+```
+
+— an inner branch whose **every arm ends in a known constructor**, scrutinised by an outer case. The
+same shape sits in every quicksort filter predicate (`--opt-effect`: fib 1.434, quicksort 1.579).
+Distributing the outer case into the inner arms folds each copy on the spot (`LT` decides `true`,
+`EQ`/`GT` decide `false`) and boolean-cases then collapse against `LtInt`'s result, finishing the
+comparison to a **single primop**.
+
+### Decision
+
+1. **The rewrite, fold-guaranteed only.** A `let r = C in … case r of alts` (and the `CIf` analogue),
+   where `C` is a `CCase`/`CIf` computation, distributes `alts` **recursively through `C`'s branch
+   tree to its leaves**: an arm whose result is itself a `CCase`/`CIf` is descended into, and the
+   condition is that **every *leaf* result of the tree decidably matches `alts`** (a known
+   constructor/literal against decidable rows, the §5 discipline) — the motivating fib shape's `_`
+   arm is exactly such a nested case (`_ -> case EqInt … of true -> EQ; _ -> GT`), whose *leaves*
+   (`EQ`, `GT`) decide even though the arm's top-level result is not itself a value. Each
+   distributed copy therefore **folds immediately at its leaf** — the rewrite is a strict shrink,
+   never a duplication, so it needs **no new size threshold** (the reference's
+   `size <= 128`/`KnownNeutral` guards are subsumed by the stronger fold-guarantee). A leaf whose
+   result is not decidable blocks the whole rewrite (v1); an intermediate arm that `let`-binds
+   computations before its leaf keeps them (they run on that arm's path exactly as before —
+   position preserved); guarded alternatives, both in the tree and in `alts`, block it (ADR-0013
+   order, as in §5).
+2. **Effect-soundness is inherited, not new.** The outer case scrutinises an atom (ANF), so no
+   computation sits between the inner branch and the dispatch; the inner branch stays at its
+   sequenced position — only the *continuation* moves into its arms, once per arm, and the binder
+   `r` must be used **only** as that scrutinee (usage `total == 1`; otherwise the rewrite is
+   declined and the shared `let` stands, per gate B).
+3. **Mechanics follow the marks pattern.** Discovery on the quoted term (the analysis already walks
+   `let`/usage), application by the next `nbeBinding` round — no new machinery class; the concrete
+   carrier (a mark set or a dedicated syntactic pre-pass inside the loop) is an implementation
+   choice inside `Nbe`, invisible at the seam.
+4. **Gates unchanged**: behavioural (`--opt ≡ --no-opt ≡ oracle`), the blow-up fixtures (a new
+   fixture pins the fold-guarantee: an inner arm with an *unknown* result must block distribution),
+   `.pmi` mode-stability, and the recorded `--opt-effect` ratios — fib and quicksort are the named
+   movers.
+
+### Alternatives considered
+
+- **Port the reference's general `DistBranches` rewrites** (distribute applications/accessors/ops
+  into branches under `Deref`-operand + `size <= 128` guards). More powerful, but re-opens
+  duplication headroom ANF has no join points to recover; the fold-guaranteed subset captures the
+  measured shape with zero residual growth. Revisit if traces show non-folding distribution wins.
+- **Compile the comparison chains away earlier (match-compilation tricks).** Rejected: ADR-0083
+  deliberately keeps `CCase` structured through the optimiser; this is precisely the reduction that
+  placement was bought for.
