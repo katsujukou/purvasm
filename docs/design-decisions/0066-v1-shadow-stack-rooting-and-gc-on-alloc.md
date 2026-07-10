@@ -3,6 +3,10 @@
 - Status: ~~Proposed~~ **Accepted** _(2026-07-01: accepted by the maintainer)_
 - Date: 2026-07-01
 
+## Abstract
+
+v1 precise rooting: a `Heap`-owned shadow-stack (`Vec<Value>`) root API with explicit reload-after-safepoint, per-function rooting (self-rooting constructors; `apply` roots over-apply leftovers; `CodeFn`s root their own live values), and `alloc` collects-and-retries (fixed heap, OOM on still-full); the pre-codegen realisation of ADR-0064 §4
+
 ## Context
 
 The v1 runtime ([0064](0064-v1-single-capability-native-abi-codegen-contract.md)) has a working

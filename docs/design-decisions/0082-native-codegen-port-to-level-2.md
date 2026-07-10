@@ -3,6 +3,10 @@
 - Status: Accepted
 - Date: 2026-07-07
 
+## Abstract
+
+Port the native LLVM backend to Level-2 PureScript (wall 3), gate split by layer: backend (`codegen_llvm` ~2465 loc) + required lowering (`DictElim`) = faithful `.ll`-byte-identical transcription vs frozen boot; optimiser (`Simplify`/`Dbe`/`EffectAnalysis` + **caller-homed higher-order specialization** + a new **NbE general inliner**) rebuilt, gated on behavioural `--opt ≡ --no-opt ≡ oracle` over **Level-2's own VM/LLVM/JS legs** *plus* a third **size/time-assert** gate the behavioural+bench gates are blind to; `--no-opt` flag on both compilers; two parallel tracks joined at native self-host. Blow-up defences pinned (reducer `Lazy` sharing, conservative inline gate + dedicated-`-O0`-TU codegen backstop). Cross-module inputs (foreign shapes + spec/inline bodies) ride the **ADR-0084** `.pmi` pruned-module summary — a prerequisite for the optimiser track (not the backend track); unboxing is link-time. Lowers the shared ADR-0083 `dtree`
+
 ## Context
 
 Wall 3 of the [0059](0059-native-abi-value-representation.md) roadmap — *bootstrap natively with

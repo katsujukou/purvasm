@@ -3,6 +3,10 @@
 - Status: ~~Proposed~~ **Accepted** _(2026-07-06: accepted by the maintainer)_
 - Date: 2026-07-05
 
+## Abstract
+
+Level-2 foreign signatures reconstructed from source via the embedded CST parser (`language-cst-parser`): a source channel for foreign-bearing modules only, arity/effect-leaf interpretation as the pinned contract (validated by a boot-registry consistency differential), shapes flow to the native-codegen port + diagnostics; the silent `arity 1` default dies; `.pmi` publication deferred to the binary-artifact record
+
 ## Context
 
 A foreign's **calling shape** — its arity, and whether it is an effectful leaf — steers three

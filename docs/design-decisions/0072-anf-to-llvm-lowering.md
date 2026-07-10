@@ -1,7 +1,11 @@
-# 0072. ANF → LLVM lowering: per-module textual IR, lambda-lifting, rooting emission, and the native differential
+# 0072. ANF → LLVM lowering
 
 - Status: ~~Proposed~~ **Accepted** _(2026-07-02: accepted by the maintainer)_
 - Date: 2026-07-02
+
+## Abstract
+
+ANF → LLVM lowering: per-module textual IR, lambda-lifting, rooting emission, and the native differential
 
 > **Revision (2026-07-02, pre-acceptance review response):** §3 corrected — `Link.free_vars` returns a
 > dependency *set*, not an order; CAF ordering now follows the **top-level ANF spine (declaration) order**

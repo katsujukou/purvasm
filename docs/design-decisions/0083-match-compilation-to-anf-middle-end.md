@@ -1,7 +1,11 @@
-# 0083. Match compilation to a shared ANF middle end, and a byte-identity cross-check
+# 0083. Match compilation to a shared ANF middle-end
 
 - Status: Accepted
 - Date: 2026-07-07
+
+## Abstract
+
+Replace the **three** per-backend matchers (bytecode = ADR-0031 decision tree; `codegen_ml` = record-binder hybrid; LLVM = CPS cascade, no tree) with ONE shared Maranget builder — a middle-end `CCase → dtree` intermediate (`Middle_end.Match_compile`, **not** a new `cexpr` node; `CCase` + optimiser passes untouched) that each backend lowers at its `CCase` site, in **both boot and Level-2**. Bytecode is a faithful split → byte-identical (golden unchanged, **no re-baseline needed**); native cascades → the tree, checked by the 4-way differential. One-time boot-freeze exception; keeps `codegen_ml` as the last insurance leg (retired once native self-host subsumes it); defers ADR-0082 (native port then just lowers the tree)
 
 ## Context
 

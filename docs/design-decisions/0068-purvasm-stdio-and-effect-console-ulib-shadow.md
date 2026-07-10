@@ -1,7 +1,11 @@
-# 0068. `purvasm-stdio`: a native stdout/stderr package, with `Effect.Console` as a `ulib` shadow over it
+# 0068. `purvasm-stdio` and the `Effect.Console` ulib shadow
 
 - Status: Accepted
 - Date: 2026-07-02
+
+## Abstract
+
+`purvasm-stdio` package (`Purvasm.Stdio.writeLine`/`writeErrLine`, stdout/stderr line leaves) + `Effect.Console` as a `ulib` shadow over it; **removes** the `Effect.Console.log`/`error` special leaves from boot's resolver so no core resolver knows a JS console name (extends the ADR-0067 reframing to boot); no-op timers/grouping natively
 
 ## Context
 

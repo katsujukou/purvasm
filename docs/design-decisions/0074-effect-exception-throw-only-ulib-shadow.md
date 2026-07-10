@@ -1,7 +1,11 @@
-# 0074. `Effect.Exception` as a throw-only `ulib` shadow: fatal abort, no native unwinding
+# 0074. `Effect.Exception` as a throw-only ulib shadow
 
 - Status: ~~Proposed~~ **Accepted** _(2026-07-04: accepted by the maintainer, with the review revision folded in)_
 - Date: 2026-07-04
+
+## Abstract
+
+`Effect.Exception` as a throw-only `ulib` shadow: pure-PS `Error`, `throwException` = stderr + `exit 1` (fatal, unrecoverable), `catchException` passes through; LLVM runtime completes the `writeErrLineImpl`/`exitImpl` leaves under a write-before-exit contract (stderr direct+flush; exit drains the stdout sink); real unwinding deferred
 
 > **Revision (2026-07-04, pre-acceptance review):** four findings folded in. **(1)** "no runtime
 > change" was inaccurate for the LLVM backend: the two capability leaves the shadow composes

@@ -3,6 +3,10 @@
 - Status: ~~Proposed~~ **Accepted** _(2026-07-05: accepted by the maintainer)_
 - Date: 2026-07-04
 
+## Abstract
+
+Direct known-arity calls + `musttail` on the LLVM backend: every lifted function gets a direct entry (generic `AbiCodeFn` becomes a tail-calling wrapper); module-local saturated calls go direct, direct→direct tail edges `musttail` (pop-frame-before-tail); cross-module stays generic pending `.pmi` publication
+
 ## Context
 
 The wall-4 baseline ([0075](0075-cross-backend-wall-clock-benchmark-harness.md)) quantifies the v1

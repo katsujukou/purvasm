@@ -1,7 +1,11 @@
-# 0073. ulib-shipped native foreign for the native backend: `.c` over the `pv_*` C-ABI, resolved by link-time `pvf_*` symbols
+# 0073. ulib-shipped native foreign, resolved at link time
 
 - Status: Accepted
 - Date: 2026-07-03
+
+## Abstract
+
+`ulib`-shipped native foreign for the native backend: `.c` over the `pv_*` C-ABI (opaque `PVWord` + `ctx`-taking scalar accessors + a rooting contract), resolved by link-time `pvf_*` symbols; PS-first with arity/effect from the `foreign import` signature
 
 ## Context
 

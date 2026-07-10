@@ -1,7 +1,11 @@
-# 0067. v1 Effect execution: thunks as closures, native leaves as Rust `CodeFn`s, and `run_effect`
+# 0067. v1 Effect execution
 
 - Status: ~~Proposed~~ **Accepted** _(2026-07-02: accepted by the maintainer)_
 - Date: 2026-07-02
+
+## Abstract
+
+v1 `Effect` execution: `Effect a` is an ordinary arity-1 closure (thunk), the monad stays compiler-structural, `run_effect` = `apply(main, unit)`, native leaves are Rust `CodeFn`s (C-ABI deferred), lead with value-observable `Effect.Ref` then a generic `stdio_write_line` leaf (adds `new_str` + an injectable output sink, v1 on `Heap`; a boot-parity/smoke-test scaffold until native FFI — `Effect.Console.log` is a `ulib` shadow, not a runtime primitive); behaviour-parity with boot
 
 ## Context
 

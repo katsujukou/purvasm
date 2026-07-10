@@ -1,7 +1,11 @@
-# 0085. Native build orchestration: per-module compilation over an in-memory dependency-summary env, with module-level DictElim as required lowering
+# 0085. Native build orchestration over an in-memory summary env
 
 - Status: ~~Proposed~~ **Accepted** _(2026-07-08: accepted by the maintainer; both tracks signed off on the in-memory-env / persisted-summary split and the co-owned env type)_
 - Date: 2026-07-08
+
+## Abstract
+
+**Native build orchestration**: replace the shortcut driver (`surfaceOf` via a redundant bytecode `compileModule` + monolithic `nativeSplit`, CoreFn→ANF lowered twice/module, no summary thread) with a **per-module compile unit** (`translExpr → normalize → DictElim(env) → (optimize) seam → emit .ll` + a module summary) driven by `build` as a **topological fold threading an in-memory dependency-summary `env`** — the clean pattern boot's *bytecode* build already uses (compile-unit + orchestrator), plus the summary thread it lacks. **DictElim is required lowering** (runs `--no-opt` too, module-level, env-consuming) so its cross-module **dictionary machinery rides the in-memory env — always**, split by *lifetime* from the optimiser's **persisted `--opt`-only `.pmi` `Summary`** (ADR-0084, `Nothing`-omitted, byte-identical): same type at the seam, orthogonal persistence. Kills the double-lowering; the `(optimize)` slot after DictElim is the optimiser track's seam (`Simplify` moves there from its per-binding stopgap). Env dict-machinery = accessor `φ` + instance `{φ→impl}`. Unblocks cross-module DictElim (both tracks were stalled on the missing summary)
 
 ## Context
 

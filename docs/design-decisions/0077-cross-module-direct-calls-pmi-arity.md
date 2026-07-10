@@ -1,7 +1,11 @@
-# 0077. Cross-module direct calls: consume the `.pmi` export surface, and distinguish recursive function members (`Erecfn`)
+# 0077. Cross-module direct calls over the `.pmi` surface
 
 - Status: ~~Proposed~~ **Accepted** _(2026-07-05: accepted by the maintainer after review round 2)_
 - Date: 2026-07-05
+
+## Abstract
+
+Cross-module direct calls: consume the `.pmi` export surface; recursive function members publish as `Erecfn of int` instead of `Efn` (recursiveness — the force-cell vs sentinel env fact — becomes interface-visible; carried via `group.recursive`) with a `format_version` 2→3 lockstep bump; top-level `$d` entries go external, `Gfun` calls skip even the `$root` load; rep publication stays deferred
 
 > **Revision (2026-07-05, maintainer review round 1):** Two P1 findings folded. (1) The record's
 > premise was wrong: recursive syntactic-lambda members are classified `Gfun` (`gdef_of_expr

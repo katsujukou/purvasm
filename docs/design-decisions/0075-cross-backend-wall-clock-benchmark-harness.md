@@ -1,7 +1,11 @@
-# 0075. Cross-backend wall-clock benchmarks: input-size sweeps, scaling exponents, and the wall-4 harness
+# 0075. Cross-backend wall-clock benchmarks
 
 - Status: ~~Proposed~~ **Accepted** _(2026-07-04: accepted by the maintainer)_
 - Date: 2026-07-04
+
+## Abstract
+
+Cross-backend wall-clock benchmarks (wall 4): input-size log sweeps, whole-process min-of-k timing, per-series scaling exponent + ratio-to-`js` baseline; `benchmarks/` PS corpus fed by argv (`purvm run` forwards guest argv); the [0026] steps/allocs harness stays the optimiser regression gate
 
 ## Context
 

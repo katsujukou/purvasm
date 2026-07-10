@@ -1,7 +1,11 @@
-# 0081. `purvasm-regex`: an ES-flavour regex engine in pure PureScript, with `Data.String.Regex` as a `ulib` shadow
+# 0081. `purvasm-regex`: a pure-PureScript regex engine
 
 - Status: ~~Proposed~~ **Accepted** _(2026-07-06: accepted by the maintainer)_
 - Date: 2026-07-06
+
+## Abstract
+
+`purvasm-regex`: an ES-flavour regex engine in pure PureScript (demand = the 0080 CST Lexer's 14 patterns → exact feature floor incl. negative lookahead + 5 Unicode general categories; out-of-floor = loud construction error), `Data.String.Regex` as a `ulib` shadow (`Regex` = unexported ADT, instance ABI preserved); C/PCRE2/libregexp rejected (ES semantics + LLVM-only vs all-backend shadow requirement)
 
 ## Context
 

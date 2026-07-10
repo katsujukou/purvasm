@@ -1,7 +1,11 @@
-# 0071. The codegen↔runtime C-ABI: `extern "C"` surface, real-address code words, the trampoline tail-call protocol, and the value/rooting/panic boundary
+# 0071. The codegen↔runtime C-ABI
 
 - Status: ~~Proposed~~ **Accepted** _(2026-07-02: accepted by the maintainer)_
 - Date: 2026-07-02
+
+## Abstract
+
+Native runtime C ABI: exported context, allocation, root, apply, effect, record, by-need, and primitive helper surface for LLVM-generated code
 
 > **Revision (2026-07-02, pre-acceptance review round 1):** §4 rewritten — the tail-bounce now composes
 > with over-application through an explicit **continuation stack**, and the `pv_tailcall` / `pv_pop_frame`

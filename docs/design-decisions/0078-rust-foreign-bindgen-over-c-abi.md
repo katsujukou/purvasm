@@ -3,6 +3,10 @@
 - Status: Accepted
 - Date: 2026-07-05
 
+## Abstract
+
+Idiomatic Rust native foreigns as a bindgen-style layer over the `pv_*` C ABI: same `pvf_*` symbols, `purvasm-sys`/safe-wrapper/attribute-macro crates speaking only `purvasm.h` (never runtime internals), rooting enforced by frame-lifetime-branded `!Send` handles, single bundled staticlib link with driver-side exactly-one-provider validation + `nm`-class symbol audit; tagged `source` schema (`c` \| `rust-crate`)
+
 ## Context
 
 [0073](0073-ulib-shipped-native-foreign-and-link-time-resolution.md) opened the native-foreign channel:

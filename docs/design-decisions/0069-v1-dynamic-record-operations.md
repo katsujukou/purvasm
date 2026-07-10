@@ -1,7 +1,11 @@
-# 0069. v1 dynamic Record operations: hash-id layout, construction, and get / insert / set / delete / modify
+# 0069. v1 dynamic Record operations
 
 - Status: Accepted
 - Date: 2026-07-02
+
+## Abstract
+
+v1 dynamic Record ops on the ADR-0059/0064 hash-id layout (`[label_ids → RawIds][values → Array]`, sorted FNV-1a-64 ids, parallel values): add `Kind::RawIds` + `new_record` + `get`/`insert`/`set`/`delete`/`modify` (immutable copy-on-update, self-rooting), dynamic keys hashed at runtime; static/literal labels collision-checked at link (ADR-0059), computed keys carry a documented negligible residual
 
 > **Revision (2026-07-03, accepted).** Two additions surfaced by the
 > Record-metaprogramming example:

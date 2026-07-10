@@ -1,7 +1,11 @@
-# 0079. The context header becomes ABI: codegen-inline fast paths for rooting and the trampoline flag
+# 0079. The context header becomes ABI
 
 - Status: ~~Proposed~~ **Accepted** _(2026-07-05: accepted by the maintainer after review round 3)_
 - Date: 2026-07-05
+
+## Abstract
+
+The context header becomes ABI: a versioned `pv_ctx_header` (roots base/len/cap + pending-tail flag) at offset 0 of `pv_ctx`, declared once in `purvasm.h` (runtime + 0078 sys layer + codegen all derive from it, `pv_abi_check` aborts on mismatch); codegen inlines the root/get/frame/pop/settle fast paths as IR — the measured remaining ~15–25 extern crossings per hot iteration — with slow paths unchanged and interoperable per site
 
 > **Revision (2026-07-05, maintainer review round 1 — from the 0078 side):** collision map
 > confirmed as absorbed by §5 (the two contact surfaces are `purvasm.h` and the

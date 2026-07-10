@@ -1,7 +1,11 @@
-# 0070. v1 by-need recursive CAFs: `ByNeed` force, black-hole, and memoisation
+# 0070. v1 by-need recursive CAFs
 
 - Status: Accepted
 - Date: 2026-07-02
+
+## Abstract
+
+v1 by-need recursive CAFs: the `ByNeed` cell `[state][result]` as a 3-state (`Unforced`/`Building`/`Forced`) memoising suspension, `force` = black-hole-then-`apply(thunk,unit)`-then-memoise (cell rooted across the safepoint), `apply` auto-forces a `ByNeed` callee, `Grec` groups over a shared env; builds on the ADR-0069 record store (a field store does not force), unblocks the recursive `Monad Effect` dictionary (ADR-0067 §2 prerequisite)
 
 ## Context
 

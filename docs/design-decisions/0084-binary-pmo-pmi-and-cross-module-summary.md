@@ -3,6 +3,10 @@
 - Status: ~~Proposed~~ **Accepted** _(2026-07-07: accepted by maintainer; JSON additive-field summary + `hash`-untouched/always-recompile invalidation per the revised §4/§5)_
 - Date: 2026-07-07
 
+## Abstract
+
+The **cross-module optimiser summary** ADR-0082 §4 names as its prerequisite — an **`--opt`-only `.pmi` extension**, **not** a binary rewrite of the `.pmi` core (that stays byte-identical to boot; core binarisation is post-boot/future). Publishes each module's **per-module-optimised, pruned `M.Module`** (purs-wasm `summarize` — inline candidates ∪ impure/mem-eff bodies ∪ spec-callees ∪ dict machinery ∪ small; drops large-multi-use-pure ≈7/8; opaque refs to dropped helpers backed by **link-only exports**) + foreign `(arity,vsat,ret_vsat)` shapes as data (ADR-0080). Leaves the `.pmi` `hash` field untouched (export surface, same in both modes) and defers precise fingerprint invalidation — `--opt` always recompiles; the summary is a plain **additive JSON field** (appended after `hash`, absent under `--no-opt`, `version:3` unbumped), **not** a binary envelope. Pins self-pollution (`M` never reads its own summary) and a mode-keyed cache (`--opt`/`--no-opt` never cross-serve). **Unboxing out of scope** (link-time). Gates the optimiser cross-module track, **not** the backend `.ll` track — a real dependency but not an ADR-0082 acceptance blocker
+
 ## Context
 
 [0082](0082-native-codegen-port-to-level-2.md) names a **prerequisite** it does not itself define: a
