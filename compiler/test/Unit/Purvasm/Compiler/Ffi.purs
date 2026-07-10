@@ -9,7 +9,7 @@ import Prelude
 
 import Data.Maybe (Maybe(..))
 import Purvasm.Compiler.CESK.AST (Term(..))
-import Purvasm.Compiler.Ffi (resolver)
+import Purvasm.Compiler.Ffi (intrinsicPrim, resolver)
 import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.Primitive (PrimOp(..))
 import Test.Spec (Spec, describe, it)
@@ -44,3 +44,18 @@ spec = describe "Purvasm.Compiler.Ffi" do
     resolver "Effect.Console.log" `shouldEqual` Nothing
     resolver "Data.Show.showIntImpl" `shouldEqual` Nothing
     resolver "Nonexistent.foreign" `shouldEqual` Nothing
+
+  it "intrinsicPrim reads the primop and arity off an eta-expanded intrinsic" do
+    intrinsicPrim "Data.Semiring.intAdd" `shouldEqual` Just { op: AddInt, arity: 2 }
+    intrinsicPrim "Purvasm.Int.zshr" `shouldEqual` Just { op: ZshrInt, arity: 2 }
+    intrinsicPrim "Data.Int.Bits.complement" `shouldEqual` Just { op: ComplementInt, arity: 1 }
+    intrinsicPrim "Purvasm.Array.unsafeSet" `shouldEqual` Just { op: SetArray, arity: 3 }
+
+  it "intrinsicPrim declines non-eta intrinsics, structural foreigns, and unknown names" do
+    -- identity lambda (charId), composite body (intDegree), constant (unit): intrinsic but not eta-primop
+    intrinsicPrim "Purvasm.Char.toCodePoint" `shouldEqual` Nothing
+    intrinsicPrim "Data.EuclideanRing.intDegree" `shouldEqual` Nothing
+    intrinsicPrim "Data.Unit.unit" `shouldEqual` Nothing
+    -- structural rung and unresolved names never denote a primop
+    intrinsicPrim "Effect.pureE" `shouldEqual` Nothing
+    intrinsicPrim "Nonexistent.foreign" `shouldEqual` Nothing

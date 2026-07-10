@@ -8,9 +8,8 @@
 -- | allocate a boxed value, so they take the ctx and go through the runtime call (`inlinePrim` returns
 -- | `Nothing`, the caller falls back to `primSym`).
 -- |
--- | Note: this compiler's `PrimOp` is missing boot's `Int` bitwise ops (`AndInt`/`OrInt`/…/`ComplementInt`)
--- | and `RecordUnion` (the [adr-0055-native-side-done] gap); `inlinePrim`/`primSym` cover exactly the
--- | `PrimOp`s that exist and grow when those land.
+-- | Note: this compiler's `PrimOp` is missing boot's `RecordUnion` (the [adr-0055-native-side-done]
+-- | gap); `inlinePrim`/`primSym` cover exactly the `PrimOp`s that exist and grow when it lands.
 module Purvasm.Compiler.Backend.LLVM.Prim
   ( primSym
   , inlinePrim
@@ -31,6 +30,13 @@ primSym = case _ of
   MulInt -> Tuple "pv_prim_mul_int" false
   DivInt -> Tuple "pv_prim_div_int" false
   ModInt -> Tuple "pv_prim_mod_int" false
+  AndInt -> Tuple "pv_prim_and_int" false
+  OrInt -> Tuple "pv_prim_or_int" false
+  XorInt -> Tuple "pv_prim_xor_int" false
+  ShlInt -> Tuple "pv_prim_shl_int" false
+  ShrInt -> Tuple "pv_prim_shr_int" false
+  ZshrInt -> Tuple "pv_prim_zshr_int" false
+  ComplementInt -> Tuple "pv_prim_complement_int" false
   EqInt -> Tuple "pv_prim_eq_int" false
   LtInt -> Tuple "pv_prim_lt_int" false
   EqBool -> Tuple "pv_prim_eq_bool" false
@@ -112,6 +118,19 @@ bin32 mnem a b = do
   emit ("  " <> r <> " = " <> mnem <> " i32 " <> va <> ", " <> vb)
   ofI32 r
 
+-- A 32-bit shift on two tagged operands, re-tagged. The shift count is masked `& 31` (prim.rs
+-- `wrapping_shl`/`shr` on a masked count), which also keeps the LLVM shift amount in range (an
+-- unmasked >=32 would be poison).
+shift32 :: String -> String -> String -> Codegen String
+shift32 mnem a b = do
+  va <- toI32 a
+  vb <- toI32 b
+  m <- fresh
+  emit ("  " <> m <> " = and i32 " <> vb <> ", 31")
+  r <- fresh
+  emit ("  " <> r <> " = " <> mnem <> " i32 " <> va <> ", " <> m)
+  ofI32 r
+
 -- A 32-bit comparison, re-tagged as a `Boolean` immediate.
 cmp32 :: String -> String -> String -> Codegen String
 cmp32 cond a b = do
@@ -137,6 +156,17 @@ inlinePrim op ops = case op, ops of
   AddInt, [ a, b ] -> Just <$> bin32 "add" a b
   SubInt, [ a, b ] -> Just <$> bin32 "sub" a b
   MulInt, [ a, b ] -> Just <$> bin32 "mul" a b
+  AndInt, [ a, b ] -> Just <$> bin32 "and" a b
+  OrInt, [ a, b ] -> Just <$> bin32 "or" a b
+  XorInt, [ a, b ] -> Just <$> bin32 "xor" a b
+  ShlInt, [ a, b ] -> Just <$> shift32 "shl" a b
+  ShrInt, [ a, b ] -> Just <$> shift32 "ashr" a b
+  ZshrInt, [ a, b ] -> Just <$> shift32 "lshr" a b
+  ComplementInt, [ a ] -> Just <$> do
+    va <- toI32 a
+    r <- fresh
+    emit ("  " <> r <> " = xor i32 " <> va <> ", -1")
+    ofI32 r
   EqInt, [ a, b ] -> Just <$> cmp32 "eq" a b
   LtInt, [ a, b ] -> Just <$> cmp32 "slt" a b
   EqBool, [ a, b ] -> Just <$> boolBin "icmp eq" a b

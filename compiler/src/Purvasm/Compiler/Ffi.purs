@@ -6,16 +6,17 @@
 -- | native `TmForeign` exactly as it drops an unresolved name (host-resolved at run), so
 -- | for producing `app.pvm` the two are indistinguishable. Hand-written CESK terms; they
 -- | must match boot's verbatim for byte-identical linked images.
-module Purvasm.Compiler.Ffi (resolver) where
+module Purvasm.Compiler.Ffi (resolver, intrinsicPrim) where
 
 import Prelude
 
 import Control.Alt ((<|>))
 import Data.Array ((..))
+import Data.Array as Array
 import Data.Foldable (foldl, foldr)
 import Data.Map (Map)
 import Data.Map as Map
-import Data.Maybe (Maybe)
+import Data.Maybe (Maybe(..))
 import Data.Tuple.Nested (type (/\), (/\))
 import Purvasm.Compiler.CESK.AST (Term(..))
 import Purvasm.Compiler.Literal (Literal(..))
@@ -365,3 +366,22 @@ structural = Map.fromFoldable
 -- | The link resolver: intrinsic rung, then structural rung (first match).
 resolver :: String -> Maybe Term
 resolver key = Map.lookup key intrinsics <|> Map.lookup key structural
+
+-- | The compile-time view of the intrinsic rung: the primop (and its arity) a foreign key
+-- | eta-expands to, or `Nothing` for non-eta intrinsics (constants, `charId`, `intDegree`),
+-- | structural foreigns, and native leaves. Derived from the `intrinsics` terms themselves —
+-- | not a second table — so it can never drift from what the linker resolves. This is what
+-- | lets the optimiser collapse a saturated intrinsic-foreign call to its primop per-module
+-- | (ADR-0027/0028: `DictElim` resolves a method to `intAdd`, `Simplify` turns it into the
+-- | primitive) — under B2 separate compilation the eta body is a *link-time* binding the
+-- | module-local pass would otherwise never see.
+intrinsicPrim :: String -> Maybe { op :: PrimOp, arity :: Int }
+intrinsicPrim key = Map.lookup key intrinsics >>= etaPrim []
+  where
+  -- Match exactly the `eta`-built shape: `\$0 … $n-1 -> Prim(op, [$0; …; $n-1])`, the operands
+  -- the parameters in order — anything else (identity lambdas, composite bodies) declines.
+  etaPrim ps = case _ of
+    TmLam p body -> etaPrim (Array.snoc ps p) body
+    TmPrim op args | not (Array.null ps), args == map TmVar ps ->
+      Just { op, arity: Array.length ps }
+    _ -> Nothing
