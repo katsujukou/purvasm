@@ -17,15 +17,18 @@ import Data.Foldable (foldM)
 import Data.Map as Map
 import Data.Maybe (Maybe(..))
 import Fmt as Fmt
+import Effect.Ref (Ref)
+import Effect.Ref as Ref
 import Purvasm.CLI.Compile (parseModule)
 import Purvasm.CLI.Effect.Env (ENV)
+import Purvasm.CLI.EmitIr (irHooks)
 import Purvasm.CLI.Effect.Filesystem (FS, FilePath)
 import Purvasm.CLI.Effect.Filesystem as FS
 import Purvasm.CLI.Effect.Log (LOG)
 import Purvasm.CLI.Effect.Log as Log
 import Purvasm.CLI.ForeignSigs as ForeignSigs
 import Purvasm.CLI.Ulib (corefnPathFor, requireUlibDir)
-import Purvasm.Compiler (BuildError(..), CompilerAction, LoadResult(..), build, defaultHooks, loadClosure)
+import Purvasm.Compiler (BuildError(..), CompilerAction, LoadResult(..), build, loadClosure)
 import Purvasm.Compiler.Backend.Bytecode (bytecodeBackend)
 import Purvasm.Compiler.Bytecode.Artifact (ModuleArtifact, interfaceToString, moduleToString)
 import Purvasm.Compiler.Bytecode.Image (imageToString)
@@ -33,7 +36,7 @@ import Purvasm.Compiler.CESK.AST (Term(..))
 import Purvasm.Compiler.Ffi as Ffi
 import Purvasm.Compiler.Link (link)
 import Purvasm.Compiler.Literal (Literal(..))
-import Run (EFFECT, Run)
+import Run (EFFECT, Run, liftEffect)
 import Run.Except (EXCEPT, throw)
 import Type.Row (type (+))
 
@@ -43,6 +46,7 @@ type Options =
   , entryModule :: String
   , checkForeignSigs :: Boolean
   , noOpt :: Boolean
+  , emitIr :: Maybe String
   }
 
 options :: ArgParser Options
@@ -75,6 +79,11 @@ options = fromRecord
         \normalisation. `--opt` runs the real optimiser over the ANF — the VM is the optimiser's\n\
         \effect-measurement field (ADR-0088); the emitted bytecode is no longer byte-identical to boot."
         # ArgParser.boolean
+  , emitIr:
+      ArgParser.argument [ "--emit-ir" ]
+        "Trace the named module's per-round optimiser ANF to `<module>.ir` under the build\n\
+        \directory (ADR-0087 §3.1). A trace, not a stop — the build still completes."
+        # ArgParser.optional
   }
 
 -- | The heuristic cap on optimiser fixpoint rounds (ADR-0087 §3.1), mirrored from the native build.
@@ -88,15 +97,16 @@ renderBuildError = case _ of
   LoadFailed e -> Fmt.fmt @"{name}: {detail}" { name: e.moduleName, detail: e.detail }
 
 -- | The CLI `CompilerAction` for the bytecode build over the `Run` stack: single-module CoreFn loading
--- | (through the `ulib` overlay) and per-module `.pmo`/`.pmi` emission. `emitEntry` is inert — the VM
--- | entry is the link-time `mainTerm` the finalisation below supplies.
+-- | (through the `ulib` overlay), per-module `.pmo`/`.pmi` emission, and the shared `--emit-ir` trace
+-- | hooks. `emitEntry` is inert — the VM entry is the link-time `mainTerm` the finalisation below supplies.
 mkAction
   :: forall r
    . Options
   -> FilePath
   -> FilePath
+  -> Ref (Array String)
   -> CompilerAction ModuleArtifact (Run (ENV + LOG + FS + EXCEPT String + EFFECT + r))
-mkAction opts ulibDir buildDir =
+mkAction opts ulibDir buildDir irBuf =
   { workdir: buildDir
   , maxOptimizeIter: optMaxIter
   , loadModule: \name -> do
@@ -115,7 +125,7 @@ mkAction opts ulibDir buildDir =
       Log.info $ Fmt.fmt @"  compiled {name}" { name }
       pure pmoPath
   , emitEntry: \_ -> pure "(vm entry is link-time)"
-  , hooks: defaultHooks
+  , hooks: irHooks opts.emitIr buildDir irBuf
   }
 
 -- | Compile every module reachable from the entry to its `.pmo`/`.pmi`, then link the closure into a
@@ -127,8 +137,9 @@ cmd opts = do
   Log.debug $ Fmt.fmt @"Overlaying patched ulib from {dir}" { dir: ulibDir }
   buildDir <- FS.joinPath [ opts.outDir, "_build" ]
   FS.mkdirP buildDir
+  irBuf <- liftEffect (Ref.new [])
   let
-    action = mkAction opts ulibDir buildDir
+    action = mkAction opts ulibDir buildDir irBuf
     buildOpts =
       { entryModule: opts.entryModule
       , entryName: "main"
