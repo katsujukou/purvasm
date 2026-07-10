@@ -6,8 +6,8 @@
 -- | `emit_gdefs`/`emit_init_all`/`emit_entry_stub`/`module_ll`/`entry_ll`), byte-identical to boot's
 -- | `.ll` (ADR-0082 §2).
 -- |
--- | Slice-1a cut: `Gfun`/`Gcaf` and the entry stub; `Grec` (recursive groups) is a later slice and
--- | crashes with a labelled `unsafeCrashWith`.
+-- | All three `Gdef` classes are emitted: `Gfun`/`Gcaf` (self-hoisted closure / strict CAF) and `Grec`
+-- | (a recursive group built by-need over a shared env via `Emit.buildGrec`, ADR-0070 §4).
 module Purvasm.Compiler.Backend.LLVM.Program
   ( gdefKeys
   , gdefInitKey
@@ -26,17 +26,18 @@ import Control.Monad.Rec.Class (Step(..), tailRec)
 import Control.Monad.State.Class (gets, modify_)
 import Data.Array as Array
 import Data.Foldable (foldl, traverse_)
+import Data.Traversable (traverse)
 import Data.List (List(..), (:))
 import Data.Map (Map)
 import Data.Map as Map
-import Data.Maybe (Maybe(..), maybe)
+import Data.Maybe (Maybe(..))
 import Data.Set (Set)
 import Data.Set as Set
 import Data.String (joinWith)
 import Data.Tuple (Tuple(..), fst, snd)
 import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.Compiler.Backend.LLVM.Abi (abiFrameOpen, abiPopFrame, abiRoot, abiStamp, ctxHeaderVersion, declarations, forceValue)
-import Purvasm.Compiler.Backend.LLVM.Emit (emitPending, expr)
+import Purvasm.Compiler.Backend.LLVM.Emit (buildGrec, emitPending, expr, readVar)
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (fvExpr)
 import Purvasm.Compiler.Backend.LLVM.Mangle (immUnit, mangle, mangleForeign)
 import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, MakeCxOptions, beginFn, emit, emitModule, fresh, makeCx, renderChunks, runCodegen, takeFn)
@@ -56,7 +57,11 @@ gdefInitKey :: Gdef -> String
 gdefInitKey = case _ of
   Gfun k _ _ -> k
   Gcaf k _ -> k
-  Grec ms -> maybe (unsafeCrashWith "Program.gdefInitKey: empty Grec") fst (Array.head ms)
+  -- a `case`, not `maybe (unsafeCrashWith …)`: PureScript is strict, so the crash operand would fire
+  -- eagerly on every (non-empty) group.
+  Grec ms -> case Array.head ms of
+    Just (Tuple k _) -> k
+    Nothing -> unsafeCrashWith "Program.gdefInitKey: empty Grec"
 
 -- | Classify a non-recursive binding: a `Ret (CLam …)` is a function, anything else a strict CAF.
 classifyNonrec :: String -> Expr -> Gdef
@@ -169,8 +174,18 @@ emitGdef = case _ of
           abiPopFrame frame
           storeRootGlobal key v
         Nothing -> unsafeCrashWith "Program.emitGdef: Gcaf body produced no value"
-  Grec _ ->
-    unsafeCrashWith "Program.emitGdef: Grec (recursive group) not yet supported (slice 2)"
+  Grec binds -> case Array.head binds of
+    Nothing -> unsafeCrashWith "Program.emitGdef: empty Grec"
+    Just (Tuple firstKey _) ->
+      emitInitFn firstKey do
+        frame <- abiFrameOpen
+        modify_ \c -> c { frame = frame }
+        -- stable member code symbols, so `gfns`'s pre-registered `$d` names line up.
+        env' <- buildGrec (\m -> Just (mangle m)) Nil binds
+        -- read each member's current cell value *before* popping the transient roots.
+        vals <- traverse (\(Tuple m _) -> Tuple m <$> readVar env' m) binds
+        abiPopFrame frame
+        traverse_ (\(Tuple m v) -> storeRootGlobal m v) vals
 
 -- | Register the unit's own function bindings for direct calls, emit each gdef's root-handle global
 -- | definition(s) (init overwrites the 0 sentinel before any read), then its init function.

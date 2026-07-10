@@ -1,5 +1,5 @@
 -- | Copy-propagation and small-callee inlining (ADR-0028) — the first `--opt` pass, ported
--- | from boot's `Simplify` (`middle_end/passes/simplify.ml`) to the Level-2 ANF. Two
+-- | from boot's `Simplify` (`middle_end/passes/simplify.ml`) to the Level-2 ANF. Three
 -- | scope-respecting, dependency-directed rewrites, applied with an environment threaded down
 -- | the term to a bounded fixpoint:
 -- |
@@ -8,11 +8,21 @@
 -- |   * saturated inlining — a call `f a₁…aₙ` whose binding is `\p₁…pₙ -> Ret c` with `c` *flat*
 -- |     (no nested lambda/if/case) and *closed but for its parameters*, exactly saturated,
 -- |     becomes `c` with each `pᵢ` replaced by `aᵢ`.
+-- |   * intrinsic-foreign saturation — a call `f a₁…aₙ` whose head resolves to a *foreign* key
+-- |     the intrinsic rung eta-expands to an arity-`n` primop becomes `Prim(op, a₁…aₙ)`. Boot's
+-- |     whole-program (B1) `Simplify` got this for free — the linker had already resolved the
+-- |     foreign into an eta-primop binding it then inlined; under B2 separate compilation the
+-- |     eta body is a link-time binding this module-local pass never sees, so the compiler-global
+-- |     intrinsic table (`Ffi.intrinsicPrim`, injected as `IntrinsicLookup`) restores exactly
+-- |     that rewrite. Under-/over-applied intrinsic calls are left for the link-time closure.
 -- |
--- | The decision is the callee's own shape, never who calls it, so the pass stays module-local
--- | ([[optimizer-modular-not-whole-program]]). Semantics-preserving: gated by
--- | `--opt ≡ --no-opt ≡ oracle` (ADR-0082 §2), not byte-identity with boot.
-module Purvasm.Compiler.MiddleEnd.Optimizer.Simplify (run) where
+-- | The decision is the callee's own shape (or the global intrinsic table), never who calls it,
+-- | so the pass stays module-local ([[optimizer-modular-not-whole-program]]). Semantics-preserving:
+-- | gated by `--opt ≡ --no-opt ≡ oracle` (ADR-0082 §2), not byte-identity with boot.
+module Purvasm.Compiler.MiddleEnd.Optimizer.Simplify
+  ( IntrinsicLookup
+  , run
+  ) where
 
 import Prelude
 
@@ -23,6 +33,12 @@ import Data.Map as Map
 import Data.Maybe (Maybe(..), fromMaybe)
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), Alt, CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.Primitive (PrimOp)
+
+-- | The compile-time view of the intrinsic foreign rung (`Ffi.intrinsicPrim`, injected so this
+-- | pass stays table-agnostic and directly testable): the primop an eta-expanded foreign key
+-- | denotes, with its arity.
+type IntrinsicLookup = String -> Maybe { op :: PrimOp, arity :: Int }
 
 -- | What a name is known to denote in the current scope: a copy-propagation alias to an atom,
 -- | or a flat, inlinable function body with its parameter names.
@@ -109,31 +125,31 @@ subst m = go
     c@(CIf _ _ _) -> c
     c@(CCase _ _) -> c
 
-rwExpr :: Map String Known -> Expr -> Expr
-rwExpr env = case _ of
-  Ret c -> Ret (rwCExpr env c)
+rwExpr :: IntrinsicLookup -> Map String Known -> Expr -> Expr
+rwExpr intr env = case _ of
+  Ret c -> Ret (rwCExpr intr env c)
   Let x c body ->
     let
-      c' = rwCExpr env c
+      c' = rwCExpr intr env c
     in
       case c' of
         -- copy-propagation: drop the binding, resolve x to the atom.
-        CAtom a -> rwExpr (Map.insert x (KAlias (resolveAtom env a)) env) body
+        CAtom a -> rwExpr intr (Map.insert x (KAlias (resolveAtom env a)) env) body
         -- a flat, saturable callee: keep its binding, register it for inlining at call sites.
         CLam params (Ret cf)
-          | inlinable params cf -> Let x c' (rwExpr (Map.insert x (KFun params cf) env) body)
+          | inlinable params cf -> Let x c' (rwExpr intr (Map.insert x (KFun params cf) env) body)
         -- x is re-bound to a non-inlinable computation: it must shadow any outer entry.
-        _ -> Let x c' (rwExpr (Map.delete x env) body)
+        _ -> Let x c' (rwExpr intr (Map.delete x env) body)
   LetRec binds body ->
     -- The bound names shadow any outer entries in both the members and the body; recursive
     -- members are conservatively never registered as inlinable.
     let
       env' = removeAll (map _.var binds) env
     in
-      LetRec (map (\b -> b { rhs = rwExpr env' b.rhs }) binds) (rwExpr env' body)
+      LetRec (map (\b -> b { rhs = rwExpr intr env' b.rhs }) binds) (rwExpr intr env' body)
 
-rwCExpr :: Map String Known -> CExpr -> CExpr
-rwCExpr env = case _ of
+rwCExpr :: IntrinsicLookup -> Map String Known -> CExpr -> CExpr
+rwCExpr intr env = case _ of
   CAtom a -> CAtom (resolveAtom env a)
   CApp h args ->
     let
@@ -144,6 +160,10 @@ rwCExpr env = case _ of
           Just (KFun params cf) | Array.length params == Array.length args' ->
             subst (Map.fromFoldable (Array.zip params args')) cf
           _ -> CApp (AtomVar g) args'
+        -- intrinsic-foreign saturation: the eta-primop the linker would bind, collapsed here.
+        AtomForeign k
+          | Just { op, arity } <- intr k
+          , arity == Array.length args' -> CPrim op args'
         h' -> CApp h' args'
   CPrim op args -> CPrim op (map (resolveAtom env) args)
   CCtor t n args -> CCtor t n (map (resolveAtom env) args)
@@ -151,34 +171,34 @@ rwCExpr env = case _ of
   CRecord fs -> CRecord (map (\f -> f { val = resolveAtom env f.val }) fs)
   CAccessor a l -> CAccessor (resolveAtom env a) l
   CUpdate a ups -> CUpdate (resolveAtom env a) (map (\u -> u { val = resolveAtom env u.val }) ups)
-  CLam ps body -> CLam ps (rwExpr (removeAll ps env) body)
-  CIf a t e -> CIf (resolveAtom env a) (rwExpr env t) (rwExpr env e)
-  CCase ats alts -> CCase (map (resolveAtom env) ats) (map (rwAlt env) alts)
+  CLam ps body -> CLam ps (rwExpr intr (removeAll ps env) body)
+  CIf a t e -> CIf (resolveAtom env a) (rwExpr intr env t) (rwExpr intr env e)
+  CCase ats alts -> CCase (map (resolveAtom env) ats) (map (rwAlt intr env) alts)
 
-rwAlt :: Map String Known -> Alt -> Alt
-rwAlt env a =
+rwAlt :: IntrinsicLookup -> Map String Known -> Alt -> Alt
+rwAlt intr env a =
   -- The alternative's binders shadow any outer entries in the result/guards.
   let
     env' = removeAll (a.binders >>= binderVars) env
   in
-    a { result = rwRhs env' a.result }
+    a { result = rwRhs intr env' a.result }
 
-rwRhs :: Map String Known -> Rhs -> Rhs
-rwRhs env = case _ of
-  Uncond e -> Uncond (rwExpr env e)
-  Guarded gs -> Guarded (map (\g -> { guard: rwExpr env g.guard, rhs: rwExpr env g.rhs }) gs)
+rwRhs :: IntrinsicLookup -> Map String Known -> Rhs -> Rhs
+rwRhs intr env = case _ of
+  Uncond e -> Uncond (rwExpr intr env e)
+  Guarded gs -> Guarded (map (\g -> { guard: rwExpr intr env g.guard, rhs: rwExpr intr env g.rhs }) gs)
 
--- | Run the two rewrites to a bounded fixpoint: a flat inlined body may expose a further
+-- | Run the three rewrites to a bounded fixpoint: a flat inlined body may expose a further
 -- | inline, but in practice one or two passes suffice (eta-primops are non-recursive); the cap
 -- | bounds any pathological chain. Convergence is detected structurally (a fired rewrite always
 -- | changes the term).
-run :: Expr -> Expr
-run = loop 5
+run :: IntrinsicLookup -> Expr -> Expr
+run intr = loop 5
   where
   loop n e
     | n <= 0 = e
     | otherwise =
         let
-          e' = rwExpr Map.empty e
+          e' = rwExpr intr Map.empty e
         in
           if e' == e then e' else loop (n - 1) e'

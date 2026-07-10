@@ -30,8 +30,10 @@ import Test.Unit.Purvasm.Compiler.Link as Link
 import Test.Unit.Purvasm.Compiler.MiddleEnd.ANF.Pretty as MiddleEnd.ANF.Pretty
 import Test.Unit.Purvasm.Compiler.MiddleEnd.MatchCompile as MiddleEnd.MatchCompile
 import Test.Unit.Purvasm.Compiler.MiddleEnd.Normalize as MiddleEnd.Normalize
+import Test.Unit.Purvasm.Compiler.MiddleEnd.Optimizer as MiddleEnd.Optimizer
 import Test.Unit.Purvasm.Compiler.MiddleEnd.Optimizer.DictElim as MiddleEnd.Optimizer.DictElim
 import Test.Unit.Purvasm.Compiler.MiddleEnd.Optimizer.Simplify as MiddleEnd.Optimizer.Simplify
+import Test.Unit.Purvasm.Compiler.Util.Fnv1a64 as Util.Fnv1a64
 import Test.Unit.Purvasm.Compiler.Util.Int64Decimal as Util.Int64Decimal
 import Test.Unit.Purvasm.Compiler.Util.MD5 as Util.MD5
 
@@ -41,6 +43,7 @@ main = runSpecAndExitProcess [ consoleReporter ] do
   MiddleEnd.MatchCompile.spec
   MiddleEnd.Optimizer.DictElim.spec
   MiddleEnd.Optimizer.Simplify.spec
+  MiddleEnd.Optimizer.spec
   MiddleEnd.ANF.Pretty.spec
   CESK.Translate.spec
   Bytecode.Lower.spec
@@ -63,3 +66,4 @@ main = runSpecAndExitProcess [ consoleReporter ] do
   Link.spec
   Util.MD5.spec
   Util.Int64Decimal.spec
+  Util.Fnv1a64.spec

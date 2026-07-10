@@ -21,6 +21,7 @@ module Purvasm.Compiler.Backend.LLVM.Monad
   , fresh
   , freshLabel
   , freshFn
+  , freshStrName
   , emit
   , emitModule
   , emitGlobal
@@ -130,6 +131,11 @@ freshLabel prefix = state \c -> let n = c.lbl + 1 in Tuple (prefix <> show n) c 
 -- | `recfn_`, `susp_`).
 freshFn :: String -> Codegen String
 freshFn prefix = state \c -> let n = c.fns + 1 in Tuple (prefix <> show n) c { fns = n }
+
+-- | A fresh module-level string-constant name `@.str.N` off the module-global string counter (never
+-- | reset per function), matching boot's `Printf.sprintf "@.str.%d" cx.strs`.
+freshStrName :: Codegen String
+freshStrName = state \c -> let n = c.strs + 1 in Tuple ("@.str." <> show n) c { strs = n }
 
 -- | Emit one line into the current function body (boot's `emit`, which appends the line + `'\n'`).
 emit :: String -> Codegen Unit

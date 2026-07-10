@@ -7,9 +7,10 @@
 -- |     computed once and handed to the fixpoint (they do not change across iterations).
 -- |   * `optimizeModule env localFacts am` — **one pass** of the real optimiser
 -- |     `DictElim ∘ Simplify ∘ Specialize ∘ Inlining ∘ …` over the module's bodies, returning
--- |     `{ module, summary }`. Only `DictElim` is wired today; the remaining passes are the optimiser
--- |     track's. **Iterating this pass to a fixpoint is the build driver's job** (ADR-0087) — the seam stays
--- |     a pure single step the driver can bracket with inspection hooks.
+-- |     `{ module, summary }`. `DictElim` and `Simplify` (with the intrinsic-foreign saturation) are
+-- |     wired today; the remaining passes are the optimiser track's. **Iterating this pass to a fixpoint
+-- |     is the build driver's job** (ADR-0087) — the seam stays a pure single step the driver can bracket
+-- |     with inspection hooks.
 -- |
 -- | This is the `--opt` path only. Under `--no-opt` the driver is the identity (ADR-0086 Addendum): it runs
 -- | **no** `DictElim` here. `DictElim` is now purely an optimiser pass; the native backend's `--no-opt`
@@ -37,8 +38,10 @@ import Data.Maybe (Maybe(..))
 import Data.Set (Set)
 import Data.Set as Set
 import Purvasm.Compiler.Bytecode.Artifact (Summary)
+import Purvasm.Compiler.Ffi (intrinsicPrim)
 import Purvasm.Compiler.MiddleEnd.Module (AnfModule, declKeys, mapDeclBodies)
 import Purvasm.Compiler.MiddleEnd.Optimizer.DictElim (DictMachinery, dictElimExpr, emptyMachinery, machineryOf, mergeMachinery)
+import Purvasm.Compiler.MiddleEnd.Optimizer.Simplify (run) as Simplify
 
 -- | The per-build, in-memory optimiser environment threaded through the module fold — carrying the facts
 -- | a module's **dependencies** contributed (their dictionary machinery, so an imported accessor/instance
@@ -80,20 +83,21 @@ localFactsOf am =
   , gkeys: Set.fromFoldable (Array.concatMap declKeys am.decls)
   }
 
--- | One pass of the real optimiser (ADR-0086 §3, the `--opt` leg): `DictElim ∘ Simplify ∘ …` over the
--- | module's bodies, under the module-visible env (`env` deps ∪ `localFacts`), returning the rewritten
--- | `AnfModule` **and its `BuildSummary`** (ADR-0086 pins `{ module, summary }`, so a summary derived from
--- | the *optimised* module reaches dependents). The **driver iterates this to a fixpoint** (ADR-0087),
--- | threading `.module` and keeping the last pass's `.summary`. Only `DictElim` is wired today (idempotent,
--- | so a module with no static dispatch converges in one round); the Simplify → Dbe → … → NbE pipeline is
--- | the optimiser track's to add here.
+-- | One pass of the real optimiser (ADR-0086 §3, the `--opt` leg): `Simplify ∘ DictElim` over the
+-- | module's bodies (`DictElim` first — it resolves a method call to its impl, e.g. `intAdd`, which
+-- | `Simplify` then collapses to the primitive; ADR-0027/0028), under the module-visible env (`env` deps
+-- | ∪ `localFacts`), returning the rewritten `AnfModule` **and its `BuildSummary`** (ADR-0086 pins
+-- | `{ module, summary }`, so a summary derived from the *optimised* module reaches dependents). The
+-- | **driver iterates this to a fixpoint** (ADR-0087), threading `.module` and keeping the last pass's
+-- | `.summary`. The Dbe → EffectAnalysis → Specialize → NbE pipeline is the optimiser track's to add here.
 optimizeModule :: BuildEnv -> LocalFacts -> AnfModule -> { module :: AnfModule, summary :: BuildSummary }
 optimizeModule (BuildEnv env) lf am =
   let
     full = mergeMachinery lf.dict env.dict
     gkeys = Set.union lf.gkeys env.gkeys
+    passes = Simplify.run intrinsicPrim <<< dictElimExpr gkeys full
   in
-    { module: am { decls = map (mapDeclBodies (dictElimExpr gkeys full)) am.decls }
+    { module: am { decls = map (mapDeclBodies passes) am.decls }
     , summary: summaryOfLocal lf
     }
 

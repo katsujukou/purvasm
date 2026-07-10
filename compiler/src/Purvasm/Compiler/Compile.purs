@@ -19,6 +19,7 @@ import Purvasm.Compiler.Bytecode.Artifact (Group, ModuleArtifact)
 import Purvasm.Compiler.Bytecode.Codegen (gdefOfExpr)
 import Purvasm.Compiler.CESK.FreeVars (freeVarsSet)
 import Purvasm.Compiler.CESK.Translate (nameKey, qualifiedKey, translExpr)
+import Purvasm.Compiler.Ffi (intrinsicPrim)
 import Purvasm.Compiler.MiddleEnd.ANF (Expr) as Anf
 import Purvasm.Compiler.MiddleEnd.Normalize (normalize)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Simplify as Simplify
@@ -29,7 +30,7 @@ import Purvasm.Compiler.MiddleEnd.Optimizer.Simplify as Simplify
 -- | today it is copy-propagation + small-callee inlining (ADR-0028).
 optimizeAnf :: Boolean -> Anf.Expr -> Anf.Expr
 optimizeAnf false = identity
-optimizeAnf true = Simplify.run
+optimizeAnf true = Simplify.run intrinsicPrim
 
 -- | One CoreFn binding → a linkable group: lower each right-hand side, record its free
 -- | variables as (sorted) dependencies, and classify its ANF into a `Gdef`. A recursive

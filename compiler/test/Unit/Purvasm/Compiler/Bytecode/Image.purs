@@ -8,8 +8,9 @@ import Prelude
 
 import Data.Tuple.Nested ((/\))
 import Purvasm.Compiler.Bytecode.Codegen (Gdef(..))
-import Purvasm.Compiler.Bytecode.Image (Json(..), floatToJson, imageToString, stringify)
+import Purvasm.Compiler.Bytecode.Image (Json(..), floatToJson, imageToString, primTag, stringify)
 import Purvasm.Compiler.Bytecode.Instruction (Instruction(..))
+import Purvasm.Compiler.Primitive (PrimOp(..))
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
 
@@ -34,6 +35,16 @@ spec = describe "Purvasm.Compiler.Bytecode.Image" do
 
     it "escapes other control characters as \\u00XX (lowercase, 4 digits)" do
       stringify (JStr "\x01") `shouldEqual` "\"\\u0001\""
+
+  describe "primTag" do
+    it "tags the Int bitwise family with boot's constructor names (Image.prim_tags)" do
+      primTag AndInt `shouldEqual` "AndInt"
+      primTag OrInt `shouldEqual` "OrInt"
+      primTag XorInt `shouldEqual` "XorInt"
+      primTag ShlInt `shouldEqual` "ShlInt"
+      primTag ShrInt `shouldEqual` "ShrInt"
+      primTag ZshrInt `shouldEqual` "ZshrInt"
+      primTag ComplementInt `shouldEqual` "ComplementInt"
 
   describe "imageToString" do
     it "serialises a linked image with version/gdefs/main/effect keys in order" do
