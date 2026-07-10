@@ -1,8 +1,12 @@
--- | The optimiser seam (ADR-0086 §3): one `optimizeModule` pass must compose `DictElim` then
--- | `Simplify` (a resolved method call collapses all the way to its primitive in a single round),
--- | resolve dispatch against the dependency env (`extendSummary` threading) exactly like a local
--- | one, and never persist a summary today (`persistedSummary = Nothing`, ADR-0084 §5 — the
--- | `.pmi` stays byte-for-byte boot's).
+-- | The optimiser seam (ADR-0086 §3): one `optimizeModule` pass must compose `DictElim` then the
+-- | NbE inliner (a resolved method call on literal operands collapses all the way to its folded
+-- | constant in a single round, ADR-0089), resolve dispatch against the dependency env
+-- | (`extendSummary` threading) exactly like a local one, and never persist a summary today
+-- | (`persistedSummary = Nothing`, ADR-0084 §5 — the `.pmi` stays byte-for-byte boot's).
+-- |
+-- | The NbE pass α-renames every binder to the reserved `$q<n>` supply and folds the accessor's
+-- | irrefutable single-`BVar` case — the expected shapes below are the *normalised* decls, not the
+-- | inputs.
 module Test.Unit.Purvasm.Compiler.MiddleEnd.Optimizer where
 
 import Prelude
@@ -14,7 +18,6 @@ import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
 import Purvasm.Compiler.MiddleEnd.Module (AnfModule, Decl)
 import Purvasm.Compiler.MiddleEnd.Optimizer (emptyBuildEnv, extendSummary, localFactsOf, optimizeModule, persistedSummary)
-import Purvasm.Compiler.Primitive (PrimOp(..))
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
 
@@ -51,13 +54,19 @@ useDecl :: String -> String -> String -> Decl
 useDecl k acc inst = nonrec k
   (Ret (CApp (var acc) [ var inst, AtomLit (LInt 1), AtomLit (LInt 2) ]))
 
+-- `AddInt(1, 2)` constant-folds under the NbE pass (VM-exact folding, ADR-0089 §5).
 collapsed :: Expr
-collapsed = Ret (CPrim AddInt [ AtomLit (LInt 1), AtomLit (LInt 2) ])
+collapsed = Ret (CAtom (AtomLit (LInt 3)))
+
+-- The accessor after normalisation: the irrefutable single-`BVar` case folds and the param is
+-- `$q`-renamed.
+accessorOpt :: Expr
+accessorOpt = Ret (CLam [ "$q1" ] (Ret (CAccessor (var "$q1") "add")))
 
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
   describe "optimizeModule" do
-    it "collapses a locally-known method call to its primitive in one pass (DictElim then Simplify)" do
+    it "collapses a locally-known method call to its folded constant in one pass (DictElim then NbE)" do
       let
         am :: AnfModule
         am =
@@ -70,15 +79,15 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
           }
         r = optimizeModule emptyBuildEnv (localFactsOf emptyBuildEnv am) am
       map _.members r.module.decls `shouldEqual`
-        [ (accessorDecl "Test.M.add").members
+        [ [ "Test.M.add" /\ accessorOpt ]
         , (instanceDecl "Test.M.semiringInt").members
         , [ "Test.M.three" /\ collapsed ]
         ]
 
     it "collapses through a floated dictionary application (the purs one-time-extraction shape)" do
       -- add1 = add semiringInt (its own top-level binding, the shape purs floats); the loop body
-      -- calls add1 — DictElim turns add1 into the intAdd alias, and Simplify's sibling facts
-      -- collapse the call to the primitive.
+      -- calls add1 — DictElim turns add1 into the intAdd alias, and the NbE sibling facts
+      -- collapse the call to the (folded) primitive.
       let
         am :: AnfModule
         am =
@@ -94,7 +103,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
           }
         r = optimizeModule emptyBuildEnv (localFactsOf emptyBuildEnv am) am
       map _.members r.module.decls `shouldEqual`
-        [ (accessorDecl "Test.M.add").members
+        [ [ "Test.M.add" /\ accessorOpt ]
         , (instanceDecl "Test.M.semiringInt").members
         , [ "Test.M.add1" /\ Ret (CAtom (AtomForeign "Data.Semiring.intAdd")) ]
         , [ "Test.M.three" /\ collapsed ]

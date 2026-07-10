@@ -1,0 +1,322 @@
+-- | The NbE general inliner's invariants (ADR-0089): the blow-up regression fixtures (§7 — the
+-- | known failure shapes as permanent executable tests), the effect-soundness pins (§5), and the
+-- | `Simplify` positive/negative suite transferred as NbE equivalents (§8 slice-1 test-transfer —
+-- | the retirement gate). The engine α-renames every binder to the reserved `$q<n>` supply, so
+-- | expected terms carry `$q` binders (deterministic per binding); free names are verbatim.
+module Test.Unit.Purvasm.Compiler.MiddleEnd.Optimizer.Nbe where
+
+import Prelude
+
+import Data.Tuple.Nested ((/\))
+import Purvasm.Compiler.Binder (Binder(..))
+import Purvasm.Compiler.Ffi (intrinsicPrim)
+import Purvasm.Compiler.Literal (Literal(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.MiddleEnd.Module (Decl)
+import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe (nbeBinding, nbeEnvOf)
+import Purvasm.Compiler.Primitive (PrimOp(..))
+import Test.Spec (Spec, describe, it)
+import Test.Spec.Assertions (shouldEqual)
+
+var :: String -> Atom
+var = AtomVar
+
+int :: Int -> Atom
+int = AtomLit <<< LInt
+
+nonrec :: String -> Expr -> Decl
+nonrec k e = { recursive: false, members: [ k /\ e ] }
+
+-- Normalise one body with no module siblings…
+nbe :: Expr -> Expr
+nbe = nbeWith []
+
+-- …or against the given sibling decls (the gate-site-A channel).
+nbeWith :: Array Decl -> Expr -> Expr
+nbeWith decls = nbeBinding (nbeEnvOf intrinsicPrim decls) "Test.binding"
+
+spec :: Spec Unit
+spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
+  describe "blow-up fixtures (ADR-0089 §7)" do
+    it "diamond: a multi-use non-reducing binding stays one shared let per level (never 2^depth)" do
+      -- let d1 = {a: base, b: base} in let d2 = {a: d1, b: d1} in {a: d2, b: d2}
+      let
+        recOf a = CRecord [ { prop: "a", val: a }, { prop: "b", val: a } ]
+      nbe
+        ( Let "d1" (recOf (var "base"))
+            (Let "d2" (recOf (var "d1")) (Ret (recOf (var "d2"))))
+        )
+        `shouldEqual`
+          Let "$q1" (recOf (var "base"))
+            (Let "$q2" (recOf (var "$q1")) (Ret (recOf (var "$q2"))))
+
+    it "a large dispatch-shaped sibling stays a call at the gate (the 0001 blow-up class)" do
+      -- M.big = \x -> <a 20-deep let chain, size ≥ 64>: every gate-A clause fails.
+      let
+        chain 0 = Ret (CAtom (var "x"))
+        chain n = Let ("v" <> show n) (CPrim AddInt [ var "x", var "x" ]) (chain (n - 1))
+        big = nonrec "M.big" (Ret (CLam [ "x" ] (chain 20)))
+        call = Ret (CApp (var "M.big") [ var "y" ])
+      nbeWith [ big ] call `shouldEqual` call
+
+    it "positive control: a small sibling unfolds and case-of-known-constructor collapses" do
+      -- M.small = \x -> case x of Just(v) -> v; _ -> 0  — applied to a known Just(5).
+      let
+        small = nonrec "M.small"
+          ( Ret
+              ( CLam [ "x" ]
+                  ( Ret
+                      ( CCase [ var "x" ]
+                          [ { binders: [ BCtor "Just" [ BVar "v" ] ]
+                            , result: Uncond (Ret (CAtom (var "v")))
+                            }
+                          , { binders: [ BNull ], result: Uncond (Ret (CAtom (int 0))) }
+                          ]
+                      )
+                  )
+              )
+          )
+      nbeWith [ small ]
+        ( Let "j" (CCtor "Just" 1 [ int 5 ])
+            (Ret (CApp (var "M.small") [ var "j" ]))
+        )
+        `shouldEqual` Ret (CAtom (int 5))
+
+    it "effect-reorder trap: pinned neutral calls keep their sequencing, even used in reverse" do
+      let
+        trap =
+          Let "a" (CApp (var "f") [ var "x" ])
+            ( Let "b" (CApp (var "g") [ var "y" ])
+                (Ret (CPrim AddInt [ var "b", var "a" ]))
+            )
+      nbe trap `shouldEqual`
+        Let "$q1" (CApp (var "f") [ var "x" ])
+          ( Let "$q2" (CApp (var "g") [ var "y" ])
+              (Ret (CPrim AddInt [ var "$q2", var "$q1" ]))
+          )
+
+    it "a dead neutral call is kept (may perform when forced; dropping waits for purity facts)" do
+      nbe (Let "a" (CApp (var "f") [ var "x" ]) (Ret (CAtom (int 1))))
+        `shouldEqual` Let "$q1" (CApp (var "f") [ var "x" ]) (Ret (CAtom (int 1)))
+
+    it "a recursive group member is never unfolded (recursion stays a call)" do
+      let
+        loop =
+          LetRec [ { var: "go", rhs: Ret (CLam [ "i" ] (Ret (CApp (var "go") [ var "i" ]))) } ]
+            (Ret (CApp (var "go") [ int 0 ]))
+      nbe loop `shouldEqual`
+        LetRec [ { var: "$q1", rhs: Ret (CLam [ "$q2" ] (Ret (CApp (var "$q1") [ var "$q2" ]))) } ]
+          (Ret (CApp (var "$q1") [ int 0 ]))
+
+    it "a recursive sibling decl is never published for unfolding" do
+      let
+        recDecl = { recursive: true, members: [ "M.r" /\ Ret (CAtom (AtomForeign "Data.Semiring.intAdd")) ] }
+        call = Ret (CApp (var "M.r") [ var "p", var "q" ])
+      nbeWith [ recDecl ] call `shouldEqual` call
+
+  describe "reductions" do
+    it "constant-folds a primop on literals (VM-exact)" do
+      nbe (Ret (CPrim AddInt [ int 2, int 3 ])) `shouldEqual` Ret (CAtom (int 5))
+      nbe (Ret (CPrim DivInt [ int 7, int 0 ])) `shouldEqual` Ret (CAtom (int 0))
+
+    it "folds a projection on a known record through a shared let (round 2)" do
+      nbe
+        ( Let "r" (CRecord [ { prop: "f", val: int 7 } ])
+            (Ret (CAccessor (var "r") "f"))
+        )
+        `shouldEqual` Ret (CAtom (int 7))
+
+    it "drops a dead value binding" do
+      nbe (Let "r" (CRecord [ { prop: "f", val: int 7 } ]) (Ret (CAtom (int 1))))
+        `shouldEqual` Ret (CAtom (int 1))
+
+    it "keeps a case whose decidable match lands on a guarded alternative (guard order observable)" do
+      let
+        guarded =
+          Let "j" (CCtor "Just" 1 [ int 5 ])
+            ( Ret
+                ( CCase [ var "j" ]
+                    [ { binders: [ BCtor "Just" [ BVar "v" ] ]
+                      , result: Guarded [ { guard: Ret (CAtom (var "p")), rhs: Ret (CAtom (var "v")) } ]
+                      }
+                    ]
+                )
+            )
+      nbe guarded `shouldEqual`
+        Let "$q1" (CCtor "Just" 1 [ int 5 ])
+          ( Ret
+              ( CCase [ var "$q1" ]
+                  [ { binders: [ BCtor "Just" [ BVar "$q2" ] ]
+                    , result: Guarded [ { guard: Ret (CAtom (var "p")), rhs: Ret (CAtom (var "$q2")) } ]
+                    }
+                  ]
+              )
+          )
+
+  describe "Simplify test-transfer (ADR-0089 §8: the retirement gate)" do
+    it "copy-propagation: drops `let x = <atom>` and resolves x to the atom" do
+      nbe (Let "x" (CAtom (int 7)) (Ret (CAtom (var "x"))))
+        `shouldEqual` Ret (CAtom (int 7))
+
+    it "copy-propagation: chases an alias chain to the underlying atom" do
+      nbe
+        ( Let "x" (CAtom (var "y"))
+            (Let "z" (CAtom (var "x")) (Ret (CPrim AddInt [ var "z", var "z" ])))
+        )
+        `shouldEqual` Ret (CPrim AddInt [ var "y", var "y" ])
+
+    it "sinks a single-use pure primop to its use site (Simplify kept it; sinking is strictly finer)" do
+      nbe (Let "x" (CPrim AddInt [ var "a", var "b" ]) (Ret (CAtom (var "x"))))
+        `shouldEqual` Ret (CPrim AddInt [ var "a", var "b" ])
+
+    it "inlines a flat, parameter-closed callee at a fully-applied call (binding drops when dead)" do
+      nbe
+        ( Let "f" (CLam [ "a", "b" ] (Ret (CPrim AddInt [ var "a", var "b" ])))
+            (Ret (CApp (var "f") [ var "p", var "q" ]))
+        )
+        `shouldEqual` Ret (CPrim AddInt [ var "p", var "q" ])
+
+    it "reduces an under-applied call to the specialised closure (β on the partial application)" do
+      -- the body was CAF-shaped, so the specialised lambda is re-shared under $q0 (the P1
+      -- binding-surface guard: ExportKind must stay mode-stable).
+      nbe
+        ( Let "f" (CLam [ "a", "b" ] (Ret (CPrim AddInt [ var "a", var "b" ])))
+            (Ret (CApp (var "f") [ var "p" ]))
+        )
+        `shouldEqual`
+          Let "$q0" (CLam [ "$q1" ] (Ret (CPrim AddInt [ var "p", var "$q1" ])))
+            (Ret (CAtom (var "$q0")))
+
+    it "inlines a non-flat callee (nested if) — the capability Simplify's flat gate could not express" do
+      nbe
+        ( Let "f"
+            (CLam [ "a" ] (Ret (CIf (var "a") (Ret (CAtom (int 1))) (Ret (CAtom (int 0))))))
+            (Ret (CApp (var "f") [ var "p" ]))
+        )
+        `shouldEqual` Ret (CIf (var "p") (Ret (CAtom (int 1))) (Ret (CAtom (int 0))))
+
+    it "scope: an alias never resolves through a shadowing case binder (α-renamed apart)" do
+      -- alt 1 rebinds `x` (must shadow the outer alias); alt 2 does not (the alias applies → y).
+      nbe
+        ( Let "x" (CAtom (var "y"))
+            ( Ret
+                ( CCase [ var "s" ]
+                    [ { binders: [ BCtor "Just" [ BVar "x" ] ]
+                      , result: Uncond (Ret (CPrim AddInt [ var "x", var "x" ]))
+                      }
+                    , { binders: [ BNull ], result: Uncond (Ret (CAtom (var "x"))) }
+                    ]
+                )
+            )
+        )
+        `shouldEqual`
+          Ret
+            ( CCase [ var "s" ]
+                [ { binders: [ BCtor "Just" [ BVar "$q1" ] ]
+                  , result: Uncond (Ret (CPrim AddInt [ var "$q1", var "$q1" ]))
+                  }
+                , { binders: [ BNull ], result: Uncond (Ret (CAtom (var "y"))) }
+                ]
+            )
+
+    it "folds an irrefutable single-BVar case even on an unknown scrutinee" do
+      -- `case s of x -> x` ≡ `s`: the row is decidable regardless of the scrutinee's value.
+      nbe
+        ( Ret
+            ( CCase [ var "s" ]
+                [ { binders: [ BVar "x" ], result: Uncond (Ret (CAtom (var "x"))) } ]
+            )
+        )
+        `shouldEqual` Ret (CAtom (var "s"))
+
+    it "collapses an exactly-saturated intrinsic-foreign call to its primop (both spellings)" do
+      nbe (Ret (CApp (AtomForeign "Data.Semiring.intAdd") [ var "p", var "q" ]))
+        `shouldEqual` Ret (CPrim AddInt [ var "p", var "q" ])
+      nbe (Ret (CApp (var "Data.Semiring.intAdd") [ var "p", var "q" ]))
+        `shouldEqual` Ret (CPrim AddInt [ var "p", var "q" ])
+
+    it "saturates an intrinsic through a local alias spine" do
+      nbe
+        ( Let "f" (CAtom (AtomForeign "Data.Semiring.intAdd"))
+            (Ret (CApp (var "f") [ var "p", var "q" ]))
+        )
+        `shouldEqual` Ret (CPrim AddInt [ var "p", var "q" ])
+
+    it "leaves an under- or over-applied intrinsic call to the link-time closure" do
+      let under = Ret (CApp (AtomForeign "Data.Semiring.intAdd") [ var "p" ])
+      let over = Ret (CApp (AtomForeign "Data.Semiring.intAdd") [ var "p", var "q", var "r" ])
+      nbe under `shouldEqual` under
+      nbe over `shouldEqual` over
+
+    it "leaves a non-intrinsic foreign call untouched" do
+      let e = Ret (CApp (AtomForeign "Effect.Console.log") [ var "p" ])
+      nbe e `shouldEqual` e
+
+    it "collapses a call through a sibling top-level alias (the floated dictionary application)" do
+      nbeWith [ nonrec "M.add1" (Ret (CAtom (AtomForeign "Data.Semiring.intAdd"))) ]
+        (Ret (CApp (var "M.add1") [ var "p", var "q" ]))
+        `shouldEqual` Ret (CPrim AddInt [ var "p", var "q" ])
+
+    it "inlines a small sibling top-level function at a saturated call" do
+      nbeWith [ nonrec "M.f" (Ret (CLam [ "a", "b" ] (Ret (CPrim AddInt [ var "a", var "b" ])))) ]
+        (Ret (CApp (var "M.f") [ var "p", var "q" ]))
+        `shouldEqual` Ret (CPrim AddInt [ var "p", var "q" ])
+
+  describe "review pins (P1/P2)" do
+    it "a CAF body never becomes a bare lambda (the .pmi ExportKind stays mode-stable)" do
+      -- f = let g = \x -> x in g  reduces to the lambda; the binding surface re-shares it under
+      -- the reserved $q0 so classifyDecl/ExportKind (and the .pmi hash) match --no-opt.
+      let
+        caf =
+          Let "g" (CLam [ "x" ] (Ret (CAtom (var "x"))))
+            (Ret (CAtom (var "g")))
+        wrapped =
+          Let "$q0" (CLam [ "$q1" ] (Ret (CAtom (var "$q1"))))
+            (Ret (CAtom (var "$q0")))
+      nbe caf `shouldEqual` wrapped
+      -- and the wrap is a fixpoint across driver rounds
+      nbe wrapped `shouldEqual` wrapped
+
+    it "applies marks discovered on an already-normal input (a later DictElim can expose them)" do
+      -- The input is already $q-normal, so the first quote is the identity — the sinkable pure
+      -- primop must still be found and applied, not skipped by premature convergence.
+      nbe (Let "$q1" (CPrim AddInt [ var "a", var "b" ]) (Ret (CAtom (var "$q1"))))
+        `shouldEqual` Ret (CPrim AddInt [ var "a", var "b" ])
+
+    it "a large multi-use lambda over globals is not 'closed' (no unconditional inline)" do
+      let
+        chain 0 = Ret (CAtom (var "v1"))
+        chain n = Let ("v" <> show n) (CApp (var "M.g") [ var "x" ]) (chain (n - 1))
+        e =
+          Let "f" (CLam [ "x" ] (chain 5))
+            (Ret (CRecord [ { prop: "a", val: var "f" }, { prop: "b", val: var "f" } ]))
+        sharedLambda = case nbe e of
+          Let _ (CLam _ _) _ -> true
+          _ -> false
+      sharedLambda `shouldEqual` true
+
+  describe "determinism" do
+    it "normalising twice is the identity on the normal form (stable $q numbering)" do
+      let
+        e = nbe
+          ( Let "d" (CRecord [ { prop: "a", val: var "base" }, { prop: "b", val: var "base" } ])
+              (Ret (CRecord [ { prop: "a", val: var "d" }, { prop: "b", val: var "d" } ]))
+          )
+      nbe e `shouldEqual` e
+
+  describe "nbeEnvOf" do
+    it "publishes only non-recursive value/lambda bodies" do
+      let
+        env = nbeEnvOf intrinsicPrim
+          [ nonrec "M.lam" (Ret (CLam [ "x" ] (Ret (CAtom (var "x")))))
+          , nonrec "M.alias" (Ret (CAtom (var "M.lam")))
+          , nonrec "M.caf" (Ret (CApp (var "M.lam") [ int 1 ]))
+          , { recursive: true, members: [ "M.rec" /\ Ret (CLam [ "x" ] (Ret (CAtom (var "x")))) ] }
+          ]
+      -- membership probed through nbeBinding behaviour instead of map internals:
+      -- the lambda inlines, the computation CAF and the recursive member stay calls.
+      nbeBinding env "t" (Ret (CApp (var "M.lam") [ var "p" ])) `shouldEqual` Ret (CAtom (var "p"))
+      nbeBinding env "t" (Ret (CApp (var "M.caf") [ var "p" ]))
+        `shouldEqual` Ret (CApp (var "M.caf") [ var "p" ])
+      nbeBinding env "t" (Ret (CApp (var "M.rec") [ var "p" ]))
+        `shouldEqual` Ret (CApp (var "M.rec") [ var "p" ])
