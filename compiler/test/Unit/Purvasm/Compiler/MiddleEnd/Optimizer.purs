@@ -68,10 +68,35 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
               , useDecl "Test.M.three" "Test.M.add" "Test.M.semiringInt"
               ]
           }
-        r = optimizeModule emptyBuildEnv (localFactsOf am) am
+        r = optimizeModule emptyBuildEnv (localFactsOf emptyBuildEnv am) am
       map _.members r.module.decls `shouldEqual`
         [ (accessorDecl "Test.M.add").members
         , (instanceDecl "Test.M.semiringInt").members
+        , [ "Test.M.three" /\ collapsed ]
+        ]
+
+    it "collapses through a floated dictionary application (the purs one-time-extraction shape)" do
+      -- add1 = add semiringInt (its own top-level binding, the shape purs floats); the loop body
+      -- calls add1 — DictElim turns add1 into the intAdd alias, and Simplify's sibling facts
+      -- collapse the call to the primitive.
+      let
+        am :: AnfModule
+        am =
+          { name: "Test.M"
+          , decls:
+              [ accessorDecl "Test.M.add"
+              , instanceDecl "Test.M.semiringInt"
+              , nonrec "Test.M.add1"
+                  (Ret (CApp (var "Test.M.add") [ var "Test.M.semiringInt" ]))
+              , nonrec "Test.M.three"
+                  (Ret (CApp (var "Test.M.add1") [ AtomLit (LInt 1), AtomLit (LInt 2) ]))
+              ]
+          }
+        r = optimizeModule emptyBuildEnv (localFactsOf emptyBuildEnv am) am
+      map _.members r.module.decls `shouldEqual`
+        [ (accessorDecl "Test.M.add").members
+        , (instanceDecl "Test.M.semiringInt").members
+        , [ "Test.M.add1" /\ Ret (CAtom (AtomForeign "Data.Semiring.intAdd")) ]
         , [ "Test.M.three" /\ collapsed ]
         ]
 
@@ -82,7 +107,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
           { name: "Test.Dep"
           , decls: [ accessorDecl "Test.Dep.add", instanceDecl "Test.Dep.semiringInt" ]
           }
-        depResult = optimizeModule emptyBuildEnv (localFactsOf dep) dep
+        depResult = optimizeModule emptyBuildEnv (localFactsOf emptyBuildEnv dep) dep
         env = extendSummary emptyBuildEnv depResult.summary
 
         user :: AnfModule
@@ -90,12 +115,12 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
           { name: "Test.User"
           , decls: [ useDecl "Test.User.three" "Test.Dep.add" "Test.Dep.semiringInt" ]
           }
-        r = optimizeModule env (localFactsOf user) user
+        r = optimizeModule env (localFactsOf env user) user
       map _.members r.module.decls `shouldEqual` [ [ "Test.User.three" /\ collapsed ] ]
 
     it "never persists a summary today (the .pmi core stays boot's)" do
       let
         am :: AnfModule
         am = { name: "Test.M", decls: [ instanceDecl "Test.M.semiringInt" ] }
-        r = optimizeModule emptyBuildEnv (localFactsOf am) am
+        r = optimizeModule emptyBuildEnv (localFactsOf emptyBuildEnv am) am
       isNothing (persistedSummary r.summary) `shouldEqual` true

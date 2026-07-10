@@ -19,18 +19,30 @@
 -- | The decision is the callee's own shape (or the global intrinsic table), never who calls it,
 -- | so the pass stays module-local ([[optimizer-modular-not-whole-program]]). Semantics-preserving:
 -- | gated by `--opt ≡ --no-opt ≡ oracle` (ADR-0082 §2), not byte-identity with boot.
+-- |
+-- | The pass is **module-scoped, not body-scoped**: `purs` floats a method's dictionary application
+-- | to its own top-level binding (`add1 = add semiringInt`), so the alias/inlinable facts a call
+-- | site needs live in *sibling* bindings (ADR-0086 §Context: an optimiser must see sibling
+-- | bindings). `moduleKnown` computes those facts from a module's (already `DictElim`'d) top-level
+-- | members; `run` takes them as its outer environment. They are known-body facts — recomputed
+-- | from the current module state each `optimizeModule` iteration, never carried in
+-- | `LocalFacts`/`BuildEnv` (ADR-0086 §3).
 module Purvasm.Compiler.MiddleEnd.Optimizer.Simplify
   ( IntrinsicLookup
+  , Known
+  , moduleKnown
   , run
   ) where
 
 import Prelude
 
-import Data.Array (length, zip) as Array
+import Data.Array (length, mapMaybe, zip) as Array
 import Data.Foldable (all, elem, foldr)
 import Data.Map (Map)
 import Data.Map as Map
 import Data.Maybe (Maybe(..), fromMaybe)
+import Data.Tuple (Tuple(..))
+import Data.Tuple.Nested (type (/\))
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), Alt, CExpr(..), Expr(..), Rhs(..))
 import Purvasm.Compiler.Primitive (PrimOp)
@@ -41,10 +53,28 @@ import Purvasm.Compiler.Primitive (PrimOp)
 type IntrinsicLookup = String -> Maybe { op :: PrimOp, arity :: Int }
 
 -- | What a name is known to denote in the current scope: a copy-propagation alias to an atom,
--- | or a flat, inlinable function body with its parameter names.
+-- | or a flat, inlinable function body with its parameter names. Abstract outside this module —
+-- | facts enter via `moduleKnown` (top-level) or are collected by the walk itself (locals).
 data Known
   = KAlias Atom
   | KFun (Array String) CExpr
+
+-- | The module-level facts (the sibling-binding channel): what each **non-recursive** top-level
+-- | member denotes, by the same shapes the local walk registers — an atom body (`add1 = intAdd`,
+-- | the floated dictionary application after `DictElim`) becomes an alias; a flat,
+-- | parameter-closed lambda becomes an inlinable callee. Everything a top-level body mentions is
+-- | itself top-level (globally in scope), so lifting these facts to any call site cannot capture.
+-- | Recursive-group members are conservatively excluded (their force-cell/by-need semantics must
+-- | not be short-circuited by an alias).
+moduleKnown :: Array { recursive :: Boolean, members :: Array (String /\ Expr) } -> Map String Known
+moduleKnown decls = Map.fromFoldable (Array.mapMaybe known (nonrecMembers decls))
+  where
+  nonrecMembers ds = ds >>= \d -> if d.recursive then [] else d.members
+
+  known (Tuple k e) = case e of
+    Ret (CAtom a) -> Just (Tuple k (KAlias a))
+    Ret (CLam params (Ret cf)) | inlinable params cf -> Just (Tuple k (KFun params cf))
+    _ -> Nothing
 
 -- | The variables a binder introduces (its shadowing set).
 binderVars :: Binder -> Array String
@@ -159,6 +189,13 @@ rwCExpr intr env = case _ of
         AtomVar g -> case Map.lookup g env of
           Just (KFun params cf) | Array.length params == Array.length args' ->
             subst (Map.fromFoldable (Array.zip params args')) cf
+          -- intrinsic-foreign saturation, the AtomVar spelling: a cross-module reference to a
+          -- foreign (`Purvasm.Int.add` from an overlaid instance) rides a plain qualified key.
+          -- No shadow risk: intrinsic keys are dotted qualified names, which no local binder can
+          -- be — and a tracked local (`Just`) took the branch above.
+          Nothing
+            | Just { op, arity } <- intr g
+            , arity == Array.length args' -> CPrim op args'
           _ -> CApp (AtomVar g) args'
         -- intrinsic-foreign saturation: the eta-primop the linker would bind, collapsed here.
         AtomForeign k
@@ -188,17 +225,18 @@ rwRhs intr env = case _ of
   Uncond e -> Uncond (rwExpr intr env e)
   Guarded gs -> Guarded (map (\g -> { guard: rwExpr intr env g.guard, rhs: rwExpr intr env g.rhs }) gs)
 
--- | Run the three rewrites to a bounded fixpoint: a flat inlined body may expose a further
--- | inline, but in practice one or two passes suffice (eta-primops are non-recursive); the cap
--- | bounds any pathological chain. Convergence is detected structurally (a fired rewrite always
--- | changes the term).
-run :: IntrinsicLookup -> Expr -> Expr
-run intr = loop 5
+-- | Run the three rewrites over one binding body to a bounded fixpoint, under the module-level
+-- | facts (`moduleKnown`; `Map.empty` for a body-only run): a flat inlined body may expose a
+-- | further inline, but in practice one or two passes suffice (eta-primops are non-recursive);
+-- | the cap bounds any pathological chain. Convergence is detected structurally (a fired rewrite
+-- | always changes the term).
+run :: IntrinsicLookup -> Map String Known -> Expr -> Expr
+run intr known = loop 5
   where
   loop n e
     | n <= 0 = e
     | otherwise =
         let
-          e' = rwExpr intr Map.empty e
+          e' = rwExpr intr known e
         in
           if e' == e then e' else loop (n - 1) e'

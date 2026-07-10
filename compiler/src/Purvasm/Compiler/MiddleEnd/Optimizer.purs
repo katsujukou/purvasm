@@ -40,8 +40,8 @@ import Data.Set as Set
 import Purvasm.Compiler.Bytecode.Artifact (Summary)
 import Purvasm.Compiler.Ffi (intrinsicPrim)
 import Purvasm.Compiler.MiddleEnd.Module (AnfModule, declKeys, mapDeclBodies)
-import Purvasm.Compiler.MiddleEnd.Optimizer.DictElim (DictMachinery, dictElimExpr, emptyMachinery, machineryOf, mergeMachinery)
-import Purvasm.Compiler.MiddleEnd.Optimizer.Simplify (run) as Simplify
+import Purvasm.Compiler.MiddleEnd.Optimizer.DictElim (DictMachinery, dictElimExpr, emptyMachinery, intrinsicLift, machineryOf, mergeMachinery)
+import Purvasm.Compiler.MiddleEnd.Optimizer.Simplify (moduleKnown, run) as Simplify
 
 -- | The per-build, in-memory optimiser environment threaded through the module fold — carrying the facts
 -- | a module's **dependencies** contributed (their dictionary machinery, so an imported accessor/instance
@@ -53,9 +53,10 @@ newtype BuildEnv = BuildEnv
   , gkeys :: Set String
   }
 
--- | The current module's **stable** facts produced by `preOptimizeModule` and handed to `optimizeModule`:
--- | its own dictionary machinery and its own top-level keys. Stable = independent of which optimiser
--- | passes run, so it is safe to compute once in the byte-identity phase and reuse in the `--opt` phase.
+-- | The current module's **stable** facts produced by `localFactsOf` and handed to the `optimizeModule`
+-- | fixpoint: its own dictionary machinery and its own top-level keys. Stable = no optimiser pass
+-- | mutates them (passes rewrite bodies, never a module's accessor/instance bindings or key set), so
+-- | they are computed once per module and reused across every fixpoint round.
 type LocalFacts =
   { dict :: DictMachinery
   , gkeys :: Set String
@@ -77,9 +78,12 @@ emptyBuildEnv = BuildEnv { dict: emptyMachinery, gkeys: Set.empty }
 -- | `AnfModule` and handed to the `optimizeModule` fixpoint (they do not change across iterations). The
 -- | driver computes this under `--opt` only (ADR-0086 Addendum); it is the half formerly folded into the
 -- | removed `preOptimizeModule` (minus that phase's `DictElim` rewrite, now the optimiser pass / LLVM bridge).
-localFactsOf :: AnfModule -> LocalFacts
-localFactsOf am =
-  { dict: machineryOf (Array.concatMap _.members am.decls)
+-- | Takes the dependency env because instance recognition must see through *imported* `$Dict` identity
+-- | wrappers (an instance is routinely declared outside its class's module); the env still holds only
+-- | dependency facts, so the self-pollution invariant is untouched.
+localFactsOf :: BuildEnv -> AnfModule -> LocalFacts
+localFactsOf (BuildEnv env) am =
+  { dict: machineryOf env.dict (Array.concatMap _.members am.decls)
   , gkeys: Set.fromFoldable (Array.concatMap declKeys am.decls)
   }
 
@@ -95,9 +99,16 @@ optimizeModule (BuildEnv env) lf am =
   let
     full = mergeMachinery lf.dict env.dict
     gkeys = Set.union lf.gkeys env.gkeys
-    passes = Simplify.run intrinsicPrim <<< dictElimExpr gkeys full
+    -- DictElim over the whole module first, then Simplify under the module's *sibling-binding*
+    -- facts (`moduleKnown`) computed from the DictElim'd decls — `purs` floats a method's
+    -- dictionary application to its own top-level binding, so the alias a call site needs
+    -- (`add1 = intAdd`) lives in a sibling, not in the same body. Known-body facts are
+    -- pass-internal: recomputed here each driver iteration, never stored (ADR-0086 §3).
+    -- `intrinsicLift`: safe on this path only because Simplify's intrinsic saturation runs next.
+    elimd = map (mapDeclBodies (dictElimExpr intrinsicLift gkeys full)) am.decls
+    known = Simplify.moduleKnown elimd
   in
-    { module: am { decls = map (mapDeclBodies passes) am.decls }
+    { module: am { decls = map (mapDeclBodies (Simplify.run intrinsicPrim known)) elimd }
     , summary: summaryOfLocal lf
     }
 

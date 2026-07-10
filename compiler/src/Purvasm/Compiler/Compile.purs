@@ -10,6 +10,7 @@ import Prelude
 
 import Data.Array (concatMap, filter) as Array
 import Data.Foldable (foldl)
+import Data.Map as Map
 import Data.Set as Set
 import Data.Tuple.Nested ((/\))
 import PureScript.CoreFn.Expr (Bind(..)) as CF
@@ -30,7 +31,7 @@ import Purvasm.Compiler.MiddleEnd.Optimizer.Simplify as Simplify
 -- | today it is copy-propagation + small-callee inlining (ADR-0028).
 optimizeAnf :: Boolean -> Anf.Expr -> Anf.Expr
 optimizeAnf false = identity
-optimizeAnf true = Simplify.run intrinsicPrim
+optimizeAnf true = Simplify.run intrinsicPrim Map.empty
 
 -- | One CoreFn binding → a linkable group: lower each right-hand side, record its free
 -- | variables as (sorted) dependencies, and classify its ANF into a `Gdef`. A recursive

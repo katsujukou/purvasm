@@ -6,7 +6,8 @@
 -- |
 -- | `declsOfModule` is the ingestion half of the seam (CoreFn → CESK term → normalised ANF), factored out
 -- | of the per-backend drivers so `translExpr → normalize` is written once; the neutral `AnfModule` it
--- | yields is what `preOptimizeModule`/`optimizeModule` (`MiddleEnd.Optimizer`) rewrite.
+-- | yields is what `optimizeModule` (`MiddleEnd.Optimizer`) rewrites under `--opt` — and what the
+-- | backends consume as-is under `--no-opt` (the driver is the identity there, ADR-0086 Addendum).
 module Purvasm.Compiler.MiddleEnd.Module
   ( Decl
   , AnfModule

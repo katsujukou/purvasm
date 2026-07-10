@@ -70,3 +70,34 @@ derive instance Eq Rhs
 derive instance Generic Rhs _
 instance Show Rhs where
   show r = genericShow r
+
+-- | Rewrite every `Atom` occurrence in an expression (operands, scrutinees, ctor/record/array fields),
+-- | recursing through nested `Expr`s (`CLam`/`CIf`/`CCase` bodies, the `Let`/`LetRec` spine, guard/rhs
+-- | clauses). A structure-preserving map: the shape is untouched, only atoms are transformed. Tree
+-- | recursion, bounded by control-flow/binding nesting (like the middle-end passes).
+mapAtoms :: (Atom -> Atom) -> Expr -> Expr
+mapAtoms f = goE
+  where
+  goE = case _ of
+    Ret c -> Ret (goC c)
+    Let x c e -> Let x (goC c) (goE e)
+    LetRec bs e -> LetRec (map (\b -> b { rhs = goE b.rhs }) bs) (goE e)
+
+  goC = case _ of
+    CAtom a -> CAtom (f a)
+    CLam ps e -> CLam ps (goE e)
+    CApp a as -> CApp (f a) (map f as)
+    CPrim op as -> CPrim op (map f as)
+    CCtor n ar as -> CCtor n ar (map f as)
+    CArray as -> CArray (map f as)
+    CRecord fs -> CRecord (map (\r -> r { val = f r.val }) fs)
+    CAccessor a l -> CAccessor (f a) l
+    CUpdate a ups -> CUpdate (f a) (map (\r -> r { val = f r.val }) ups)
+    CIf a t e -> CIf (f a) (goE t) (goE e)
+    CCase as alts -> CCase (map f as) (map goAlt alts)
+
+  goAlt alt = alt { result = goRhs alt.result }
+
+  goRhs = case _ of
+    Uncond e -> Uncond (goE e)
+    Guarded gs -> Guarded (map (\g -> { guard: goE g.guard, rhs: goE g.rhs }) gs)

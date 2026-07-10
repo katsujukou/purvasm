@@ -332,7 +332,7 @@ build backend action opts =
   -- `maxOptimizeIter`. Today's only pass (`DictElim`) is idempotent, so a module with no static dispatch
   -- converges in one round. Returns the last pass's `{ module, summary }`.
   runOptimizer env am = do
-    let lf = localFactsOf am
+    let lf = localFactsOf env am
     action.hooks.onEnterOptimizeIter am
     let
       go n prev = do
