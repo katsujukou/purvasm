@@ -1,6 +1,6 @@
 # 0089. The NbE general inliner on the optimiser seam
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-07-10
 
 ## Abstract
@@ -101,11 +101,24 @@ The domain mirrors §ref 2/3, over ANF instead of `BackendSyntax`:
   multi-reference body is evaluated at most once (a pinned ADR-0082 defence). This is the structural fix
   for unfold-then-cap (§ref 3, the purs-wasm failure).
 
-Variable representation: the reference uses de Bruijn levels; purvasm keeps **names**, with `quote`
-generating fresh, globally-unique binder names from a counter — HOAS makes capture structurally
-impossible during evaluation, and unique post-quote binders are what the analysis keys on. (A level
-bridge was considered and rejected — §Alternatives.) `--opt` output must be **deterministic** (counter
-per binding, no global state leaks), but is not byte-identical to anything.
+Variable representation: the reference uses de Bruijn levels; purvasm keeps **names** — HOAS makes
+capture structurally impossible *during evaluation*, and the residual term's safety is carried by a
+**pinned fresh-name discipline at `quote`**:
+
+- `quote` **α-renames every binder it reifies** — no binder name from the input, from an unfolded
+  sibling/cross-module body, or from a generator upstream survives into the residual term; and
+- the supply draws from a **reserved prefix namespace disjoint from every other name producer in the
+  pipeline** — distinct from source identifiers (PureScript cannot lex a `$`-initial identifier), from
+  `purs`'s own synthesised names (`$__unused`, `…$Dict`), from `Normalize`'s `$a<n>`, and from
+  `MatchCompile`'s `$dt<n>`; the concrete prefix is pinned at implementation (e.g. `$q<n>`) and
+  documented on the supply.
+
+Together these make collision impossible **by namespace disjointness, not by counter luck**: after
+`quote`, every binder is a fresh reserved-prefix name, and the only free names in a residual body are
+top-level/foreign keys (dotted or source-lexable — never reserved-prefix). Unique post-quote binders
+are also what the analysis keys on. (A level bridge was considered and rejected — §Alternatives.)
+`--opt` output must be **deterministic** (counter per binding, no global state leaks), but is not
+byte-identical to anything.
 
 ### 3. The analysis: `complexity`/`usage`/`size`, cached per node
 
@@ -165,15 +178,42 @@ post-hoc `normalFormSizeCap`.
   saturation becomes the evaluation-time foreign-lowering rule (§ref 7's table shape, seeded with the
   intrinsic rung; the structural rung is *not* auto-inlined in slice 1).
 
-### 6. `Simplify` is absorbed; `DictElim` stays
+### 6. `Simplify` is absorbed; `DictElim` stays — permanently, as the directive substitute
 
 Copy-propagation, flat saturated inlining, sibling facts (`moduleKnown`), and intrinsic saturation are
 all natural consequences of §2–§5; when the NbE pass reproduces them under the behavioural gate,
 `optimizeModule`'s pipeline becomes `fix (DictElim ∘ Nbe)` and **`Simplify` (the module) retires** —
-kept only through bring-up as a bisection reference, then deleted. `DictElim` stays a separate pass: it
-is cheap, idempotent, its machinery already threads cross-module, and the LLVM backend's private
-byte-identity bridge shares its implementation (ADR-0086 Addendum) — subsuming it into NbE would couple
-the bridge to the inliner.
+kept only through bring-up as a bisection reference, then deleted, with retirement **gated by the §8
+slice-1 test-transfer** (every existing `Simplify` positive/negative test ported as an NbE equivalent
+and green first).
+
+**`DictElim` stays a permanent pass, not a bridge artefact.** The reference's heuristic gate alone does
+not reliably collapse type-class dispatch — real-world purs-backend-optimizer usage leans on `@inline`
+directives, whose accessor forms `InlineProp`/`InlineSpineProp` exist specifically to name
+instance-dictionary methods (`dict.method`, §ref 8), and unsaturated method applications are exactly
+what `arity=N` directives force through. purvasm has no directive channel (deferred, §8);
+**`DictElim` is its deterministic substitute for the dictionary-dispatch class**, and it is stronger
+than a gate-driven inline on that class in three ways:
+
+- Its rewrite is an **atom swap** (dispatch devirtualization), never a body copy: size monotonically
+  non-increasing, so it needs **no gate** and carries **no blow-up risk** — it fires on every
+  statically-known dispatch regardless of the method body's size or use count, where the NbE gate would
+  (correctly) refuse to inline a large impl body yet the dispatch itself should still become a direct
+  call.
+- It collapses **unsaturated** dispatch (`accessor dict`, the floated partial application — e.g.
+  `Control.Bind.bind(bindEffect)` → `Effect.bindE`) with no arity directive.
+- Its machinery (accessors / instance field maps / identity wrappers) threads cross-module **as compact
+  data**, no body publication required — dispatch devirtualizes even for impls slice 2 would never
+  publish (large, multi-use), and it lowers what slice 2 must carry.
+
+NbE **complements** it on the one class static recognition cannot reach: **constructed** dictionaries
+(`bindStateT(monadIdentity)`, superclass thunk forcing) — β-reduction and projection folding expose the
+record, and the fixpoint's next `DictElim`/fold round collapses the now-static dispatch. The two passes
+are cooperative inside `fix (DictElim ∘ Nbe)`, not redundant.
+
+(The LLVM backend's private byte-identity **bridge** shares `DictElim`'s implementation and expires at
+boot retirement, per ADR-0086's Addendum — what expires is the bridge invocation, never the optimiser
+pass.)
 
 ### 7. Verification gates (all pre-existing gate styles, no new kinds)
 
@@ -193,17 +233,29 @@ the bridge to the inliner.
 
 ### 8. Slicing
 
-1. **Slice 1 — the module-local engine**: §2–§6 complete, `Simplify` retirement, fixtures green,
-   ratios recorded (expected ~flat).
+1. **Slice 1 — the module-local engine**: §2–§6 complete, fixtures green, ratios recorded (expected
+   ~flat), and **`Simplify` retirement gated explicitly**: every existing `Simplify` unit/IR
+   *positive* test (copy-propagation, flat saturated inlining, sibling `moduleKnown` facts, intrinsic
+   saturation in both atom spellings, and the scope/shadowing negatives) is **ported as an NbE
+   equivalent and kept green** before the module is deleted — retirement is a test-transfer, not a
+   judgement call.
 2. **Slice 2 — cross-module bodies**: `BuildSummary`'s optimiser component gains the per-binding
-   `(analysis, pruned body)` map for **gate-passing candidates only** (ADR-0084's selection: inline
-   candidates ∪ dict machinery ∪ small; large-multi-use-pure dropped); `extendSummary` threads it;
-   gate site (A) consults it. **In-memory only**: `persistedSummary` stays `Nothing` — `--opt` always
-   recompiles (sanctioned by ADR-0084, which owns eventual persistence). Self-pollution stays
-   structural (a module's own summary is folded in only after it finishes, ADR-0086 §3).
+   `(analysis, pruned body)` map, selected by a **spine-independent, conservative publish predicate**
+   (a size-bounded superset shaped by ADR-0084's selection: inline candidates ∪ dict machinery ∪
+   small; large-multi-use-pure dropped). The publish side deliberately does **not** try to precompute
+   "gate-passing": the inline gate is use-site/spine-dependent (delayed-arity and per-argument-usage
+   clauses), so the producer cannot decide it — **the consumer's gate site (A) always makes the final
+   call**, and the predicate errs toward publishing anything a consumer clause could accept (bounded by
+   the gate's largest size threshold). `extendSummary` threads it; **in-memory only**:
+   `persistedSummary` stays `Nothing` — `--opt` always recompiles (sanctioned by ADR-0084, which owns
+   eventual persistence). Self-pollution stays structural (a module's own summary is folded in only
+   after it finishes, ADR-0086 §3).
 3. **Named deferrals** (explicitly not this record's scope): case-of-case / branch distribution /
    record-ctor unpacking (the §ref 6 catalogue over `CCase`); `@inline`-style directives (§ref 8;
-   needs a syntax decision + the CST channel); caller-homed specialization (its own track, ADR-0082);
+   needs a syntax decision + the CST channel — and the dictionary-dispatch class they chiefly serve in
+   the reference is already covered deterministically by `DictElim`, §6, so their residual value is
+   forcing *non-dictionary* cases the gate declines); caller-homed specialization (its own track,
+   ADR-0082);
    `EffectAnalysis` purity facts; the **codegen-side per-lifted-function size budget** — the named
    backstop for whatever the gate misses (measured super-linear `-O2`, §ref 10) — which is
    backend-track-owned and lands at the LLVM boundary, not in the optimiser.
@@ -255,6 +307,16 @@ the bridge to the inliner.
 - **Slice 2 first (publish bodies for the existing `Simplify`).** Rejected: `Simplify`'s flat-only gate
   cannot consume the bodies that matter (`lessThan` is non-flat), so the channel would ship with no
   measurable consumer and no gate exercising it.
-- **Subsume `DictElim` into the NbE pass immediately.** Rejected for now: the LLVM byte-identity bridge
-  shares `DictElim`'s implementation; coupling it to the inliner would drag the bridge's parity mandate
-  into the new engine. Revisit at boot retirement (the bridge's expiry).
+- **Subsume `DictElim` into the NbE pass** (treat dictionary dispatch as ordinary inlining +
+  projection). Rejected — and not merely for the bridge coupling: gate-driven inlining is the *wrong
+  mechanism* for the dispatch class. The reference itself cannot collapse this class heuristically (its
+  users reach for `@inline` directives whose `InlineProp`/`InlineSpineProp` forms name dictionary
+  methods, §ref 8); `DictElim`'s gate-free atom swap devirtualizes dispatch without copying bodies,
+  covers unsaturated `accessor dict` partials, works on large/multi-use impls the inline gate must
+  refuse, and threads cross-module as data. `DictElim` is purvasm's directive substitute for this class
+  and stays permanently (§6).
+- **An `@inline` directive channel instead of (or before) `DictElim`+NbE.** Rejected for this record:
+  directives are user-facing surface (syntax decision, CST wiring, ulib annotation policy) and the
+  reference needs them *because* its dispatch elimination is heuristic; purvasm already has the
+  deterministic pass. Directives stay a named deferral (§8) for forcing *non-dictionary* cases the gate
+  declines.

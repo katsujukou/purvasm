@@ -130,10 +130,11 @@ language and are kept out of version control.)
 | [0081](0081-purvasm-regex-pure-ps-es-engine.md) | `purvasm-regex`: a pure-PureScript regex engine | Accepted |
 | [0082](0082-native-codegen-port-to-level-2.md) | Porting the native (LLVM) code generator to the Level-2 compiler | Accepted |
 | [0083](0083-match-compilation-to-anf-middle-end.md) | Match compilation to a shared ANF middle-end | Accepted (implemented) |
-| [0085](0085-native-build-orchestration-inmemory-summary-env.md) | Native build orchestration over an in-memory summary env | Accepted |
 | [0084](0084-binary-pmo-pmi-and-cross-module-summary.md) | The cross-module optimiser summary — an `--opt`-only `.pmi` extension | Accepted |
+| [0085](0085-native-build-orchestration-inmemory-summary-env.md) | Native build orchestration over an in-memory summary env | Accepted |
 | [0086](0086-optimizer-codegen-seam-two-phase-module-pipeline.md) | The optimiser/codegen seam over a backend-neutral ANF module | Accepted |
 | [0087](0087-backend-neutral-build-driver-compileraction.md) | A backend-neutral build driver over an injected `CompilerAction` | Accepted |
 | [0088](0088-vm-backend-lowers-like-native-release-boot-byte-identity.md) | The VM backend lowers the optimiser seam like native, released from boot byte-identity | Accepted |
-| [0089](0089-nbe-general-inliner.md) | The NbE general inliner on the optimiser seam | Proposed |
+| [0089](0089-nbe-general-inliner.md) | The NbE general inliner on the optimiser seam | Accepted |
+
 ## Scope
