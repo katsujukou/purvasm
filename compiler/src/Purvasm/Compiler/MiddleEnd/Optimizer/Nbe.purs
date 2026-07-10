@@ -25,15 +25,17 @@ import Data.Array as Array
 import Data.Lazy (defer)
 import Data.Map (Map)
 import Data.Map as Map
-import Data.Maybe (Maybe(..))
+import Data.Maybe (Maybe(..), isJust)
 import Data.Set as Set
 import Data.Tuple (Tuple(..))
 import Data.Tuple.Nested (type (/\))
 import Partial.Unsafe (unsafeCrashWith)
+import Purvasm.Compiler.Ffi (resolver)
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..))
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (cfExpr, fvExpr)
+import Purvasm.Compiler.MiddleEnd.Normalize (normalize)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Analysis (inlineMarks, sizeExpr)
-import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Eval (evalC, evalExpr)
+import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Eval (evalExpr)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Quote (quote)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (EvalEnv, ExternEntry, InlineCandidate, NbeEnv)
 import Purvasm.Compiler.Primitive (PrimOp)
@@ -134,24 +136,41 @@ candidatesOf intrinsic deps decls =
     where
     bounded cand = if cand.size < publishBound then Just cand else Nothing
 
-  shapeOf e = case e of
-    Ret c@(CLam ps body) -> Just (lamCand c ps body)
-    Let x c@(CLam ps body) (Ret (CAtom (AtomVar x')))
-      | x == x' -> Just (lamCand c ps body)
-    Ret c | valueBody c -> Just
-      { arity: Nothing, size: sizeExpr e, cxLeqDeref: isAtomBody c, closed: false, body: c }
-    Ret c@(CApp h args)
-      | Just residual <- partialResidual h args -> Just
-          { arity: Just residual, size: sizeExpr e, cxLeqDeref: false, closed: false, body: c }
-    _ -> Nothing
+  -- Unwrap the body's pure-value `let` chain (every rhs a value construction — re-constructing
+  -- them per use site is pure, so a marked-inline evaluation of the chain cannot re-execute
+  -- anything), collecting the binders' shapes for arity chasing; then judge the tail.
+  shapeOf e0 = go Map.empty e0
     where
-    lamCand c ps body =
-      { arity: Just (Array.length ps)
-      , size: sizeExpr e
-      , cxLeqDeref: false
-      , closed: Set.isEmpty (fvExpr (Set.fromFoldable ps) body) && Set.isEmpty (cfExpr body)
-      , body: c
-      }
+    go chain = case _ of
+      Let x c rest | pureValueRhs c -> go (Map.insert x c chain) rest
+      Ret c -> tailShape chain c
+      _ -> Nothing
+
+    tailShape chain c = case c of
+      CLam ps body -> Just
+        { arity: Just (Array.length ps)
+        , size: sizeExpr e0
+        , cxLeqDeref: false
+        , closed:
+            Map.isEmpty chain
+              && Set.isEmpty (fvExpr (Set.fromFoldable ps) body)
+              && Set.isEmpty (cfExpr body)
+        , body: e0
+        }
+      -- an alias tail: chase it through the chain for the published arity.
+      CAtom (AtomVar x)
+        | Just c' <- Map.lookup x chain -> tailShape (Map.delete x chain) c'
+      CApp h args
+        | Just residual <- partialResidual h args -> Just
+            { arity: Just residual, size: sizeExpr e0, cxLeqDeref: false, closed: false, body: e0 }
+      _ | valueBody c -> Just
+        { arity: Nothing
+        , size: sizeExpr e0
+        , cxLeqDeref: isAtomBody c && isRet e0
+        , closed: false
+        , body: e0
+        }
+      _ -> Nothing
 
   partialResidual h args = do
     a <- case h of
@@ -160,6 +179,10 @@ candidatesOf intrinsic deps decls =
       AtomLit _ -> Nothing
     let n = Array.length args
     if n < a then Just (a - n) else Nothing
+
+  isRet = case _ of
+    Ret _ -> true
+    _ -> false
 
   valueBody = case _ of
     CAtom _ -> true
@@ -171,6 +194,17 @@ candidatesOf intrinsic deps decls =
   isAtomBody = case _ of
     CAtom _ -> true
     _ -> false
+
+-- | The pure-value `let`-rhs classes a publishable chain may contain: value constructions and
+-- | aliases only (never a call, a branch, or a pinned primop — those are init-once computations).
+pureValueRhs :: CExpr -> Boolean
+pureValueRhs = case _ of
+  CAtom _ -> true
+  CLam _ _ -> true
+  CCtor _ _ _ -> true
+  CArray _ -> true
+  CRecord _ -> true
+  _ -> false
 
 -- | Build the evaluation facts for one module's `nbeBinding` runs: the dependency candidates (from
 -- | `BuildEnv`, ADR-0084/0089 slice 2) plus the module's own siblings (via the same publish
@@ -194,22 +228,67 @@ nbeEnvOf
 nbeEnvOf intrinsic deps decls =
   { externs: Map.union localExterns depExterns
   , intrinsic
+  , structural
   }
   where
-  base = { locals: Map.empty, marks: Set.empty, nbe: { externs: Map.empty, intrinsic } }
+  base = { locals: Map.empty, marks: Set.empty, nbe: { externs: Map.empty, intrinsic, structural } }
 
   depExterns0 = map (entryFromCandidate base) deps
-  envD = base { nbe = { externs: depExterns0, intrinsic } }
+  envD = base { nbe = { externs: depExterns0, intrinsic, structural } }
   depExterns = map (entryFromCandidate envD) deps
 
-  envL = base { nbe = { externs: depExterns, intrinsic } }
+  envL = base { nbe = { externs: depExterns, intrinsic, structural } }
   localExterns = map (entryFromCandidate envL) (candidatesOf intrinsic deps decls)
 
+  -- The compiler-global **structural rung** as on-demand extern entries (ADR-0089 §1's
+  -- compiler-global table, extended from the eta-primop view to the resolver's guest terms): a
+  -- structural foreign's term is what the VM linker would substitute anyway, so unfolding it at
+  -- compile time (size-gated by the consumer, like any extern) is the same program earlier.
+  -- Intrinsic keys are excluded (they ride the `TIntrinsic` saturation path), and a structural
+  -- body evaluates with the structural lookup *disabled* — depth one, no re-entry, no knot.
+  structuralBase =
+    { locals: Map.empty
+    , marks: Set.empty
+    , nbe: { externs: Map.empty, intrinsic, structural: \_ -> Nothing }
+    }
+
+  structural k =
+    if isJust (intrinsic k) then Nothing
+    else resolver k <#> \term ->
+      let
+        body = normalize term
+      in
+        case body of
+          Ret (CLam ps b) ->
+            { arity: Just (Array.length ps)
+            , size: sizeExpr body
+            , cxLeqDeref: false
+            , closed: Set.isEmpty (fvExpr (Set.fromFoldable ps) b) && Set.isEmpty (cfExpr b)
+            , value: defer \_ -> evalExpr structuralBase body
+            }
+          _ ->
+            { arity: Nothing
+            , size: sizeExpr body
+            , cxLeqDeref: false
+            , closed: false
+            , value: defer \_ -> evalExpr structuralBase body
+            }
+
+-- | Rebuild a consumer-side extern entry from a published candidate. The body's (validated
+-- | pure-value) chain binders are **marked**, so forcing the entry yields the bare tail value —
+-- | a projection/match peeks straight through, and the chain's constructions are re-materialised
+-- | at use sites (pure by the publish predicate).
 entryFromCandidate :: EvalEnv -> InlineCandidate -> ExternEntry
 entryFromCandidate env c =
   { arity: c.arity
   , size: c.size
   , cxLeqDeref: c.cxLeqDeref
   , closed: c.closed
-  , value: defer \_ -> evalC env c.body
+  , value: defer \_ -> evalExpr (env { marks = chainBinders c.body }) c.body
   }
+  where
+  chainBinders = go Set.empty
+    where
+    go acc = case _ of
+      Let x _ rest -> go (Set.insert x acc) rest
+      _ -> acc

@@ -35,7 +35,7 @@ import Data.Maybe (Maybe)
 import Data.Set (Set)
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Literal (Literal)
-import Purvasm.Compiler.MiddleEnd.ANF (Atom, CExpr)
+import Purvasm.Compiler.MiddleEnd.ANF (Atom, Expr)
 import Purvasm.Compiler.Primitive (PrimOp(..))
 
 -- | A semantic value. `SVar` is an opaque reference (a residual local minted by `Quote`, or an
@@ -98,25 +98,31 @@ data NRhs
   = NUncond (Array Sem -> Sem)
   | NGuarded (Array { guard :: Array Sem -> Sem, rhs :: Array Sem -> Sem })
 
--- | A published inline candidate (ADR-0089 §8 slice 2): the gate facts plus the binding's tail
--- | `CExpr` as **plain data** — `Sem` carries host functions, so what crosses module (and driver
--- | round) boundaries is syntax; the consumer rebuilds an `ExternEntry` (with its per-round `Lazy`
--- | evaluation) from it. `arity` is `Just` for a lambda-valued candidate (including a strictly
--- | under-applied pure partial application, whose arity is the *residual* one), `Nothing` for a
--- | data/alias value.
+-- | A published inline candidate (ADR-0089 §8 slice 2): the gate facts plus the binding's body as
+-- | **plain data** — `Sem` carries host functions, so what crosses module (and driver round)
+-- | boundaries is syntax; the consumer rebuilds an `ExternEntry` (with its per-round `Lazy`
+-- | evaluation) from it. The body is a full `Expr`: a pure-value **let chain** (every binding a
+-- | value construction) around a value/partial-application tail is publishable — the consumer
+-- | marks the chain binders so forcing yields the bare value. `arity` is `Just` for a
+-- | lambda-valued candidate (including a strictly under-applied pure partial application, whose
+-- | arity is the *residual* one), `Nothing` for a data/alias value.
 type InlineCandidate =
   { arity :: Maybe Int
   , size :: Int
   , cxLeqDeref :: Boolean
   , closed :: Boolean
-  , body :: CExpr
+  , body :: Expr
   }
 
--- | The module facts `Eval` consults (ADR-0089 §1: module siblings + the compiler-global intrinsic
--- | table; slice 2 adds dependency-published bodies).
+-- | The module facts `Eval` consults (ADR-0089 §1): module siblings and dependency-published
+-- | bodies (`externs`), the compiler-global intrinsic table, and the compiler-global **structural
+-- | rung** (`structural` — the resolver's guest terms as on-demand extern entries, so a
+-- | `Data.Ord.ordIntImpl`-class impl can unfold instead of staying a link-time call; the closure
+-- | is built by `Nbe.nbeEnvOf`, which owns evaluation — `Eval` only calls it).
 type NbeEnv =
   { externs :: Map String ExternEntry
   , intrinsic :: String -> Maybe { op :: PrimOp, arity :: Int }
+  , structural :: String -> Maybe ExternEntry
   }
 
 -- | The evaluation environment: local bindings, the current round's gate-B inline marks (binder

@@ -344,6 +344,54 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
       nbeCross deps locals (Ret (CApp (var "L.lt1") [ var "p", var "q" ]))
         `shouldEqual` Ret (CApp (var "L.cmp") [ var "p", var "q" ])
 
+  describe "structural guest terms (compiler-global rung)" do
+    it "unfolds ordIntImpl and folds the whole comparison on known operands" do
+      -- ordCmp: \lt eq gt x y -> if LtInt(x,y) then lt else if EqInt(x,y) then eq else gt
+      nbe (Ret (CApp (AtomForeign "Data.Ord.ordIntImpl") [ var "l", var "e", var "g", int 1, int 2 ]))
+        `shouldEqual` Ret (CAtom (var "l"))
+
+    it "unfolds an Effect combinator's lambda at saturation (pureE = \\a $u -> a)" do
+      nbe (Ret (CApp (AtomForeign "Effect.pureE") [ var "a", var "u" ]))
+        `shouldEqual` Ret (CAtom (var "a"))
+
+    it "resolves the literal builtins (Prim.undefined) so superclass forcing β-reduces" do
+      nbe
+        ( Let "g" (CLam [ "$u" ] (Ret (CAtom (int 7))))
+            (Ret (CApp (var "g") [ var "Prim.undefined" ]))
+        )
+        `shouldEqual` Ret (CAtom (int 7))
+
+    it "leaves a native leaf untouched (not in any compiler-global rung)" do
+      let e = Ret (CApp (AtomForeign "Data.Show.showIntImpl") [ var "p" ])
+      nbe e `shouldEqual` e
+
+  describe "let-wrapped value CAFs (publication through pure-value chains)" do
+    it "peeks a published record CAF through its chain and β-reduces the projected method" do
+      -- D.ord = let cmp = \x y -> LtInt(x,y) in { compare: cmp } — the real ulib instance shape.
+      let
+        deps =
+          [ nonrec "D.ord"
+              ( Let "cmp" (CLam [ "x", "y" ] (Ret (CPrim LtInt [ var "x", var "y" ])))
+                  (Ret (CRecord [ { prop: "compare", val: var "cmp" } ]))
+              )
+          ]
+        consumer =
+          Let "f" (CAccessor (var "D.ord") "compare")
+            (Ret (CApp (var "f") [ var "p", var "q" ]))
+      nbeCross deps [] consumer `shouldEqual` Ret (CPrim LtInt [ var "p", var "q" ])
+
+    it "does not publish a chain containing a computation binding" do
+      -- the let is a call: an init-once computation — the whole binding stays opaque.
+      let
+        deps =
+          [ nonrec "D.bad"
+              ( Let "r" (CApp (var "D.mk") [ int 1 ])
+                  (Ret (CRecord [ { prop: "f", val: var "r" } ]))
+              )
+          ]
+        consumer = Ret (CAccessor (var "D.bad") "f")
+      nbeCross deps [] consumer `shouldEqual` consumer
+
   describe "determinism" do
     it "normalising twice is the identity on the normal form (stable $q numbering)" do
       let

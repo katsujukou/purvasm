@@ -97,15 +97,18 @@ evalAtom env = case _ of
     Just v -> v
     Nothing -> refOf env a x
 
--- | A non-local name: a module sibling (gate-A target), an intrinsic foreign, or an opaque global.
+-- | A non-local name: a module sibling / dependency candidate (gate-A target), an intrinsic
+-- | foreign, a structural-rung guest term (also gate-A-target shaped), or an opaque global.
 refOf :: EvalEnv -> Atom -> String -> Sem
 refOf env atom k = case Map.lookup k env.nbe.externs of
   Just entry -> SRef { atom, target: TExtern entry, spine: [] }
   Nothing -> case env.nbe.intrinsic k of
     Just ia -> SRef { atom, target: TIntrinsic ia, spine: [] }
-    Nothing -> case atom of
-      AtomForeign _ -> SForeign k
-      _ -> SVar k
+    Nothing -> case env.nbe.structural k of
+      Just entry -> SRef { atom, target: TExtern entry, spine: [] }
+      Nothing -> case atom of
+        AtomForeign _ -> SForeign k
+        _ -> SVar k
 
 -- | Application. β fires on a known lambda; an `SRef` accumulates its spine and is judged at
 -- | saturation (gate site A); an application *of* a computation sequences it first; everything
@@ -143,7 +146,7 @@ applySem f0 args0
                 else neutral
               -- a value-body extern (alias / data CAF) applied: force it if small, else neutral.
               Nothing ->
-                if entry.size < peekSize then applySem (force entry.value) spine'
+                if entry.size < forceCallBound then applySem (force entry.value) spine'
                 else neutral
       SCtor t n as ->
         let
@@ -161,17 +164,25 @@ applySem f0 args0
 gateA :: forall r. { size :: Int, closed :: Boolean | r } -> Boolean
 gateA e = e.size < 16 || (e.closed && e.size < 64)
 
--- | The size bound for peeking at a value-body extern (an alias or small data CAF) when its value
--- | is demanded (application head, projection, scrutinee) — `shouldInlineExternReference`'s bound.
-peekSize :: Int
-peekSize = 16
+-- | The size bound for forcing a value-body extern **as a whole** (an alias applied as a callee):
+-- | the entire value survives reification, so this stays the reference's
+-- | `shouldInlineExternReference` bound.
+forceCallBound :: Int
+forceCallBound = 16
+
+-- | The size bound for peeking at a value-body extern under a **projection or match**: only the
+-- | projected field / matched substructure survives reification (the rest of the forced value is
+-- | discarded, never quoted), so the bound is the publish bound — the peek's residual is governed
+-- | by gate B and the size/time gate, not by the container's size.
+peekBound :: Int
+peekBound = 64
 
 -- | Peek through a bare small extern reference when a *value* is demanded (projection, match).
 known :: Sem -> Sem
 known = case _ of
   s@(SRef r)
     | Array.null r.spine -> case r.target of
-        TExtern e | isNothing e.arity, e.size < peekSize -> known (force e.value)
+        TExtern e | isNothing e.arity, e.size < peekBound -> known (force e.value)
         _ -> s
   s -> s
 
