@@ -134,14 +134,14 @@ optimizeModule (BuildEnv env) lf am =
     full = mergeMachinery lf.dict env.dict
     gkeys = Set.union lf.gkeys env.gkeys
     elimd = map (mapDeclBodies (dictElimExpr intrinsicLift gkeys full)) am.decls
-    nbe = nbeEnvOf intrinsicPrim env.inlines elimd
+    nbe = nbeEnvOf intrinsicPrim gkeys env.inlines elimd
     optimised = elimd <#> \d ->
       d { members = d.members <#> \(Tuple k e) -> Tuple k (nbeBinding nbe k e) }
   in
     { module: am { decls = optimised }
     , summary:
         let
-          inlines = candidatesOf intrinsicPrim env.inlines optimised
+          inlines = candidatesOf intrinsicPrim gkeys env.inlines optimised
           -- own foreign shapes the candidate bodies reference — on either atom spelling (a foreign
           -- key rides `AtomForeign` or a plain qualified `AtomVar`); see `BuildSummary.foreignSigs`.
           referenced = Array.foldl
