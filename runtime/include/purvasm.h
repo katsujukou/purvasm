@@ -54,6 +54,22 @@ typedef uint64_t PVWord;
  */
 typedef PVWord (*PVCodeFn)(PVContext *ctx, PVWord closure, const PVWord *args, size_t nargs);
 
+/**
+ * `PVF_EXPORT(ident)` — name a native-leaf provider by its bare PureScript identifier, letting the build
+ * supply the module (ADR-0091). For a project module `M`'s sibling `.c`, the build injects
+ * `-DPVF_MODULE=<escapeIdent(M)>` (a valid C token, e.g. `Data.Show` → `Data_2eShow`); this macro pastes
+ * the exported symbol `pvf_<PVF_MODULE>_2e<ident>` = `pvf_<escapeIdent("M.ident")>` (ADR-0073 §3 ABI).
+ * A provider writes `PVWord PVF_EXPORT(foo)(PVContext *ctx, PVWord clo, const PVWord *args, size_t n)`.
+ *
+ * Correct only when `ident` is purely alphanumeric (the common case). An ident containing `_` or other
+ * bytes mangles differently (`_localeCompare` → `_5flocaleCompare`); export such a leaf under its full
+ * hand-written `pvf_<escapeIdent("M.ident")>` symbol. Needs `-DPVF_MODULE=…`, which the build injects
+ * per file — the symbol audit (ADR-0091 §4) reports a mismatch by key, so a typo fails by name.
+ */
+#define PVF_CAT_(a, b) a##b
+#define PVF_CAT(a, b) PVF_CAT_(a, b)
+#define PVF_EXPORT(ident) PVF_CAT(PVF_CAT(pvf_, PVF_MODULE), PVF_CAT(_2e, ident))
+
 /* ── Shadow-stack rooting (see the contract above) ─────────────────────────────────────────────────── */
 
 /** Open a shadow-stack frame; returns a mark to pass to `pv_pop_frame`. */
