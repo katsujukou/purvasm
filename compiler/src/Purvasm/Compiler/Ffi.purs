@@ -305,11 +305,12 @@ recordRename :: Term
 recordRename = lams [ "o", "n", "r" ]
   (TmPrim RecordSet [ v "n", TmPrim RecordGet [ v "o", v "r" ], TmPrim RecordDelete [ v "o", v "r" ] ])
 
--- `Data.Number.fromStringImpl` (ADR-0046): parse via the first-order `parseFloatImpl` leaf, then
--- apply the caller's `isFinite`/`Just`/`Nothing`, so a NaN/non-finite parse becomes `Nothing`.
+-- `Data.Number.fromStringImpl` (ADR-0046): parse via the declared `Purvasm.Number.parseFloat` ABI-floor
+-- leaf (ADR-0092 — a structural intrinsic references only declared foreigns, never an invented leaf),
+-- then apply the caller's `isFinite`/`Just`/`Nothing`, so a NaN/non-finite parse becomes `Nothing`.
 numberFromStringImpl :: Term
 numberFromStringImpl = lams [ "str", "isFin", "just", "nothing" ]
-  ( TmLet "n" (TmApp (TmForeign "Data.Number.parseFloatImpl") (v "str"))
+  ( TmLet "n" (TmApp (TmForeign "Purvasm.Number.parseFloat") (v "str"))
       (TmIf (TmApp (v "isFin") (v "n")) (TmApp (v "just") (v "n")) (v "nothing"))
   )
 
