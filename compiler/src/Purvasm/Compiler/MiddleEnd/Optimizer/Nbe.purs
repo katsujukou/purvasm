@@ -39,6 +39,7 @@ import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Analysis (inlineMarks, sizeExpr)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Distribute (distributeCases)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Eval (evalC, evalExpr)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Quote (quote)
+import Purvasm.Compiler.MiddleEnd.Optimizer.Specialize (isSpecKey)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (ArgUse, EvalEnv, ExternEntry, InlineCandidate, NbeEnv, RefTarget(..), Sem(..))
 import Purvasm.Compiler.Primitive (PrimOp)
 
@@ -110,16 +111,25 @@ preserveOuterShape input output = case input, output of
 -- | bound (`< 64`, the gate's largest size threshold) keeps the in-memory summary small.
 candidatesOf
   :: (String -> Maybe { op :: PrimOp, arity :: Int })
-  -> Set String
   -> Map String InlineCandidate
   -> Array { recursive :: Boolean, members :: Array (String /\ Expr) }
   -> Map String InlineCandidate
-candidatesOf intrinsic gkeys deps decls =
+candidatesOf intrinsic deps decls =
   Map.union
     (Map.fromFoldable (Array.mapMaybe candidateOf nonrecMembers))
     groupedBuilders
   where
-  nonrecMembers = decls >>= \d -> if d.recursive then [] else d.members
+  -- ADR-0093 §4: specialization clones are module-private — never published as candidates
+  -- (dependents that want the same specialization discover their own, caller-homed).
+  nonrecMembers = decls >>= \d ->
+    if d.recursive then []
+    else Array.filter (\(Tuple k _) -> not (isSpecKey k)) d.members
+
+  -- ADR-0093 §4's other half: a *wrapper* body that references a clone (the rewritten call
+  -- site, `CApp M.$spec$… args` / `CAtom M.$spec$…`) must not travel either — inlined into a
+  -- dependent it would carry the module-private clone reference across the module boundary.
+  noSpecRefs body =
+    Set.isEmpty (Set.filter isSpecKey (Set.union (fvExpr Set.empty body) (cfExpr body)))
 
   publishBound = 64
 
@@ -136,7 +146,7 @@ candidatesOf intrinsic gkeys deps decls =
           in
             d.members # Array.mapMaybe \(Tuple k e) -> case e of
               Ret (CLam ps body)
-                | recordTail body, sizeExpr e < publishBound -> Just $ Tuple k
+                | recordTail body, sizeExpr e < publishBound, noSpecRefs e -> Just $ Tuple k
                     { arity: Just (Array.length ps)
                     , size: sizeExpr e
                     , cxLeqDeref: false
@@ -164,8 +174,7 @@ candidatesOf intrinsic gkeys deps decls =
   -- **any** free name — local or global — un-closes the body. The S7 relaxation (free globals
   -- allowed) opened the sibling-web channel the reference bars with `not s.externs`, and the
   -- compiler's own parser modules blew up ×14.5 through it; the dictionary shapes it was aimed
-  -- at ride the scrutinised-known-arg tier and the grouped trigger instead. (`gkeys` stays a
-  -- parameter for the driver's classifier plumbing, unused by this predicate.)
+  -- at ride the scrutinised-known-arg tier and the grouped trigger instead.
   strictClosed ps body =
     Set.isEmpty (fvExpr (Set.fromFoldable ps) body) && Set.isEmpty (cfExpr body)
 
@@ -188,7 +197,8 @@ candidatesOf intrinsic gkeys deps decls =
 
   candidateOf (Tuple k e) = Tuple k <$> (bounded =<< shapeOf e)
     where
-    bounded cand = if cand.size < publishBound then Just cand else Nothing
+    bounded cand =
+      if cand.size < publishBound && noSpecRefs cand.body then Just cand else Nothing
 
   -- Unwrap the body's pure-value `let` chain (every rhs a value construction — re-constructing
   -- them per use site is pure, so a marked-inline evaluation of the chain cannot re-execute
@@ -338,11 +348,10 @@ pureValueRhs = case _ of
 -- | per driver round (ADR-0087's outer fixpoint).
 nbeEnvOf
   :: (String -> Maybe { op :: PrimOp, arity :: Int })
-  -> Set String
   -> Map String InlineCandidate
   -> Array { recursive :: Boolean, members :: Array (String /\ Expr) }
   -> NbeEnv
-nbeEnvOf intrinsic gkeys deps decls =
+nbeEnvOf intrinsic deps decls =
   { externs: Map.union localExterns depExterns
   , intrinsic
   , structural
@@ -355,7 +364,7 @@ nbeEnvOf intrinsic gkeys deps decls =
   depExterns = map (entryFromCandidate envD) deps
 
   envL = base { nbe = { externs: depExterns, intrinsic, structural } }
-  localExterns = map (entryFromCandidate envL) (candidatesOf intrinsic gkeys deps decls)
+  localExterns = map (entryFromCandidate envL) (candidatesOf intrinsic deps decls)
 
   -- The compiler-global **structural rung** as on-demand extern entries (ADR-0089 §1's
   -- compiler-global table, extended from the eta-primop view to the resolver's guest terms): a

@@ -8,9 +8,6 @@ module Test.Unit.Purvasm.Compiler.MiddleEnd.Optimizer.Nbe where
 import Prelude
 
 import Data.Map as Map
-import Data.Set (Set)
-import Data.Set as Set
-import Data.Tuple (fst)
 import Data.Tuple.Nested ((/\))
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Ffi (intrinsicPrim)
@@ -37,21 +34,14 @@ nbe = nbeWith []
 
 -- …or against the given sibling decls (the gate-site-A channel)…
 nbeWith :: Array Decl -> Expr -> Expr
-nbeWith decls = nbeBinding (nbeEnvOf intrinsicPrim (gkeysOf decls) Map.empty decls) "Test.binding"
+nbeWith decls = nbeBinding (nbeEnvOf intrinsicPrim Map.empty decls) "Test.binding"
 
 -- …or against dependency decls published through the slice-2 candidate channel, plus local
 -- sibling decls (mirrors `optimizeModule`'s wiring: deps ride `BuildEnv.inlines`, and the
 -- closedness classifier sees every module's top-level keys).
 nbeCross :: Array Decl -> Array Decl -> Expr -> Expr
 nbeCross depDecls locals =
-  nbeBinding (nbeEnvOf intrinsicPrim gkeys (candidatesOf intrinsicPrim (gkeysOf depDecls) Map.empty depDecls) locals) "Test.binding"
-  where
-  gkeys = Set.union (gkeysOf depDecls) (gkeysOf locals)
-
--- All top-level keys of the given decls — the test-side mirror of the driver's
--- `LocalFacts.gkeys ∪ BuildEnv.gkeys` classifier input.
-gkeysOf :: Array Decl -> Set String
-gkeysOf decls = Set.fromFoldable (decls >>= \d -> map fst d.members)
+  nbeBinding (nbeEnvOf intrinsicPrim (candidatesOf intrinsicPrim Map.empty depDecls) locals) "Test.binding"
 
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
@@ -666,7 +656,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
           , nonrec "M.caf" (Ret (CApp (var "M.lam") [ int 1 ]))
           , { recursive: true, members: [ "M.rec" /\ Ret (CLam [ "x" ] (Ret (CAtom (var "x")))) ] }
           ]
-        env = nbeEnvOf intrinsicPrim (gkeysOf decls) Map.empty decls
+        env = nbeEnvOf intrinsicPrim Map.empty decls
       -- membership probed through nbeBinding behaviour instead of map internals:
       -- the lambda inlines, the computation CAF and the recursive member stay calls.
       nbeBinding env "t" (Ret (CApp (var "M.lam") [ var "p" ])) `shouldEqual` Ret (CAtom (var "p"))

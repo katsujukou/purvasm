@@ -55,6 +55,7 @@ import Purvasm.Compiler.MiddleEnd.Optimizer.DictElim (DictMachinery, dictElimExp
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe (candidatesOf, nbeBinding, nbeEnvOf)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Analysis (sizeExpr)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (InlineCandidate)
+import Purvasm.Compiler.MiddleEnd.Optimizer.Specialize (specializeModule)
 
 -- | The per-build, in-memory optimiser environment threaded through the module fold — carrying the facts
 -- | a module's **dependencies** contributed: their dictionary machinery (so an imported
@@ -138,7 +139,7 @@ optimizeModule (BuildEnv env) lf am =
     full = mergeMachinery lf.dict env.dict
     gkeys = Set.union lf.gkeys env.gkeys
     elimd = map (mapDeclBodies (dictElimExpr intrinsicLift gkeys full)) am.decls
-    nbe = nbeEnvOf intrinsicPrim gkeys env.inlines elimd
+    nbe = nbeEnvOf intrinsicPrim env.inlines elimd
     -- The round-growth backstop (ADR-0089 self-compile extension) wraps every binding: a round
     -- output that grew past `roundGrowthMax`× the round input keeps the input — term-preserving,
     -- never a mid-flight re-reduction — and **everything below derives from the post-backstop
@@ -148,11 +149,16 @@ optimizeModule (BuildEnv env) lf am =
     -- for sits orders of magnitude above it.
     optimised = elimd <#> \d ->
       d { members = d.members <#> \(Tuple k e) -> Tuple k (backstop k e (nbeBinding nbe k e)) }
+    -- Dictionary specialization (ADR-0093): `Specialize ∘ Nbe ∘ DictElim` per round. Discovery on
+    -- the (post-backstop) NbE output; emitted clones and rewritten sites become part of the
+    -- module the next round (and the summary below) derive from.
+    localInlines = candidatesOf intrinsicPrim env.inlines optimised
+    specialized = specializeModule am.name lf.gkeys (Map.union localInlines env.inlines) optimised
   in
-    { module: am { decls = optimised }
+    { module: am { decls = specialized }
     , summary:
         let
-          inlines = candidatesOf intrinsicPrim gkeys env.inlines optimised
+          inlines = candidatesOf intrinsicPrim env.inlines specialized
           -- own foreign shapes the candidate bodies reference — on either atom spelling (a foreign
           -- key rides `AtomForeign` or a plain qualified `AtomVar`); see `BuildSummary.foreignSigs`.
           referenced = Array.foldl
@@ -193,7 +199,10 @@ backstop key input output =
       unsafePerformEffect do
         warn
           ( "purvasm: optimizer round-growth backstop fired at " <> key
-              <> " (input " <> show inSize <> " -> output " <> show outSize
+              <> " (input "
+              <> show inSize
+              <> " -> output "
+              <> show outSize
               <> " nodes); keeping the round input"
           )
         pure input
