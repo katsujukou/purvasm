@@ -123,16 +123,48 @@ if [ "$OPT_EFFECT" = "1" ]; then
   # `purvm run --count` prints stats to stderr, the guest's result to stdout.
   instr_count() { "$PURVM" run --count "$1" "$2" 2>&1 1>/dev/null | awk '/instructions/{print $2}'; }
   guest_out() { "$PURVM" run "$1" "$2" 2>/dev/null; }
+  now() { perl -MTime::HiRes=time -e 'printf "%.3f", time'; }
+  pmo_bytes() { cat "$1"/_build/*.pmo 2>/dev/null | wc -c | tr -d ' '; }
+
+  # The ADR-0089 §7 size/time gate: a silent optimiser blow-up the behavioural checks cannot see
+  # must fail loudly. Thresholds carry headroom over the measured baseline (2026-07-11: emitted
+  # `.pmo` size ratio ≈ 0.94–1.0 — the optimiser is a net shrink today — and compile wall time
+  # ≈ 1.5–2.4× --no-opt, but wall-clock on ~1s node processes swings ±2× with startup noise — hence the wide time headroom); tighten or justify raising them with measurements.
+  SIZE_RATIO_MAX=1.5
+  TIME_RATIO_MAX=4.0
 
   optsum="$OUT/opt-effect.txt"
-  printf '%-16s %-10s %14s %14s %8s %7s\n' bench n opt no-opt ratio 'red%' | tee "$optsum"
+  printf '%-16s %-10s %14s %14s %8s %7s %7s %7s\n' bench n opt no-opt ratio 'red%' 'size×' 'time×' | tee "$optsum"
   echo "$BENCH_TABLE" | while read -r name module start heap; do
     [ -n "$name" ] || continue
     if [ -n "$ONLY" ] && ! echo "$ONLY" | tr ' ' '\n' | grep -qx "$name"; then continue; fi
     odir="$OUT/opt/$name/opt"
     ndir="$OUT/opt/$name/noopt"
+    # Fresh outdirs: pmo_bytes sums the whole `_build`, so a `.pmo` left by an earlier run (or
+    # another branch's closure shape) would silently pollute the size gate.
+    rm -rf "$odir" "$ndir"
     mkdir -p "$odir" "$ndir"
-    if ! l2_compile "$module" "$odir" opt || ! l2_compile "$module" "$ndir" noopt; then
+    # Warm the page cache (the closure's corefn.json reads) with an untimed compile: whichever
+    # mode runs first otherwise pays the cold I/O alone, biasing the time× ratio. The timed
+    # measurement is min-of-2 per mode (the ADR-0075 noise discipline) — single-shot wall clock on
+    # ~1s node processes swings past the gate on outliers.
+    l2_compile "$module" "$ndir" noopt >/dev/null 2>&1 || true
+    ot=""
+    nt=""
+    cfail=0
+    for _rep in 1 2; do
+      t0=$(now)
+      l2_compile "$module" "$odir" opt || cfail=1
+      t1=$(now)
+      l2_compile "$module" "$ndir" noopt || cfail=1
+      t2=$(now)
+      [ "$cfail" = "1" ] && break
+      od=$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.3f", b - a }')
+      nd=$(awk -v b="$t1" -v c="$t2" 'BEGIN { printf "%.3f", c - b }')
+      if [ -z "$ot" ]; then ot=$od; else ot=$(awk -v x="$ot" -v y="$od" 'BEGIN { print (y < x) ? y : x }'); fi
+      if [ -z "$nt" ]; then nt=$nd; else nt=$(awk -v x="$nt" -v y="$nd" 'BEGIN { print (y < x) ? y : x }'); fi
+    done
+    if [ "$cfail" = "1" ]; then
       printf '%-16s %-10s %14s\n' "$name" "$start" "COMPILE-FAILED" | tee -a "$optsum"
       touch "$OUT/.opt-failed"
       continue
@@ -149,10 +181,48 @@ if [ "$OPT_EFFECT" = "1" ]; then
     ni=$(instr_count "$ndir/app.pvm" "$start")
     ratio=$(awk -v n="$ni" -v o="$oi" 'BEGIN { if (o > 0) printf "%.3f", n / o; else printf "n/a" }')
     red=$(awk -v n="$ni" -v o="$oi" 'BEGIN { if (n > 0) printf "%.1f", (n - o) * 100 / n; else printf "n/a" }')
-    printf '%-16s %-10s %14s %14s %8s %7s\n' "$name" "$start" "$oi" "$ni" "$ratio" "$red" | tee -a "$optsum"
+    # The size/time gate (ADR-0089 §7). Zero emitted bytes on either side means the compile did
+    # not actually produce a closure into the fresh outdir — a harness bug, not a measurement.
+    os=$(pmo_bytes "$odir")
+    ns=$(pmo_bytes "$ndir")
+    if [ "$os" = "0" ] || [ "$ns" = "0" ]; then
+      printf '%-16s %-10s %14s (opt=%sB / noopt=%sB)\n' "$name" "$start" "NO-PMO-EMITTED" "$os" "$ns" | tee -a "$optsum"
+      touch "$OUT/.opt-failed"
+      continue
+    fi
+    sizer=$(awk -v a="$os" -v b="$ns" 'BEGIN { if (b > 0) printf "%.3f", a / b; else printf "n/a" }')
+    timer=$(awk -v o="$ot" -v n="$nt" 'BEGIN { if (n > 0) printf "%.3f", o / n; else printf "n/a" }')
+    gate=""
+    if awk -v r="$sizer" -v m="$SIZE_RATIO_MAX" 'BEGIN { exit !(r > m) }'; then
+      gate=" SIZE-GATE-EXCEEDED(>$SIZE_RATIO_MAX)"
+      touch "$OUT/.opt-failed"
+    fi
+    if awk -v r="$timer" -v m="$TIME_RATIO_MAX" 'BEGIN { exit !(r > m) }'; then
+      gate="$gate TIME-GATE-EXCEEDED(>$TIME_RATIO_MAX)"
+      touch "$OUT/.opt-failed"
+    fi
+    printf '%-16s %-10s %14s %14s %8s %7s %7s %7s%s\n' "$name" "$start" "$oi" "$ni" "$ratio" "$red" "$sizer" "$timer" "$gate" | tee -a "$optsum"
   done
   echo
-  echo "opt-effect summary → $optsum  (--opt vs --no-opt VM instruction counts; exact, ratio = noopt/opt)"
+  echo "opt-effect summary → $optsum  (ratio = noopt/opt instructions; size×/time× = opt/noopt emitted-.pmo bytes and compile wall time, gated at $SIZE_RATIO_MAX/$TIME_RATIO_MAX per ADR-0089 §7)"
+  # ratio bar chart next to the 4-way wall-clock PNGs. Note the scope difference: those graphs are
+  # boot-compiled legs; only this plot (and the table above) shows the Level-2 optimiser's effect.
+  gp="$OUT/opt-effect.gp"
+  {
+    echo "set terminal pngcairo size 900,480"
+    echo "set output '$OUT/opt-effect.png'"
+    echo "set title 'Level-2 optimiser effect — VM instruction ratio (--no-opt / --opt), higher is better'"
+    echo "set style data histogram"
+    echo "set style fill solid 0.8 border -1"
+    echo "set boxwidth 0.6"
+    echo "set yrange [0:*]"
+    echo "set grid ytics"
+    echo "set ylabel 'ratio'"
+    echo "plot '$optsum' every ::1 using 5:xtic(1) notitle, \\"
+    echo "     '' every ::1 using 0:5:5 with labels offset 0,0.6 notitle"
+  } >"$gp"
+  gnuplot "$gp" 2>/dev/null && echo "opt-effect plot → $OUT/opt-effect.png" \
+    || echo "   (gnuplot unavailable — table written, plot skipped)"
   st=0
   [ -f "$OUT/.opt-failed" ] && st=1
   rm -f "$OUT/.opt-failed"
