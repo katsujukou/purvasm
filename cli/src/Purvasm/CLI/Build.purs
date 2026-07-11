@@ -24,6 +24,8 @@ import Data.List as List
 import Data.Map (Map)
 import Data.Map as Map
 import Data.Maybe (Maybe(..))
+import Data.String (Pattern(..))
+import Data.String as String
 import Data.Set as Set
 import Data.Tuple (fst, snd)
 import Data.Tuple.Nested (type (/\), (/\))
@@ -66,6 +68,10 @@ type Options =
   -- | `--opt-max-iter <N>`: the optimiser fixpoint round cap, clamped to `[1, optMaxIterCap]`.
   , optMaxIter :: Int
   , runtimeLib :: Maybe FilePath
+  -- | `--rust-ffi <dir>`: the single app-Rust foreign crate (ADR-0091 §3/§Addendum). Selecting it makes app
+  -- | FFI Rust — the crate is bundled with the runtime rlib into one staticlib and linked; C siblings are
+  -- | not compiled, only scanned to enforce C-xor-Rust (a co-located `.c` is then an ambiguity error).
+  , rustFfi :: Maybe FilePath
   }
 
 -- | The heuristic hard cap on optimiser fixpoint rounds (ADR-0087 §3.1) — the outer-round analogue of
@@ -127,7 +133,8 @@ options = fromRecord
         # ArgParser.optional
   , optMaxIter:
       ArgParser.argument [ "--opt-max-iter" ]
-        "Maximum optimiser fixpoint rounds per module (clamped to [1, 10]). Defaults to the cap."
+        "Maximum optimiser fixpoint rounds per module (clamped to [1, 10]).\n\
+        \Defaults to the cap."
         # ArgParser.int
         # ArgParser.default optMaxIterCap
   , runtimeLib:
@@ -135,10 +142,32 @@ options = fromRecord
         "Path to the runtime staticlib (libpurvasm_rt.a). Defaults to $PURVASM_RT_A or\n\
         \runtime/target/release/libpurvasm_rt.a."
         # ArgParser.optional
+  , rustFfi:
+      ArgParser.argument [ "--rust-ffi" ]
+        "Path to the Rust crate implementing foreign modules. \n\
+        \Specify only when using Rust for foreign modules;\n\
+        \cannot be combined with C foreign modules."
+        # ArgParser.optional
   }
 
 importNames :: Module -> Array String
 importNames m = map (nameKey <<< _.moduleName) m.imports
+
+-- | The local workspace source modules (ADR-0091 §2): cache-db entries whose `.purs` is **not** under
+-- | `.spago` (a registry dependency). This is the app-C sibling `.c` search space handed to the linker;
+-- | a registry dependency's adjacent `.c` is never app FFI — it stays packaged-provider work (ADR-0091
+-- | §2). A local *library* package is included but normally backs its leaves through the runtime/ulib
+-- | (no sibling `.c`). A cache-db decode failure ⇒ none (the failure surfaces through FSR where it matters).
+projectModules :: ForeignSigs.Env -> Array { key :: String, sourcePath :: FilePath }
+projectModules fsEnv = case fsEnv.cacheDb of
+  Left _ -> []
+  Right cdb ->
+    Array.mapMaybe
+      ( \(name /\ path) ->
+          if String.contains (Pattern ".spago") path then Nothing
+          else Just { key: name, sourcePath: path }
+      )
+      (Map.toUnfoldable cdb)
 
 -- | Load the entry module and the transitive closure of its imports (the `Map`-based CLI helper used by
 -- | `--check-foreign-sigs` and the `foreign-sigs` command). The library `Purvasm.Compiler.loadClosure`
@@ -275,4 +304,6 @@ cmd opts = do
           , moduleCount: n
           , runtimeLib: opts.runtimeLib
           , ulibDir
+          , appModules: projectModules fsEnv
+          , rustFfiDir: opts.rustFfi
           }
