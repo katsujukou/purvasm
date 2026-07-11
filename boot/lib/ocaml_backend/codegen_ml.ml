@@ -201,7 +201,7 @@ let foreign = function
   | "Data.Number.sin" -> VClos (fun v -> VNumber (Float.sin (as_num v)))
   | "Data.Number.isFinite" -> VClos (fun v -> VBool (Float.is_finite (as_num v)))
   | "Data.Number.isNaN" -> VClos (fun v -> VBool (Float.is_nan (as_num v)))
-  | "Data.Number.parseFloatImpl" ->
+  | "Purvasm.Number.parseFloat" ->
     VClos (fun v -> VNumber (try float_of_string (as_str v) with _ -> Float.nan))
   | "Purvasm.Number.floatBitsHi" ->
     VClos

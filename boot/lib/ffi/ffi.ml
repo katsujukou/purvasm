@@ -419,16 +419,17 @@ let record_rename : C.term =
 (* `Data.Number.fromStringImpl` is the higher-order `Fn4 String (Number -> Boolean)
    (forall a. a -> Maybe a) (forall a. Maybe a) (Maybe Number)` foreign behind
    `Data.Number.fromString` (ADR-0046). Like the `Fn*`/`ST` adapters it is a structural guest
-   term, not a native leaf (native leaves are first-order, ADR-0022): it parses via the
-   first-order `parseFloatImpl` leaf, then applies the caller's `isFinite`/`Just`/`Nothing` —
-   so a `NaN`/non-finite parse becomes `Nothing`, exactly as the prelude's
-   `runFn4 _ str isFinite Just Nothing`. *)
+   term, not a native leaf (native leaves are first-order, ADR-0022): it parses via the declared
+   first-order `Purvasm.Number.parseFloat` ABI-floor leaf (ADR-0092 — a structural intrinsic
+   references only declared foreigns, never an invented leaf), then applies the caller's
+   `isFinite`/`Just`/`Nothing` — so a `NaN`/non-finite parse becomes `Nothing`, exactly as the
+   prelude's `runFn4 _ str isFinite Just Nothing`. *)
 let number_from_string_impl : C.term =
   lams
     [ "str"; "isFin"; "just"; "nothing" ]
     (C.Let
        ( "n"
-       , C.App (C.Foreign "Data.Number.parseFloatImpl", v "str")
+       , C.App (C.Foreign "Purvasm.Number.parseFloat", v "str")
        , C.If (C.App (v "isFin", v "n"), C.App (v "just", v "n"), v "nothing") ))
 
 let structural : (string * C.term) list =
@@ -727,17 +728,17 @@ let host : Cesk.Machine.host =
         (unary (function
            | V.VNumber f -> V.VBool (Stdlib.Float.is_nan f)
            | _ -> Cesk.Errors.stuck "isNaN: not a Number"))
-    (* `Data.Number.parseFloatImpl :: String -> Number` (ADR-0046): the first-order parse engine
-       behind the structural `fromStringImpl`. A parse failure yields `NaN`; the guest term turns
+    (* `Purvasm.Number.parseFloat :: String -> Number` (ADR-0092, the ABI-floor leaf behind the
+       structural `fromStringImpl`; ADR-0046). A parse failure yields `NaN`; the guest term turns
        that into `Nothing` via `isFinite`, so this leaf never needs to build a `Maybe`. *)
-    | "Data.Number.parseFloatImpl" ->
+    | "Purvasm.Number.parseFloat" ->
       Some
         (unary (function
            | V.VString s ->
              V.VNumber
                (try Stdlib.float_of_string s with
                 | _ -> Stdlib.Float.nan)
-           | _ -> Cesk.Errors.stuck "parseFloatImpl: not a String"))
+           | _ -> Cesk.Errors.stuck "parseFloat: not a String"))
     (* `Purvasm.Number.floatBitsHi`/`floatBitsLo :: Number -> Int` (ADR-0038 §4's float-bits read):
        the halves of a `Number`'s IEEE-754 bits, each reinterpreted as a signed 32-bit `Int`. The
        representation-level primitive the self-host's bit-exact `Number` serialisation builds on —
