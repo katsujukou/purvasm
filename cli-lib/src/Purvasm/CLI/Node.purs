@@ -83,6 +83,11 @@ nodeProcHandler = case _ of
     pure case res of
       Left e -> Left (Exn.message e)
       Right out -> Right out
+  ExecCaptureQuiet cmd args k -> k <$> liftEffect do
+    res <- try (execFileCaptureQuietImpl cmd args)
+    pure case res of
+      Left e -> Left (Exn.message e)
+      Right out -> Right out
   ExecInput cmd args input k -> k <$> liftEffect do
     res <- try (execFileInputImpl cmd args input)
     pure case res of
@@ -101,6 +106,10 @@ foreign import readStdinImpl :: Effect String
 -- | Run an external tool synchronously and return its captured stdout (`execFileSync` with
 -- | `encoding: utf8`); throws on failure, which the handler turns into `Left` via `try`.
 foreign import execFileCaptureImpl :: String -> Array String -> Effect String
+
+-- | Like `execFileCaptureImpl` but with the child's stderr discarded (`stdio` ignores it), so benign
+-- | tool noise does not leak to the terminal.
+foreign import execFileCaptureQuietImpl :: String -> Array String -> Effect String
 
 -- | Read/write a file as bytes. `node:fs` deals in `Buffer`, which *is* a `Uint8Array`, so these
 -- | convert at the boundary with no copy — keeping the `Filesystem` effect Node-agnostic.

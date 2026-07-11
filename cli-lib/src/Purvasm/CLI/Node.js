@@ -21,6 +21,15 @@ export const readStdinImpl = () => readFileSync(0, "utf8");
 export const execFileCaptureImpl = (cmd) => (args) => () =>
   execFileSync(cmd, args, { encoding: "utf8", maxBuffer: 1e8 });
 
+// Capture stdout, DISCARD stderr (stdio[2] = "ignore"): a tool whose stderr is benign noise (e.g.
+// `llvm-nm`'s "no symbols" per empty archive member) then does not leak to the terminal.
+export const execFileCaptureQuietImpl = (cmd) => (args) => () =>
+  execFileSync(cmd, args, {
+    encoding: "utf8",
+    maxBuffer: 1e8,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+
 // `readFileSync` returns a Buffer, which is a Uint8Array; `writeFileSync` accepts a Uint8Array.
 // So the CLI's binary currency stays `Uint8Array` with no Buffer conversion.
 export const readFileBytesImpl = (path) => () => readFileSync(path);
