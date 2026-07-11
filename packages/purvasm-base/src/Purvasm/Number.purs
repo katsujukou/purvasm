@@ -13,6 +13,7 @@ module Purvasm.Number
   , lt
   , floatBitsHi
   , floatBitsLo
+  , parseFloat
   ) where
 
 foreign import add :: Number -> Number -> Number
@@ -38,3 +39,10 @@ foreign import floatBitsHi :: Number -> Int
 
 -- | The low 32 bits of the `Number`'s IEEE-754 representation, as `floatBitsHi`.
 foreign import floatBitsLo :: Number -> Int
+
+-- | The first-order string→double parse engine (ADR-0092): a full-consumption parse with surrounding
+-- | whitespace rejected; a non-number (or the empty string) yields `NaN`. This is the ABI floor the
+-- | `ulib` `Data.Number.fromString` builds on (the compiler's `fromStringImpl` structural intrinsic
+-- | folds the `NaN`/non-finite case to `Nothing` via the caller's `isFinite`). On purvasm: the runtime
+-- | leaf `pvf_Purvasm_2eNumber_2eparseFloat`; the JS foreign is used only by stock `purs` builds.
+foreign import parseFloat :: String -> Number

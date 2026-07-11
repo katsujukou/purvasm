@@ -329,6 +329,21 @@ extern "C" fn leaf_float_bits_lo(ctx: *mut Heap, _clo: u64, args: *const u64, na
     })
 }
 
+/// `Purvasm.Number.parseFloat :: String -> Number` (ADR-0092) — the first-order string→double parse
+/// engine behind the guest `Data.Number.fromString`. Full-consumption parse with surrounding
+/// whitespace rejected (Rust's `str::parse::<f64>` matches the `strtod` arm it replaces on every
+/// JSON-shaped lexeme); a non-number yields `NaN`, which the guest folds to `Nothing` via `isFinite`.
+#[export_name = "pvf_Purvasm_2eNumber_2eparseFloat"]
+extern "C" fn leaf_parse_float(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: usize) -> u64 {
+    // SAFETY: as [`leaf_show_int`]; `args[0]` is a `String`.
+    guard(|| unsafe {
+        let h = heap(ctx);
+        let s = h.checked_ptr(args_slice(args, nargs)[0]);
+        let r = h.str_read(s).parse::<f64>().unwrap_or(f64::NAN);
+        h.new_number(r).as_word().to_bits()
+    })
+}
+
 /// `Purvasm.String.byteLength :: String -> Int` — the UTF-8 byte length (ADR-0052).
 #[export_name = "pvf_Purvasm_2eString_2ebyteLength"]
 extern "C" fn leaf_byte_length(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: usize) -> u64 {
@@ -414,6 +429,30 @@ mod tests {
                 h.str_read(HeapPtr::from_word(TaggedWord::from_bits(r))),
                 "-42"
             );
+            pv_runtime_free(ctx);
+        }
+    }
+
+    #[test]
+    fn parse_float_leaf_full_consumption_or_nan() {
+        // `Purvasm.Number.parseFloat` (ADR-0092): a well-formed, whitespace-free lexeme parses; a
+        // non-number, the empty string, or surrounding/trailing garbage yields NaN (the guest folds it
+        // to `Nothing`). Guards the frontier the retired `Data.Number.parseFloatImpl` used to cover.
+        let ctx = pv_runtime_new(1 << 12);
+        unsafe {
+            let pf = leaf(ctx, leaf_parse_float, 1);
+            let call = |s: &[u8]| -> f64 {
+                let sv = heap(ctx).new_str(s).as_word().to_bits();
+                let a = [sv];
+                let r = pv_apply(ctx, pf, a.as_ptr(), a.len());
+                f64::from_bits(heap(ctx).number_bits(HeapPtr::from_word(TaggedWord::from_bits(r))))
+            };
+            assert_eq!(call(b"42.0"), 42.0);
+            assert_eq!(call(b"-2.5e10"), -2.5e10);
+            assert!(call(b"abc").is_nan());
+            assert!(call(b"").is_nan());
+            assert!(call(b" 3.0").is_nan()); // leading whitespace rejected
+            assert!(call(b"3.0x").is_nan()); // trailing garbage rejected
             pv_runtime_free(ctx);
         }
     }

@@ -17,3 +17,13 @@ export const floatBitsLo = (f) => {
   floatBitsView.setFloat64(0, f);
   return floatBitsView.getInt32(4);
 };
+
+// Full-consumption decimal parse matching the native runtime leaf (Rust `str::parse::<f64>`): reject
+// surrounding whitespace, the empty string, and the JS-only numeric forms `Number` accepts but the
+// native parse rejects — hex/binary/octal literals (`0x…`/`0b…`/`0o…`). A non-number then yields NaN,
+// which the guest `fromString` folds to `Nothing`. Only stock `purs`/purs-backend-es builds reach this
+// stub; the purvasm backend resolves `parseFloat` to the runtime leaf and ignores it.
+export const parseFloat = (s) => {
+  if (s.length === 0 || s.trim() !== s || /^[+-]?0[xXbBoO]/.test(s)) return NaN;
+  return Number(s);
+};
