@@ -10,7 +10,6 @@
 #include "purvasm.h"
 
 #include <math.h>
-#include <stdlib.h>
 #include <string.h>
 
 static double num_arg(PVContext *ctx, PVWord w) {
@@ -66,33 +65,4 @@ PVWord pvf_Data_2eNumber_2eisNaN(PVContext *ctx, PVWord clo, const PVWord *args,
   (void)clo;
   (void)nargs;
   return pv_bool(isnan(num_arg(ctx, args[0])));
-}
-
-/* `parseFloatImpl :: String -> Number` (ADR-0046): the first-order parse engine behind the guest
- * `fromString`; a parse failure yields NaN (the guest folds it to `Nothing` via `isFinite`). Boot's
- * arm is OCaml `float_of_string`; this is full-consumption `strtod` with leading whitespace rejected
- * — identical on every JSON-shaped lexeme (`purvasm-json`'s number path, the load-bearing consumer).
- * OCaml-only spellings (digit underscores) are not accepted; no reachable producer emits them. */
-PVWord pvf_Data_2eNumber_2eparseFloatImpl(PVContext *ctx, PVWord clo, const PVWord *args,
-                                          size_t nargs) {
-  (void)clo;
-  (void)nargs;
-  size_t len = pv_str_len(ctx, args[0]);
-  double r = NAN;
-  if (len > 0) {
-    char *buf = (char *)malloc(len + 1);
-    if (buf != NULL) {
-      size_t n = pv_str_copy(ctx, args[0], (uint8_t *)buf, len);
-      buf[n] = '\0';
-      /* strtod skips leading whitespace (OCaml float_of_string does not) and stops at an embedded
-       * NUL; requiring the parse to consume exactly the copied length rejects both. */
-      if (buf[0] != ' ' && buf[0] != '\t' && buf[0] != '\n' && buf[0] != '\r') {
-        char *end = NULL;
-        double v = strtod(buf, &end);
-        if (end == buf + n && n == len) r = v;
-      }
-      free(buf);
-    }
-  }
-  return mk_number(ctx, r);
 }
