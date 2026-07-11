@@ -83,6 +83,7 @@ nativeProcHandler :: forall r. ProcF ~> Run (EFFECT + r)
 nativeProcHandler = case _ of
   Exec _ _ _ -> unsafeCrashWith notYet
   ExecCapture _ _ _ -> unsafeCrashWith notYet
+  ExecCaptureQuiet _ _ _ -> unsafeCrashWith notYet
   ExecInput _ _ _ _ -> unsafeCrashWith notYet
   where
   notYet = "Process: exec not yet available on the purvasm-native CLI (ADR-0045); use the Node CLI for `build`."
