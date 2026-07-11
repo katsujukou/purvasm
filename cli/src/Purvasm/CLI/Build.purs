@@ -274,4 +274,5 @@ cmd opts = do
           , buildDir
           , moduleCount: n
           , runtimeLib: opts.runtimeLib
+          , ulibDir
           }

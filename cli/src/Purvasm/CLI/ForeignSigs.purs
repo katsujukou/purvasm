@@ -59,10 +59,19 @@ type Env =
   { ulibDir :: FilePath
   , ulibSigs :: Either String ForeignSigMap
   , cacheDb :: Either String (Map String FilePath)
+  -- | The source-derived foreign signatures of the reachable `purvasm-base` ABI-floor modules
+  -- | (ADR-0092), unioned into **every** module's shapes. `purvasm-base` sits between `Prim` and
+  -- | `Prelude` as the compiler/runtime ABI surface, so it is an implicit dependency of every
+  -- | `ulib`/structural-intrinsic context: a structural intrinsic (e.g. `Data.Number.fromStringImpl`)
+  -- | may reference a declared `Purvasm.*` leaf (`Purvasm.Number.parseFloat`) whose owning module the
+  -- | referencing module does not import, so its arity must be visible regardless of the loaded closure.
+  -- | Not a hidden arity table — the shape still comes from the `foreign import` signature in
+  -- | purvasm-base source. Deferred like the others: a reconstruction failure surfaces per-module.
+  , abiFloorSigs :: Either String ForeignSigMap
   }
 
--- | Read the two static inputs once. Non-fallible: absence ⇒ empty, and a decode failure is captured as
--- | a `Left` in [Env] (forced per-module by the provenance branch that needs it), not thrown here.
+-- | Read the static inputs once. Non-fallible: absence ⇒ empty, and a decode/reconstruction failure is
+-- | captured as a `Left` in [Env] (forced per-module by the branch that needs it), not thrown here.
 loadEnv
   :: forall r
    . { ulibDir :: FilePath, corefnDir :: FilePath }
@@ -70,7 +79,8 @@ loadEnv
 loadEnv dirs = do
   ulibSigs <- loadUlibSigs dirs.ulibDir
   cacheDb <- loadCacheDb dirs.corefnDir
-  pure { ulibDir: dirs.ulibDir, ulibSigs, cacheDb }
+  abiFloorSigs <- loadAbiFloorSigs cacheDb
+  pure { ulibDir: dirs.ulibDir, ulibSigs, cacheDb, abiFloorSigs }
 
 -- | One module's foreign shapes (ADR-0033 separate-compilation granularity): syntactic and
 -- | module-local, no dependency on any other module. Empty when the module declares no foreigns.
@@ -87,7 +97,10 @@ moduleForeignSigs env m
       entries <-
         if overlaid then fromUlib env name m.foreignNames
         else fromSource env name m.foreignNames
-      pure (Map.fromFoldable entries)
+      -- ADR-0092: union the `Purvasm.*` ABI floor so a structural intrinsic's declared leaf resolves
+      -- even when this module does not import its owning purvasm-base module. Own sigs win a collision.
+      abiFloor <- either throw pure env.abiFloorSigs
+      pure (Map.union (Map.fromFoldable entries) abiFloor)
 
 -- | `moduleForeignSigs` with its `EXCEPT String` discharged to a returned `Either` — the shape the
 -- | build driver's `CompilerAction.foreignSigsOf` capability needs (ADR-0090 §2: FSR failure is
@@ -161,6 +174,31 @@ fromSource env name foreigns = do
 isUlibOverlaid :: forall r. FilePath -> String -> Run (FS + r) Boolean
 isUlibOverlaid ulibDir name =
   FS.joinPath [ ulibDir, name, "corefn.json" ] >>= FS.exists
+
+-- | The `Purvasm.*` ABI-floor foreign signatures (ADR-0092), reconstructed from source: the cache-db
+-- | entries whose `.purs` lives under `purvasm-base` (so `Purvasm.Compiler.*` and other `Purvasm.*`
+-- | subsystems are excluded). Reconstructed directly from source — independent of the loaded closure —
+-- | so a structural intrinsic's leaf resolves even when no loaded module imports its purvasm-base owner.
+-- | Deferred: a read/reconstruction failure is returned as `Left`, surfaced per-module in `moduleForeignSigs`.
+loadAbiFloorSigs
+  :: forall r
+   . Either String (Map String FilePath)
+  -> Run (FS + r) (Either String ForeignSigMap)
+loadAbiFloorSigs = case _ of
+  Left e -> pure (Left e)
+  Right cacheDb -> runExcept do
+    let
+      baseEntries =
+        Array.filter (\(_ /\ p) -> String.contains (Pattern "purvasm-base") p)
+          (Map.toUnfoldable cacheDb :: Array (String /\ FilePath))
+    grouped <- for baseEntries \(name /\ path) -> do
+      src <- FS.readText path >>= case _ of
+        Just s -> pure s
+        Nothing -> throw (Fmt.fmt @"foreign-sigs: ABI floor {name}: cannot read source {path}" { name, path })
+      case reconstructModule src of
+        Left issue -> throw (Fmt.fmt @"foreign-sigs: ABI floor {name}: {issue}" { name, issue: show issue })
+        Right rec -> pure (map (\(ident /\ shape) -> (rec.moduleName <> "." <> ident) /\ shape) rec.sigs)
+    pure (Map.fromFoldable (Array.concat grouped))
 
 -- | The aggregated `foreignSigs` of `<ulibDir>/ulib.json` (absent file / field ⇒ empty). A decode
 -- | failure is returned as `Left` (deferred, ADR-0090 §2), not thrown.
