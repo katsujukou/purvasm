@@ -13,7 +13,8 @@
 -- | (mutation / allocation identity / mutable-read ordering); every other primop is a pure value
 -- | operation.
 module Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types
-  ( Sem(..)
+  ( ArgUse
+  , Sem(..)
   , Comp(..)
   , NAlt
   , NRhs(..)
@@ -69,11 +70,20 @@ data RefTarget
 -- | from the binding's post-DictElim body each `optimizeModule` round) and its lazily-evaluated
 -- | semantic value. `arity` is `Just` for a `Ret (CLam …)` body (unfold at saturation), `Nothing`
 -- | for a value body (an alias / data CAF — unfold on demand, size-gated).
+-- | Per-parameter consumption facts of a lambda candidate (the scrutinised-known-arg 64-tier,
+-- | ADR-0089 self-compile extension): `projected` counts projection/match-scrutinee positions,
+-- | `appliedHead` counts call-head positions; pass-through occurrences are the visible remainder
+-- | `total - projected - appliedHead`.
+type ArgUse = { total :: Int, projected :: Int, appliedHead :: Int }
+
 type ExternEntry =
   { arity :: Maybe Int
   , size :: Int
   , cxLeqDeref :: Boolean
   , closed :: Boolean
+  -- | Per-parameter facts for lambda candidates (`[]` otherwise — the known-arg tier never
+  -- | fires without them).
+  , argUses :: Array ArgUse
   -- | Non-empty for a Rec-group dictionary builder (or a saturated alias of one): the whole
   -- | group's key set (ADR-0089 parameterized-instance extension). A grouped entry never unfolds
   -- | at bare saturation; it folds only through the deferred-ref projection trigger, and its
@@ -116,6 +126,8 @@ type InlineCandidate =
   , size :: Int
   , cxLeqDeref :: Boolean
   , closed :: Boolean
+  -- | See `ExternEntry.argUses`.
+  , argUses :: Array ArgUse
   -- | See `ExternEntry.group`; `Set.empty` for every ordinary (NonRec) candidate.
   , group :: Set String
   , body :: Expr

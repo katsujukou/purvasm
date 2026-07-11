@@ -39,7 +39,7 @@ import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Analysis (inlineMarks, sizeExpr)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Distribute (distributeCases)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Eval (evalC, evalExpr)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Quote (quote)
-import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (EvalEnv, ExternEntry, InlineCandidate, NbeEnv, RefTarget(..), Sem(..))
+import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (ArgUse, EvalEnv, ExternEntry, InlineCandidate, NbeEnv, RefTarget(..), Sem(..))
 import Purvasm.Compiler.Primitive (PrimOp)
 
 -- | The inner rewrite-fuel cap (the reference's `rewriteLimit` analogue, sidenote 0012 §1).
@@ -140,7 +140,8 @@ candidatesOf intrinsic gkeys deps decls =
                     { arity: Just (Array.length ps)
                     , size: sizeExpr e
                     , cxLeqDeref: false
-                    , closed: Set.isEmpty (Set.filter (not <<< isGlobal) (fvExpr (Set.fromFoldable ps) body))
+                    , closed: strictClosed ps body
+                    , argUses: argUsesOf ps body
                     , group
                     , body: e
                     }
@@ -159,12 +160,14 @@ candidatesOf intrinsic gkeys deps decls =
       Just c | not (Set.isEmpty c.group) -> Just { arity: c.arity, group: c.group }
       _ -> Nothing
 
-  -- The gate-A closedness classifier (ADR-0089 Addendum extension, Accepted 2026-07-11): a free
-  -- name is relocation-safe iff it is a known top-level key (own module ∪ dependency closure,
-  -- the same set `dictElimExpr` classifies with) or in the compiler-global intrinsic/structural
-  -- domain. Anything else — a local escape, an unresolved key — keeps the body un-closed; never
-  -- a naming-convention judgement.
-  isGlobal n = Set.member n gkeys || isJust (intrinsic n) || isJust (resolver n)
+  -- The 64-tier `closed` is the reference's strict form again (ADR-0089 self-compile extension):
+  -- **any** free name — local or global — un-closes the body. The S7 relaxation (free globals
+  -- allowed) opened the sibling-web channel the reference bars with `not s.externs`, and the
+  -- compiler's own parser modules blew up ×14.5 through it; the dictionary shapes it was aimed
+  -- at ride the scrutinised-known-arg tier and the grouped trigger instead. (`gkeys` stays a
+  -- parameter for the driver's classifier plumbing, unused by this predicate.)
+  strictClosed ps body =
+    Set.isEmpty (fvExpr (Set.fromFoldable ps) body) && Set.isEmpty (cfExpr body)
 
   -- a partial-application target's arity: dependency candidate, intrinsic, or local syntactic
   -- lambda (local partial-CAF chains are conservatively not chased).
@@ -202,10 +205,8 @@ candidatesOf intrinsic gkeys deps decls =
         { arity: Just (Array.length ps)
         , size: sizeExpr e0
         , cxLeqDeref: false
-        -- capture-safety only: free *globals* do not un-close (`AtomForeign`s are link-time
-        -- globals by construction, so the old `cfExpr` conjunct is gone); a chain binder used by
-        -- the body surfaces here as a free non-global, so the chain needs no separate conjunct.
-        , closed: Set.isEmpty (Set.filter (not <<< isGlobal) (fvExpr (Set.fromFoldable ps) body))
+        , closed: Map.isEmpty chain && strictClosed ps body
+        , argUses: argUsesOf ps body
         , group: Set.empty
         , body: e0
         }
@@ -225,17 +226,19 @@ candidatesOf intrinsic gkeys deps decls =
             , size: sizeExpr e0
             , cxLeqDeref: false
             , closed: false
+            , argUses: []
             , group: g.group
             , body: e0
             }
       CApp h args
         | Just residual <- partialResidual h args -> Just
-            { arity: Just residual, size: sizeExpr e0, cxLeqDeref: false, closed: false, group: Set.empty, body: e0 }
+            { arity: Just residual, size: sizeExpr e0, cxLeqDeref: false, closed: false, argUses: [], group: Set.empty, body: e0 }
       _ | valueBody c -> Just
         { arity: Nothing
         , size: sizeExpr e0
         , cxLeqDeref: isAtomBody c && isRet e0
         , closed: false
+        , argUses: []
         , group: Set.empty
         , body: e0
         }
@@ -263,6 +266,50 @@ candidatesOf intrinsic gkeys deps decls =
   isAtomBody = case _ of
     CAtom _ -> true
     _ -> false
+
+-- | Per-parameter consumption facts for the scrutinised-known-arg 64-tier (ADR-0089 self-compile
+-- | extension): count every occurrence (`total`), projection/match-scrutinee positions
+-- | (`projected`), and call-head positions (`appliedHead`) of each lambda parameter across the
+-- | whole body. Shadowing cannot occur on the shapes we publish (post-quote `$q`-unique binders;
+-- | the pre-optimisation first round is conservative at worst).
+argUsesOf :: Array String -> Expr -> Array ArgUse
+argUsesOf ps body = ps <#> \p -> goE p { total: 0, projected: 0, appliedHead: 0 } body
+  where
+  hit p u a = case a of
+    AtomVar y | y == p -> u { total = u.total + 1 }
+    _ -> u
+
+  hits p = Array.foldl (hit p)
+
+  proj p u a = case a of
+    AtomVar y | y == p -> u { total = u.total + 1, projected = u.projected + 1 }
+    _ -> u
+
+  hd p u a = case a of
+    AtomVar y | y == p -> u { total = u.total + 1, appliedHead = u.appliedHead + 1 }
+    _ -> u
+
+  goE p u = case _ of
+    Ret c -> goC p u c
+    Let _ c rest -> goE p (goC p u c) rest
+    LetRec bs rest -> goE p (Array.foldl (\a b -> goE p a b.rhs) u bs) rest
+
+  goC p u = case _ of
+    CAtom a -> hit p u a
+    CLam _ b -> goE p u b
+    CApp h as -> hits p (hd p u h) as
+    CPrim _ as -> hits p u as
+    CCtor _ _ as -> hits p u as
+    CArray as -> hits p u as
+    CRecord fs -> hits p u (map _.val fs)
+    CAccessor a _ -> proj p u a
+    CUpdate a us -> hits p (hit p u a) (map _.val us)
+    CIf a t e -> goE p (goE p (hit p u a) t) e
+    CCase ss alts -> Array.foldl (goAlt p) (Array.foldl (proj p) u ss) alts
+
+  goAlt p u alt = case alt.result of
+    Uncond e -> goE p u e
+    Guarded gs -> Array.foldl (\a g -> goE p (goE p a g.guard) g.rhs) u gs
 
 -- | The pure-value `let`-rhs classes a publishable chain may contain: value constructions and
 -- | aliases only (never a call, a branch, or a pinned primop — those are init-once computations).
@@ -335,6 +382,7 @@ nbeEnvOf intrinsic gkeys deps decls =
             , size: sizeExpr body
             , cxLeqDeref: false
             , closed: Set.isEmpty (fvExpr (Set.fromFoldable ps) b) && Set.isEmpty (cfExpr b)
+            , argUses: argUsesOf ps b
             , group: Set.empty
             , value: defer \_ -> evalExpr structuralBase body
             }
@@ -343,6 +391,7 @@ nbeEnvOf intrinsic gkeys deps decls =
             , size: sizeExpr body
             , cxLeqDeref: false
             , closed: false
+            , argUses: []
             , group: Set.empty
             , value: defer \_ -> evalExpr structuralBase body
             }
@@ -363,6 +412,7 @@ entryFromCandidate env c =
   , size: c.size
   , cxLeqDeref: c.cxLeqDeref
   , closed: c.closed
+  , argUses: c.argUses
   , group: c.group
   , value: defer \_ -> case aliasRef of
       Just ref -> ref

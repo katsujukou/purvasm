@@ -32,7 +32,7 @@ import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr(..), Expr(..), Rhs(..))
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (cfExpr, fvExpr)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Quote (quote)
-import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (Comp(..), EvalEnv, NRhs(..), RefTarget(..), Sem(..), binderVarsOrdered)
+import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (ArgUse, Comp(..), EvalEnv, NRhs(..), RefTarget(..), Sem(..), binderVarsOrdered)
 import Purvasm.Compiler.Primitive (PrimOp(..))
 
 -- | Float a value's inner sequencing outward: the continuation receives the settled value, and any
@@ -165,7 +165,7 @@ applySem f0 args0
                 -- deferred-ref projection trigger; unfolding here would residualize the whole
                 -- record with its stopped sibling calls).
                 else if not (Set.isEmpty entry.group) then neutral
-                else if gateA entry then
+                else if gateA entry || knownArgTier entry (Array.take a spine') then
                   seqSem (applySem (force entry.value) (Array.take a spine')) \res ->
                     applySem res (Array.drop a spine')
                 else neutral
@@ -190,6 +190,29 @@ applySem f0 args0
 -- | small, or closed (no free names at all) and moderately small.
 gateA :: forall r. { size :: Int, closed :: Boolean | r } -> Boolean
 gateA e = e.size < 16 || (e.closed && e.size < 64)
+
+-- | The scrutinised-known-arg 64-tier (ADR-0089 self-compile extension) — the surgical channel
+-- | for 16–63-node dictionary builders after the 64-tier's return to strict closedness. Fires at
+-- | saturation iff **no parameter is ever applied in head position** (universal — an existential
+-- | check would admit a mixed combinator: a projected config record alongside an applied lambda
+-- | parameter; the reference survives its existential only because its clauses stop at 16) and
+-- | some argument is a **known value shape** (through the `known` peek — a dictionary CAF
+-- | arrives as an `SRef`; the peek is decision-only, substitution still uses the atom-derived
+-- | spine element) whose parameter is projected somewhere. Lambda arguments never qualify.
+knownArgTier :: forall r. { size :: Int, argUses :: Array ArgUse | r } -> Array Sem -> Boolean
+knownArgTier e args =
+  e.size < 64
+    && not (Array.null e.argUses)
+    && Array.all (\u -> u.appliedHead == 0) e.argUses
+    && Array.any identity (Array.zipWith qualifying e.argUses args)
+  where
+  qualifying u a = u.projected > 0 && knownValueShape (known a)
+
+  knownValueShape = case _ of
+    SRec _ -> true
+    SCtor _ n as -> Array.length as == n
+    SLit _ -> true
+    _ -> false
 
 -- | The size bound for forcing a value-body extern **as a whole** (an alias applied as a callee):
 -- | the entire value survives reification, so this stays the reference's

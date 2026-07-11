@@ -782,3 +782,77 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
       nbeCross selfDecls []
         (Let "q" (CApp (var "M.self") [ var "d0" ]) (Ret (CAccessor (var "q") "go")))
         `shouldEqual` stable
+
+  describe "scrutinised-known-arg 64-tier + backstop (ADR-0089 self-compile extension)" do
+    let
+      -- Pad a body with dead pure lets so the candidate sits in the 16..63 band (below 16 the
+      -- unconditional tier would mask what this describe tests).
+      pad 0 e = e
+      pad n e = Let ("w" <> show (n :: Int)) (CRecord []) (pad (n - 1) e)
+
+      dictDecl = nonrec "M.dict" (Ret (CRecord [ { prop: "f", val: int 1 } ]))
+
+      -- b1 projects its dict and forwards it to b2 (the pass-through the clause allows);
+      -- b2 only projects. Both are 16..63 nodes with no parameter applied in head position.
+      builderChain =
+        [ dictDecl
+        , nonrec "M.b1"
+            ( Ret
+                ( CLam [ "d" ]
+                    ( pad 8
+                        ( Let "x" (CAccessor (var "d") "f")
+                            ( Let "fwd" (CApp (var "M.b2") [ var "d" ])
+                                (Ret (CRecord [ { prop: "out", val: var "x" }, { prop: "next", val: var "fwd" } ]))
+                            )
+                        )
+                    )
+                )
+            )
+        , nonrec "M.b2"
+            ( Ret
+                ( CLam [ "d" ]
+                    (pad 8 (Let "y" (CAccessor (var "d") "f") (Ret (CRecord [ { prop: "out", val: var "y" } ]))))
+                )
+            )
+        ]
+
+    it "positive: a known-record argument with a projected param folds (incl. the SRef peek and the forwarding chain)" do
+      let
+        out = nbeCross builderChain [] (Ret (CApp (var "M.b1") [ var "M.dict" ]))
+        expected =
+          Let "$q1" (CRecord [ { prop: "out", val: int 1 } ])
+            (Ret (CRecord [ { prop: "out", val: int 1 }, { prop: "next", val: var "$q1" } ]))
+      out `shouldEqual` expected
+
+    it "negative: a lambda argument never qualifies" do
+      let
+        e0 = Let "l" (CLam [ "z" ] (Ret (CAtom (var "z"))))
+          (Ret (CApp (var "M.b1") [ var "l" ]))
+        out = nbeCross builderChain [] e0
+      -- the call survives; run the output again to pin it as the fixpoint.
+      nbeCross builderChain [] out `shouldEqual` out
+
+    it "negative: an applied parameter refuses even with a known-record argument elsewhere-projected (mixed combinator)" do
+      let
+        -- like a real combinator, M.c references a sibling (so it is not strictly closed and the
+        -- plain 64-tier stays shut) and applies its second parameter in head position.
+        mixed = builderChain <>
+          [ nonrec "M.c"
+              ( Ret
+                  ( CLam [ "cfg", "p" ]
+                      ( pad 8
+                          ( Let "x" (CAccessor (var "cfg") "f")
+                              ( Let "s" (CApp (var "M.b2") [ var "cfg" ])
+                                  (Let "r" (CApp (var "p") [ var "x" ]) (Ret (CAtom (var "r"))))
+                              )
+                          )
+                      )
+                  )
+              )
+          ]
+        e0 = Let "l" (CLam [ "z" ] (Ret (CAtom (var "z"))))
+          (Ret (CApp (var "M.c") [ var "M.dict", var "l" ]))
+        out = nbeCross mixed [] e0
+      -- the call survives (the universal appliedHead conjunct refuses); pin the fixpoint.
+      nbeCross mixed [] out `shouldEqual` out
+      (out /= Ret (CAtom (int 1))) `shouldEqual` true

@@ -11,7 +11,8 @@ module Test.Unit.Purvasm.Compiler.MiddleEnd.Optimizer where
 
 import Prelude
 
-import Data.Maybe (isNothing)
+import Data.Array as Array
+import Data.Maybe (Maybe(..), isNothing)
 import Data.Tuple.Nested ((/\))
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Literal (Literal(..))
@@ -67,6 +68,7 @@ accessorOpt = Ret (CLam [ "$q1" ] (Ret (CAccessor (var "$q1") "add")))
 
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
+  backstopSpec
   describe "optimizeModule" do
     it "collapses a locally-known method call to its folded constant in one pass (DictElim then NbE)" do
       let
@@ -182,3 +184,50 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
         am = { name: "Test.M", decls: [ instanceDecl "Test.M.semiringInt" ] }
         r = optimizeModule emptyBuildEnv (localFactsOf emptyBuildEnv am) am
       isNothing (persistedSummary r.summary) `shouldEqual` true
+
+-- --- round-growth backstop (ADR-0089 self-compile extension) -------------------------------------
+
+-- | A ~50-node *live* builder body (fields keep every padded record alive, so unfolding it
+-- | re-materialises the whole thing) that qualifies for the scrutinised-known-arg tier: the dict
+-- | parameter is projected, nothing is applied in head position.
+bigBuilderDecl :: String -> Decl
+bigBuilderDecl k = nonrec k (Ret (CLam [ "d" ] (body 12)))
+  where
+  body :: Int -> Expr
+  body 0 =
+    Let "x" (CAccessor (var "d") "f")
+      ( Ret
+          ( CRecord
+              ( [ { prop: "p", val: var "x" } ]
+                  <> map (\i -> { prop: "w" <> show i, val: var ("w" <> show i) }) (Array.range 1 12)
+              )
+          )
+      )
+  body n = Let ("w" <> show n) (CRecord [ { prop: "k", val: AtomLit (LInt n) } ]) (body (n - 1))
+
+backstopSpec :: Spec Unit
+backstopSpec = describe "round-growth backstop (ADR-0089 self-compile extension)" do
+  it "keeps the round input when a binding's output grows past the cap, and the summary derives from it" do
+    let
+      -- ten saturated known-arg calls: each unfold re-materialises ~50 live nodes, so the round
+      -- output would sit far past 4x the ~45-node input (and past the floor).
+      bigBody :: Expr
+      bigBody = calls 10
+        where
+        calls :: Int -> Expr
+        calls 0 = Ret (CRecord (map (\i -> { prop: "r" <> show i, val: var ("r" <> show i) }) (Array.range 1 10)))
+        calls n = Let ("r" <> show n) (CApp (var "Test.M.b") [ var "Test.M.dict" ]) (calls (n - 1))
+
+      am :: AnfModule
+      am =
+        { name: "Test.M"
+        , decls:
+            [ nonrec "Test.M.dict" (Ret (CRecord [ { prop: "f", val: AtomLit (LInt 1) } ]))
+            , bigBuilderDecl "Test.M.b"
+            , nonrec "Test.M.big" bigBody
+            ]
+        }
+      r = optimizeModule emptyBuildEnv (localFactsOf emptyBuildEnv am) am
+      bigOut = Array.concatMap _.members r.module.decls # Array.find (\(k /\ _) -> k == "Test.M.big")
+    -- the backstop kept the (dictElim'd = identical) round input for the exploding binding.
+    map (\(_ /\ e) -> e) bigOut `shouldEqual` Just bigBody

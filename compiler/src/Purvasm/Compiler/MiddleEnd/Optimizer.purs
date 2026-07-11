@@ -43,13 +43,17 @@ import Data.Maybe (Maybe(..))
 import Data.Set (Set)
 import Data.Set as Set
 import Data.Tuple (Tuple(..))
+import Effect.Console (warn)
+import Effect.Unsafe (unsafePerformEffect)
 import Purvasm.Compiler.Bytecode.Artifact (Summary)
 import Purvasm.Compiler.ForeignSig (ForeignShape)
+import Purvasm.Compiler.MiddleEnd.ANF (Expr)
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (cfExpr, fvExpr)
 import Purvasm.Compiler.Ffi (intrinsicPrim)
 import Purvasm.Compiler.MiddleEnd.Module (AnfModule, declKeys, mapDeclBodies)
 import Purvasm.Compiler.MiddleEnd.Optimizer.DictElim (DictMachinery, dictElimExpr, emptyMachinery, intrinsicLift, machineryOf, mergeMachinery)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe (candidatesOf, nbeBinding, nbeEnvOf)
+import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Analysis (sizeExpr)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (InlineCandidate)
 
 -- | The per-build, in-memory optimiser environment threaded through the module fold — carrying the facts
@@ -135,8 +139,15 @@ optimizeModule (BuildEnv env) lf am =
     gkeys = Set.union lf.gkeys env.gkeys
     elimd = map (mapDeclBodies (dictElimExpr intrinsicLift gkeys full)) am.decls
     nbe = nbeEnvOf intrinsicPrim gkeys env.inlines elimd
+    -- The round-growth backstop (ADR-0089 self-compile extension) wraps every binding: a round
+    -- output that grew past `roundGrowthMax`× the round input keeps the input — term-preserving,
+    -- never a mid-flight re-reduction — and **everything below derives from the post-backstop
+    -- decls**, so an inflated term neither republishes into this module's next round nor leaks
+    -- to dependents. The growth floor keeps legitimate small-binding unfolds (a 5-node CAF
+    -- normalising to a 20-node lambda) out of the backstop's reach; the blow-up class it exists
+    -- for sits orders of magnitude above it.
     optimised = elimd <#> \d ->
-      d { members = d.members <#> \(Tuple k e) -> Tuple k (nbeBinding nbe k e) }
+      d { members = d.members <#> \(Tuple k e) -> Tuple k (backstop k e (nbeBinding nbe k e)) }
   in
     { module: am { decls = optimised }
     , summary:
@@ -156,6 +167,37 @@ optimizeModule (BuildEnv env) lf am =
             , foreignSigs: Map.filterKeys (\k -> Set.member k referenced) lf.foreignSigs
             }
     }
+
+-- | The per-round growth cap (ADR-0089 self-compile extension): raising it needs a measured
+-- | justification (the measured blow-up was ×12.6 module-wide, ×167 per binding, in one round).
+roundGrowthMax :: Int
+roundGrowthMax = 4
+
+-- | Below this output size the backstop never fires: a small binding legitimately quadruples
+-- | when a ≤64-tier body unfolds into it. Implementation refinement over the accepted sketch
+-- | (which pinned only the ×4), recorded in the extension's Progress note.
+growthFloor :: Int
+growthFloor = 256
+
+-- | Keep the round input when a binding's round output grew past `roundGrowthMax`× (above the
+-- | floor). The warning goes through `unsafePerformEffect`: the seam step is pinned pure
+-- | (ADR-0086), and a fired backstop is a diagnosis-worthy event that must not vanish into a
+-- | silently smaller term.
+backstop :: String -> Expr -> Expr -> Expr
+backstop key input output =
+  let
+    inSize = sizeExpr input
+    outSize = sizeExpr output
+  in
+    if outSize > growthFloor && outSize > roundGrowthMax * inSize then
+      unsafePerformEffect do
+        warn
+          ( "purvasm: optimizer round-growth backstop fired at " <> key
+              <> " (input " <> show inSize <> " -> output " <> show outSize
+              <> " nodes); keeping the round input"
+          )
+        pure input
+    else output
 
 -- | Fold a just-compiled module's summary into the build env, so its dependents' phases see it.
 extendSummary :: BuildEnv -> BuildSummary -> BuildEnv

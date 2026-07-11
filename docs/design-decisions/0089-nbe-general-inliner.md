@@ -735,3 +735,161 @@ Two review pins narrowing the shipped scope against the sketch's wording:
   "refusal is term-identity" pin. Deep uses still count toward the use total, so they also
   disqualify single-use. Regression fixtures: the refused field projected under a lambda, and a
   projection inside a case arm — both keep the outer shared `let` byte-stable.
+
+### ~~Proposed~~ Accepted extension (2026-07-11): the self-compile blow-up — restore the reference's extern-free 64-tier, add the known-args clause and a round-growth backstop
+
+**Status: Accepted (2026-07-11)**
+
+#### Measured motivation (the scale probe)
+
+The optimiser had never been run at its real workload's scale. Building the compiler's own closure
+(`run --entry Purvasm.CLI.Main`, 321 modules) under `--opt`:
+
+- **Crash**: `RangeError: Maximum call stack size exceeded` inside the *host*'s bytecode lowering
+  (`Bytecode.Lower.Match`, a `StateT` recursion with no `MonadRec`) while compiling
+  `PureScript.CST.Parser`. With `--stack-size=16384` the build completes — the lowering recursion
+  is depth-proportional to term size and not stack-safe (a latent host defect: a large enough
+  *source* binding crashes `--no-opt` too; tracked as a separate engineering item).
+- **Blow-up** (the real cause): whole-closure emitted size ratio **1.666** (the five bench
+  closures sit at 0.92–1.05 — the size gate's blind spot is closures it never measures), module
+  `PureScript.CST.Parser` ×14.5 (179 KB → 2.6 MB), single binding `parseDeclClass1` **×260**
+  (3.2 KB → 831 KB). The `--emit-ir` round curve is the mechanism: input 96 KB → round 1
+  249 KB → **round 2 = 3.1 MB (×12.6 in one round; ×167 for `parseDeclClass1`)** → converged.
+  Per-round recomputation of *sibling* candidates republishes round-1's already-inlined bodies,
+  and a parser-combinator grammar — hundreds of small mutually-referencing bindings, each under
+  the 64-tier — compounds layer by layer.
+
+#### Root cause
+
+The gate-A closedness extension (Accepted above) diverged from the reference in exactly the spot
+the reference guards: purs-backend-optimizer's 64-tier is
+
+```
+Map.isEmpty s.usages && not s.externs && s.size < 64
+```
+
+— `not s.externs`: a body referencing **any other top-level** never rides the 64-tier (its only
+channels are the 16-tiers). Our relaxation made every ≤64 sibling-referencing binding inlinable at
+every call site; a combinator grammar is the densest possible counterexample. (The reference
+handles the *dictionary* cases the relaxation was aimed at through `@inline` **directives**, a
+channel purvasm lacks — and, in our shipped design, through the grouped deferred-ref trigger,
+which does not consult gate A at all.)
+
+#### Decision (sketch, for review)
+
+1. **Restore the reference's 64-tier**: `closed` for the `size < 64` clause again requires **no
+   free names of any kind** — no locals *and* no extern/global references (the pre-S7 strict
+   check). The S7 `globalKeys` classifier is kept, but demoted to what it is sound for:
+   *relocation-safety* of the ≤16-tier and the candidate facts, not a license for the 64-tier.
+2. **The scrutinised-known-arg 64-tier** — the surgical dictionary channel, a purvasm-specific
+   clause. First, the honest accounting the review demanded: the reference's 3rd/4th clauses
+   (`delayed && … && size < 16`, with `shouldInlineExternAppArg u = case _ of SemLam _ _ ->
+   u.captured <= CaptureBranch && u.total > 0 && u.call == u.total; _ -> false` — verified
+   against the clone) relax the *complexity* requirement of its 16-tier. Purvasm's gate A has no
+   complexity requirement on applications at all — its unconditional `size < 16` already
+   **subsumes** them, so porting them verbatim adds nothing. What the S7 revert actually orphans
+   is the 16–63-node dictionary builder (`monadStateT(monadIdentity)`-class), and the clause for
+   it must be argument-productivity-gated at 64, not 16:
+
+   > unfold a **saturated** extern application with `size < 64` iff **no parameter of the callee
+   > is ever applied in head position** (`∀j. argUses[j].appliedHead == 0`) **and** some argument
+   > `i` is a **known value shape** (`SRec`, saturated `SCtor`, or `SLit` — deliberately **not**
+   > `SLam`) whose parameter is **projected somewhere** (`argUses[i].projected > 0`).
+
+   The first conjunct is **universal, not per-qualifying-argument** (review pin): an existential
+   check would let a *mixed* combinator through — a known config record that is projected
+   alongside a parser/lambda parameter the callee applies. The reference survives its existential
+   because its clauses stop at `< 16`; at `< 64` the universal form is required. A dictionary
+   builder applies none of its parameters (fields are projected, dicts forwarded), so the target
+   still passes.
+
+   **The shape is judged through the `known` peek, not on the raw call-site `Sem`** (review pin):
+   a cross-module dictionary CAF like `monadIdentity` evaluates to an `SRef`, not an `SRec` — the
+   clause applies the existing peek (a spine-null value-body extern of size `< peekBound` forces
+   to its value; grouped entries stay excluded per the S8 `known` guard) and judges the *forced*
+   shape. The peek is for the decision only; what the unfold substitutes is still the original
+   atom-derived spine element, so no structural copy rides the residual.
+
+   **Pass-through is deliberately allowed** (review pin, the second conjunct's exact scope): the
+   clause does **not** demand `projected == total`. The orphaned target itself forwards its dict
+   — `monadStateStateT`'s body passes the parameter on to `monadStateT(dict)` — so an
+   eliminator-only condition would exclude precisely the case this channel exists for. The
+   load-bearing exclusion is `appliedHead == 0`: the measured CST.Parser explosion required
+   lambda arguments *applied* by the callee (both conjuncts fail for a combinator web); a
+   known-record chain that projects a little and forwards the rest re-references an **atom** per
+   forward, and its unfold cascade is bounded by the *builder-chain depth* (a transformer stack),
+   not a grammar web's breadth. That residual risk is named, carried by a dedicated fixture
+   (a record-forwarding chain stays size-bounded across rounds), and hard-stopped by the
+   round-growth backstop (3) and the self-compile leg (4). Capture is deliberately **not**
+   consulted: spine elements are atom-derived, so inlining substitutes the argument *atom* into
+   residual closures — no structural copy (unlike the reference's lambda-arg case, where
+   captured-under-closure duplication is real).
+
+   **Implementation-grade facts** (the review's second P1): `InlineCandidate`/`ExternEntry` gain
+   `argUses :: Array { total :: Int, projected :: Int, appliedHead :: Int }` (pass-through
+   occurrences are the visible remainder `total - projected - appliedHead`, so fixtures and
+   traces can assert the clause's scope), computed at publish time for lambda candidates by a
+   dedicated per-parameter walker (`projected` counts `CAccessor`/match-scrutinee positions,
+   `appliedHead` counts `CApp` head positions; the existing `Analysis.Usage = { total, capture }`
+   stays untouched — no global Info change). Non-lambda candidates publish `[]`, and the clause
+   never fires for them.
+3. **Round-growth backstop, loud and term-preserving**: after each `optimizeModule` round, a
+   binding whose quoted size exceeded `roundGrowthMax`× its round-input size keeps the **round
+   input** (the previous round's term — never a mid-flight re-reduction, which is the purs-wasm
+   trap this record's §7 rejects). Backstop fires are logged per binding. Start
+   `roundGrowthMax = 4`; raising it needs a measured justification. **The backstop applies
+   before anything is derived from the round's output**: `BuildSummary` — `candidatesOf`,
+   `foreignSigs`, the sibling-candidate recomputation for the next round — is computed from the
+   **post-backstop** module, so an inflated term can neither republish itself to this module's
+   next round nor leak as a candidate to dependents.
+4. **Close the gate blind spot**: `run-benchmarks.sh --opt-effect` gains a **self-compile size
+   leg** — build the compiler closure `--opt` vs `--no-opt` (VM target), asserting the
+   whole-closure emitted ratio ≤ `SIZE_RATIO_MAX`. Until the bytecode-lowering stack-safety item
+   lands this leg is **diagnostic about stack**: it runs with an explicit, documented
+   `--stack-size` headroom and asserts *size only*; the "completes on the default stack"
+   assertion is added when that item closes. This is the regression gate for the entire blow-up
+   class.
+
+Expected effect: the five bench ratios should hold (their wins flow through the 16-tier, the
+scrutinised-known-arg clause, and the grouped trigger — S7's own measured delta was only
+count-state 1.396→1.448, and S8's fusion does not ride gate A); the compiler closure returns to
+≈ 1.0 size with `--opt` usable at scale. Any bench regression is measured and reported with the
+implementation.
+
+#### Owed with implementation
+
+- Fixtures: a mutually-referencing small-binding web (grammar shape) — sizes stay bounded across
+  rounds; a backstop-fire fixture (loud log, term equals round input, and the round's published
+  candidates derive from the post-backstop term); scrutinised-known-arg positive (a 16–63-node
+  builder applied to a known record whose param is projected — folds; including the peeked
+  `SRef`-CAF spelling of the argument) and negatives (a lambda argument; a known-record argument
+  whose param is applied; and the **mixed-args combinator** — a projected known record alongside
+  a lambda parameter the callee applies in head position, refused by the universal conjunct —
+  all stay a call); the pass-through risk fixture (a known-record **forwarding chain** of
+  16–63-node builders — unfold cascade bounded by chain depth, sizes bounded across rounds).
+- The bytecode-lowering stack-safety defect is explicitly **out of scope** (host engineering,
+  its own item); the self-compile leg's stack posture is pinned in Decision 4 (documented
+  headroom + size-only assertion until that item closes).
+
+#### Progress (2026-07-11): landed and measured — the compiler self-compiles under `--opt`
+
+Implemented as pinned: strict extern-free 64-tier restored (`strictClosed`); the
+scrutinised-known-arg tier (`knownArgTier` in `Eval`, `argUses` facts published by a dedicated
+per-parameter walker); the round-growth backstop in `optimizeModule` (summary derives from the
+post-backstop decls) with one implementation refinement recorded for review — a `growthFloor`
+(256 nodes) below which the backstop never fires, since a small binding legitimately quadruples
+when a ≤64 body unfolds into it; the harness self-compile leg. 251/251 unit + E2E green,
+`.pmi` 564/564, all gates pass (exit 0).
+
+Measured. **Self-compile: whole-closure size ratio 1.666 → 1.109** (`CST.Parser` ×14.5 → gone
+from the outlier list; the worst residual is `CST.Layout` ×2.7 ≈ 220 KB — ordinary inlining, two
+orders below the blow-up); the backstop fired 27 times across the closure (loud per-binding
+warnings, e.g. `Node.FS.Perms.eqPerms` 63 → 303 kept). Bench ratios: fib 3.131 / map-fold 1.896 /
+quicksort 1.866 / json-parse 2.975 all hold; **count-state 2.163 → 1.801** — the predicted,
+accepted cost of the revert: `monadStateStateT`-class builders whose dict parameter is *only
+passed through* (`projected == 0`) qualify for neither the strict 64-tier nor the known-arg tier,
+so the `get`/`put` machinery de-fuses while the S8 grouped `bind`/`pure` fusion survives.
+Recovering it cleanly is future work (candidates: a pass-through-aware tier with its own
+blow-up argument, or specialisation). The default-stack self-compile still crashes in the
+bytecode lowering even at ×2.7 module growth — confirming the stack-safety item is real and
+independent; the leg's documented-headroom posture stands.
