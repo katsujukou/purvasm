@@ -5,15 +5,20 @@
 -- | ```
 -- |
 -- | by pushing the outer `case` **recursively through the tree to its leaves** — but **only** when
--- | every leaf's result value decidably matches `oalts` **and every outer right-hand side is a
--- | bare atom** (`Ret (CAtom …)`). The two conditions together are what make the rewrite a strict
--- | shrink: leaf-decidability guarantees exactly one alternative survives per leaf, and the
--- | atom-RHS bound makes each surviving copy a single node (a larger RHS would still duplicate
--- | once per leaf — the ADR-0089 Addendum's Correction; a size-budgeted relaxation is a separate
--- | Proposed extension). No size threshold, no residual duplication, and ANF's missing join points
--- | never bite. A leaf whose match is undecidable, a non-atom outer RHS, a guarded alternative
--- | (tree or outer, ADR-0013 order), a multi-scrutinee outer case, or any other use of `r` blocks
--- | the rewrite.
+-- | every leaf's result value decidably matches `oalts` (the fold guarantee: exactly one
+-- | alternative survives per leaf), and one of two tiers licenses the copying (ADR-0089 Addendum +
+-- | its accepted 2026-07-11 extension):
+-- |
+-- |   * **atom tier** — every outer right-hand side is a bare atom (`Ret (CAtom …)`): each
+-- |     surviving copy is a single node, so the rewrite is a strict shrink with no threshold.
+-- |   * **bounded tier** — non-atom RHSs are allowed when every alternative is *leaf-independent*
+-- |     (no binder variable occurs free in its RHS — folding then never substitutes the leaf value
+-- |     into the copy, so the budget counts the whole cost) and the total copied size
+-- |     (Σ over leaves of the *selected* alternative's RHS size) fits `dupBudget`.
+-- |
+-- | A leaf whose match is undecidable, a guarded alternative (tree or outer, ADR-0013 order), a
+-- | multi-scrutinee outer case, any other use of `r`, or a non-atom-RHS case failing the bounded
+-- | tier's conditions blocks the rewrite.
 -- |
 -- | The pass is **syntactic**, run on the quoted (uniquely-`$q`-named) term inside `nbeBinding`'s
 -- | loop: at each qualifying leaf it re-shares the leaf value under the *same* binder `r`
@@ -33,12 +38,14 @@ import Prelude
 
 import Data.Array as Array
 import Data.Foldable (foldl)
-import Data.Maybe (Maybe(..), fromMaybe)
+import Data.Maybe (Maybe(..))
 import Data.Set as Set
 import Data.Traversable (traverse)
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr(..), Expr(..), Rhs(..))
-import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (fvAlt)
+import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (fvAlt, fvExpr)
+import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Analysis (sizeExpr)
+import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (binderVarsOrdered)
 
 -- | Apply the distribution wherever it fires, bottom-up over the whole term.
 distributeCases :: Expr -> Expr
@@ -56,13 +63,20 @@ distributeCases = goExpr
           Ret (CCase [ AtomVar r' ] oalts)
             | r' == r
             , isBranch c'
-            -- every outer right-hand side must be a bare atom: the fold-guarantee bounds how many
-            -- alternatives survive per leaf (one), not their size — a larger (or binder-consuming)
-            -- RHS would still duplicate once per leaf. Atom RHSs make each surviving copy one
-            -- node, so the rewrite is a strict shrink in fact, not just in alternative count.
-            , Array.all atomRhs oalts
             , not (Set.member r (altsFree oalts)) ->
-                fromMaybe (Let r c' rest') (push r oalts (Ret c'))
+                -- two tiers (ADR-0089 Addendum + its accepted extension):
+                --   * atom tier — every outer RHS a bare atom: each surviving copy is one node, so
+                --     the rewrite is a strict shrink (the fold-guarantee alone bounds surviving
+                --     alternative *count*, not size).
+                --   * bounded tier — non-atom RHSs allowed when every alternative is
+                --     **leaf-independent** (no binder variable occurs in its RHS — a
+                --     binder-consuming row substitutes the leaf value into the copy, duplication
+                --     the budget below cannot count) and the total copied size fits the budget.
+                case push r oalts (Ret c') of
+                  Just pushed
+                    | Array.all atomRhs oalts -> pushed.expr
+                    | Array.all leafIndependent oalts && pushed.copied <= dupBudget -> pushed.expr
+                  _ -> Let r c' rest'
           _ -> Let r c' rest'
     LetRec bs rest -> LetRec (bs <#> \b -> b { rhs = goExpr b.rhs }) (goExpr rest)
 
@@ -88,44 +102,71 @@ distributeCases = goExpr
     Uncond (Ret (CAtom _)) -> true
     _ -> false
 
+  -- No binder variable of the row occurs free in its RHS (`binderVars ∩ fv(rhs) = ∅`): folding
+  -- then never substitutes the leaf value into the copied RHS, so `copied` is the whole cost.
+  leafIndependent alt = case alt.result of
+    Uncond e ->
+      let
+        bound = Array.concatMap binderVarsOrdered alt.binders
+        free = fvExpr Set.empty e
+      in
+        not (Array.any (\v -> Set.member v free) bound)
+    Guarded _ -> false
+
   altsFree = foldl (\s a -> Set.union s (fvAlt Set.empty a)) Set.empty
 
--- | Push `case r of oalts` through the branch tree to its leaves; `Nothing` blocks the whole
--- | rewrite (an undecidable leaf, a guarded tree alternative, or a tree shape we do not descend).
-push :: String -> Array Alt -> Expr -> Maybe Expr
+-- | The bounded tier's duplication budget (the accepted extension): the sum over leaves of the
+-- | *selected* alternative's quoted-ANF size. Starts at 16; raising it (at most to 32) requires a
+-- | measured justification.
+dupBudget :: Int
+dupBudget = 16
+
+-- | Push `case r of oalts` through the branch tree to its leaves, returning the rewritten tree
+-- | **and the total copied size** (Σ over leaves of the selected alternative's RHS size, for the
+-- | bounded tier's budget); `Nothing` blocks the whole rewrite (an undecidable leaf, a guarded
+-- | tree alternative, or a tree shape we do not descend).
+push :: String -> Array Alt -> Expr -> Maybe { expr :: Expr, copied :: Int }
 push r oalts = go
   where
-  go :: Expr -> Maybe Expr
+  go :: Expr -> Maybe { expr :: Expr, copied :: Int }
   go = case _ of
     -- intermediate bindings stay on their path; only the continuation is rewritten.
-    Let x c rest -> Let x c <$> go rest
-    LetRec bs rest -> LetRec bs <$> go rest
+    Let x c rest -> (\p -> p { expr = Let x c p.expr }) <$> go rest
+    LetRec bs rest -> (\p -> p { expr = LetRec bs p.expr }) <$> go rest
     Ret c -> case c of
-      CIf a t e -> Ret <$> (CIf a <$> go t <*> go e)
-      CCase ss ialts -> Ret <<< CCase ss <$> traverse goAlt ialts
-      leaf | leafDecides leaf -> Just (Let r leaf (Ret (CCase [ AtomVar r ] oalts)))
+      CIf a t e -> do
+        t' <- go t
+        e' <- go e
+        Just { expr: Ret (CIf a t'.expr e'.expr), copied: t'.copied + e'.copied }
+      CCase ss ialts -> do
+        alts' <- traverse goAlt ialts
+        Just
+          { expr: Ret (CCase ss (map _.alt alts'))
+          , copied: foldl (\n a -> n + a.copied) 0 alts'
+          }
+      leaf | Just sz <- leafDecides leaf ->
+        Just { expr: Let r leaf (Ret (CCase [ AtomVar r ] oalts)), copied: sz }
       _ -> Nothing
 
   goAlt alt = case alt.result of
-    Uncond e -> (\e' -> alt { result = Uncond e' }) <$> go e
+    Uncond e -> (\p -> { alt: alt { result = Uncond p.expr }, copied: p.copied }) <$> go e
     Guarded _ -> Nothing
 
-  -- Will `case <leaf> of oalts` decidably fold? Mirrors `Eval.matchBinder`/`evalCase.go`
-  -- syntactically: skip decidably-non-matching rows, land on a decidable match with an
-  -- unconditional rhs. Anything else (undecidable row, guarded target, no matching row — a stuck
-  -- program we must preserve as-is) declines.
+  -- Will `case <leaf> of oalts` decidably fold — and onto which alternative? Mirrors
+  -- `Eval.matchBinder`/`evalCase.go` syntactically: skip decidably-non-matching rows, land on a
+  -- decidable match with an unconditional rhs (returning that rhs's size, the leaf's copy cost).
+  -- Anything else (undecidable row, guarded target, no matching row — a stuck program we must
+  -- preserve as-is) declines.
   leafDecides leaf = decide 0
     where
     decide i = case Array.index oalts i of
-      Nothing -> false
+      Nothing -> Nothing
       Just alt -> case matchRow leaf alt.binders of
         No -> decide (i + 1)
-        Yes -> uncondAlt alt
-        Unknown -> false
-
-  uncondAlt alt = case alt.result of
-    Uncond _ -> true
-    Guarded _ -> false
+        Yes -> case alt.result of
+          Uncond e -> Just (sizeExpr e)
+          Guarded _ -> Nothing
+        Unknown -> Nothing
 
   matchRow leaf = case _ of
     [ b ] -> matchC leaf b

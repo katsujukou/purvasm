@@ -414,7 +414,7 @@ behind the bounded-continuation-duplication extension below.
 
 ### Proposed extension (2026-07-11): two residual boolean-case rules
 
-- Status: Proposed — awaits acceptance before implementation.
+- Status: ~~Proposed~~ **Accepted** _(2026-07-11: accepted by the maintainer)_.
 
 The landed slice leaves fib's comparison as
 `case LtInt(a,b) of true -> true; _ -> (let q = EqInt(a,b) in case q of true -> false; _ -> false)`
@@ -439,8 +439,9 @@ no irrefutable row).
 
 ### Proposed extension (2026-07-11): bounded continuation duplication
 
-- Status: Proposed — awaits acceptance before implementation. The atom-RHS guard (the Correction
-  above) is the committed baseline; this extension relaxes it as a **separate slice**.
+- Status: ~~Proposed~~ **Accepted** _(2026-07-11: accepted by the maintainer, with the leaf-independence
+  condition of the P2 review fix)_. The atom-RHS guard (the Correction above) is the committed
+  baseline; this extension relaxes it as a **separate slice**.
 
 The atom-RHS guard blocked distribution sites that are semantically safe and measurably profitable:
 fib's own body case (a 12-node recursive arm duplicated into two leaves) is worth ≈ +0.6 ratio
@@ -476,3 +477,108 @@ which is a size-gate question, not a semantics one.
 
 Evidence for the budget's value: fib 1.951 → ≈ 2.59, json-parse 2.573 → ≈ 2.79 (the pre-guard
 measurements); quicksort is unaffected either way.
+
+### Progress (2026-07-11): both extensions landed; the Context §1 chain is closed
+
+The boolean-case rules (in `evalCase`, ahead of the neutral) and the bounded tier (in `Distribute`,
+`Σ copiedRhsSize <= 16` under leaf-independence) landed together. Composed with the earlier slices
+they close the loop this record's Context opened: `Bench.Fib.Main.lessThan` normalises to
+`\a b -> LtInt(a, b)` and inlines at its call sites — the ~20–30-instruction dispatch chain of
+Context §1 is now literally the single `LtInt`. Measured (outputs equal, `.pmi` mode-stable,
+size×/time× gates green — the harness gained min-of-2 compile timing to keep the time gate
+outlier-proof): fib **3.131** (68.1% fewer instructions than `--no-opt`), count-state 1.396,
+map-fold-array 1.896, quicksort **1.866**, json-parse **2.975**; emitted size ratio 0.92–0.96 (the
+optimiser is a net shrink).
+
+### Proposed extension (2026-07-11): gate-A closedness — free globals do not un-close a body
+
+**Status: Proposed**
+
+#### Measured motivation
+
+With the Context-§1 chain closed, the laggard is count-state at **1.396** (every other bench
+1.87–3.13). Its converged IR shows why: the whole State-monad step survives as *dictionary-builder
+applications* —
+
+```
+Bench.CountState.Main.bindStateT = Control.Monad.State.Trans.bindStateT(Data.Identity.monadIdentity)
+Bench.CountState.Main.bind      = Bench.CountState.Main.bindStateT.bind
+Bench.CountState.Main.pure      = …applicativeStateT(monadIdentity).pure
+```
+
+so every loop iteration pays the un-fused `tailRecM`/`bind`/`pure`/`get`/`put` machinery in
+`Control.Monad.State.Trans`. These are exactly the parameterized instances `DictElim` cannot touch
+(it eliminates *projections from known dictionaries*; a parameterized instance needs the builder
+application *instantiated* — inlining's job, the `@inline arity=N` gap of §Context).
+
+Gate A (`size < 16 || (closed && size < 64)`) refuses them because the candidate fact computes
+
+```
+closed = Set.isEmpty (fvExpr (Set.fromFoldable ps) body) && Set.isEmpty (cfExpr body)
+```
+
+and a sibling builder reference like `applyStateT` is a **qualified `AtomVar`** — it surfaces as a
+free variable in the `fvExpr` half (`fvExpr` deliberately reports free `AtomVar`s as reachability
+edges, with no local/global classification), not in the `cfExpr` (foreign-key) half. Every
+realistic instance builder references its siblings through superclass fields (`bindStateT`'s body
+references `applyStateT`, size ≈ 25), so the `closed && < 64` tier is dead code for the very shape
+it was written for. (Pinning this matters: an implementation that dropped only the `cfExpr`
+conjunct would change nothing for count-state.)
+
+#### Decision
+
+Redefine a candidate's `closed` as **capture-safety only**: no free *local* variables under the
+lambda's parameters. Free *globals* (qualified `AtomVar`/`AtomForeign` keys) do not un-close a
+body. The exact new predicate:
+
+```
+closed = Set.isEmpty (Set.difference (fvExpr (Set.fromFoldable ps) body) globalKeys)
+```
+
+- **`globalKeys` — the classifier's source of truth**: the defining module's own top-level keys
+  (`LocalFacts.gkeys`, i.e. `declKeys` over all decls) ∪ the dependency closure's keys
+  (`BuildEnv.gkeys`) ∪ the intrinsic domain (`intrinsicPrim`/structural resolver keys). This is
+  the same set the driver already threads to `dictElimExpr` for its liftability classification;
+  `candidatesOf` gains it as a parameter. A free name **not** in this set — a local escape, an
+  unresolved or malformed key — keeps `closed = false`: the capture-safety claim stays mechanical,
+  never convention-based (no `$q`-namespace heuristics).
+- **The `cfExpr` conjunct is dropped**: an `AtomForeign` key is a link-time global by
+  construction, and candidate bodies carrying (possibly non-exported) foreign keys is already the
+  shipped ADR-0090 discipline (shapes forwarded via `BuildSummary.foreignSigs`).
+- **Gate-B `closedParams` (`Eval.purs`) is deliberately untouched**: this extension refines only
+  the gate-A *candidate fact*, so the hole the earlier P2 closed — unconditionally copying a
+  large multi-use global wrapper at local use sites — stays closed.
+
+Soundness, by the three concerns the strict check conflated:
+
+1. **Capture** — still excluded: free locals keep `closed = false` unchanged.
+2. **Resolvability** — a qualified global key is position-independent: every top-level binding of
+   every closure module is a linked gdef, and the system already ships candidate bodies that carry
+   (possibly non-exported) foreign keys, with their shapes forwarded via
+   `BuildSummary.foreignSigs` (the ADR-0090 integration). Plain globals need no shape forwarding
+   at all.
+3. **Initialization order** — a consumer imports the candidate's defining module, so any sibling
+   global that body references initializes strictly earlier (topological CAF order over the
+   transitive closure).
+
+`.pmi` mode-stability (ADR-0084) is untouched — only `.pmo` bodies change. Thresholds stay 16/64;
+the existing behavioural, `.pmi`, and size/time gates are the blow-up backstop.
+
+#### Expected effect
+
+`bindStateT(monadIdentity)`, `applicativeStateT(…)`, `monadStateStateT(…)` and — the loop itself —
+`monadRecStateT(monadRecIdentity).tailRecM` come under the 64-tier and unfold at the consumer;
+projection folding then exposes the raw `\ma f s -> …` bodies to the ordinary β/case machinery, and
+the per-iteration `get/put/bind` chain can fuse toward `\s -> Tuple(Loop(i-1), s+1)` modulo
+`Identity` wrapping. Measured after implementation; count-state is the target, the other four
+benches are the no-regression watch.
+
+#### Alternatives considered
+
+- **Source-level inline directives** (purs-backend-optimizer's `@inline arity=N`): rejected —
+  purvasm has no directive channel, and the gate-side fix is general rather than per-callsite.
+- **Exported-globals-only filter**: adds no soundness (private globals are linked gdefs, and
+  under `--opt` any dep-body change already obligates consumer recompilation — the persisted-summary
+  track's invariant, ADR-0084); it would only re-refuse builders whose helpers happen to be private.
+- **Raising the open-term 16-bound instead**: touches every candidate shape, not just the
+  relocation-safe ones; strictly harder to reason about duplication cost.

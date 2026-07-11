@@ -422,26 +422,9 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
         e =
           Let "r" (CPrim LtInt [ var "a", var "b" ])
             (Let "s" inner (Ret (CCase [ var "s" ] outer)))
-      nbe e `shouldEqual`
-        Let "$q1" (CPrim LtInt [ var "a", var "b" ])
-          ( Ret
-              ( CCase [ var "$q1" ]
-                  [ { binders: [ BLit (LBool true) ], result: Uncond (Ret (CAtom (AtomLit (LBool true)))) }
-                  , { binders: [ BNull ]
-                    , result: Uncond
-                        ( Let "$q2" (CPrim EqInt [ var "a", var "b" ])
-                            ( Ret
-                                ( CCase [ var "$q2" ]
-                                    [ { binders: [ BLit (LBool true) ], result: Uncond (Ret (CAtom (AtomLit (LBool false)))) }
-                                    , { binders: [ BNull ], result: Uncond (Ret (CAtom (AtomLit (LBool false)))) }
-                                    ]
-                                )
-                            )
-                        )
-                    }
-                  ]
-              )
-          )
+      -- distribution + constant-arm collapse (the EqInt sub-case: both leaves false) + dead-pure
+      -- drop (the now-unused EqInt binding) + boolean case-eta compose to a single primop.
+      nbe e `shouldEqual` Ret (CPrim LtInt [ var "a", var "b" ])
 
     it "blocks when any leaf is undecidable (an unknown value against a constructor row)" do
       let
@@ -465,9 +448,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
           _ -> false
       stillNested `shouldEqual` true
 
-    it "blocks when an outer right-hand side is not a bare atom (per-leaf duplication guard)" do
-      -- a non-atom RHS would be duplicated once per leaf — the fold-guarantee bounds surviving
-      -- alternative *count*, not size, so this must not distribute.
+    it "bounded tier: a small leaf-independent non-atom RHS distributes under the budget" do
       let
         e =
           Let "s"
@@ -485,10 +466,90 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
                     ]
                 )
             )
+      nbe e `shouldEqual`
+        Ret
+          ( CCase [ var "c" ]
+              [ { binders: [ BLit (LBool true) ], result: Uncond (Ret (CAtom (AtomLit (LBool true)))) }
+              , { binders: [ BNull ], result: Uncond (Ret (CPrim AddInt [ var "a", var "big" ])) }
+              ]
+          )
+
+    it "bounded tier: blocked when the copied total exceeds the budget" do
+      let
+        -- pinned calls: never dropped or moved, so the RHS size is stable under the engine.
+        chain 0 = Ret (CPrim AddInt [ var "a", var "big" ])
+        chain n = Let ("v" <> show n) (CApp (var "g") [ var "a" ]) (chain (n - 1))
+        e =
+          Let "s"
+            ( CCase [ var "c" ]
+                [ { binders: [ BLit (LBool true) ], result: Uncond (Ret (CCtor "LT" 0 [])) }
+                , { binders: [ BNull ], result: Uncond (Ret (CCtor "GT" 0 [])) }
+                ]
+            )
+            ( Ret
+                ( CCase [ var "s" ]
+                    [ { binders: [ BCtor "LT" [] ], result: Uncond (Ret (CAtom (AtomLit (LBool true)))) }
+                    , { binders: [ BNull ], result: Uncond (chain 5) }
+                    ]
+                )
+            )
         stillNested = case nbe e of
           Let _ (CCase _ _) (Ret (CCase _ _)) -> true
           _ -> false
       stillNested `shouldEqual` true
+
+    it "bounded tier: blocked on a binder-consuming row (leaf-independence)" do
+      -- the BVar row's variable occurs in its RHS: folding would substitute the leaf value into
+      -- the copy — duplication the budget cannot count.
+      let
+        e =
+          Let "s"
+            ( CCase [ var "c" ]
+                [ { binders: [ BLit (LBool true) ], result: Uncond (Ret (CCtor "LT" 0 [])) }
+                , { binders: [ BNull ], result: Uncond (Ret (CCtor "GT" 0 [])) }
+                ]
+            )
+            ( Ret
+                ( CCase [ var "s" ]
+                    [ { binders: [ BVar "x" ]
+                      , result: Uncond (Ret (CPrim AddInt [ var "x", var "x" ]))
+                      }
+                    ]
+                )
+            )
+        stillNested = case nbe e of
+          Let _ (CCase _ _) (Ret (CPrim _ _)) -> true -- the irrefutable outer folds via case-eta…
+          Let _ (CCase _ _) (Ret (CCase _ _)) -> true
+          _ -> false
+      stillNested `shouldEqual` true
+
+    it "bounded tier: an effectful let inside a copied RHS stays on its single path" do
+      let
+        e =
+          Let "s"
+            ( CCase [ var "c" ]
+                [ { binders: [ BLit (LBool true) ], result: Uncond (Ret (CCtor "LT" 0 [])) }
+                , { binders: [ BNull ], result: Uncond (Ret (CCtor "GT" 0 [])) }
+                ]
+            )
+            ( Ret
+                ( CCase [ var "s" ]
+                    [ { binders: [ BCtor "LT" [] ], result: Uncond (Ret (CAtom (AtomLit (LBool true)))) }
+                    , { binders: [ BNull ]
+                      , result: Uncond (Let "eff" (CApp (var "f") [ var "y" ]) (Ret (CAtom (var "eff"))))
+                      }
+                    ]
+                )
+            )
+      nbe e `shouldEqual`
+        Ret
+          ( CCase [ var "c" ]
+              [ { binders: [ BLit (LBool true) ], result: Uncond (Ret (CAtom (AtomLit (LBool true)))) }
+              , { binders: [ BNull ]
+                , result: Uncond (Let "$q1" (CApp (var "f") [ var "y" ]) (Ret (CAtom (var "$q1"))))
+                }
+              ]
+          )
 
     it "blocks when the outer alternatives are guarded (ADR-0013 order)" do
       let
@@ -513,6 +574,68 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
           Let _ (CCase _ _) (Ret (CCase _ _)) -> true
           _ -> false
       stillNested `shouldEqual` true
+
+  describe "boolean-case rules (ADR-0089 Addendum extension)" do
+    it "case-eta: the boolean identity case reduces to its scrutinee" do
+      nbe
+        ( Ret
+            ( CCase [ var "b" ]
+                [ { binders: [ BLit (LBool true) ], result: Uncond (Ret (CAtom (AtomLit (LBool true)))) }
+                , { binders: [ BNull ], result: Uncond (Ret (CAtom (AtomLit (LBool false)))) }
+                ]
+            )
+        )
+        `shouldEqual` Ret (CAtom (var "b"))
+
+    it "case-eta: the negated form reduces to NotBool" do
+      nbe
+        ( Ret
+            ( CCase [ var "b" ]
+                [ { binders: [ BLit (LBool true) ], result: Uncond (Ret (CAtom (AtomLit (LBool false)))) }
+                , { binders: [ BNull ], result: Uncond (Ret (CAtom (AtomLit (LBool true)))) }
+                ]
+            )
+        )
+        `shouldEqual` Ret (CPrim NotBool [ var "b" ])
+
+    it "constant-arm collapse: all arms the same literal with an irrefutable trailing row" do
+      nbe
+        ( Ret
+            ( CCase [ var "x" ]
+                [ { binders: [ BCtor "A" [] ], result: Uncond (Ret (CAtom (int 0))) }
+                , { binders: [ BNull ], result: Uncond (Ret (CAtom (int 0))) }
+                ]
+            )
+        )
+        `shouldEqual` Ret (CAtom (int 0))
+
+    it "constant-arm collapse: blocked without an irrefutable trailing row (stuck must survive)" do
+      let
+        e = Ret
+          ( CCase [ var "x" ]
+              [ { binders: [ BCtor "A" [] ], result: Uncond (Ret (CAtom (int 0))) }
+              , { binders: [ BCtor "B" [] ], result: Uncond (Ret (CAtom (int 0))) }
+              ]
+          )
+      nbe e `shouldEqual` e
+
+    it "constant-arm collapse: blocked when a row introduces a binding" do
+      -- (the case survives; its binder is `$q`-renamed like any residual binder)
+      nbe
+        ( Ret
+            ( CCase [ var "x" ]
+                [ { binders: [ BCtor "A" [ BVar "v" ] ], result: Uncond (Ret (CAtom (int 0))) }
+                , { binders: [ BNull ], result: Uncond (Ret (CAtom (int 0))) }
+                ]
+            )
+        )
+        `shouldEqual`
+          Ret
+            ( CCase [ var "x" ]
+                [ { binders: [ BCtor "A" [ BVar "$q1" ] ], result: Uncond (Ret (CAtom (int 0))) }
+                , { binders: [ BNull ], result: Uncond (Ret (CAtom (int 0))) }
+                ]
+            )
 
   describe "determinism" do
     it "normalising twice is the identity on the normal form (stable $q numbering)" do

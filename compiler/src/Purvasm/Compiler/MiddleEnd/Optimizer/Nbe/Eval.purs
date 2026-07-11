@@ -239,7 +239,9 @@ evalCase env scruts alts = go 0
   where
   -- Walk the alternatives: a decidably-non-matching row is skipped; the first decidable match
   -- with an unconditional rhs folds; a guarded or undecidable row keeps the whole case neutral
-  -- (guard order is observable, ADR-0013 — v1 does not attempt guard-chain reduction).
+  -- (guard order is observable, ADR-0013 — v1 does not attempt guard-chain reduction). Before
+  -- building the neutral, the two accepted boolean-case rules (ADR-0089 Addendum extension) get a
+  -- cheap shape check.
   go i = case Array.index alts i of
     Nothing -> neutral -- no alternative can match: a stuck program, preserved as the residual case
     Just alt -> case matchRow scruts alt.binders of
@@ -249,7 +251,47 @@ evalCase env scruts alts = go 0
         Guarded _ -> neutral
       MUnknown -> neutral
 
-  neutral = SComp (NCase scruts (map naltOf alts))
+  neutral = case booleanCaseRule of
+    Just v -> v
+    Nothing -> SComp (NCase scruts (map naltOf alts))
+
+  -- The ADR-0089 Addendum boolean-case rules, checked only once folding failed:
+  --
+  --   * boolean case-eta — `case b of <true-lit> -> x; <irrefutable> -> y` with boolean-literal
+  --     results is the identity (`x == tb, y == not tb` → `b`) or the negation (`NotBool(b)`).
+  --     Well-typed corefn guarantees the scrutinee is Boolean (the same assumption the ordinary
+  --     folding makes); the alternatives bind nothing, so nothing is dropped or moved.
+  --   * constant-arm collapse — every alternative returns the *same* literal directly, no row
+  --     introduces a binding, and an irrefutable trailing row guarantees some arm matches (a
+  --     potentially-stuck match must be preserved): the case is that literal. The scrutinees are
+  --     atoms, so dropping the dispatch drops no computation.
+  booleanCaseRule = case scruts, alts of
+    [ s ],
+    [ { binders: [ BLit (LBool tb) ], result: Uncond (Ret (CAtom (AtomLit (LBool r1)))) }
+    , { binders: [ irr ], result: Uncond (Ret (CAtom (AtomLit (LBool r2)))) }
+    ]
+      | irrefutable irr ->
+          if r1 == tb && r2 == not tb then Just s
+          else if r1 == not tb && r2 == tb then Just (evalPrim NotBool [ s ])
+          else constArm
+    _, _ -> constArm
+
+  constArm = case Array.uncons alts of
+    Just { head }
+      | Just l <- litRhs head
+      , Array.all (\a -> litRhs a == Just l && Array.null (Array.concatMap binderVarsOrdered a.binders)) alts
+      , Just lastAlt <- Array.last alts
+      , Array.all irrefutable lastAlt.binders -> Just (SLit l)
+    _ -> Nothing
+
+  litRhs alt = case alt.result of
+    Uncond (Ret (CAtom (AtomLit l))) -> Just l
+    _ -> Nothing
+
+  irrefutable = case _ of
+    BNull -> true
+    BVar _ -> true
+    _ -> false
 
   naltOf alt =
     let

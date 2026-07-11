@@ -136,6 +136,8 @@ language and are kept out of version control.)
 | [0087](0087-backend-neutral-build-driver-compileraction.md) | A backend-neutral build driver over an injected `CompilerAction` | Accepted |
 | [0088](0088-vm-backend-lowers-like-native-release-boot-byte-identity.md) | The VM backend lowers the optimiser seam like native, released from boot byte-identity | Accepted |
 | [0089](0089-nbe-general-inliner.md) | The NbE general inliner on the optimiser seam | Accepted |
-Accepted |
+| [0090](0090-foreign-signatures-threaded-through-build-env.md) | Foreign signatures threaded through the build env | Accepted |
+| [0091](0091-user-native-ffi-c-sibling-rust-dir.md) | User-defined native FFI: C siblings vs. one Rust dir | Proposed |
+| [0092](0092-no-undeclared-native-leaves-from-intrinsics.md) | Structural intrinsics introduce no undeclared native leaves | Accepted |
 
 ## Scope
