@@ -79,9 +79,10 @@ linker's reachability result; scoping to workspace keys buys the user-facing nam
 diagnostics without it.
 
 **App FFI is C xor Rust.** At most one app class is active: `--rust-ffi` selects
-app-Rust and suppresses app-C discovery; its absence selects app-C. The runtime
-and ulib classes are always present and orthogonal to the app's choice — a Rust
-app still links the ulib's `Data.Show.c` and the runtime's `parseFloat`.
+app-Rust and suppresses app-C provider *compilation* (workspace `.c` siblings are
+still *scanned*, to enforce the exclusivity — §Addendum); its absence selects app-C.
+The runtime and ulib classes are always present and orthogonal to the app's choice —
+a Rust app still links the ulib's `Data.Show.c` and the runtime's `parseFloat`.
 
 ### 2. App-C discovery: local workspace source modules
 
@@ -141,8 +142,8 @@ a leaf must be exported under its full hand-mangled symbol.
 (ADR-0078) that provides **all** app foreigns. The user writes an ordinary Rust
 crate against `purvasm-foreign`; the crate exports each `pvf_<mangle(key)>` (the DX
 layer's macro handles the mangling Rust-side). One crate, one directory — no
-per-module wiring. The crate is a single app-Rust provider entry in the map,
-audited (§4) exactly like the app-C objects.
+per-module wiring. The crate is the single app-Rust provider in the map, audited
+through the bundle's defined-symbol count (§Addendum), not linked as a bare object.
 
 ### 4. Build, audit, enforce
 
@@ -218,8 +219,8 @@ audit and §1 provider-map enforcement before invoking the linker.
 
 ## Addendum (2026-07-11): app-Rust implementation
 
-- Status: Proposed _(the app-C path of this ADR is implemented; this addendum is the
-  concrete plan for the deferred app-Rust class, for review before implementation)_
+- Status: ~~Proposed~~ **Accepted + Implemented** _(2026-07-11: accepted by the maintainer;
+  both the app-C and app-Rust paths are now implemented in `NativeLink`)_
 
 §3 named `--rust-ffi <dir>` and the top of §1 listed **app-Rust** as the fourth
 provider class; the implementation so far errors on the flag. This addendum pins
@@ -258,25 +259,27 @@ ADR-0078's own note: "the provider map, exactly-one validation, bundle link, and
 audit are discovery-agnostic and survive unchanged; only where the providers are *found*
 differs per level." So app-Rust reuses §1/§4 verbatim:
 
-- **Discovery.** `--rust-ffi <dir>` selects app-Rust: the one crate provides **all** app
-  foreigns, and local workspace `.c` siblings are **not compiled**. They are still *scanned*
-  only to enforce C-xor-Rust — a workspace module with a sibling `.c` present alongside
+- **Discovery — C-xor-Rust is a *workspace* policy.** `--rust-ffi <dir>` selects app-Rust: the
+  one crate provides **all** app foreigns, and local workspace `.c` siblings are **not
+  compiled**. **Every** workspace module's sibling `.c` is still *scanned* (not referenced-only:
+  an unused C sibling still means the project mixed C and Rust FFI) — any one present alongside
   `--rust-ffi` is the §4 ambiguous-language error, not a silently-ignored file.
 - **Audit substrate ≠ provider set.** The bundle folds the runtime rlib **and** the app
   crate, so its full `pvf_*` set is **not** the app-Rust provider set — reading it as such
-  would conflate runtime and app providers. The bundle `nm` is the *audit substrate*:
-  - the **app-Rust provider set is the expected app keys confirmed in the bundle** — a
-    defined-symbol **count == 1** per expected key (ADR-0078 §5 / `native_bundle.ml`); a
-    referenced app key the bundle does not export fails by key name (a `#[pv_foreign]`
-    `module`/`name` typo), never a raw linker `undefined symbol`;
-  - the **runtime provider set stays the runtime staticlib's own export set** (its `nm`),
-    kept separate — never inferred from the bundle.
+  would conflate runtime and app providers. The bundle `nm` is the *audit substrate*: the
+  **app-Rust provider set is the expected app keys confirmed in the bundle** — a defined-symbol
+  **count** per expected key (ADR-0078 §5 / `native_bundle.ml`): 0 = the crate did not export it
+  (fails by key name — a `#[pv_foreign]` `module`/`name` typo, never a raw linker `undefined
+  symbol`), 1 = ok, **> 1 = the runtime rlib *and* the crate both define it** (a Rust foreign
+  shadowing the runtime, or two crates) — which archive-member selection would resolve silently.
 - **Enforce.** The §1 exactly-one check over workspace-namespace keys runs against
-  `{runtime, ulib, app-Rust}` (app-C absent under `--rust-ffi`). The **cross-class collision**
-  — an expected app key whose symbol the **runtime already defines** — is checked *before*
-  bundling, against the runtime export set (boot's `check_intrinsic_collisions`), so a Rust
-  foreign shadowing an intrinsic is a named duplicate, not a silent archive-member pick.
-  `nmDefinedPvf` is the shared substrate for all of this, upgraded to prefer `llvm-nm`.
+  `{runtime, ulib, app-Rust}` (app-C absent under `--rust-ffi`). The **runtime-shadow collision
+  is the count `> 1` case above** — audited on the *actual* bundled runtime rlib, so it cannot
+  disagree with a separate prebuilt staticlib (an earlier design nm'd the staticlib pre-cargo,
+  boot's `check_intrinsic_collisions`; that risks a staticlib-vs-crate skew, so Level-2 folds the
+  check into the bundle audit instead). For the same reason `--runtime-lib` — a staticlib
+  app-Rust never links — is **rejected** under `--rust-ffi`. `nmDefinedPvf`(+`List`) is the shared
+  substrate, upgraded to prefer `llvm-nm`.
 
 ### Scope / non-goals
 
