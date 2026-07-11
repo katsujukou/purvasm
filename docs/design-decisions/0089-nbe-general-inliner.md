@@ -601,9 +601,9 @@ follow-up decision — prior art exists (sidenote-0012: purs-backend-optimizer p
 groups and terminates via `envForGroup`/`addStop` `InlineNever` self-stops) — to be proposed on its
 own evidence.
 
-### Proposed extension (2026-07-11): parameterized-instance unfolding — recursive builder groups
+### ~~Proposed~~ Accepted extension (2026-07-11): parameterized-instance unfolding — recursive builder groups
 
-**Status: Proposed**
+**Status: Accepted (2026-07-11)**
 
 #### Measured motivation
 
@@ -673,16 +673,17 @@ application at its single occurrence (no growth, no new sites — by the single-
 and a committed fold contributes a residual verified group-free (no new group sites) — so the set
 of group application sites is non-increasing round over round and the module fixpoint's
 convergence is preserved. The ratchet is closed by the **group-free commit check**, not by
-projection-onliness. The deferral marks ride the existing convergence criterion
-(`e' == e && marks' == marks`), so a stably-refused mark does not keep the binding's fixpoint
-spinning.
+projection-onliness. The deferral marks join the convergence criterion as their own conjunct —
+`e' == e && marks' == marks && defers' == defers` as shipped — so a stably-refused mark does not
+keep the binding's fixpoint spinning.
 
 #### Owed with implementation
 
 - **Marks representation** (review note, 2026-07-11): an ordinary inline mark and a grouped
   deferred-ref mark have different application semantics at `Let` (inline-and-drop vs
   bind-as-deferred-ref), so they must not share one `Set String` — keep the carriers internally
-  distinct (both still ride the `e' == e && marks' == marks` convergence criterion).
+  distinct, each with its own stability conjunct in the convergence criterion
+  (`e' == e && marks' == marks && defers' == defers` as shipped).
 - Fixtures: a two-member mutual builder group (project one field — folds; a selected field that
   itself references a sibling — commit refused, term byte-stable; bare saturated application with
   no consuming projection — never deferred, stays the pinned neutral; **multi-use**
@@ -693,3 +694,44 @@ spinning.
   publish predicate) is explicitly **out of scope** here — separate evidence, separate proposal.
 - count-state is the target measurement; the other four benches and compile time× are the
   no-regression watch.
+
+#### Progress (2026-07-11): landed and measured — count-state 2.163
+
+Implemented as pinned (candidate/entry `group` fact + dictionary-shape publish; the CAF-split
+saturated-alias publish; marks-separate `defers` carrier discovered on the quoted output and
+applied at `Let`; grouped entries barred from bare-saturation gate-A unfold *and* from the
+value-body peek in `known`; the trigger in `evalAcc` via `groupedProject` with the group-free
+commit check). All six owed fixtures pass as written; 245/245 unit + E2E green.
+
+Measured (outputs equal, `.pmi` 0 differ, size× ≤ 1.05 / time× ~2.1 within gates):
+**count-state 1.448 → 2.163 (53.8% fewer instructions)**, json-parse 2.980 → 2.992, fib/map-fold/
+quicksort unchanged. The converged IR shows the intended endpoint exactly: `Main.pure` is
+`\a s -> Tuple(a, s)` and `Main.bind` is `\m f s -> case m(s) of Tuple(a, s') -> f(a)(s')` — the
+StateT-over-Identity machinery folded to raw state-passing.
+
+One implementation lesson worth recording: the first `settle` substituted *computation* rhss into
+the body's `SLet` continuations, and `applySem`'s computation-head wrap regenerates the identical
+`SLet` — an infinite loop inside a single evaluation round (hit by `monoidStateT`, whose builder
+projects-and-applies over an *unknown* dict parameter; surfaced as a silent hang because neither
+the rewrite fuel nor the driver cap ever ticks). The fix is the quoter's own discipline: `settle`
+substitutes values only, and a computation link refuses the commit — precisely the unknown-dict
+case the extension never targeted. The `known` guard is the refusal-soundness twin: forcing a
+grouped alias outside the trigger would let the neutral fallback reify the application inline,
+changing the term on refusal.
+
+##### Correction (2026-07-11, review): v1 trigger is projection-only, on the binder's own level
+
+Two review pins narrowing the shipped scope against the sketch's wording:
+
+- **Projection-only**: the sketch said "projected field / matched alternative"; the shipped
+  discovery counts only `CAccessor` uses and the shipped trigger lives in `evalAcc`. A `CCase`
+  scrutinee is an ordinary (disqualifying) use. The match variant — scrutinee-side discovery plus
+  a group-free *selected-alternative* commit — is future work on its own evidence; dictionaries
+  are consumed by projection in lowered corefn, so nothing measured today needs it.
+- **Same-level uses only**: the qualifying projection must sit on the deferred binder's own
+  `let`-spine level. A projection inside a lambda or branch never defers — refusal there would
+  reify the application at the projection site, moving the pinned construction across a
+  lambda/branch boundary (re-materialised per call / per branch entry), violating this record's
+  "refusal is term-identity" pin. Deep uses still count toward the use total, so they also
+  disqualify single-use. Regression fixtures: the refused field projected under a lambda, and a
+  projection inside a case arm — both keep the outer shared `let` byte-stable.

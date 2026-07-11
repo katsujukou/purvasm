@@ -674,3 +674,111 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
         `shouldEqual` Ret (CApp (var "M.caf") [ var "p" ])
       nbeBinding env "t" (Ret (CApp (var "M.rec") [ var "p" ]))
         `shouldEqual` Ret (CApp (var "M.rec") [ var "p" ])
+
+  describe "parameterized-instance unfolding (ADR-0089 Accepted extension)" do
+    let
+      -- a two-member mutual builder group: `bind` is group-free once selected, `Apply0` is the
+      -- superclass thunk carrying the (group-stopped) sibling call.
+      groupDecls =
+        [ { recursive: true
+          , members:
+              [ "M.b1" /\ Ret
+                  ( CLam [ "d" ]
+                      ( Let "f" (CLam [ "x" ] (Ret (CAtom (var "x"))))
+                          ( Let "t" (CLam [ "u" ] (Ret (CApp (var "M.b2") [ var "d" ])))
+                              (Ret (CRecord [ { prop: "bind", val: var "f" }, { prop: "Apply0", val: var "t" } ]))
+                          )
+                      )
+                  )
+              , "M.b2" /\ Ret
+                  ( CLam [ "d" ]
+                      ( Let "g" (CLam [ "y" ] (Ret (CApp (var "M.b1") [ var "d" ])))
+                          (Ret (CRecord [ { prop: "apply", val: var "g" } ]))
+                      )
+                  )
+              ]
+          }
+        ]
+      idLam = Let "$q0" (CLam [ "$q1" ] (Ret (CAtom (var "$q1")))) (Ret (CAtom (var "$q0")))
+
+    it "projecting a group-free field folds the builder application" do
+      nbeCross groupDecls []
+        (Let "q" (CApp (var "M.b1") [ var "M.dict" ]) (Ret (CAccessor (var "q") "bind")))
+        `shouldEqual` idLam
+
+    it "a selected field referencing a group sibling refuses the commit (term stable)" do
+      let
+        stable = Let "$q1" (CApp (var "M.b1") [ var "M.dict" ]) (Ret (CAccessor (var "$q1") "Apply0"))
+      nbeCross groupDecls []
+        (Let "q" (CApp (var "M.b1") [ var "M.dict" ]) (Ret (CAccessor (var "q") "Apply0")))
+        `shouldEqual` stable
+      nbeCross groupDecls [] stable `shouldEqual` stable
+
+    it "a bare saturated application with no consuming projection is never deferred" do
+      nbeCross groupDecls []
+        (Let "q" (CApp (var "M.b1") [ var "M.dict" ]) (Ret (CAtom (var "q"))))
+        `shouldEqual` Let "$q1" (CApp (var "M.b1") [ var "M.dict" ]) (Ret (CAtom (var "$q1")))
+
+    it "a multi-use application keeps the single shared let (sharing never lost)" do
+      nbeCross groupDecls []
+        ( Let "q" (CApp (var "M.b1") [ var "M.dict" ])
+            (Ret (CRecord [ { prop: "a", val: var "q" }, { prop: "b", val: var "q" } ]))
+        )
+        `shouldEqual`
+          Let "$q1" (CApp (var "M.b1") [ var "M.dict" ])
+            (Ret (CRecord [ { prop: "a", val: var "$q1" }, { prop: "b", val: var "$q1" } ]))
+
+    it "the CAF-split alias spelling folds through the published saturated application" do
+      let deps = groupDecls <> [ nonrec "M.alias" (Ret (CApp (var "M.b1") [ var "M.dict" ])) ]
+      nbeCross deps [] (Ret (CAccessor (var "M.alias") "bind")) `shouldEqual` idLam
+
+    it "a projection inside a lambda never defers (refusal would move the pinned app inward)" do
+      -- the sole use of `q` is a projection, but it sits under a lambda: deferring would, on the
+      -- Apply0 refusal, reify `M.b1(M.dict)` inside the lambda — re-materialising the pinned
+      -- construction per call. The outer shared let must survive at its own level.
+      nbeCross groupDecls []
+        ( Let "q" (CApp (var "M.b1") [ var "M.dict" ])
+            (Ret (CLam [ "k" ] (Ret (CAccessor (var "q") "Apply0"))))
+        )
+        `shouldEqual`
+          Let "$q1" (CApp (var "M.b1") [ var "M.dict" ])
+            (Ret (CLam [ "$q2" ] (Ret (CAccessor (var "$q1") "Apply0"))))
+
+    it "a projection inside a case arm never defers" do
+      let
+        e0 = Let "q" (CApp (var "M.b1") [ var "M.dict" ])
+          ( Ret
+              ( CCase [ var "s" ]
+                  [ { binders: [ BCtor "C" [] ], result: Uncond (Ret (CAccessor (var "q") "bind")) }
+                  , { binders: [ BNull ], result: Uncond (Ret (CAtom (int 0))) }
+                  ]
+              )
+          )
+        stable = Let "$q1" (CApp (var "M.b1") [ var "M.dict" ])
+          ( Ret
+              ( CCase [ var "s" ]
+                  [ { binders: [ BCtor "C" [] ], result: Uncond (Ret (CAccessor (var "$q1") "bind")) }
+                  , { binders: [ BNull ], result: Uncond (Ret (CAtom (int 0))) }
+                  ]
+              )
+          )
+      nbeCross groupDecls [] e0 `shouldEqual` stable
+
+    it "a self-recursive builder never unfolds inside itself" do
+      let
+        selfDecls =
+          [ { recursive: true
+            , members:
+                [ "M.self" /\ Ret
+                    ( CLam [ "d" ]
+                        ( Let "s" (CLam [ "u" ] (Ret (CApp (var "M.self") [ var "d" ])))
+                            (Ret (CRecord [ { prop: "go", val: var "s" } ]))
+                        )
+                    )
+                ]
+            }
+          ]
+        stable = Let "$q1" (CApp (var "M.self") [ var "d0" ]) (Ret (CAccessor (var "$q1") "go"))
+      nbeCross selfDecls []
+        (Let "q" (CApp (var "M.self") [ var "d0" ]) (Ret (CAccessor (var "q") "go")))
+        `shouldEqual` stable

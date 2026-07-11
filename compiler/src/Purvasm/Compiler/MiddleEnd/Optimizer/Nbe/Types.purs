@@ -74,6 +74,11 @@ type ExternEntry =
   , size :: Int
   , cxLeqDeref :: Boolean
   , closed :: Boolean
+  -- | Non-empty for a Rec-group dictionary builder (or a saturated alias of one): the whole
+  -- | group's key set (ADR-0089 parameterized-instance extension). A grouped entry never unfolds
+  -- | at bare saturation; it folds only through the deferred-ref projection trigger, and its
+  -- | `value` is evaluated with the group's externs removed (the `InlineNever` self-stop).
+  , group :: Set String
   , value :: Lazy Sem
   }
 
@@ -111,6 +116,8 @@ type InlineCandidate =
   , size :: Int
   , cxLeqDeref :: Boolean
   , closed :: Boolean
+  -- | See `ExternEntry.group`; `Set.empty` for every ordinary (NonRec) candidate.
+  , group :: Set String
   , body :: Expr
   }
 
@@ -126,10 +133,14 @@ type NbeEnv =
   }
 
 -- | The evaluation environment: local bindings, the current round's gate-B inline marks (binder
--- | names the previous round's analysis approved for inlining), and the module facts.
+-- | names the previous round's analysis approved for inlining), the grouped deferral marks
+-- | (binder names whose rhs is a saturated grouped application with a single projection use —
+-- | a **separate carrier** from `marks`: the application semantics at `Let` differ,
+-- | inline-and-drop vs bind-as-deferred-ref), and the module facts.
 type EvalEnv =
   { locals :: Map String Sem
   , marks :: Set String
+  , defers :: Set String
   , nbe :: NbeEnv
   }
 

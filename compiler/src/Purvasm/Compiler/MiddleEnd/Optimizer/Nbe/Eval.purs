@@ -30,6 +30,8 @@ import Data.Tuple (Tuple(..))
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (cfExpr, fvExpr)
+import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Quote (quote)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (Comp(..), EvalEnv, NRhs(..), RefTarget(..), Sem(..), binderVarsOrdered)
 import Purvasm.Compiler.Primitive (PrimOp(..))
 
@@ -61,6 +63,13 @@ eager = case _ of
 evalExpr :: EvalEnv -> Expr -> Sem
 evalExpr env = case _ of
   Ret c -> evalC env c
+  -- A defer-marked binder (saturated grouped application, single projection use — ADR-0089
+  -- parameterized-instance extension) binds the *deferred saturated ref* instead of a pinned
+  -- computation: the marked projection then sees the ref and judges the fold. Single-use (checked
+  -- at discovery) is what makes this sharing-safe.
+  Let x (CApp h args) rest
+    | Set.member x env.defers
+    , Just d <- deferredOf env h args -> evalExpr (bindLocal env x d) rest
   Let x c rest ->
     seqSem (evalC env c) \v ->
       if eager v || Set.member x env.marks then evalExpr (bindLocal env x v) rest
@@ -152,13 +161,19 @@ applySem f0 args0
             TExtern entry -> case entry.arity of
               Just a ->
                 if nargs < a then SRef r { spine = spine' }
+                -- a grouped builder never unfolds at bare saturation (its fold site is the
+                -- deferred-ref projection trigger; unfolding here would residualize the whole
+                -- record with its stopped sibling calls).
+                else if not (Set.isEmpty entry.group) then neutral
                 else if gateA entry then
                   seqSem (applySem (force entry.value) (Array.take a spine')) \res ->
                     applySem res (Array.drop a spine')
                 else neutral
               -- a value-body extern (alias / data CAF) applied: force it if small, else neutral.
+              -- A grouped alias applied as a function is ill-typed; keep it neutral.
               Nothing ->
-                if entry.size < forceCallBound then applySem (force entry.value) spine'
+                if entry.size < forceCallBound && Set.isEmpty entry.group then
+                  applySem (force entry.value) spine'
                 else neutral
       SCtor t n as ->
         let
@@ -190,13 +205,78 @@ peekBound :: Int
 peekBound = 64
 
 -- | Peek through a bare small extern reference when a *value* is demanded (projection, match).
+-- | Grouped entries are excluded: their forced value is (or contains) a deferred saturated ref,
+-- | whose only legal consumer is the `groupedProject` trigger — forcing one here would let the
+-- | neutral fallback reify the application inline, changing the term on refusal.
 known :: Sem -> Sem
 known = case _ of
   s@(SRef r)
     | Array.null r.spine -> case r.target of
-        TExtern e | isNothing e.arity, e.size < peekBound -> known (force e.value)
+        TExtern e | isNothing e.arity, e.size < peekBound, Set.isEmpty e.group -> known (force e.value)
         _ -> s
   s -> s
+
+-- | The deferred saturated ref (ADR-0089 parameterized-instance extension): a defer-marked
+-- | binder's rhs `builder(dicts…)` as a first-class carrier, judged at its (single) projection.
+deferredOf :: EvalEnv -> Atom -> Array Atom -> Maybe Sem
+deferredOf env h args = case evalAtom env h of
+  SRef r
+    | Array.null r.spine
+    , TExtern e <- r.target
+    , not (Set.isEmpty e.group)
+    , Just a <- e.arity
+    , Array.length args == a -> Just (SRef r { spine = map (evalAtom env) args })
+  _ -> Nothing
+
+-- | The grouped fold trigger: force the (group-stopped) builder value, apply the spine, select
+-- | the projected field, and **commit only if the selected residual is group-free** — a selected
+-- | field that still references a group sibling folds to a term containing a fresh group call,
+-- | which would ratchet one level per driver round (the ADR's termination pin). Refusal returns
+-- | `Nothing` and the caller's neutral path reifies the *original* reference unchanged.
+-- |
+-- | `settle` substitutes let-bound values into the record (the builder body's field lambdas are
+-- | `SLet`-shared): sharing loss is bounded by the entry's published size, and the unselected
+-- | fields — the superclass thunks carrying the stopped sibling calls — never reify at all.
+groupedProject :: Sem -> String -> Maybe Sem
+groupedProject s0 field = case s0 of
+  SRef r
+    | TExtern e <- r.target
+    , not (Set.isEmpty e.group) -> case e.arity of
+        Just a
+          | Array.length r.spine == a ->
+              case settle (applySem (force e.value) r.spine) of
+                Just (SRec fs)
+                  | Just f <- Array.find (\g -> g.prop == field) fs
+                  , groupFree e.group f.val -> Just f.val
+                _ -> Nothing
+        -- the CAF-split alias (a published saturated application): its value is the deferred
+        -- ref itself — recurse into the saturated case.
+        Nothing
+          | Array.null r.spine
+          , e.size < peekBound -> case force e.value of
+              s'@(SRef _) -> groupedProject s' field
+              _ -> Nothing
+        _ -> Nothing
+  _ -> Nothing
+  where
+  -- Substitute only *values* through the body's `SLet` chain: a computation rhs must refuse the
+  -- commit — the quoter substitutes a fresh variable there, but `settle` passes the rhs itself,
+  -- and `applySem`'s computation-head wrap (`SLet Nothing (SComp c) (\v -> applySem v args)`)
+  -- would then regenerate the identical `SLet` forever (the Control.Monad.State.Trans
+  -- `monoidStateT` hang: a projected thunk applied over an *unknown* dict parameter). With known
+  -- dict arguments — the shape the extension targets — those chain links fold to values first.
+  settle = case _ of
+    SLet _ v k -> case v of
+      SComp _ -> Nothing
+      _ -> settle (k v)
+    v@(SRec _) -> Just v
+    _ -> Nothing
+
+  groupFree grp v =
+    let
+      e = quote v
+    in
+      Set.isEmpty (Set.intersection grp (Set.union (fvExpr Set.empty e) (cfExpr e)))
 
 evalPrim :: PrimOp -> Array Sem -> Sem
 evalPrim op args = case traverse litOf args of
@@ -208,7 +288,12 @@ evalPrim op args = case traverse litOf args of
     _ -> Nothing
 
 evalAcc :: Sem -> String -> Sem
-evalAcc s0 field = seqSem s0 \s -> case known s of
+evalAcc s0 field = seqSem s0 \s -> case groupedProject s field of
+  Just v -> v
+  Nothing -> evalAccKnown s field
+
+evalAccKnown :: Sem -> String -> Sem
+evalAccKnown s field = case known s of
   SRec fs -> case Array.find (\f -> f.prop == field) fs of
     Just f -> f.val
     -- a missing field is type-impossible; keep the projection neutral (stuck preserved).

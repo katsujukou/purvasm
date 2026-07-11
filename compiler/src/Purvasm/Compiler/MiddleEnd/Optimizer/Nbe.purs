@@ -25,21 +25,21 @@ import Data.Array as Array
 import Data.Lazy (defer)
 import Data.Map (Map)
 import Data.Map as Map
-import Data.Maybe (Maybe(..), isJust)
+import Data.Maybe (Maybe(..), isJust, isNothing)
 import Data.Set (Set)
 import Data.Set as Set
 import Data.Tuple (Tuple(..))
 import Data.Tuple.Nested (type (/\))
 import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.Compiler.Ffi (resolver)
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (cfExpr, fvExpr)
 import Purvasm.Compiler.MiddleEnd.Normalize (normalize)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Analysis (inlineMarks, sizeExpr)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Distribute (distributeCases)
-import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Eval (evalExpr)
+import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Eval (evalC, evalExpr)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Quote (quote)
-import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (EvalEnv, ExternEntry, InlineCandidate, NbeEnv)
+import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (EvalEnv, ExternEntry, InlineCandidate, NbeEnv, RefTarget(..), Sem(..))
 import Purvasm.Compiler.Primitive (PrimOp)
 
 -- | The inner rewrite-fuel cap (the reference's `rewriteLimit` analogue, sidenote 0012 §1).
@@ -66,19 +66,20 @@ rewriteFuel = 1000
 -- | The lambda normal form is re-shared under the reserved binder `$q0` (the quote supply starts
 -- | at `$q1`, so the wrap never collides and round-trips stably).
 nbeBinding :: NbeEnv -> String -> Expr -> Expr
-nbeBinding nbe key e0 = preserveOuterShape e0 (loop rewriteFuel Set.empty e0)
+nbeBinding nbe key e0 = preserveOuterShape e0 (loop rewriteFuel Set.empty Set.empty e0)
   where
-  loop n marks e
+  loop n marks defers e
     | n <= 0 = unsafeCrashWith ("Nbe.nbeBinding: rewrite fuel exhausted at " <> key)
     | otherwise =
         let
           -- fold-guaranteed case-of-case distribution (slice 3) runs on the quoted term (unique
           -- binders); the placed leaf cases fold in the next evaluation round.
-          e' = distributeCases (quote (evalExpr { locals: Map.empty, marks, nbe } e))
+          e' = distributeCases (quote (evalExpr { locals: Map.empty, marks, defers, nbe } e))
           marks' = inlineMarks e'
+          defers' = deferMarks nbe e'
         in
-          if e' == e && marks' == marks then e
-          else loop (n - 1) marks' e'
+          if e' == e && marks' == marks && defers' == defers then e
+          else loop (n - 1) marks' defers' e'
 
 -- | The binding-surface guard: a non-lambda body that normalised to a bare lambda is re-shared as
 -- | a CAF (`let $q0 = \… in $q0`), keeping `classifyDecl`/`ExportKind` mode-stable. A lambda body
@@ -114,11 +115,49 @@ candidatesOf
   -> Array { recursive :: Boolean, members :: Array (String /\ Expr) }
   -> Map String InlineCandidate
 candidatesOf intrinsic gkeys deps decls =
-  Map.fromFoldable (Array.mapMaybe candidateOf nonrecMembers)
+  Map.union
+    (Map.fromFoldable (Array.mapMaybe candidateOf nonrecMembers))
+    groupedBuilders
   where
   nonrecMembers = decls >>= \d -> if d.recursive then [] else d.members
 
   publishBound = 64
+
+  -- Rec-group dictionary builders (ADR-0089 parameterized-instance extension, Accepted
+  -- 2026-07-11): a Rec-group member is publishable iff it is dictionary-shaped — a lambda whose
+  -- body tail is a record construction — carrying its whole group's key set. The consumer's
+  -- entry evaluates group-stopped and folds only through the deferred-ref projection trigger.
+  groupedBuilders = Map.fromFoldable
+    ( decls >>= \d ->
+        if not d.recursive then []
+        else
+          let
+            group = Set.fromFoldable (map (\(Tuple k _) -> k) d.members)
+          in
+            d.members # Array.mapMaybe \(Tuple k e) -> case e of
+              Ret (CLam ps body)
+                | recordTail body, sizeExpr e < publishBound -> Just $ Tuple k
+                    { arity: Just (Array.length ps)
+                    , size: sizeExpr e
+                    , cxLeqDeref: false
+                    , closed: Set.isEmpty (Set.filter (not <<< isGlobal) (fvExpr (Set.fromFoldable ps) body))
+                    , group
+                    , body: e
+                    }
+              _ -> Nothing
+    )
+
+  recordTail = case _ of
+    Let _ _ rest -> recordTail rest
+    Ret (CRecord _) -> true
+    _ -> false
+
+  -- A saturated application headed by a grouped builder: the group of the head, if so.
+  groupOfHead t = case Map.lookup t deps of
+    Just c | not (Set.isEmpty c.group) -> Just { arity: c.arity, group: c.group }
+    _ -> case Map.lookup t groupedBuilders of
+      Just c | not (Set.isEmpty c.group) -> Just { arity: c.arity, group: c.group }
+      _ -> Nothing
 
   -- The gate-A closedness classifier (ADR-0089 Addendum extension, Accepted 2026-07-11): a free
   -- name is relocation-safe iff it is a known top-level key (own module ∪ dependency closure,
@@ -167,19 +206,37 @@ candidatesOf intrinsic gkeys deps decls =
         -- globals by construction, so the old `cfExpr` conjunct is gone); a chain binder used by
         -- the body surfaces here as a free non-global, so the chain needs no separate conjunct.
         , closed: Set.isEmpty (Set.filter (not <<< isGlobal) (fvExpr (Set.fromFoldable ps) body))
+        , group: Set.empty
         , body: e0
         }
       -- an alias tail: chase it through the chain for the published arity.
       CAtom (AtomVar x)
         | Just c' <- Map.lookup x chain -> tailShape (Map.delete x chain) c'
+      -- the CAF-split spelling of a grouped-builder application (`M.bind = bindStateT(dict)`):
+      -- publishable as a value candidate — the ADR-pinned exception to the saturated-CAF-app
+      -- rule (dictionary construction is pure, so a consumer re-materialising it re-executes
+      -- nothing observable). Only the whole-body spelling (empty chain) is published.
+      CApp h args
+        | Map.isEmpty chain
+        , AtomVar t <- h
+        , Just g <- groupOfHead t
+        , g.arity == Just (Array.length args) -> Just
+            { arity: Nothing
+            , size: sizeExpr e0
+            , cxLeqDeref: false
+            , closed: false
+            , group: g.group
+            , body: e0
+            }
       CApp h args
         | Just residual <- partialResidual h args -> Just
-            { arity: Just residual, size: sizeExpr e0, cxLeqDeref: false, closed: false, body: e0 }
+            { arity: Just residual, size: sizeExpr e0, cxLeqDeref: false, closed: false, group: Set.empty, body: e0 }
       _ | valueBody c -> Just
         { arity: Nothing
         , size: sizeExpr e0
         , cxLeqDeref: isAtomBody c && isRet e0
         , closed: false
+        , group: Set.empty
         , body: e0
         }
       _ -> Nothing
@@ -244,7 +301,7 @@ nbeEnvOf intrinsic gkeys deps decls =
   , structural
   }
   where
-  base = { locals: Map.empty, marks: Set.empty, nbe: { externs: Map.empty, intrinsic, structural } }
+  base = { locals: Map.empty, marks: Set.empty, defers: Set.empty, nbe: { externs: Map.empty, intrinsic, structural } }
 
   depExterns0 = map (entryFromCandidate base) deps
   envD = base { nbe = { externs: depExterns0, intrinsic, structural } }
@@ -262,6 +319,7 @@ nbeEnvOf intrinsic gkeys deps decls =
   structuralBase =
     { locals: Map.empty
     , marks: Set.empty
+    , defers: Set.empty
     , nbe: { externs: Map.empty, intrinsic, structural: \_ -> Nothing }
     }
 
@@ -277,6 +335,7 @@ nbeEnvOf intrinsic gkeys deps decls =
             , size: sizeExpr body
             , cxLeqDeref: false
             , closed: Set.isEmpty (fvExpr (Set.fromFoldable ps) b) && Set.isEmpty (cfExpr b)
+            , group: Set.empty
             , value: defer \_ -> evalExpr structuralBase body
             }
           _ ->
@@ -284,6 +343,7 @@ nbeEnvOf intrinsic gkeys deps decls =
             , size: sizeExpr body
             , cxLeqDeref: false
             , closed: false
+            , group: Set.empty
             , value: defer \_ -> evalExpr structuralBase body
             }
 
@@ -291,17 +351,123 @@ nbeEnvOf intrinsic gkeys deps decls =
 -- | pure-value) chain binders are **marked**, so forcing the entry yields the bare tail value —
 -- | a projection/match peeks straight through, and the chain's constructions are re-materialised
 -- | at use sites (pure by the publish predicate).
+-- |
+-- | A **grouped** candidate (ADR-0089 parameterized-instance extension) is special twice: its
+-- | body evaluates with the whole group removed from the externs (the `InlineNever` self-stop —
+-- | sibling and self references degrade to neutral global calls, so re-entry is structurally
+-- | impossible), and a grouped *alias* (a published saturated builder application) forces
+-- | directly to the deferred saturated ref, so a consumer's projection can judge the fold.
 entryFromCandidate :: EvalEnv -> InlineCandidate -> ExternEntry
 entryFromCandidate env c =
   { arity: c.arity
   , size: c.size
   , cxLeqDeref: c.cxLeqDeref
   , closed: c.closed
-  , value: defer \_ -> evalExpr (env { marks = chainBinders c.body }) c.body
+  , group: c.group
+  , value: defer \_ -> case aliasRef of
+      Just ref -> ref
+      Nothing -> evalExpr (stopped { marks = chainBinders c.body }) c.body
   }
   where
+  stopped =
+    if Set.isEmpty c.group then env
+    else env { nbe = env.nbe { externs = Map.filterKeys (\k -> not (Set.member k c.group)) env.nbe.externs } }
+
+  aliasRef = case c.body of
+    Ret (CApp h@(AtomVar t) args)
+      | not (Set.isEmpty c.group), isNothing c.arity ->
+          case Map.lookup t env.nbe.externs of
+            Just hEntry | not (Set.isEmpty hEntry.group) -> Just
+              ( SRef
+                  { atom: h
+                  , target: TExtern hEntry
+                  , spine: map (\a -> evalC env (CAtom a)) args
+                  }
+              )
+            _ -> Nothing
+    _ -> Nothing
+
   chainBinders = go Set.empty
     where
     go acc = case _ of
       Let x _ rest -> go (Set.insert x acc) rest
       _ -> acc
+
+-- | Discovery half of the grouped deferral (ADR-0089 parameterized-instance extension), run on
+-- | the quoted output like `inlineMarks` (binders are `$q`-unique, so plain occurrence counting
+-- | is shadow-free): mark a binder whose rhs is a **saturated grouped application** and whose
+-- | use count is exactly one, that use being a projection scrutinee. Single-use is the
+-- | sharing-safety condition: applied next round, the deferral can never re-materialise the
+-- | application at more than the one site it already occupies.
+deferMarks :: NbeEnv -> Expr -> Set String
+deferMarks nbe = goE Set.empty
+  where
+  goE acc = case _ of
+    Ret c -> goC acc c
+    Let x (CApp h args) rest
+      | groupedSaturated h args
+      , singleProjectionUse x rest -> goE (Set.insert x acc) rest
+    Let _ c rest -> goE (goC acc c) rest
+    LetRec bs rest -> goE (Array.foldl (\a b -> goE a b.rhs) acc bs) rest
+
+  goC acc = case _ of
+    CLam _ b -> goE acc b
+    CIf _ t e -> goE (goE acc t) e
+    CCase _ alts -> Array.foldl goAlt acc alts
+    _ -> acc
+
+  goAlt acc alt = case alt.result of
+    Uncond e -> goE acc e
+    Guarded gs -> Array.foldl (\a g -> goE (goE a g.guard) g.rhs) acc gs
+
+  groupedSaturated h args = case h of
+    AtomVar t -> case Map.lookup t nbe.externs of
+      Just e -> not (Set.isEmpty e.group) && e.arity == Just (Array.length args)
+      Nothing -> false
+    _ -> false
+
+  -- The qualifying use must sit on the binder's own `let`-spine level: a projection *inside* a
+  -- lambda or a branch (`deep`) never qualifies — deferring there would, on refusal, reify the
+  -- application at the projection site, moving the pinned construction across a lambda/branch
+  -- boundary (the ADR pins refusal as term-identity). Deep occurrences still count toward
+  -- `total`, so any such use also disqualifies the single-use condition.
+  singleProjectionUse x rest =
+    let
+      u = usesIn rest
+    in
+      u.total == 1 && u.proj == 1
+    where
+    add u a = case a of
+      AtomVar y | y == x -> u { total = u.total + 1 }
+      _ -> u
+
+    adds u = Array.foldl add u
+
+    usesIn = goUE false { total: 0, proj: 0 }
+      where
+      goUE deep u = case _ of
+        Ret c -> goUC deep u c
+        Let _ c rest' -> goUE deep (goUC deep u c) rest'
+        LetRec bs rest' -> goUE deep (Array.foldl (\a b -> goUE true a b.rhs) u bs) rest'
+
+      goUC deep u = case _ of
+        CAtom a -> add u a
+        CLam _ b -> goUE true u b
+        CApp h as -> adds (add u h) as
+        CPrim _ as -> adds u as
+        CCtor _ _ as -> adds u as
+        CArray as -> adds u as
+        CRecord fs -> adds u (map _.val fs)
+        CAccessor a _ -> case a of
+          AtomVar y
+            | y == x ->
+                if deep then u { total = u.total + 1 }
+                else u { total = u.total + 1, proj = u.proj + 1 }
+          _ -> u
+        CUpdate a us -> adds (add u a) (map _.val us)
+        CIf a t e -> goUE true (goUE true (add u a) t) e
+        CCase ss alts -> Array.foldl (goUAlt) (adds u ss) alts
+
+      goUAlt u alt = case alt.result of
+        Uncond e -> goUE true u e
+        Guarded gs -> Array.foldl (\a g -> goUE true (goUE true a g.guard) g.rhs) u gs
