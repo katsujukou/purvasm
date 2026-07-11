@@ -490,9 +490,9 @@ outlier-proof): fib **3.131** (68.1% fewer instructions than `--no-opt`), count-
 map-fold-array 1.896, quicksort **1.866**, json-parse **2.975**; emitted size ratio 0.92–0.96 (the
 optimiser is a net shrink).
 
-### Proposed extension (2026-07-11): gate-A closedness — free globals do not un-close a body
+### ~~Proposed~~ Accepted extension (2026-07-11): gate-A closedness — free globals do not un-close a body
 
-**Status: Proposed**
+**Status: Accepted (2026-07-11)**
 
 #### Measured motivation
 
@@ -545,7 +545,7 @@ closed = Set.isEmpty (Set.difference (fvExpr (Set.fromFoldable ps) body) globalK
 - **The `cfExpr` conjunct is dropped**: an `AtomForeign` key is a link-time global by
   construction, and candidate bodies carrying (possibly non-exported) foreign keys is already the
   shipped ADR-0090 discipline (shapes forwarded via `BuildSummary.foreignSigs`).
-- **Gate-B `closedParams` (`Eval.purs`) is deliberately untouched**: this extension refines only
+- **Gate-B `closedParams` (`Analysis.purs`) is deliberately untouched**: this extension refines only
   the gate-A *candidate fact*, so the hole the earlier P2 closed — unconditionally copying a
   large multi-use global wrapper at local use sites — stays closed.
 
@@ -582,3 +582,114 @@ benches are the no-regression watch.
   track's invariant, ADR-0084); it would only re-refuse builders whose helpers happen to be private.
 - **Raising the open-term 16-bound instead**: touches every candidate shape, not just the
   relocation-safe ones; strictly harder to reason about duplication cost.
+
+#### Progress (2026-07-11): landed; measured; the next wall identified
+
+Implemented as pinned (`candidatesOf`/`nbeEnvOf` gain the `globalKeys` classifier input, threaded
+from the driver's existing `lf.gkeys ∪ env.gkeys`; the `cfExpr` conjunct and the chain conjunct are
+subsumed). All gates green (outputs equal, `.pmi` 564/564, size×/time× within bounds; emitted size
+rose 0.92→0.95 as more bodies travel — well inside the 1.5 gate).
+
+Measured: count-state **1.396 → 1.448**, other benches unchanged (fib 3.131 / mf 1.896 / qs 1.866 /
+jp 2.980). The IR shows why the win is partial: `monadStateStateT(monadIdentity)` (a NonRec builder)
+now unfolds — that is this extension working — but the core `bindStateT`/`applyStateT`/
+`applicativeStateT`/`monadStateT` builders are one CoreFn **Rec group** (mutual superclass-thunk
+references), and §5's "recursive decls are never published" bars them before closedness is ever
+consulted. Additionally `monadRecStateT` (NonRec) still fails the publish predicate on its
+non-pure-value `let` chain. Unblocking parameterized-instance fusion is therefore a separate
+follow-up decision — prior art exists (sidenote-0012: purs-backend-optimizer publishes recursive
+groups and terminates via `envForGroup`/`addStop` `InlineNever` self-stops) — to be proposed on its
+own evidence.
+
+### Proposed extension (2026-07-11): parameterized-instance unfolding — recursive builder groups
+
+**Status: Proposed**
+
+#### Measured motivation
+
+With closedness fixed, count-state (1.448; every other bench ≥ 1.87) still pays the whole StateT
+step per iteration, because the builders that matter — `bindStateT`, `applyStateT`,
+`applicativeStateT`, `monadStateT` — form one CoreFn **Rec group** (superclass fields are thunks
+referencing sibling builders), and §5 pins "recursive decls are never published". That pin's
+purpose is termination (a self-recursive function body unfolding inside itself forever); for
+mutually-recursive *builder* groups it throws away exactly the parameterized instances the
+`@inline arity=N` gap needs. Prior art directly on point (sidenote-0012 §5): the reference
+publishes recursive groups and terminates by inserting an `InlineNever` **self-stop for the whole
+group** before evaluating an inlined group member (`envForGroup`/`addStop`).
+
+#### Decision (sketch, for review)
+
+1. **Publish Rec-group members that are dictionary-shaped** — a lambda whose body tail is a
+   record construction (`\dicts -> let … in { … }`, validated at publish like `shapeOf`'s other
+   shapes) — with one new candidate fact: `group :: Set String`, the member's whole Rec-group key
+   set (empty for NonRec, which changes nothing for existing candidates).
+2. **Representation — a marks-discovered, single-use peephole deferral.** A *saturated*
+   application of a grouped entry is, by default, exactly what it is today: a pinned neutral. The
+   deferral is a **peephole on the one shape the trigger needs** — in ANF, `builder(dict).field`
+   is spelled `let q = CApp builder [dict] in … CAccessor q field` — discovered and applied
+   through the engine's existing **marks** pattern: the analysis on the quoted output marks a
+   binder `q` whose rhs is a saturated grouped application **and whose use count is exactly one,
+   that use being a projection/match scrutinee**; the next evaluation round binds a marked `q` to
+   an `SRef` carrying the full spine (the existing under-application carrier extended to
+   `nargs == arity`) instead of a pinned `SLet`, so the projection sees the ref, not an opaque
+   variable. Single-use is what keeps sharing trivially intact: a **multi-use** grouped
+   application is never deferred — it stays one pinned, shared `let` (the same discipline that
+   fixed the 0002 diamond), so refusal can never re-materialise it per use site. *The purity
+   claim licensing even the single-use move*: a dictionary builder's application constructs a
+   record whose fields are values/thunks — deferring it past the `let` reorders nothing
+   observable; the record-tail publish shape in (1) is the claim's syntactic anchor. A deferred
+   ref whose fold is refused reifies at its **single** occurrence back to the identical
+   application — refusal never grows or changes the term, by construction rather than by
+   argument. (Fan-out over a multi-use dictionary — folding several projections of one shared
+   `q` — is a possible later relaxation, on its own evidence.)
+3. **Trigger — at the marked projection, commit only on a group-free residual.** At the
+   projection/match that is the marked single use: force the entry's value — evaluated, per the
+   prior art, under `externs` with **every group key removed** (`envForGroup`/`addStop`'s
+   `InlineNever` analogue: sibling and self references inside the body degrade to neutral global
+   calls; re-entry during that evaluation is structurally impossible) — apply the spine, select
+   the projected field / matched alternative, and **commit the fold only if the selected
+   residual's free names contain no group key** (checked on the selected part only; its size is
+   already bounded by the entry's gate). Otherwise leave the deferred ref untouched. Unselected
+   superclass-thunk fields die at eval time either way; the group-free commit check is what
+   additionally covers a *selected* field that itself references a sibling — projection-onliness
+   alone does not.
+4. **The CAF-split spelling gets the same treatment one binding out.** ANF also splits the shape
+   across top-level bindings (`Main.bindStateT = bindStateT(monadIdentity)`;
+   `Main.bind = Main.bindStateT.bind`). A saturated application **whose head is a grouped
+   dictionary builder** is therefore itself publishable as a value candidate (`arity: Nothing`,
+   body = the application) — sound by the same purity claim, and the lone, shape-anchored
+   exception to slice 2's "saturated CAF applications are never published" (whose rationale —
+   re-executing an arbitrary init-once computation — is exactly what dictionary construction
+   escapes). The consumer's projection then peeks through the alias into the deferred ref and (3)
+   applies.
+5. Everything else is unchanged: existing gate-A thresholds judge the entry; a self-recursive
+   *function* (a 1-member Rec group) either fails the dictionary shape outright or, if it returns
+   a record, has its self-reference stopped inside the entry and blocked from folding by the
+   group-free commit check — the §5 guarantee enforced semantically rather than by exclusion.
+
+Termination argument, in two parts. **Within one entry evaluation**: the group is absent from the
+environment — no re-entry. **Across driver rounds**: a refused site reifies to the identical
+application at its single occurrence (no growth, no new sites — by the single-use construction),
+and a committed fold contributes a residual verified group-free (no new group sites) — so the set
+of group application sites is non-increasing round over round and the module fixpoint's
+convergence is preserved. The ratchet is closed by the **group-free commit check**, not by
+projection-onliness. The deferral marks ride the existing convergence criterion
+(`e' == e && marks' == marks`), so a stably-refused mark does not keep the binding's fixpoint
+spinning.
+
+#### Owed with implementation
+
+- **Marks representation** (review note, 2026-07-11): an ordinary inline mark and a grouped
+  deferred-ref mark have different application semantics at `Let` (inline-and-drop vs
+  bind-as-deferred-ref), so they must not share one `Set String` — keep the carriers internally
+  distinct (both still ride the `e' == e && marks' == marks` convergence criterion).
+- Fixtures: a two-member mutual builder group (project one field — folds; a selected field that
+  itself references a sibling — commit refused, term byte-stable; bare saturated application with
+  no consuming projection — never deferred, stays the pinned neutral; **multi-use**
+  `let q = builder(d) in { a: q, b: q }` — never deferred, the single shared `let` survives
+  byte-stable; the CAF-split alias spelling folds through (4); a self-recursive function spelled
+  as a 1-member Rec group — never unfolds inside itself).
+- The non-pure-value chain in `monadRecStateT`'s body (a NonRec builder that still fails the
+  publish predicate) is explicitly **out of scope** here — separate evidence, separate proposal.
+- count-state is the target measurement; the other four benches and compile time× are the
+  no-regression watch.

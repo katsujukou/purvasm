@@ -26,6 +26,7 @@ import Data.Lazy (defer)
 import Data.Map (Map)
 import Data.Map as Map
 import Data.Maybe (Maybe(..), isJust)
+import Data.Set (Set)
 import Data.Set as Set
 import Data.Tuple (Tuple(..))
 import Data.Tuple.Nested (type (/\))
@@ -108,15 +109,23 @@ preserveOuterShape input output = case input, output of
 -- | bound (`< 64`, the gate's largest size threshold) keeps the in-memory summary small.
 candidatesOf
   :: (String -> Maybe { op :: PrimOp, arity :: Int })
+  -> Set String
   -> Map String InlineCandidate
   -> Array { recursive :: Boolean, members :: Array (String /\ Expr) }
   -> Map String InlineCandidate
-candidatesOf intrinsic deps decls =
+candidatesOf intrinsic gkeys deps decls =
   Map.fromFoldable (Array.mapMaybe candidateOf nonrecMembers)
   where
   nonrecMembers = decls >>= \d -> if d.recursive then [] else d.members
 
   publishBound = 64
+
+  -- The gate-A closedness classifier (ADR-0089 Addendum extension, Accepted 2026-07-11): a free
+  -- name is relocation-safe iff it is a known top-level key (own module ∪ dependency closure,
+  -- the same set `dictElimExpr` classifies with) or in the compiler-global intrinsic/structural
+  -- domain. Anything else — a local escape, an unresolved key — keeps the body un-closed; never
+  -- a naming-convention judgement.
+  isGlobal n = Set.member n gkeys || isJust (intrinsic n) || isJust (resolver n)
 
   -- a partial-application target's arity: dependency candidate, intrinsic, or local syntactic
   -- lambda (local partial-CAF chains are conservatively not chased).
@@ -154,10 +163,10 @@ candidatesOf intrinsic deps decls =
         { arity: Just (Array.length ps)
         , size: sizeExpr e0
         , cxLeqDeref: false
-        , closed:
-            Map.isEmpty chain
-              && Set.isEmpty (fvExpr (Set.fromFoldable ps) body)
-              && Set.isEmpty (cfExpr body)
+        -- capture-safety only: free *globals* do not un-close (`AtomForeign`s are link-time
+        -- globals by construction, so the old `cfExpr` conjunct is gone); a chain binder used by
+        -- the body surfaces here as a free non-global, so the chain needs no separate conjunct.
+        , closed: Set.isEmpty (Set.filter (not <<< isGlobal) (fvExpr (Set.fromFoldable ps) body))
         , body: e0
         }
       -- an alias tail: chase it through the chain for the published arity.
@@ -225,10 +234,11 @@ pureValueRhs = case _ of
 -- | per driver round (ADR-0087's outer fixpoint).
 nbeEnvOf
   :: (String -> Maybe { op :: PrimOp, arity :: Int })
+  -> Set String
   -> Map String InlineCandidate
   -> Array { recursive :: Boolean, members :: Array (String /\ Expr) }
   -> NbeEnv
-nbeEnvOf intrinsic deps decls =
+nbeEnvOf intrinsic gkeys deps decls =
   { externs: Map.union localExterns depExterns
   , intrinsic
   , structural
@@ -241,7 +251,7 @@ nbeEnvOf intrinsic deps decls =
   depExterns = map (entryFromCandidate envD) deps
 
   envL = base { nbe = { externs: depExterns, intrinsic, structural } }
-  localExterns = map (entryFromCandidate envL) (candidatesOf intrinsic deps decls)
+  localExterns = map (entryFromCandidate envL) (candidatesOf intrinsic gkeys deps decls)
 
   -- The compiler-global **structural rung** as on-demand extern entries (ADR-0089 §1's
   -- compiler-global table, extended from the eta-primop view to the resolver's guest terms): a
