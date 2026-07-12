@@ -228,6 +228,15 @@ consumer. The three load-bearing conservatisms are pinned explicitly:
   (§3). Any future consumer that moves code must consume the memory-effect
   extension, not this record's facts.
 
+> **Note (2026-07-13).** Dead-drop of a pure-*shaped* foreign call rests on a
+> premise this record left implicit and ADR-0096 §3 now pins as the **FFI
+> semantic contract**: a foreign whose reconstructed shape claims purity must
+> be observationally pure — its declared type is its effect contract. Hidden
+> mutation under a pure type is supported only for the compiler-known
+> linear-return `unsafe` class (`unsafeSetByte`, ADR-0052, where a dead result
+> has no observer); a pure-typed foreign mutating observable host state is
+> outside the supported FFI semantics and must be typed `Effect`.
+
 ### 5. Verification
 
 - **Behaviour gates:** `--opt ≡ --no-opt ≡ oracle` (value + stdout order) on the
