@@ -26,7 +26,7 @@ command =
         "Compile a single module and emit pmi/pmo files"
         ((Compile <$> Compile.options) <* ArgParser.flagHelp)
     , ArgParser.command [ "run" ]
-        "Build project with the Purvasm bytecode compiler and execute"
+        "Build and execute program with purvasm bytecode compiler/interpreter"
         ((Run <$> Run.options) <* ArgParser.flagHelp)
     , ArgParser.command [ "foreign-sigs" ]
         "Dump the closure's reconstructed foreign signatures as JSON (ADR-0080). \
@@ -40,5 +40,5 @@ command =
 parse :: Array String -> Either ArgParser.ArgError Command
 parse =
   ArgParser.parseArgs "purvasm"
-    "A bytecode compiler and interpreter for PureScript"
+    "A bytecode and native code toolchain for PureScript"
     command
