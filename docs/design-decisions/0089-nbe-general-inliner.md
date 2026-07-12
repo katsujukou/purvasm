@@ -893,3 +893,40 @@ Recovering it cleanly is future work (candidates: a pass-through-aware tier with
 blow-up argument, or specialisation). The default-stack self-compile still crashes in the
 bytecode lowering even at ×2.7 module growth — confirming the stack-safety item is real and
 independent; the leg's documented-headroom posture stands.
+
+## Engine status (2026-07-12): complete, reconciled divergences, and the future-work index
+
+With the self-compile extension and the ADR-0093/0094 integrations landed, the engine is treated
+as **near-frozen**: the reference architecture of §1–§9 is fully in place (the `quote ∘ eval`
+per-binding fixpoint, HOAS domain, `SRef` spine deferral, marks discovery/application, the `$q`
+discipline, both gate sites, `CCase`-structured folding, VM-exact constant folding, the slice-2
+candidate channel), hardened at the compiler's own scale (the self-compile size leg and
+round-growth backstop are standing gates), and verified by ~260 unit fixtures + the E2E fold-parity
+harness + `.pmi` mode-stability. Further engine changes ride dated extensions of this record with
+measured evidence, as every change since slice 3 has.
+
+**Reconciled divergence from §3 (recorded here rather than by rewriting §3):** the shipped
+analysis is a deliberate subset of §3's sketch. `Usage` carries `{ total, capture }` (no per-arity
+call counts, no separate `access`/`case` counters); complexity exists as the candidate-level
+`cxLeqDeref` fact plus the per-parameter `argUses` walker (the self-compile extension), not a
+per-node cached lattice; and the application 16-tier carries **no complexity guard at all** —
+wider than both §3 and the reference's `complexity <= Deref && size < 16`. What holds this safe is
+the strict extern-free 64-tier, the round-growth backstop, and the self-compile gate; the measured
+benches never produced a `< 16` body whose unconditional duplication bites. Completing the lattice
+is threshold-gated future work: the evidence that reopens it is a trace where a small
+`NonTrivial` body's per-site duplication shows up in the size gates.
+
+**Future-work index** (each pinned where it was decided, listed here for one-stop reference):
+
+- match-side grouped trigger — the parameterized-instance extension's projection-only Correction;
+- multi-use dictionary fan-out for the deferral marks — the same extension's Decision (2);
+- bounded-`Distribute` residual-size budget — the bounded-duplication extension (deferred until a
+  binder-consuming trace);
+- pass-through-aware tier / spec-callee body channel / grouped-callee clones — the self-compile
+  extension's Progress note and ADR-0093's Progress note (the count-state 1.801 recovery);
+- dead neutral-call dropping and the `Effect`/`ST` structural lowering — the ADR-0034 effect
+  track (§5's conservatism is explicit about waiting for purity facts; ADR-0094 keeps those
+  structural keys out of its slice for the same reason);
+- higher-order specialization — its own future ADR, opening with the owed purs-wasm
+  `Specialize.purs` close reading (ADR-0093 §Prior art);
+- `Dbe` — the seam pipeline's named remaining slot (`Optimizer.purs` preamble).
