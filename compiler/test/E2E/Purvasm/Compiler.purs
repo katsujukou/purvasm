@@ -7,6 +7,21 @@ module Test.E2E.Purvasm.Compiler where
 import Prelude
 
 import Data.Argonaut.Parser (jsonParser)
+import Data.Array as Array
+import Data.Bifunctor (lmap)
+import Data.Set as Set
+import Data.Traversable (traverse)
+import Data.Tuple (Tuple(..), fst, snd)
+import Effect.Class (liftEffect)
+import Node.Encoding (Encoding(..))
+import Node.FS.Sync (exists, readTextFile, readdir) as FSSync
+import Purvasm.Compiler.Literal (Literal(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..)) as A
+import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (cfExpr, fvExpr)
+import Purvasm.Compiler.MiddleEnd.Module (declsOfModule)
+import Purvasm.Compiler.MiddleEnd.Optimizer (emptyBuildEnv, extendSummary, localFactsOf, optimizeModule)
+import Purvasm.Compiler.Primitive (PrimOp(..)) as Po
+import PureScript.CoreFn.Module (Module) as CFM
 import Data.Either (Either(..))
 import Data.Maybe (Maybe(..))
 import Effect (Effect)
@@ -57,6 +72,7 @@ main = runSpecAndExitProcess [ consoleReporter ] spec
 
 spec :: Spec Unit
 spec = do
+  paritySpec
   describe "pipeline: CoreFn → CESK → ANF → bytecode" do
     it "lowers a curried application to one uncurried tail call" do
       compile (CF.App nullAnn (CF.App nullAnn (local "f") (int 1)) (int 2))
@@ -75,3 +91,159 @@ spec = do
           Right m -> do
             moduleToString (compileModule m) `shouldEqual` refPmoDiaA
             interfaceToString (interfaceOf (compileModule m)) `shouldEqual` refPmiDiaA
+
+-- --- ADR-0094 fold parity: sliced structural keys ride the ulib shadow bodies --------------------
+
+-- | Load a real corefn artifact by the build's own resolution rule (ulib overlay first, then the
+-- | workspace output) — the parity harness must fold the artifacts programs actually compile.
+loadReal :: String -> Effect (Maybe CFM.Module)
+loadReal name = go roots
+  where
+  roots = do
+    base <- [ "", "../" ]
+    root <- [ "dist/ulib/", "output/" ]
+    pure (base <> root <> name <> "/corefn.json")
+
+  go = Array.uncons >>> case _ of
+    Nothing -> pure Nothing
+    Just { head, tail } -> FSSync.exists head >>= case _ of
+      false -> go tail
+      true -> do
+        txt <- FSSync.readTextFile UTF8 head
+        case jsonParser txt of
+          Left _ -> pure Nothing
+          Right json -> case decodeModule json of
+            Left _ -> pure Nothing
+            Right m -> pure (Just m)
+
+-- | Thread the loaded closure through the real optimiser seam in dependency order, then optimize
+-- | a probe module against the accumulated env — the whole `--opt` pipeline in miniature.
+optimizeProbe :: Array CFM.Module -> Array (Tuple String A.Expr) -> Array (Tuple String A.Expr)
+optimizeProbe mods probes =
+  let
+    env = Array.foldl
+      ( \e m ->
+          let
+            am = declsOfModule m
+          in
+            extendSummary e (optimizeModule e (localFactsOf e am) am).summary
+      )
+      emptyBuildEnv
+      mods
+    probeAm = { name: "Parity.T", decls: map (\(Tuple k e) -> { recursive: false, members: [ Tuple k e ] }) probes }
+  in
+    Array.concatMap _.members (optimizeModule env (localFactsOf env probeAm) probeAm).module.decls
+
+-- | Does the expression anywhere use the given primop / reference the given name?
+usesPrim :: Po.PrimOp -> A.Expr -> Boolean
+usesPrim op = goE
+  where
+  goE = case _ of
+    A.Ret c -> goC c
+    A.Let _ c rest -> goC c || goE rest
+    A.LetRec bs rest -> Array.any (goE <<< _.rhs) bs || goE rest
+
+  goC = case _ of
+    A.CPrim o _ -> o == op
+    A.CLam _ b -> goE b
+    A.CIf _ t e -> goE t || goE e
+    A.CCase _ alts -> Array.any goAlt alts
+    _ -> false
+
+  goAlt alt = case alt.result of
+    A.Uncond e -> goE e
+    A.Guarded gs -> Array.any (\g -> goE g.guard || goE g.rhs) gs
+
+refsName :: String -> A.Expr -> Boolean
+refsName n e = Set.member n (Set.union (fvExpr Set.empty e) (cfExpr e))
+
+paritySpec :: Spec Unit
+paritySpec = describe "ADR-0094 fold parity (sliced structural keys ride the ulib shadow bodies)" do
+  let
+    avar = A.AtomVar
+    aint = A.AtomLit <<< LInt
+    load names = liftEffect (map Array.catMaybes (traverse loadReal names))
+    -- the shadow Ord closure: Ordering (workspace), Eq + Ord (overlay shadows).
+    ordClosure = [ "Data.Ordering", "Data.Eq", "Data.Ord" ]
+
+  it "scalar compare/lessThan fold to constants through the real shadow closure (Int)" do
+    mods <- load ordClosure
+    Array.length mods `shouldEqual` 3
+    let
+      out = optimizeProbe mods
+        [ Tuple "Parity.T.cmp" (A.Ret (A.CApp (avar "Data.Ord.compare") [ avar "Data.Ord.ordInt", aint 1, aint 2 ]))
+        , Tuple "Parity.T.lt" (A.Ret (A.CApp (avar "Data.Ord.lessThan") [ avar "Data.Ord.ordInt", aint 1, aint 2 ]))
+        ]
+    map snd out `shouldEqual`
+      [ A.Ret (A.CCtor "LT" 0 [])
+      , A.Ret (A.CAtom (A.AtomLit (LBool true)))
+      ]
+
+  it "string compare survives as a call to the shadow's recursive byte-loop body (no constant fold)" do
+    -- The real shadow implements string compare as a recursive UTF-8 byte loop
+    -- (`compareStringImpl`, byte-exact with the VM's order by construction) — not an `LtString`
+    -- composition as ADR-0094's sketch assumed from the registry guest term. Recursion never
+    -- inlines (ADR-0089 §5), so parity here is body *visibility*: the dispatch collapses to a
+    -- direct call into the shadow body.
+    mods <- load ordClosure
+    let
+      str = A.AtomLit <<< LString
+      out = optimizeProbe mods
+        [ Tuple "Parity.T.s"
+            (A.Ret (A.CApp (avar "Data.Ord.compare") [ avar "Data.Ord.ordString", str "a", str "b" ]))
+        ]
+    Array.any (refsName "Data.Ord.compareStringImpl" <<< snd) out `shouldEqual` true
+
+  it "array eq / functor map shadow bodies are visible and lower as calls" do
+    mods <- load [ "Data.Ordering", "Data.Eq", "Data.Ord", "Data.Functor" ]
+    let
+      out = optimizeProbe mods
+        [ Tuple "Parity.T.m"
+            ( A.Let "f" (A.CLam [ "x" ] (A.Ret (A.CPrim Po.AddInt [ avar "x", aint 1 ])))
+                ( A.Let "a" (A.CArray [ aint 1, aint 2 ])
+                    (A.Ret (A.CApp (avar "Data.Functor.arrayMap") [ avar "f", avar "a" ]))
+                )
+            )
+        ]
+      outEq = optimizeProbe mods
+        [ Tuple "Parity.T.e"
+            ( A.Let "f" (A.CLam [ "x", "y" ] (A.Ret (A.CPrim Po.EqInt [ avar "x", avar "y" ])))
+                ( A.Let "a" (A.CArray [ aint 1, aint 2 ])
+                    (A.Ret (A.CApp (avar "Data.Eq.eqArrayImpl") [ avar "f", avar "a", avar "a" ]))
+                )
+            )
+        ]
+      -- correct lowering, two admissible shapes: the shadow body is a non-recursive wrapper over
+      -- an internal loop, so the optimiser may inline it (the residual then carries the loop's
+      -- array primitives) or keep the call. Either way the behaviour rides the shadow body — a
+      -- vanished call with no loop would mean the work disappeared.
+      lowered = Array.any (\(Tuple _ e) -> refsName "Data.Functor.arrayMap" e || usesPrim Po.SetArray e) out
+      -- same two admissible shapes for the Eq slice key: the shadow `eqArrayImpl` is a
+      -- non-recursive wrapper over an internal element loop (the loop's `IndexArray` reads are
+      -- the pinned trace it leaves when inlined).
+      loweredEq = Array.any (\(Tuple _ e) -> refsName "Data.Eq.eqArrayImpl" e || usesPrim Po.IndexArray e) outEq
+    lowered `shouldEqual` true
+    loweredEq `shouldEqual` true
+
+  it "the sliced foreign keys are unreachable in the overlay corpus (dead as a provider)" do
+    -- Data.Ord's shadow drops the *Impl names entirely; Data.Eq/Data.Functor keep them as
+    -- ordinary PS bindings. In neither case may any overlay corefn declare them as FOREIGN.
+    entries <- liftEffect do
+      base <- FSSync.exists "dist/ulib" >>= if _ then pure "dist/ulib" else pure "../dist/ulib"
+      dirs <- FSSync.readdir base
+      map Array.concat $ traverse
+        ( \d -> do
+            let p = base <> "/" <> d <> "/corefn.json"
+            FSSync.exists p >>= case _ of
+              false -> pure []
+              true -> do
+                txt <- FSSync.readTextFile UTF8 p
+                case lmap show (jsonParser txt) >>= (decodeModule >>> lmap show) of
+                  Left _ -> pure []
+                  Right m -> pure [ Tuple d m.foreignNames ]
+        )
+        dirs
+    let
+      sliced = [ "arrayMap", "eqArrayImpl", "ordIntImpl", "ordNumberImpl", "ordStringImpl", "ordCharImpl", "ordBooleanImpl" ]
+      offenders = Array.filter (\(Tuple _ fs) -> Array.any (\f -> Array.elem f sliced) fs) entries
+    map fst offenders `shouldEqual` []
