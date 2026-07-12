@@ -16,11 +16,10 @@ import Prelude
 import ArgParse.Basic (ArgParser, fromRecord)
 import ArgParse.Basic as ArgParser
 import Data.Array as Array
-import Data.Map (Map)
 import Data.Map as Map
 import Data.String (joinWith)
 import Data.Traversable (traverse)
-import Data.Tuple.Nested (type (/\), (/\))
+import Data.Tuple.Nested ((/\))
 import Effect.Console as Console
 import Purvasm.CLI.Build (depOrder, loadClosure)
 import Purvasm.CLI.Effect.Env (ENV)
