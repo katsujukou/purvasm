@@ -9,7 +9,8 @@
 -- |     (ADR-0089: `DictElim`'s gate-free dispatch devirtualization, then the NbE general inliner —
 -- |     which absorbed `Simplify`, ADR-0089 §6/§8), over the module's bodies, returning
 -- |     `{ module, summary }` — the summary carrying the dict machinery **and** the slice-2 inline
--- |     candidates for dependents. Dbe/EffectAnalysis/Specialize are the optimiser track's to add.
+-- |     candidates for dependents. `EffectAnalysis` (ADR-0095) supplies the pass's effect-fact
+-- |     oracle; its dead-drop consumer lives inside the NbE gate (no separate `Dbe` pass).
 -- |     **Iterating this pass to a fixpoint is the build driver's job** (ADR-0087) — the seam stays a
 -- |     pure single step the driver can bracket with inspection hooks.
 -- |
@@ -52,6 +53,8 @@ import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (cfExpr, fvExpr)
 import Purvasm.Compiler.Ffi (intrinsicPrim)
 import Purvasm.Compiler.MiddleEnd.Module (AnfModule, declKeys, mapDeclBodies)
 import Purvasm.Compiler.MiddleEnd.Optimizer.DictElim (DictMachinery, dictElimExpr, emptyMachinery, intrinsicLift, machineryOf, mergeMachinery)
+import Data.Lazy (force)
+import Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis (moduleEffects, moduleEffectsLazy)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe (candidatesOf, nbeBinding, nbeEnvOf)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Analysis (sizeExpr)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (InlineCandidate)
@@ -67,11 +70,14 @@ newtype BuildEnv = BuildEnv
   { dict :: DictMachinery
   , gkeys :: Set String
   , inlines :: Map String InlineCandidate
-  -- | Dependencies' exported foreign shapes (ADR-0090), for effect analysis (ADR-0034). The **build
+  -- | Dependencies' exported foreign shapes (ADR-0090), for effect analysis (ADR-0034/0095). The **build
   -- | driver** owns the primary `ForeignFacts` thread (every mode, feeding codegen via
   -- | `LoweredModule.foreignSigs`); it injects the same deps here via `withForeignSigs` only under `--opt`,
   -- | where the optimiser runs. No pass mutates it, so it is not folded by `extendSummary`.
   , foreignSigs :: Map String ForeignShape
+  -- | Dependencies' published effect summaries (ADR-0095 §2): per-binding `ForeignShape` facts
+  -- | folded through `extendSummary` like `dict`/`inlines`.
+  , effects :: Map String ForeignShape
   }
 
 -- | The current module's **stable** facts produced by `localFactsOf` and handed to the `optimizeModule`
@@ -101,11 +107,17 @@ newtype BuildSummary = BuildSummary
   -- | — the driver's exports-only `ForeignFacts` publication cannot see them. Read by the driver
   -- | via `publishedForeignSigs` and folded into that thread.
   , foreignSigs :: Map String ForeignShape
+  -- | The module's per-binding effect summaries for dependents (ADR-0095 §2). The seam has no
+  -- | export visibility, so **every** top-level key is published — the superset of the ADR's
+  -- | "exports ∪ candidate-reachable privates" floor (under-publication is the failure mode the
+  -- | ADR guards against: a private helper's fact regressing to `unknown` at the very site a
+  -- | cross-module inline just created; over-publication only costs in-memory map entries).
+  , effects :: Map String ForeignShape
   }
 
 -- | The starting env, before any module has contributed.
 emptyBuildEnv :: BuildEnv
-emptyBuildEnv = BuildEnv { dict: emptyMachinery, gkeys: Set.empty, inlines: Map.empty, foreignSigs: Map.empty }
+emptyBuildEnv = BuildEnv { dict: emptyMachinery, gkeys: Set.empty, inlines: Map.empty, foreignSigs: Map.empty, effects: Map.empty }
 
 -- | A module's **stable** facts — its own dictionary machinery and top-level keys — computed once from its
 -- | `AnfModule` and handed to the `optimizeModule` fixpoint (they do not change across iterations). The
@@ -127,10 +139,9 @@ localFactsOf (BuildEnv env) am =
 -- | the module-visible env (`env` deps ∪ `localFacts`), returning the rewritten `AnfModule` **and its
 -- | `BuildSummary`** (ADR-0086 pins `{ module, summary }`, so a summary derived from the *optimised*
 -- | module reaches dependents). The **driver iterates this to a fixpoint** (ADR-0087), threading
--- | `.module` and keeping the last pass's `.summary`. Sibling-body facts (`nbeEnvOf`) are
--- | pass-internal: recomputed from the DictElim'd decls each driver iteration, never stored
--- | (ADR-0086 §3). The Dbe → EffectAnalysis → Specialize pipeline is the optimiser track's to add
--- | here; cross-module inline candidates arrive with ADR-0089 slice 2.
+-- | `.module` and keeping the last pass's `.summary`. Sibling-body facts (`nbeEnvOf`) and the
+-- | module's own effect summaries (`moduleEffects`, ADR-0095) are pass-internal: recomputed from
+-- | the DictElim'd decls each driver iteration, never stored (ADR-0086 §3 / ADR-0095 §2).
 -- |
 -- | `intrinsicLift`: safe on this path only because the NbE intrinsic saturation runs next.
 optimizeModule :: BuildEnv -> LocalFacts -> AnfModule -> { module :: AnfModule, summary :: BuildSummary }
@@ -140,6 +151,21 @@ optimizeModule (BuildEnv env) lf am =
     gkeys = Set.union lf.gkeys env.gkeys
     elimd = map (mapDeclBodies (dictElimExpr intrinsicLift gkeys full)) am.decls
     nbe = nbeEnvOf intrinsicPrim env.inlines elimd
+    -- The ADR-0095 effect-fact oracle. Dependency facts (their published summaries, their foreign
+    -- shapes) and the module's own foreign shapes are stable; the module's own **binding**
+    -- summaries are pass-local — recomputed here from the post-DictElim term each round (never
+    -- stored in `LocalFacts`, never read back from this module's own summary, ADR-0095 §2) — so
+    -- precision gained by a previous round's Specialize/NbE arrives with the driver's next round.
+    depEffects k = case Map.lookup k lf.foreignSigs of
+      Just s -> Just s
+      Nothing -> case Map.lookup k env.effects of
+        Just s -> Just s
+        Nothing -> Map.lookup k env.foreignSigs
+    -- own summaries stay lazy: only the callees the mark walk actually consults are computed.
+    ownEffects = moduleEffectsLazy depEffects elimd
+    effectOracle k = case Map.lookup k ownEffects of
+      Just s -> Just (force s)
+      Nothing -> depEffects k
     -- The round-growth backstop (ADR-0089 self-compile extension) wraps every binding: a round
     -- output that grew past `roundGrowthMax`× the round input keeps the input — term-preserving,
     -- never a mid-flight re-reduction — and **everything below derives from the post-backstop
@@ -148,7 +174,7 @@ optimizeModule (BuildEnv env) lf am =
     -- normalising to a 20-node lambda) out of the backstop's reach; the blow-up class it exists
     -- for sits orders of magnitude above it.
     optimised = elimd <#> \d ->
-      d { members = d.members <#> \(Tuple k e) -> Tuple k (backstop k e (nbeBinding nbe k e)) }
+      d { members = d.members <#> \(Tuple k e) -> Tuple k (backstop k e (nbeBinding nbe effectOracle k e)) }
     -- Dictionary specialization (ADR-0093): `Specialize ∘ Nbe ∘ DictElim` per round. Discovery on
     -- the (post-backstop) NbE output; emitted clones and rewritten sites become part of the
     -- module the next round (and the summary below) derive from.
@@ -171,6 +197,10 @@ optimizeModule (BuildEnv env) lf am =
             , gkeys: lf.gkeys
             , inlines
             , foreignSigs: Map.filterKeys (\k -> Set.member k referenced) lf.foreignSigs
+            -- ADR-0086 §3: a summary derived from the *final* module reaches dependents — the
+            -- published effect facts are recomputed from the post-Specialize decls, not reused
+            -- from the pre-NbE `ownEffects` this pass consumed.
+            , effects: moduleEffects depEffects specialized
             }
     }
 
@@ -217,6 +247,7 @@ extendSummary (BuildEnv env) (BuildSummary s) = BuildEnv
   -- Foreign shapes are threaded by the driver's `ForeignFacts` (re-injected via `withForeignSigs` each
   -- `--opt` step, ADR-0090), not folded through the summary; preserve whatever is set.
   , foreignSigs: env.foreignSigs
+  , effects: Map.union s.effects env.effects
   }
 
 -- | Inject the driver's dependency foreign shapes into the env for `optimizeModule` (ADR-0090). Called by

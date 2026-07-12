@@ -164,6 +164,7 @@
             "fmt",
             "foreign-object",
             "language-cst-parser",
+            "lazy",
             "lists",
             "prelude",
             "purvasm-base"
@@ -171,6 +172,8 @@
         },
         "test": {
           "dependencies": [
+            "node-buffer",
+            "node-fs",
             "spec",
             "spec-node"
           ]

@@ -8,9 +8,11 @@ module Test.Unit.Purvasm.Compiler.MiddleEnd.Optimizer.Nbe where
 import Prelude
 
 import Data.Map as Map
+import Data.Maybe (Maybe(..))
 import Data.Tuple.Nested ((/\))
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Ffi (intrinsicPrim)
+import Purvasm.Compiler.ForeignSig (ForeignShape)
 import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
 import Purvasm.Compiler.MiddleEnd.Module (Decl)
@@ -34,14 +36,18 @@ nbe = nbeWith []
 
 -- …or against the given sibling decls (the gate-site-A channel)…
 nbeWith :: Array Decl -> Expr -> Expr
-nbeWith decls = nbeBinding (nbeEnvOf intrinsicPrim Map.empty decls) "Test.binding"
+nbeWith decls = nbeBinding (nbeEnvOf intrinsicPrim Map.empty decls) (const Nothing) "Test.binding"
+
+-- …or with ADR-0095 effect facts (the dead-only drop branch's oracle)…
+nbeEffects :: Map.Map String ForeignShape -> Expr -> Expr
+nbeEffects sigs = nbeBinding (nbeEnvOf intrinsicPrim Map.empty []) (\k -> Map.lookup k sigs) "Test.binding"
 
 -- …or against dependency decls published through the slice-2 candidate channel, plus local
 -- sibling decls (mirrors `optimizeModule`'s wiring: deps ride `BuildEnv.inlines`, and the
 -- closedness classifier sees every module's top-level keys).
 nbeCross :: Array Decl -> Array Decl -> Expr -> Expr
 nbeCross depDecls locals =
-  nbeBinding (nbeEnvOf intrinsicPrim (candidatesOf intrinsicPrim Map.empty depDecls) locals) "Test.binding"
+  nbeBinding (nbeEnvOf intrinsicPrim (candidatesOf intrinsicPrim Map.empty depDecls) locals) (const Nothing) "Test.binding"
 
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
@@ -103,9 +109,56 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
               (Ret (CPrim AddInt [ var "$q2", var "$q1" ]))
           )
 
-    it "a dead neutral call is kept (may perform when forced; dropping waits for purity facts)" do
+    it "a dead neutral call is kept absent purity facts (the conservative default)" do
       nbe (Let "a" (CApp (var "f") [ var "x" ]) (Ret (CAtom (int 1))))
         `shouldEqual` Let "$q1" (CApp (var "f") [ var "x" ]) (Ret (CAtom (int 1)))
+
+  describe "dead-drop with purity facts (ADR-0095 §3, the dead-only branch)" do
+    it "fires: a dead pure call is dropped in place" do
+      nbeEffects (Map.singleton "M.pureFn" { arity: 1, vsat: false, retVsat: false })
+        (Let "a" (CApp (var "M.pureFn") [ var "x" ]) (Ret (CAtom (int 1))))
+        `shouldEqual` Ret (CAtom (int 1))
+
+    it "a dead Effect-thunk construction is dropped (I1: construction ≠ execution)" do
+      -- let a = log s in 1 — builds the thunk, never forces it.
+      nbeEffects (Map.singleton "M.log" { arity: 1, vsat: false, retVsat: true })
+        (Let "a" (CApp (var "M.log") [ var "s" ]) (Ret (CAtom (int 1))))
+        `shouldEqual` Ret (CAtom (int 1))
+
+    it "a dead effectful force is kept (the thunk's saturation may perform)" do
+      -- let t = log s in let u = t unit in 1 — u's rhs forces the thunk (over-application of
+      -- t's arity-0 summary → may-perform); t stays live through u.
+      nbeEffects (Map.singleton "M.log" { arity: 1, vsat: false, retVsat: true })
+        ( Let "t" (CApp (var "M.log") [ var "s" ])
+            (Let "u" (CApp (var "t") [ int 0 ]) (Ret (CAtom (int 1))))
+        )
+        `shouldEqual`
+          Let "$q1" (CApp (var "M.log") [ var "s" ])
+            (Let "$q2" (CApp (var "$q1") [ int 0 ]) (Ret (CAtom (int 1))))
+
+    it "a dead bare-EffectFnN saturation is kept (vsat: saturating it IS the effect)" do
+      nbeEffects (Map.singleton "M.effectFn2" { arity: 2, vsat: true, retVsat: false })
+        (Let "a" (CApp (var "M.effectFn2") [ var "x", var "y" ]) (Ret (CAtom (int 1))))
+        `shouldEqual`
+          Let "$q1" (CApp (var "M.effectFn2") [ var "x", var "y" ]) (Ret (CAtom (int 1)))
+
+    it "no-motion guard: a live single-use pure call never sinks, even across a SetArray" do
+      -- let a = M.read arr in let w = SetArray arr 0 1 in a — sinking `a` past the write would
+      -- read the mutated cell (ADR-0095 §3: vsat=false does not license motion).
+      nbeEffects (Map.singleton "M.read" { arity: 1, vsat: false, retVsat: false })
+        ( Let "a" (CApp (var "M.read") [ var "arr" ])
+            (Let "w" (CPrim SetArray [ var "arr", int 0, int 1 ]) (Ret (CAtom (var "a"))))
+        )
+        `shouldEqual`
+          Let "$q1" (CApp (var "M.read") [ var "arr" ])
+            (Let "$q2" (CPrim SetArray [ var "arr", int 0, int 1 ]) (Ret (CAtom (var "$q1"))))
+
+    it "the guard's dual: the same callee's *dead* call is dropped (nothing observes it)" do
+      nbeEffects (Map.singleton "M.read" { arity: 1, vsat: false, retVsat: false })
+        ( Let "a" (CApp (var "M.read") [ var "arr" ])
+            (Let "w" (CPrim SetArray [ var "arr", int 0, int 1 ]) (Ret (CAtom (int 1))))
+        )
+        `shouldEqual` Let "$q1" (CPrim SetArray [ var "arr", int 0, int 1 ]) (Ret (CAtom (int 1)))
 
     it "a recursive group member is never unfolded (recursion stays a call)" do
       let
@@ -662,10 +715,10 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
         env = nbeEnvOf intrinsicPrim Map.empty decls
       -- membership probed through nbeBinding behaviour instead of map internals:
       -- the lambda inlines, the computation CAF and the recursive member stay calls.
-      nbeBinding env "t" (Ret (CApp (var "M.lam") [ var "p" ])) `shouldEqual` Ret (CAtom (var "p"))
-      nbeBinding env "t" (Ret (CApp (var "M.caf") [ var "p" ]))
+      nbeBinding env (const Nothing) "t" (Ret (CApp (var "M.lam") [ var "p" ])) `shouldEqual` Ret (CAtom (var "p"))
+      nbeBinding env (const Nothing) "t" (Ret (CApp (var "M.caf") [ var "p" ]))
         `shouldEqual` Ret (CApp (var "M.caf") [ var "p" ])
-      nbeBinding env "t" (Ret (CApp (var "M.rec") [ var "p" ]))
+      nbeBinding env (const Nothing) "t" (Ret (CApp (var "M.rec") [ var "p" ]))
         `shouldEqual` Ret (CApp (var "M.rec") [ var "p" ])
 
   describe "parameterized-instance unfolding (ADR-0089 Accepted extension)" do

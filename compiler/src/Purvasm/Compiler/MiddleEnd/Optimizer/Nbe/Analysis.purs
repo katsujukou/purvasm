@@ -5,10 +5,17 @@
 -- | discovery/application split): `Eval` then binds the value in its environment instead of
 -- | sharing it.
 -- |
--- | Only *gate-eligible* right-hand sides are ever marked: value forms (`CLam`/`CCtor`/`CArray`/
--- | `CRecord`), pure dereference forms (`CAccessor`, non-pinned `CPrim`, `CUpdate`). Pinned
--- | computations (calls, pinned prims, branches) are never marked — not even dead — preserving
--- | ADR-0089 §5 (dead-drop of pinned bindings waits for `EffectAnalysis` purity facts).
+-- | Only *gate-eligible* right-hand sides are ever marked through the ordinary `verdict`: value
+-- | forms (`CLam`/`CCtor`/`CArray`/`CRecord`), pure dereference forms (`CAccessor`, non-pinned
+-- | `CPrim`, `CUpdate`). Pinned computations (calls, pinned prims, branches) never enter it.
+-- |
+-- | The ADR-0095 **dead-only branch** is the one exception, and it is deliberately *not* verdict
+-- | eligibility: a `CApp` whose effect facts prove it cannot perform (`eperfC` false) is marked
+-- | **only when it is dead** (`usage = Nothing`) — the mark then eliminates it in place (a dead
+-- | marked binder's value is bound, unused, and never reified). At any use count ≥ 1 a pure call
+-- | stays pinned/ineligible: the ordinary mark *is* the sink (re-materialise at the use site next
+-- | round), and purity facts license elimination when dead, never motion (ADR-0095 §3/§4 — the
+-- | summary does not track mutable-memory reads).
 module Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Analysis
   ( inlineMarks
   , sizeExpr
@@ -18,6 +25,7 @@ import Prelude
 
 import Data.Array as Array
 import Data.Foldable (foldl)
+import Data.Lazy (defer)
 import Data.Map (Map)
 import Data.Map as Map
 import Data.Maybe (Maybe(..))
@@ -25,6 +33,7 @@ import Data.Set (Set)
 import Data.Set as Set
 import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr(..), Expr(..), Rhs(..))
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (cfExpr, fvExpr)
+import Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis (EffectEnv, EffectGlobals, bindFact, bindUnknown, emptyEffectEnv, eperfC, extendGroupVars, vsumC)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (binderVarsOrdered, pinnedPrim)
 
 -- --- usage ---------------------------------------------------------------------------------------
@@ -71,7 +80,8 @@ derive instance Ord Cx
 
 type RhsFacts = { cx :: Cx, isAbs :: Boolean, closedParams :: Boolean }
 
--- | The gate-eligible right-hand-side classes; `Nothing` = pinned/ineligible (never marked).
+-- | The gate-eligible right-hand-side classes; `Nothing` = pinned/ineligible (never marked
+-- | through `verdict` — a pure dead `CApp` rides the ADR-0095 dead-only branch instead).
 classifyRhs :: CExpr -> Maybe RhsFacts
 classifyRhs = case _ of
   CAtom _ -> Just { cx: Trivial, isAbs: false, closedParams: false }
@@ -108,40 +118,52 @@ verdict f rhsSize = case _ of
 
 -- --- the walk ------------------------------------------------------------------------------------
 
--- | The gate-B marks for one quoted binding body: the `let` binders the next round should inline.
-inlineMarks :: Expr -> Set String
-inlineMarks e = (infoExpr e).marks
+-- | The gate-B marks for one quoted binding body: the `let` binders the next round should inline
+-- | (or, for the ADR-0095 dead-only branch, drop). `globals` is the effect-fact oracle
+-- | (dependencies' summaries + foreign shapes + the module's own pass-local summaries); the local
+-- | fact environment is threaded lexically along this walk — per-binding lifetime (ADR-0095 §1).
+inlineMarks :: EffectGlobals -> Expr -> Set String
+inlineMarks globals e = (infoExpr (emptyEffectEnv globals) e).marks
 
--- | A binding body's node-count size (also the extern-entry size for gate A).
+-- | A binding body's node-count size (also the extern-entry size for gate A). Size and usage are
+-- | fact-independent, so the degenerate oracle is fine here.
 sizeExpr :: Expr -> Int
-sizeExpr e = (infoExpr e).size
+sizeExpr e = (infoExpr (emptyEffectEnv (const Nothing)) e).size
 
-infoExpr :: Expr -> Info
-infoExpr = case _ of
-  Ret c -> infoC c
+infoExpr :: EffectEnv -> Expr -> Info
+infoExpr env = case _ of
+  Ret c -> infoC env c
   Let x c rest ->
     let
-      rc = infoC c
-      rr = infoExpr rest
+      rc = infoC env c
+      rr = infoExpr (bindFact x (defer \_ -> vsumC env c) env) rest
+      usage = Map.lookup x rr.usages
       marked = case classifyRhs c of
-        Just f | verdict f rc.size (Map.lookup x rr.usages) -> Set.singleton x
-        _ -> Set.empty
+        Just f | verdict f rc.size usage -> Set.singleton x
+        Just _ -> Set.empty
+        -- ADR-0095 §3, the dead-only branch: usage first — only a *dead* (`Nothing`) pure call
+        -- is marked (the drop mark); a live pure call stays pinned (motion needs memory-effect
+        -- facts this summary does not carry).
+        Nothing -> case c, usage of
+          CApp _ _, Nothing | not (eperfC env c) -> Set.singleton x
+          _, _ -> Set.empty
       merged = mergeI rc (dropVars [ x ] rr)
     in
       merged { size = merged.size + 1, marks = Set.union merged.marks marked }
   LetRec binds body ->
     let
       names = map _.var binds
-      ri = foldl (\i b -> mergeI i (infoExpr b.rhs)) emptyI binds
-      rb = infoExpr body
+      env' = extendGroupVars env binds
+      ri = foldl (\i b -> mergeI i (infoExpr env' b.rhs)) emptyI binds
+      rb = infoExpr env' body
       merged = dropVars names (mergeI ri rb)
     in
       merged { size = merged.size + 1 }
 
-infoC :: CExpr -> Info
-infoC = case _ of
+infoC :: EffectEnv -> CExpr -> Info
+infoC env = case _ of
   CAtom a -> useAtom a
-  CLam ps body -> bump (dropVars ps (capAt CapClosure (infoExpr body)))
+  CLam ps body -> bump (dropVars ps (capAt CapClosure (infoExpr (bindUnknown ps env) body)))
   CApp h args -> bump (mergeI (useAtom h) (useAtoms args))
   CPrim _ args -> bump (useAtoms args)
   CCtor _ _ args -> bump (useAtoms args)
@@ -149,12 +171,17 @@ infoC = case _ of
   CRecord fs -> bump (useAtoms (map _.val fs))
   CAccessor a _ -> bump (useAtom a)
   CUpdate a ups -> bump (mergeI (useAtom a) (useAtoms (map _.val ups)))
-  CIf a t e -> bump (mergeI (useAtom a) (capAt CapBranch (mergeI (infoExpr t) (infoExpr e))))
-  CCase scruts alts -> bump (mergeI (useAtoms scruts) (capAt CapBranch (foldl (\i alt -> mergeI i (infoAlt alt)) emptyI alts)))
+  CIf a t e -> bump (mergeI (useAtom a) (capAt CapBranch (mergeI (infoExpr env t) (infoExpr env e))))
+  CCase scruts alts -> bump (mergeI (useAtoms scruts) (capAt CapBranch (foldl (\i alt -> mergeI i (infoAlt env alt)) emptyI alts)))
   where
   bump i = i { size = i.size + 1 }
 
-infoAlt :: Alt -> Info
-infoAlt alt = dropVars (Array.concatMap binderVarsOrdered alt.binders) case alt.result of
-  Uncond e -> infoExpr e
-  Guarded gs -> foldl (\i g -> mergeI i (mergeI (infoExpr g.guard) (infoExpr g.rhs))) emptyI gs
+infoAlt :: EffectEnv -> Alt -> Info
+infoAlt env alt =
+  let
+    vars = Array.concatMap binderVarsOrdered alt.binders
+    env' = bindUnknown vars env
+  in
+    dropVars vars case alt.result of
+      Uncond e -> infoExpr env' e
+      Guarded gs -> foldl (\i g -> mergeI i (mergeI (infoExpr env' g.guard) (infoExpr env' g.rhs))) emptyI gs

@@ -113,6 +113,89 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
         , [ "Test.M.three" /\ collapsed ]
         ]
 
+    it "drops a dead pure call through the own-foreign fact channel (ADR-0095: LocalFacts.foreignSigs → oracle)" do
+      -- f = \x -> let dead = pureImpl x in x — the callee's shape arrives the way the driver
+      -- injects the module's own reconstructed sigs (`lf { foreignSigs = ownSigs }`).
+      let
+        am :: AnfModule
+        am =
+          { name: "Test.M"
+          , decls:
+              [ nonrec "Test.M.f"
+                  ( Ret
+                      ( CLam [ "x" ]
+                          ( Let "dead" (CApp (AtomForeign "Test.M.pureImpl") [ var "x" ])
+                              (Ret (CAtom (var "x")))
+                          )
+                      )
+                  )
+              ]
+          }
+        lf = (localFactsOf emptyBuildEnv am)
+          { foreignSigs = Map.singleton "Test.M.pureImpl" { arity: 1, vsat: false, retVsat: false } }
+        r = optimizeModule emptyBuildEnv lf am
+      map _.members r.module.decls `shouldEqual`
+        [ [ "Test.M.f" /\ Ret (CLam [ "$q1" ] (Ret (CAtom (var "$q1")))) ] ]
+
+    it "keeps the same dead call when no fact is available (the conservative default end-to-end)" do
+      let
+        am :: AnfModule
+        am =
+          { name: "Test.M"
+          , decls:
+              [ nonrec "Test.M.f"
+                  ( Ret
+                      ( CLam [ "x" ]
+                          ( Let "dead" (CApp (AtomForeign "Test.M.pureImpl") [ var "x" ])
+                              (Ret (CAtom (var "x")))
+                          )
+                      )
+                  )
+              ]
+          }
+        r = optimizeModule emptyBuildEnv (localFactsOf emptyBuildEnv am) am
+      map _.members r.module.decls `shouldEqual`
+        [ [ "Test.M.f" /\ Ret
+              ( CLam [ "$q1" ]
+                  ( Let "$q2" (CApp (AtomForeign "Test.M.pureImpl") [ var "$q1" ])
+                      (Ret (CAtom (var "$q1")))
+                  )
+              )
+          ]
+        ]
+
+    it "drops a dead pure cross-module call via the dependency's published effects (extendSummary)" do
+      -- Test.Dep.big is pure but too large to publish as an inline candidate (≥ the 64 publish
+      -- bound), so the *only* channel that can prove the user's dead call droppable is the
+      -- ADR-0095 effects summary riding extendSummary.
+      let
+        chain :: Int -> Expr
+        chain 0 = Ret (CAtom (var "x"))
+        chain n = Let ("v" <> show n) (CPrim AddInt [ var "x", var "x" ]) (chain (n - 1))
+
+        dep :: AnfModule
+        dep = { name: "Test.Dep", decls: [ nonrec "Test.Dep.big" (Ret (CLam [ "x" ] (chain 20))) ] }
+        depResult = optimizeModule emptyBuildEnv (localFactsOf emptyBuildEnv dep) dep
+        env = extendSummary emptyBuildEnv depResult.summary
+
+        user :: AnfModule
+        user =
+          { name: "Test.User"
+          , decls:
+              [ nonrec "Test.User.g"
+                  ( Ret
+                      ( CLam [ "y" ]
+                          ( Let "dead" (CApp (var "Test.Dep.big") [ var "y" ])
+                              (Ret (CAtom (var "y")))
+                          )
+                      )
+                  )
+              ]
+          }
+        r = optimizeModule env (localFactsOf env user) user
+      map _.members r.module.decls `shouldEqual`
+        [ [ "Test.User.g" /\ Ret (CLam [ "$q1" ] (Ret (CAtom (var "$q1")))) ] ]
+
     it "resolves an imported accessor/instance from the dependency env (extendSummary)" do
       let
         dep :: AnfModule

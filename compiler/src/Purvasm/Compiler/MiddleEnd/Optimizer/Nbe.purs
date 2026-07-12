@@ -35,6 +35,7 @@ import Purvasm.Compiler.Ffi (resolver)
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (cfExpr, fvExpr)
 import Purvasm.Compiler.MiddleEnd.Normalize (normalize)
+import Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis (EffectGlobals)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Analysis (inlineMarks, sizeExpr)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Distribute (distributeCases)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Eval (evalC, evalExpr)
@@ -49,7 +50,9 @@ rewriteFuel :: Int
 rewriteFuel = 1000
 
 -- | Normalise one binding body to its (gate-bounded) normal form. `key` names the binding in the
--- | fuel-exhaustion crash.
+-- | fuel-exhaustion crash. `effects` is the ADR-0095 effect-fact oracle the per-round analysis
+-- | consults for the dead-only drop branch (`const Nothing` degrades to the pre-0095 behaviour:
+-- | every call conservatively may-perform).
 -- |
 -- | Convergence is **term stability and mark stability together** (`e' == e && marks' == marks`).
 -- | Term stability alone under-runs: an input already in `$q`-normal form (a previous driver
@@ -66,8 +69,8 @@ rewriteFuel = 1000
 -- | consumers' ADR-0077 call facts (derived pre-optimisation) would mismatch the emitted object.
 -- | The lambda normal form is re-shared under the reserved binder `$q0` (the quote supply starts
 -- | at `$q1`, so the wrap never collides and round-trips stably).
-nbeBinding :: NbeEnv -> String -> Expr -> Expr
-nbeBinding nbe key e0 = preserveOuterShape e0 (loop rewriteFuel Set.empty Set.empty e0)
+nbeBinding :: NbeEnv -> EffectGlobals -> String -> Expr -> Expr
+nbeBinding nbe effects key e0 = preserveOuterShape e0 (loop rewriteFuel Set.empty Set.empty e0)
   where
   loop n marks defers e
     | n <= 0 = unsafeCrashWith ("Nbe.nbeBinding: rewrite fuel exhausted at " <> key)
@@ -76,7 +79,7 @@ nbeBinding nbe key e0 = preserveOuterShape e0 (loop rewriteFuel Set.empty Set.em
           -- fold-guaranteed case-of-case distribution (slice 3) runs on the quoted term (unique
           -- binders); the placed leaf cases fold in the next evaluation round.
           e' = distributeCases (quote (evalExpr { locals: Map.empty, marks, defers, nbe } e))
-          marks' = inlineMarks e'
+          marks' = inlineMarks effects e'
           defers' = deferMarks nbe e'
         in
           if e' == e && marks' == marks && defers' == defers then e
