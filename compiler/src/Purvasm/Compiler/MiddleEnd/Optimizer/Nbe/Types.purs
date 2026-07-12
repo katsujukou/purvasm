@@ -135,9 +135,11 @@ type InlineCandidate =
 
 -- | The module facts `Eval` consults (ADR-0089 §1): module siblings and dependency-published
 -- | bodies (`externs`), the compiler-global intrinsic table, and the compiler-global **structural
--- | rung** (`structural` — the resolver's guest terms as on-demand extern entries, so a
--- | `Data.Ord.ordIntImpl`-class impl can unfold instead of staying a link-time call; the closure
--- | is built by `Nbe.nbeEnvOf`, which owns evaluation — `Eval` only calls it).
+-- | rung** (`structural` — the resolver's remaining guest terms as on-demand extern entries, so an
+-- | `Effect.pureE` / `Data.Number.fromStringImpl`-class impl can unfold instead of staying a
+-- | link-time call; the pure `Data.Ord`/`Data.Eq`/`Data.Functor` keys are retired to ulib shadow
+-- | bodies, ADR-0094. The closure is built by `Nbe.nbeEnvOf`, which owns evaluation — `Eval` only
+-- | calls it).
 type NbeEnv =
   { externs :: Map String ExternEntry
   , intrinsic :: String -> Maybe { op :: PrimOp, arity :: Int }

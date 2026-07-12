@@ -154,62 +154,6 @@ unitLit = intLit 0
 runEff :: Term -> Term
 runEff e = TmApp e unitLit
 
-arrayMap :: Term
-arrayMap = lams [ "f", "xs" ]
-  ( TmLet "n" (TmPrim LengthArray [ v "xs" ])
-      ( TmLetrec
-          [ "go" /\ lams [ "out", "i" ]
-              ( TmIf (TmPrim LtInt [ v "i", v "n" ])
-                  ( TmApp
-                      ( TmApp (v "go")
-                          ( TmPrim SetArray
-                              [ v "out", v "i", TmApp (v "f") (TmPrim IndexArray [ v "xs", v "i" ]) ]
-                          )
-                      )
-                      (TmPrim AddInt [ v "i", intLit 1 ])
-                  )
-                  (v "out")
-              )
-          ]
-          (TmApp (TmApp (v "go") (TmPrim NewArray [ v "n" ])) (intLit 0))
-      )
-  )
-
-eqArray :: Term
-eqArray = lams [ "eq", "xs", "ys" ]
-  ( TmLet "n" (TmPrim LengthArray [ v "xs" ])
-      ( TmIf (TmPrim EqInt [ v "n", TmPrim LengthArray [ v "ys" ] ])
-          ( TmLetrec
-              [ "go" /\ TmLam "i"
-                  ( TmIf (TmPrim LtInt [ v "i", v "n" ])
-                      ( TmIf
-                          ( TmApp
-                              (TmApp (v "eq") (TmPrim IndexArray [ v "xs", v "i" ]))
-                              (TmPrim IndexArray [ v "ys", v "i" ])
-                          )
-                          (TmApp (v "go") (TmPrim AddInt [ v "i", intLit 1 ]))
-                          (TmLit (LBool false))
-                      )
-                      (TmLit (LBool true))
-                  )
-              ]
-              (TmApp (v "go") (intLit 0))
-          )
-          (TmLit (LBool false))
-      )
-  )
-
-ordCmp :: PrimOp -> PrimOp -> Term
-ordCmp lt eq = lams [ "lt", "eq", "gt", "x", "y" ]
-  ( TmIf (TmPrim lt [ v "x", v "y" ])
-      (v "lt")
-      (TmIf (TmPrim eq [ v "x", v "y" ]) (v "eq") (v "gt"))
-  )
-
-ordBoolean :: Term
-ordBoolean = lams [ "lt", "eq", "gt", "x", "y" ]
-  (TmIf (TmPrim EqBool [ v "x", v "y" ]) (v "eq") (TmIf (v "x") (v "gt") (v "lt")))
-
 effPure :: Term
 effPure = lams [ "a", "$u" ] (v "a")
 
@@ -348,18 +292,16 @@ stUncurried = [ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 ] >>= \n ->
     , ("Control.Monad.ST.Uncurried.runSTFn" <> show n) /\ lams ([ "g" ] <> xs <> [ "$u" ]) (appArgs (v "g") xs)
     ]
 
+-- ADR-0094 (the sliced keys): `Data.Ord.{ordInt,ordNumber,ordString,ordChar,ordBoolean}Impl`,
+-- `Data.Eq.eqArrayImpl`, and `Data.Functor.arrayMap` are retired — the ulib pure-PS shadows own
+-- those bodies (the overlay never emits the foreigns), and the optimiser folds the shadow bodies
+-- through the ordinary candidate channel (fold parity pinned by the E2E harness). The remaining
+-- entries are each owed their own relocation decision (ADR-0094 §Scope).
 structural :: Map String Term
 structural = Map.fromFoldable
-  ( [ "Data.Functor.arrayMap" /\ arrayMap
-    , "Data.Number.fromStringImpl" /\ numberFromStringImpl
+  ( [ "Data.Number.fromStringImpl" /\ numberFromStringImpl
     , "Record.Builder.unsafeModify" /\ recordModify
     , "Record.Builder.unsafeRename" /\ recordRename
-    , "Data.Eq.eqArrayImpl" /\ eqArray
-    , "Data.Ord.ordIntImpl" /\ ordCmp LtInt EqInt
-    , "Data.Ord.ordNumberImpl" /\ ordCmp LtNumber EqNumber
-    , "Data.Ord.ordStringImpl" /\ ordCmp LtString EqString
-    , "Data.Ord.ordCharImpl" /\ ordCmp LtInt EqInt
-    , "Data.Ord.ordBooleanImpl" /\ ordBoolean
     , "Effect.pureE" /\ effPure
     , "Effect.bindE" /\ effBind
     , "Effect.untilE" /\ effUntil

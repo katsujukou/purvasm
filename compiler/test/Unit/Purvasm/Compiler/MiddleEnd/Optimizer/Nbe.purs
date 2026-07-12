@@ -346,10 +346,13 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
         `shouldEqual` Ret (CApp (var "L.cmp") [ var "p", var "q" ])
 
   describe "structural guest terms (compiler-global rung)" do
-    it "unfolds ordIntImpl and folds the whole comparison on known operands" do
-      -- ordCmp: \lt eq gt x y -> if LtInt(x,y) then lt else if EqInt(x,y) then eq else gt
-      nbe (Ret (CApp (AtomForeign "Data.Ord.ordIntImpl") [ var "l", var "e", var "g", int 1, int 2 ]))
-        `shouldEqual` Ret (CAtom (var "l"))
+    -- ADR-0094: the `Data.Ord.*Impl` / `eqArrayImpl` / `arrayMap` guest terms are retired — the
+    -- ulib shadow bodies fold through the ordinary candidate channel instead; the positive is the
+    -- E2E fold-parity harness (real `dist/ulib` artifacts). The retired keys must now be plain
+    -- native-leaf-shaped: untouched by any compiler-global rung.
+    it "a retired sliced key is no longer a structural rung (ADR-0094)" do
+      let e = Ret (CApp (AtomForeign "Data.Ord.ordIntImpl") [ var "l", var "e", var "g", int 1, int 2 ])
+      nbe e `shouldEqual` e
 
     it "unfolds an Effect combinator's lambda at saturation (pureE = \\a $u -> a)" do
       nbe (Ret (CApp (AtomForeign "Effect.pureE") [ var "a", var "u" ]))

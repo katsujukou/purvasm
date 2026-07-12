@@ -25,7 +25,6 @@ import Data.Map (Map)
 import Data.Map as Map
 import Data.Maybe (Maybe(..), fromMaybe)
 import Data.Traversable (for)
-import Data.Tuple (Tuple(..))
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (Comp(..), NRhs(..), Sem(..))
