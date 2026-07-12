@@ -12,29 +12,37 @@
 -- |   * `retVsat` — is the value *produced* by that saturation itself effectful, i.e. does
 -- |     saturating *it* in turn perform?
 -- |
--- | The summary type is `ForeignShape` (ADR-0095 §1): a binding's effect summary has the same
--- | shape a foreign declares — foreigns are simply the leaf case of the analysis, read from the
--- | ADR-0090 `foreignSigs` channel through the `EffectGlobals` oracle.
+-- | The summary extends `ForeignShape` (ADR-0095 §1 / ADR-0096 §1) with the two-level
+-- | mutable-store bit: `mtouch` ("may saturating this value touch the mutable store" — the motion
+-- | hazard `vsat` cannot express) and `retMtouch` (the same question one saturation later).
+-- | Foreigns are the leaf case, read from the ADR-0090 `foreignSigs` channel through the
+-- | `EffectGlobals` oracle and **lifted dirty** (`liftShape`): a type cannot prove
+-- | memory-cleanness (ADR-0096 §1 — `unsafeSetByte` is the pure-typed hidden-write
+-- | counterexample), so only structurally computed facts ever carry a clean `mtouch`.
 -- |
 -- | `eperfC` ("does evaluating this computation perform") is the dead-drop predicate (ADR-0095
 -- | §3): construction — including a *partial* application — is pure; an exact saturation takes
 -- | the callee's `vsat`; an over-application is conservatively may-perform (a two-level summary
 -- | cannot see effects buried deeper); the mutation primops (`NewArray`/`SetArray`) perform.
 -- |
--- | These facts license **elimination when dead, never motion** (ADR-0095 §4): the summary does
--- | not track mutable-memory reads (a callee wrapping `IndexArray` is `vsat = false` yet must not
--- | move across a `SetArray`), so no consumer may reorder, sink, or duplicate a call on the
--- | strength of `vsat = false` alone.
+-- | The licensing boundary (ADR-0095 §4, completed by ADR-0096): `vsat = false` **alone** never
+-- | licenses motion — a callee wrapping `IndexArray` is perform-clean yet must not move across a
+-- | `SetArray`. Motion is licensed only by the conjunction the `mtouch` pair supplies: an
+-- | exact-saturated call proving `vsat = false ∧ mtouch = false` (`sinkableCall`) may **sink** to
+-- | its sole use site (single use, capture at most a branch — the mark walk's half of the
+-- | clause); elimination when dead still needs only the perform bit.
 -- |
 -- | Local-name uniqueness invariant (boot's `effect_analysis.ml` carries the same note): CoreFn
 -- | renames shadowed locals and the quote supply is `$q`-fresh, so a name missing from the local
 -- | scope is genuinely free and the conservative `unknown` default is correct. Lambda parameters
 -- | are still explicitly shadowed to `unknown` as a defence.
 module Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis
-  ( EffectEnv
+  ( EffectFact
+  , EffectEnv
   , EffectGlobals
   , pureValue
   , unknownValue
+  , liftShape
   , emptyEffectEnv
   , bindFact
   , bindUnknown
@@ -44,6 +52,9 @@ module Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis
   , vsumExpr
   , eperfC
   , eperfExpr
+  , mtouchC
+  , mtouchExpr
+  , sinkableCall
   , fixGroup
   , extendGroupVars
   ) where
@@ -60,44 +71,63 @@ import Data.Tuple (Tuple(..))
 import Purvasm.Compiler.ForeignSig (ForeignShape)
 import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr(..), Expr(..), Rhs(..))
 import Purvasm.Compiler.MiddleEnd.Module (Decl)
+import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (pinnedPrim)
 import Purvasm.Compiler.Primitive (PrimOp(..))
 
+-- | The analysis' summary (ADR-0096 §1): `ForeignShape`'s triple plus the two-level
+-- | mutable-store bit. In-memory only — `ForeignShape` itself (FSR output, `ulib.json`, codec)
+-- | is never extended; it lifts at the boundary via `liftShape`.
+type EffectFact =
+  { arity :: Int
+  , vsat :: Boolean
+  , retVsat :: Boolean
+  , mtouch :: Boolean
+  , retMtouch :: Boolean
+  }
+
 -- | The non-local fact oracle: dependencies' exported summaries, foreign shapes (own and
--- | dependencies', ADR-0090), and — inside `optimizeModule` — the module's own pass-local
--- | top-level summaries. `Nothing` is the conservative miss.
-type EffectGlobals = String -> Maybe ForeignShape
+-- | dependencies', ADR-0090, lifted dirty), and — inside `optimizeModule` — the module's own
+-- | pass-local top-level summaries. `Nothing` is the conservative miss.
+type EffectGlobals = String -> Maybe EffectFact
 
 -- | The lexically-scoped analysis environment (ADR-0095 §1): the global oracle plus the local
 -- | facts of the binding body being walked — per-binding lifetime, never a module-flat local map.
 -- |
 -- | Local facts are **demand-driven** (`Lazy`): the mark walk (`Nbe/Analysis`) binds a fact at
--- | every `let` it passes, but consults one only at a dead `CApp` (the ADR-0095 §3 branch) or
--- | through a callee's fact chain — a lambda's summary walks its whole body (`eperfExpr` +
--- | `vsumExpr`), so computing it eagerly at every binder made the per-iteration analysis pay the
--- | full effect walk even when nothing consumed it (measured as an opt-compile time× regression
--- | past the ADR-0089 §7 gate on the benchmark corpus).
+-- | every `let` it passes, but consults one only at the call branch's decisions — a dead `CApp`'s
+-- | drop (ADR-0095 §3), a live single-use `CApp`'s `sinkableCall` (ADR-0096 §2) — or through a
+-- | callee's fact chain. A lambda's summary walks its whole body (`eperfExpr` + `vsumExpr` +
+-- | `mtouchExpr`), so computing it eagerly at every binder made the per-iteration analysis pay
+-- | the full effect walk even when nothing consumed it (measured as an opt-compile time×
+-- | regression past the ADR-0089 §7 gate on the benchmark corpus).
 type EffectEnv =
   { globals :: EffectGlobals
-  , locals :: Map String (Lazy ForeignShape)
+  , locals :: Map String (Lazy EffectFact)
   }
 
--- | A plain, fully-evaluated data value: nothing to force, nothing to perform.
-pureValue :: ForeignShape
-pureValue = { arity: 0, vsat: false, retVsat: false }
+-- | A plain, fully-evaluated data value: nothing to force, nothing to perform, nothing touched.
+pureValue :: EffectFact
+pureValue = { arity: 0, vsat: false, retVsat: false, mtouch: false, retMtouch: false }
 
 -- | The conservative default for anything opaque (a free variable, a parameter, a projected
--- | field): applying it may perform, and its result may itself be effectful.
-unknownValue :: ForeignShape
-unknownValue = { arity: 0, vsat: true, retVsat: true }
+-- | field): applying it may perform and may touch the store, and so may its result.
+unknownValue :: EffectFact
+unknownValue = { arity: 0, vsat: true, retVsat: true, mtouch: true, retMtouch: true }
+
+-- | Lift a foreign's reconstructed shape to a fact — **dirty** (ADR-0096 §1): the declared type
+-- | proves the perform bits (under the §3 FFI contract) but can never prove memory-cleanness,
+-- | so every foreign leaf conservatively may touch the store at every level.
+liftShape :: ForeignShape -> EffectFact
+liftShape s = { arity: s.arity, vsat: s.vsat, retVsat: s.retVsat, mtouch: true, retMtouch: true }
 
 emptyEffectEnv :: EffectGlobals -> EffectEnv
 emptyEffectEnv globals = { globals, locals: Map.empty }
 
 -- | Bind a deferred fact — forced only if some consumer actually consults the name.
-bindFact :: String -> Lazy ForeignShape -> EffectEnv -> EffectEnv
+bindFact :: String -> Lazy EffectFact -> EffectEnv -> EffectEnv
 bindFact x s env = env { locals = Map.insert x s env.locals }
 
-lazyUnknown :: Lazy ForeignShape
+lazyUnknown :: Lazy EffectFact
 lazyUnknown = defer \_ -> unknownValue
 
 -- | Shadow names (lambda parameters, case binders) to the conservative default.
@@ -105,15 +135,17 @@ bindUnknown :: Array String -> EffectEnv -> EffectEnv
 bindUnknown xs env =
   env { locals = foldl (\m x -> Map.insert x lazyUnknown m) env.locals xs }
 
--- | Branch-join: fewer args to saturate and either side's perform bit — conservative both ways.
-joinSum :: ForeignShape -> ForeignShape -> ForeignShape
+-- | Branch-join: fewer args to saturate and either side's hazard bits — conservative both ways.
+joinSum :: EffectFact -> EffectFact -> EffectFact
 joinSum a b =
   { arity: min a.arity b.arity
   , vsat: a.vsat || b.vsat
   , retVsat: a.retVsat || b.retVsat
+  , mtouch: a.mtouch || b.mtouch
+  , retMtouch: a.retMtouch || b.retMtouch
   }
 
-atomSum :: EffectEnv -> Atom -> ForeignShape
+atomSum :: EffectEnv -> Atom -> EffectFact
 atomSum env = case _ of
   AtomVar x -> case Map.lookup x env.locals of
     Just s -> force s
@@ -123,33 +155,41 @@ atomSum env = case _ of
   AtomLit _ -> pureValue
 
 -- | The summary of the value an expression evaluates to.
-vsumExpr :: EffectEnv -> Expr -> ForeignShape
+vsumExpr :: EffectEnv -> Expr -> EffectFact
 vsumExpr env = case _ of
   Ret c -> vsumC env c
   Let x c rest -> vsumExpr (bindFact x (defer \_ -> vsumC env c) env) rest
   LetRec binds rest -> vsumExpr (extendGroupVars env binds) rest
 
--- | The summary of the value a computation produces.
-vsumC :: EffectEnv -> CExpr -> ForeignShape
+-- | The summary of the value a computation produces (the ADR-0096 §1 equations; each `mtouch`
+-- | line mirrors its `vsat` analogue one to one).
+vsumC :: EffectEnv -> CExpr -> EffectFact
 vsumC env = case _ of
   CAtom a -> atomSum env a
   CLam ps body ->
     let
       env' = bindUnknown ps env
+      bodySum = vsumExpr env' body
     in
       { arity: Array.length ps
       , vsat: eperfExpr env' body -- saturating the closure runs its body
-      , retVsat: (vsumExpr env' body).vsat -- its result, when forced, performs?
+      , retVsat: bodySum.vsat -- its result, when forced, performs?
+      , mtouch: mtouchExpr env' body -- saturating the closure may touch the store
+      , retMtouch: bodySum.mtouch -- its result, when forced, may touch?
       }
   CApp f args ->
     let
       sf = atomSum env f
       n = Array.length args
     in
-      if n < sf.arity then { arity: sf.arity - n, vsat: sf.vsat, retVsat: sf.retVsat } -- PAP
-      -- saturated result: one level of `ret` info; `arity: 0` forces any later application of
-      -- it onto the over-application path (conservatively safe).
-      else if n == sf.arity then { arity: 0, vsat: sf.retVsat, retVsat: sf.retVsat }
+      -- PAP: constructing it is clean, but its summary carries the callee's bits **verbatim**
+      -- (ADR-0096 review P2 — the residual saturation must not lose the hazard).
+      if n < sf.arity then
+        { arity: sf.arity - n, vsat: sf.vsat, retVsat: sf.retVsat, mtouch: sf.mtouch, retMtouch: sf.retMtouch }
+      -- saturated result: one level of `ret` info shifts down; `arity: 0` forces any later
+      -- application of it onto the over-application path (conservatively safe).
+      else if n == sf.arity then
+        { arity: 0, vsat: sf.retVsat, retVsat: sf.retVsat, mtouch: sf.retMtouch, retMtouch: sf.retMtouch }
       else unknownValue -- over-application result is an opaque value (see `eperfC`)
   CPrim _ _ -> pureValue
   CCtor _ _ _ -> pureValue
@@ -160,7 +200,7 @@ vsumC env = case _ of
   CIf _ t e -> joinSum (vsumExpr env t) (vsumExpr env e)
   CCase _ alts -> foldl (\acc a -> joinSum acc (altVsum env a)) pureValue alts
 
-altVsum :: EffectEnv -> Alt -> ForeignShape
+altVsum :: EffectEnv -> Alt -> EffectFact
 altVsum env alt = case alt.result of
   Uncond e -> vsumExpr env e
   Guarded gs -> foldl (\acc g -> joinSum acc (vsumExpr env g.rhs)) pureValue gs
@@ -207,6 +247,55 @@ altEperf env alt = case alt.result of
   Uncond e -> eperfExpr env e
   Guarded gs -> Array.any (\g -> eperfExpr env g.guard || eperfExpr env g.rhs) gs
 
+-- | May evaluating this expression touch the mutable store? (`eperfExpr`'s `mtouch` mirror.)
+mtouchExpr :: EffectEnv -> Expr -> Boolean
+mtouchExpr env = case _ of
+  Ret c -> mtouchC env c
+  Let x c rest -> mtouchC env c || mtouchExpr (bindFact x (defer \_ -> vsumC env c) env) rest
+  LetRec binds rest -> mtouchExpr (extendGroupVars env binds) rest -- building closures is clean
+
+-- | May evaluating this computation touch the mutable store? (The ADR-0096 §1 evaluation
+-- | predicate.) Covers all three `pinnedPrim`s for honesty, but only `IndexArray` adds
+-- | information over `eperfC` — `NewArray`/`SetArray` are already `may-perform`, and must stay
+-- | so (dead-drop consults `eperfC` alone; observable writes never enter a relaxed class).
+mtouchC :: EffectEnv -> CExpr -> Boolean
+mtouchC env = case _ of
+  CAtom _ -> false
+  CLam _ _ -> false
+  CCtor _ _ _ -> false
+  CArray _ -> false
+  CRecord _ -> false
+  CAccessor _ _ -> false
+  CUpdate _ _ -> false
+  CPrim op _ -> pinnedPrim op
+  CApp f args ->
+    let
+      sf = atomSum env f
+      n = Array.length args
+    in
+      if n < sf.arity then false -- constructing a PAP is clean
+      else if n == sf.arity then sf.mtouch
+      else true -- over-application: a two-level summary cannot see deeper
+  CIf _ t e -> mtouchExpr env t || mtouchExpr env e
+  CCase _ alts -> Array.any (altMtouch env) alts
+
+altMtouch :: EffectEnv -> Alt -> Boolean
+altMtouch env alt = case alt.result of
+  Uncond e -> mtouchExpr env e
+  Guarded gs -> Array.any (\g -> mtouchExpr env g.guard || mtouchExpr env g.rhs) gs
+
+-- | The ADR-0096 §2 sink condition on a `let`'s right-hand side: an **exact-saturated** call
+-- | whose saturation neither performs nor touches the store. (Usage/capture gating — single
+-- | use, at most branch capture — is the mark walk's half of the clause.)
+sinkableCall :: EffectEnv -> CExpr -> Boolean
+sinkableCall env = case _ of
+  CApp f args ->
+    let
+      sf = atomSum env f
+    in
+      Array.length args == sf.arity && not sf.vsat && not sf.mtouch
+  _ -> false
+
 -- | The arity to *seed* a recursive-group member with before the fixpoint: its parameter count
 -- | when it is a (possibly let-wrapped) lambda. Seeding low is safe: an under-approximate arity
 -- | only makes applications look like over-applications (conservatively may-perform).
@@ -221,12 +310,12 @@ rhsArity = case _ of
 -- | member optimistically pure (with its seeded arity) and re-evaluate under the group's own
 -- | bindings until nothing changes. Monotone (`false → true`; arity settles from the lambda a
 -- | point-free member bottoms out at), so it converges within the bounded loop.
-fixGroup :: EffectEnv -> Array { name :: String, rhs :: Expr } -> Map String ForeignShape
+fixGroup :: EffectEnv -> Array { name :: String, rhs :: Expr } -> Map String EffectFact
 fixGroup env binds = loop (Array.length binds + 2) init
   where
   init = Map.fromFoldable
     ( binds <#> \b ->
-        Tuple b.name { arity: rhsArity b.rhs, vsat: false, retVsat: false }
+        Tuple b.name (pureValue { arity = rhsArity b.rhs })
     )
 
   step facts =
@@ -237,7 +326,7 @@ fixGroup env binds = loop (Array.length binds + 2) init
 
   changed a b = Array.any
     ( \bind -> case Map.lookup bind.name a, Map.lookup bind.name b of
-        Just x, Just y -> x.arity /= y.arity || x.vsat /= y.vsat || x.retVsat /= y.retVsat
+        Just x, Just y -> x /= y
         _, _ -> true
     )
     binds
@@ -273,12 +362,12 @@ extendGroupVars env binds =
 -- | the module), recursive groups by `fixGroup`. Pass-local inside `optimizeModule` (ADR-0095 §2:
 -- | recomputed each round from the current term — never stored in `LocalFacts`, never read back
 -- | from the module's own `BuildSummary`).
-moduleEffects :: EffectGlobals -> Array Decl -> Map String ForeignShape
+moduleEffects :: EffectGlobals -> Array Decl -> Map String EffectFact
 moduleEffects globals decls = map force (moduleEffectsLazy globals decls)
 
 -- | The demand-driven spelling: entries force (and memoise) on first consultation, so an oracle
 -- | that touches only the callees the mark walk actually meets never pays the full module walk.
-moduleEffectsLazy :: EffectGlobals -> Array Decl -> Map String (Lazy ForeignShape)
+moduleEffectsLazy :: EffectGlobals -> Array Decl -> Map String (Lazy EffectFact)
 moduleEffectsLazy globals decls = foldl step Map.empty decls
   where
   step acc d =

@@ -196,6 +196,89 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
       map _.members r.module.decls `shouldEqual`
         [ [ "Test.User.g" /\ Ret (CLam [ "$q1" ] (Ret (CAtom (var "$q1")))) ] ]
 
+    it "sinks a live single-use cross-module clean call via the dependency's published effects (ADR-0096)" do
+      -- Test.Dep.big is pure arithmetic and too large to publish as an inline candidate, so the
+      -- effects summary is the only channel that can prove the user's live call movable: it
+      -- sinks past the pinned unknown call `g w` to its use site. The chain must be **live**
+      -- (each step feeds the next) — an all-dead chain would be swept by the dependency's own
+      -- NbE pass, leaving a tiny publishable body and no residual call to sink. Each step is
+      -- deliberately **linear** (`prev + 1`, one use of the previous binding): the diamond
+      -- spelling (`prev + prev`) trips a pre-existing engine blow-up (the multi-use small-deref
+      -- clause compounds 2^depth at quote), which is a separate finding, not this test's topic.
+      let
+        liveChain :: Int -> String -> Expr
+        liveChain 0 prev = Ret (CAtom (var prev))
+        liveChain n prev =
+          Let ("v" <> show n) (CPrim AddInt [ var prev, AtomLit (LInt 1) ])
+            (liveChain (n - 1) ("v" <> show n))
+
+        dep :: AnfModule
+        dep = { name: "Test.Dep", decls: [ nonrec "Test.Dep.big" (Ret (CLam [ "x" ] (liveChain 20 "x"))) ] }
+        depResult = optimizeModule emptyBuildEnv (localFactsOf emptyBuildEnv dep) dep
+        env = extendSummary emptyBuildEnv depResult.summary
+
+        user :: AnfModule
+        user =
+          { name: "Test.User"
+          , decls:
+              [ nonrec "Test.User.h"
+                  ( Ret
+                      ( CLam [ "y" ]
+                          ( Let "x" (CApp (var "Test.Dep.big") [ var "y" ])
+                              ( Let "z" (CApp (var "g") [ var "y" ])
+                                  (Ret (CCtor "T" 2 [ var "x", var "z" ]))
+                              )
+                          )
+                      )
+                  )
+              ]
+          }
+        r = optimizeModule env (localFactsOf env user) user
+      map _.members r.module.decls `shouldEqual`
+        [ [ "Test.User.h" /\ Ret
+              ( CLam [ "$q1" ]
+                  ( Let "$q2" (CApp (var "g") [ var "$q1" ])
+                      ( Let "$q3" (CApp (var "Test.Dep.big") [ var "$q1" ])
+                          (Ret (CCtor "T" 2 [ var "$q3", var "$q2" ]))
+                      )
+                  )
+              )
+          ]
+        ]
+
+    it "never sinks a live foreign-shaped call (the ADR-0096 dirty lift, end-to-end)" do
+      let
+        am :: AnfModule
+        am =
+          { name: "Test.M"
+          , decls:
+              [ nonrec "Test.M.f"
+                  ( Ret
+                      ( CLam [ "x" ]
+                          ( Let "a" (CApp (AtomForeign "Test.M.pureImpl") [ var "x" ])
+                              ( Let "z" (CApp (var "g") [ var "x" ])
+                                  (Ret (CCtor "T" 2 [ var "a", var "z" ]))
+                              )
+                          )
+                      )
+                  )
+              ]
+          }
+        lf = (localFactsOf emptyBuildEnv am)
+          { foreignSigs = Map.singleton "Test.M.pureImpl" { arity: 1, vsat: false, retVsat: false } }
+        r = optimizeModule emptyBuildEnv lf am
+      map _.members r.module.decls `shouldEqual`
+        [ [ "Test.M.f" /\ Ret
+              ( CLam [ "$q1" ]
+                  ( Let "$q2" (CApp (AtomForeign "Test.M.pureImpl") [ var "$q1" ])
+                      ( Let "$q3" (CApp (var "g") [ var "$q1" ])
+                          (Ret (CCtor "T" 2 [ var "$q2", var "$q3" ]))
+                      )
+                  )
+              )
+          ]
+        ]
+
     it "resolves an imported accessor/instance from the dependency env (extendSummary)" do
       let
         dep :: AnfModule

@@ -14,6 +14,9 @@ import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Ffi (intrinsicPrim)
 import Purvasm.Compiler.ForeignSig (ForeignShape)
 import Purvasm.Compiler.Literal (Literal(..))
+import Data.Set as Set
+import Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis (EffectFact, liftShape)
+import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Analysis (inlineMarks)
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
 import Purvasm.Compiler.MiddleEnd.Module (Decl)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe (candidatesOf, nbeBinding, nbeEnvOf)
@@ -38,9 +41,15 @@ nbe = nbeWith []
 nbeWith :: Array Decl -> Expr -> Expr
 nbeWith decls = nbeBinding (nbeEnvOf intrinsicPrim Map.empty decls) (const Nothing) "Test.binding"
 
--- …or with ADR-0095 effect facts (the dead-only drop branch's oracle)…
+-- …or with foreign-shape effect facts (ADR-0095's drop oracle — shapes lift **dirty**, so no
+-- motion can ever come from these, ADR-0096 §1)…
 nbeEffects :: Map.Map String ForeignShape -> Expr -> Expr
-nbeEffects sigs = nbeBinding (nbeEnvOf intrinsicPrim Map.empty []) (\k -> Map.lookup k sigs) "Test.binding"
+nbeEffects sigs = nbeBinding (nbeEnvOf intrinsicPrim Map.empty []) (\k -> liftShape <$> Map.lookup k sigs) "Test.binding"
+
+-- …or with full effect facts (the shape a dependency's structural summary arrives in — the
+-- ADR-0096 sink oracle)…
+nbeFacts :: Map.Map String EffectFact -> Expr -> Expr
+nbeFacts facts = nbeBinding (nbeEnvOf intrinsicPrim Map.empty []) (\k -> Map.lookup k facts) "Test.binding"
 
 -- …or against dependency decls published through the slice-2 candidate channel, plus local
 -- sibling decls (mirrors `optimizeModule`'s wiring: deps ride `BuildEnv.inlines`, and the
@@ -159,6 +168,141 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
             (Let "w" (CPrim SetArray [ var "arr", int 0, int 1 ]) (Ret (CAtom (int 1))))
         )
         `shouldEqual` Let "$q1" (CPrim SetArray [ var "arr", int 0, int 1 ]) (Ret (CAtom (int 1)))
+
+  describe "single-use clean-call sink (ADR-0096 §2)" do
+    let
+      cleanFact :: EffectFact
+      cleanFact = { arity: 1, vsat: false, retVsat: false, mtouch: false, retMtouch: false }
+
+      readerFact :: EffectFact
+      readerFact = { arity: 1, vsat: false, retVsat: false, mtouch: true, retMtouch: true }
+
+      dirty2Fact :: EffectFact
+      dirty2Fact = { arity: 2, vsat: false, retVsat: false, mtouch: true, retMtouch: true }
+
+      mkReaderFact :: EffectFact
+      mkReaderFact = { arity: 1, vsat: false, retVsat: false, mtouch: false, retMtouch: true }
+
+    it "fires (CapNone): a live single-use clean call sinks past a pinned call to its use site" do
+      nbeFacts (Map.singleton "M.clean" cleanFact)
+        ( Let "x" (CApp (var "M.clean") [ var "a" ])
+            ( Let "z" (CApp (var "g") [ var "w" ])
+                (Ret (CCtor "T" 2 [ var "x", var "z" ]))
+            )
+        )
+        `shouldEqual`
+          Let "$q1" (CApp (var "g") [ var "w" ])
+            ( Let "$q2" (CApp (var "M.clean") [ var "a" ])
+                (Ret (CCtor "T" 2 [ var "$q2", var "$q1" ]))
+            )
+
+    it "fires (CapBranch): a clean call sinks into the branch arm that uses it" do
+      -- the sole use is the arm's tail, so the sunk computation reifies as the arm's tail call —
+      -- executed only on the path that uses it (the conditional-execution win).
+      nbeFacts (Map.singleton "M.clean" cleanFact)
+        ( Let "x" (CApp (var "M.clean") [ var "a" ])
+            (Ret (CIf (var "c") (Ret (CAtom (var "x"))) (Ret (CAtom (int 0)))))
+        )
+        `shouldEqual`
+          Ret
+            ( CIf (var "c")
+                (Ret (CApp (var "M.clean") [ var "a" ]))
+                (Ret (CAtom (int 0)))
+            )
+
+    it "multi-use stays pinned (duplication)" do
+      let
+        term =
+          Let "x" (CApp (var "M.clean") [ var "a" ])
+            (Ret (CCtor "T" 2 [ var "x", var "x" ]))
+      nbeFacts (Map.singleton "M.clean" cleanFact) term
+        `shouldEqual`
+          Let "$q1" (CApp (var "M.clean") [ var "a" ])
+            (Ret (CCtor "T" 2 [ var "$q1", var "$q1" ]))
+
+    it "CapClosure stays pinned (multi-execution)" do
+      let
+        term =
+          Let "x" (CApp (var "M.clean") [ var "a" ])
+            (Ret (CLam [ "u" ] (Ret (CAtom (var "x")))))
+      nbeFacts (Map.singleton "M.clean" cleanFact) term
+        `shouldEqual`
+          Let "$q1" (CApp (var "M.clean") [ var "a" ])
+            (Ret (CLam [ "$q2" ] (Ret (CAtom (var "$q1")))))
+
+    it "a store-reading callee never sinks, even live single-use across a SetArray" do
+      let
+        term =
+          Let "r" (CApp (var "M.reader") [ var "arr" ])
+            (Let "w" (CPrim SetArray [ var "arr", int 0, int 1 ]) (Ret (CAtom (var "r"))))
+      nbeFacts (Map.singleton "M.reader" readerFact) term
+        `shouldEqual`
+          Let "$q1" (CApp (var "M.reader") [ var "arr" ])
+            (Let "$q2" (CPrim SetArray [ var "arr", int 0, int 1 ]) (Ret (CAtom (var "$q1"))))
+
+    it "PAP residual: the PAP construction is droppable when dead, its saturation never sinks" do
+      -- dead PAP of a dirty callee: dropped (clean construction).
+      nbeFacts (Map.singleton "M.dirty2" dirty2Fact)
+        (Let "g" (CApp (var "M.dirty2") [ var "a" ]) (Ret (CAtom (int 1))))
+        `shouldEqual` Ret (CAtom (int 1))
+      -- live residual saturation: `g b` is exact on the PAP's summary and carries the callee's
+      -- dirt — no sink even at single use under a branch.
+      nbeFacts (Map.singleton "M.dirty2" dirty2Fact)
+        ( Let "g" (CApp (var "M.dirty2") [ var "a" ])
+            ( Let "x" (CApp (var "g") [ var "b" ])
+                (Ret (CIf (var "c") (Ret (CAtom (var "x"))) (Ret (CAtom (int 0)))))
+            )
+        )
+        `shouldEqual`
+          Let "$q1" (CApp (var "M.dirty2") [ var "a" ])
+            ( Let "$q2" (CApp (var "$q1") [ var "b" ])
+                (Ret (CIf (var "c") (Ret (CAtom (var "$q2"))) (Ret (CAtom (int 0)))))
+            )
+
+    it "retMtouch pins the result's exact saturation at the marks level (bidirectional)" do
+      -- `x = r []` is a zero-argument application — the only *exact* saturation an arity-0
+      -- result summary admits. Eval collapses it to an alias (`applySem f [] = f`), so the
+      -- normalised *term* cannot witness the shift (the outer clean call legitimately sinks
+      -- either way); the **mark decision** can: with the correct `retMtouch → mtouch` shift
+      -- `x` is never marked, and with the shift broken (retMtouch dropped) it would be.
+      let
+        term =
+          Let "r" (CApp (var "M.mkReader") [ var "arr" ])
+            ( Let "x" (CApp (var "r") [])
+                (Ret (CIf (var "c") (Ret (CAtom (var "x"))) (Ret (CAtom (int 0)))))
+            )
+        marksWith fact = inlineMarks (\k -> Map.lookup k (Map.singleton "M.mkReader" fact)) term
+      -- correct shift: the result's saturation is dirty → no sink mark on x.
+      Set.member "x" (marksWith mkReaderFact) `shouldEqual` false
+      -- the broken-shift simulation (a ret-clean closure returner): x would be marked — the
+      -- assertion that makes a silent retMtouch regression fail loudly.
+      Set.member "x" (marksWith (mkReaderFact { retMtouch = false })) `shouldEqual` true
+
+    it "reader-closure return: the clean outer call may move, the returned closure's may not" do
+      -- r = mkReader a (clean saturation, retMtouch dirty); x = r u (over-applies r's arity-0
+      -- summary → pinned). The hazard shifted retMtouch → mtouch across the exact application.
+      let
+        term =
+          Let "r" (CApp (var "M.mkReader") [ var "arr" ])
+            ( Let "x" (CApp (var "r") [ int 0 ])
+                (Ret (CIf (var "c") (Ret (CAtom (var "x"))) (Ret (CAtom (int 0)))))
+            )
+      nbeFacts (Map.singleton "M.mkReader" mkReaderFact) term
+        `shouldEqual`
+          Let "$q1" (CApp (var "M.mkReader") [ var "arr" ])
+            ( Let "$q2" (CApp (var "$q1") [ int 0 ])
+                (Ret (CIf (var "c") (Ret (CAtom (var "$q2"))) (Ret (CAtom (int 0)))))
+            )
+
+    it "a foreign-shaped pure callee never sinks (the dirty lift — ADR-0096 §1)" do
+      let
+        term =
+          Let "x" (CApp (var "M.pure") [ var "a" ])
+            (Ret (CIf (var "c") (Ret (CAtom (var "x"))) (Ret (CAtom (int 0)))))
+      nbeEffects (Map.singleton "M.pure" { arity: 1, vsat: false, retVsat: false }) term
+        `shouldEqual`
+          Let "$q1" (CApp (var "M.pure") [ var "a" ])
+            (Ret (CIf (var "c") (Ret (CAtom (var "$q1"))) (Ret (CAtom (int 0)))))
 
     it "a recursive group member is never unfolded (recursion stays a call)" do
       let

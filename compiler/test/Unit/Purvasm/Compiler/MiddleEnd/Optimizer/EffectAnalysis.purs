@@ -12,7 +12,7 @@ import Purvasm.Compiler.ForeignSig (ForeignShape)
 import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..))
 import Data.Lazy (defer)
-import Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis (EffectEnv, bindFact, emptyEffectEnv, eperfC, moduleEffects, vsumC, vsumExpr)
+import Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis (EffectEnv, EffectFact, bindFact, emptyEffectEnv, eperfC, liftShape, moduleEffects, mtouchC, sinkableCall, vsumC, vsumExpr)
 import Purvasm.Compiler.Primitive (PrimOp(..))
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
@@ -45,8 +45,13 @@ sigs = Map.fromFoldable
   , "M.effectFn2" /\ effectFn2Shape
   ]
 
+-- foreign shapes reach the analysis through the **dirty lift** (ADR-0096 §1).
 envOf :: Map.Map String ForeignShape -> EffectEnv
-envOf m = emptyEffectEnv (\k -> Map.lookup k m)
+envOf m = emptyEffectEnv (\k -> liftShape <$> Map.lookup k m)
+
+-- hand-made full facts (the shape a dependency's structural summary arrives in).
+envOfFacts :: Map.Map String EffectFact -> EffectEnv
+envOfFacts m = emptyEffectEnv (\k -> Map.lookup k m)
 
 env0 :: EffectEnv
 env0 = envOf sigs
@@ -83,26 +88,28 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis" do
       eperfC env0 (CPrim IndexArray [ var "a", int 0 ]) `shouldEqual` false
       eperfC env0 (CPrim AddInt [ int 1, int 2 ]) `shouldEqual` false
 
-    it "a lambda wrapping a mutable read is vsat=false (droppable when dead, never movable)" do
-      -- read = \a -> IndexArray a 0 — the ADR-0095 §3 example: pure by this summary, which is
-      -- why the facts license elimination only (motion would cross a SetArray).
+    it "a lambda wrapping a mutable read is vsat=false but mtouch=true (droppable when dead, never movable)" do
+      -- read = \a -> IndexArray a 0 — the ADR-0095 §3 example, now carried by the fact itself:
+      -- pure by the perform bit (elimination allowed), dirty by the store bit (motion denied).
       let readLam = CLam [ "a" ] (Ret (CPrim IndexArray [ var "a", int 0 ]))
       (vsumC env0 readLam).vsat `shouldEqual` false
+      (vsumC env0 readLam).mtouch `shouldEqual` true
 
-  describe "vsumC / vsumExpr (the two-level summary)" do
+  describe "vsumC / vsumExpr (the two-level summary; foreign shapes lift dirty)" do
     it "a perform-leaf saturation yields an effect thunk (retVsat one level down)" do
       vsumC env0 (CApp (AtomForeign "Effect.Console.log") [ var "s" ])
-        `shouldEqual` { arity: 0, vsat: true, retVsat: true }
+        `shouldEqual` { arity: 0, vsat: true, retVsat: true, mtouch: true, retMtouch: true }
 
     it "a partial application keeps the callee's bits with the residual arity" do
       vsumC env0 (CApp (AtomForeign "M.effectFn2") [ var "a" ])
-        `shouldEqual` { arity: 1, vsat: true, retVsat: false }
+        `shouldEqual` { arity: 1, vsat: true, retVsat: false, mtouch: true, retMtouch: true }
 
     it "a lambda's vsat is its body's eperf; its retVsat is the body value's vsat" do
       -- \s -> log s : saturating runs the body (pure — it builds the thunk); the *result* is
-      -- the effect thunk. The classic `Effect`-returning function shape.
+      -- the effect thunk. The classic `Effect`-returning function shape. (The store bits are
+      -- dirty here because the leaf lifted dirty.)
       vsumC env0 (CLam [ "s" ] (Ret (CApp (AtomForeign "Effect.Console.log") [ var "s" ])))
-        `shouldEqual` { arity: 1, vsat: false, retVsat: true }
+        `shouldEqual` { arity: 1, vsat: false, retVsat: true, mtouch: true, retMtouch: true }
 
     it "a let-chained body threads local facts (vsumExpr)" do
       -- let t = log s in t — the binding's value is the effect thunk.
@@ -112,7 +119,89 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis" do
           )
       ).vsat `shouldEqual` true
 
-  describe "moduleEffects (per-module fold + SCC fixpoint)" do
+  describe "mtouch equations (ADR-0096 §1 two-level propagation)" do
+    let
+      -- a structurally clean-perform but store-dirty callee, as a dependency summary would
+      -- carry it (a big reader lambda: saturating reads the store).
+      readerFact :: EffectFact
+      readerFact = { arity: 1, vsat: false, retVsat: false, mtouch: true, retMtouch: true }
+
+      -- a clean two-argument callee (big pure arithmetic).
+      cleanFact :: EffectFact
+      cleanFact = { arity: 2, vsat: false, retVsat: false, mtouch: false, retMtouch: false }
+
+      -- a closure-returning callee: its own saturation is clean, the returned closure's is not
+      -- (the let-returned reader shape — see the lambda test below for the structural source).
+      mkReaderFact :: EffectFact
+      mkReaderFact = { arity: 1, vsat: false, retVsat: false, mtouch: false, retMtouch: true }
+
+      envF = envOfFacts
+        ( Map.fromFoldable
+            [ "M.reader" /\ readerFact, "M.clean" /\ cleanFact, "M.mkReader" /\ mkReaderFact ]
+        )
+
+    it "PAP: construction is clean, but the summary carries the callee's bits verbatim" do
+      let dirtyFacts = Map.fromFoldable [ "M.dirty2" /\ { arity: 2, vsat: false, retVsat: false, mtouch: true, retMtouch: true } ]
+      mtouchC (envOfFacts dirtyFacts) (CApp (var "M.dirty2") [ var "a" ]) `shouldEqual` false
+      vsumC (envOfFacts dirtyFacts) (CApp (var "M.dirty2") [ var "a" ])
+        `shouldEqual` { arity: 1, vsat: false, retVsat: false, mtouch: true, retMtouch: true }
+
+    it "exact saturation: the predicate reads mtouch; the result summary shifts retMtouch down" do
+      mtouchC envF (CApp (var "M.reader") [ var "a" ]) `shouldEqual` true
+      mtouchC envF (CApp (var "M.clean") [ var "a", var "b" ]) `shouldEqual` false
+      -- mkReader's own saturation is clean, but its result's saturation is dirty:
+      mtouchC envF (CApp (var "M.mkReader") [ var "a" ]) `shouldEqual` false
+      (vsumC envF (CApp (var "M.mkReader") [ var "a" ])).mtouch `shouldEqual` true
+
+    it "over-application is dirty" do
+      mtouchC envF (CApp (var "M.clean") [ var "a", var "b", var "c" ]) `shouldEqual` true
+
+    it "the let-returned reader lambda: mtouch=false, retMtouch=true (the ADR fixture shape)" do
+      -- outer = \a -> let reader = \u -> IndexArray a 0 in reader — the curried spelling would
+      -- uncurry to CLam [a, u] (ADR-0025), so the fixture is pinned to this let-returned form.
+      let
+        outer = CLam [ "a" ]
+          ( Let "reader" (CLam [ "u" ] (Ret (CPrim IndexArray [ var "a", int 0 ])))
+              (Ret (CAtom (var "reader")))
+          )
+      vsumC env0 outer
+        `shouldEqual` { arity: 1, vsat: false, retVsat: false, mtouch: false, retMtouch: true }
+
+    it "sinkableCall: exact-saturated clean calls only" do
+      sinkableCall envF (CApp (var "M.clean") [ var "a", var "b" ]) `shouldEqual` true
+      sinkableCall envF (CApp (var "M.reader") [ var "a" ]) `shouldEqual` false -- dirty
+      sinkableCall envF (CApp (var "M.clean") [ var "a" ]) `shouldEqual` false -- PAP, not exact
+      sinkableCall envF (CApp (var "opaque") [ var "a" ]) `shouldEqual` false -- unknown
+      sinkableCall env0 (CApp (AtomForeign "Data.Show.showIntImpl") [ var "n" ]) `shouldEqual` false -- foreign: dirty lift
+
+  describe "moduleEffects (mtouch propagation)" do
+    it "a point-free alias chain preserves the dirt" do
+      let
+        decls =
+          [ { recursive: false
+            , members:
+                [ "M.reader" /\ Ret (CLam [ "a" ] (Ret (CPrim IndexArray [ var "a", int 0 ]))) ]
+            }
+          , { recursive: false
+            , members: [ "M.alias" /\ Ret (CAtom (var "M.reader")) ]
+            }
+          ]
+        facts = moduleEffects (const Nothing) decls
+      (map _.mtouch (Map.lookup "M.alias" facts)) `shouldEqual` Just true
+
+    it "a recursive group member calling a reader sibling is dirty at the fixpoint" do
+      let
+        decls =
+          [ { recursive: true
+            , members:
+                [ "M.f" /\ Ret (CLam [ "x" ] (Ret (CApp (var "M.g") [ var "x" ])))
+                , "M.g" /\ Ret (CLam [ "y" ] (Ret (CPrim IndexArray [ var "y", int 0 ])))
+                ]
+            }
+          ]
+        facts = moduleEffects (const Nothing) decls
+      (map _.mtouch (Map.lookup "M.f" facts)) `shouldEqual` Just true
+      (map _.vsat (Map.lookup "M.f" facts)) `shouldEqual` Just false
     it "classifies siblings dependency-directed within the module" do
       let
         decls =
@@ -123,9 +212,9 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis" do
             , members: [ "M.alias" /\ Ret (CAtom (var "M.show5")) ]
             }
           ]
-        facts = moduleEffects (\k -> Map.lookup k sigs) decls
-      Map.lookup "M.show5" facts `shouldEqual` Just { arity: 0, vsat: false, retVsat: false }
-      Map.lookup "M.alias" facts `shouldEqual` Just { arity: 0, vsat: false, retVsat: false }
+        facts = moduleEffects (\k -> liftShape <$> Map.lookup k sigs) decls
+      Map.lookup "M.show5" facts `shouldEqual` Just { arity: 0, vsat: false, retVsat: false, mtouch: true, retMtouch: true }
+      Map.lookup "M.alias" facts `shouldEqual` Just { arity: 0, vsat: false, retVsat: false, mtouch: true, retMtouch: true }
 
     it "SCC least fixpoint: a self-recursive effectful loop is not misclassified pure" do
       -- go = \n -> let t = log n in let u = t unit in go n  — saturating go performs.
@@ -144,7 +233,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis" do
                 ]
             }
           ]
-        facts = moduleEffects (\k -> Map.lookup k sigs) decls
+        facts = moduleEffects (\k -> liftShape <$> Map.lookup k sigs) decls
       (map _.vsat (Map.lookup "M.go" facts)) `shouldEqual` Just true
 
     it "SCC least fixpoint: a pure recursive loop stays pure" do
@@ -157,8 +246,8 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis" do
                 [ "M.go" /\ Ret (CLam [ "n" ] (Ret (CApp (var "M.go") [ var "n" ]))) ]
             }
           ]
-        facts = moduleEffects (\k -> Map.lookup k sigs) decls
-      Map.lookup "M.go" facts `shouldEqual` Just { arity: 1, vsat: false, retVsat: false }
+        facts = moduleEffects (\k -> liftShape <$> Map.lookup k sigs) decls
+      Map.lookup "M.go" facts `shouldEqual` Just { arity: 1, vsat: false, retVsat: false, mtouch: false, retMtouch: false }
 
     it "a recursive point-free member recovers its arity across the fixpoint" do
       -- M.f = \x y -> M.g x y ; M.g = M.f (a 2-hop alias cycle: both settle at arity 2, pure)
@@ -171,5 +260,5 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis" do
                 ]
             }
           ]
-        facts = moduleEffects (\k -> Map.lookup k sigs) decls
+        facts = moduleEffects (\k -> liftShape <$> Map.lookup k sigs) decls
       (map _.arity (Map.lookup "M.g" facts)) `shouldEqual` Just 2

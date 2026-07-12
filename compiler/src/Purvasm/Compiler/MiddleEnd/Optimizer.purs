@@ -54,7 +54,7 @@ import Purvasm.Compiler.Ffi (intrinsicPrim)
 import Purvasm.Compiler.MiddleEnd.Module (AnfModule, declKeys, mapDeclBodies)
 import Purvasm.Compiler.MiddleEnd.Optimizer.DictElim (DictMachinery, dictElimExpr, emptyMachinery, intrinsicLift, machineryOf, mergeMachinery)
 import Data.Lazy (force)
-import Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis (moduleEffects, moduleEffectsLazy)
+import Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis (EffectFact, liftShape, moduleEffects, moduleEffectsLazy)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe (candidatesOf, nbeBinding, nbeEnvOf)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Analysis (sizeExpr)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (InlineCandidate)
@@ -75,9 +75,10 @@ newtype BuildEnv = BuildEnv
   -- | `LoweredModule.foreignSigs`); it injects the same deps here via `withForeignSigs` only under `--opt`,
   -- | where the optimiser runs. No pass mutates it, so it is not folded by `extendSummary`.
   , foreignSigs :: Map String ForeignShape
-  -- | Dependencies' published effect summaries (ADR-0095 §2): per-binding `ForeignShape` facts
-  -- | folded through `extendSummary` like `dict`/`inlines`.
-  , effects :: Map String ForeignShape
+  -- | Dependencies' published effect summaries (ADR-0095 §2 / ADR-0096 §1): per-binding
+  -- | `EffectFact`s (structurally computed, so they carry a *real* `mtouch`) folded through
+  -- | `extendSummary` like `dict`/`inlines`.
+  , effects :: Map String EffectFact
   }
 
 -- | The current module's **stable** facts produced by `localFactsOf` and handed to the `optimizeModule`
@@ -112,7 +113,7 @@ newtype BuildSummary = BuildSummary
   -- | "exports ∪ candidate-reachable privates" floor (under-publication is the failure mode the
   -- | ADR guards against: a private helper's fact regressing to `unknown` at the very site a
   -- | cross-module inline just created; over-publication only costs in-memory map entries).
-  , effects :: Map String ForeignShape
+  , effects :: Map String EffectFact
   }
 
 -- | The starting env, before any module has contributed.
@@ -156,11 +157,13 @@ optimizeModule (BuildEnv env) lf am =
     -- summaries are pass-local — recomputed here from the post-DictElim term each round (never
     -- stored in `LocalFacts`, never read back from this module's own summary, ADR-0095 §2) — so
     -- precision gained by a previous round's Specialize/NbE arrives with the driver's next round.
+    -- Foreign shapes lift **dirty** (`liftShape`, ADR-0096 §1); dependency summaries arrive as
+    -- full facts with their structurally computed `mtouch`.
     depEffects k = case Map.lookup k lf.foreignSigs of
-      Just s -> Just s
+      Just s -> Just (liftShape s)
       Nothing -> case Map.lookup k env.effects of
         Just s -> Just s
-        Nothing -> Map.lookup k env.foreignSigs
+        Nothing -> liftShape <$> Map.lookup k env.foreignSigs
     -- own summaries stay lazy: only the callees the mark walk actually consults are computed.
     ownEffects = moduleEffectsLazy depEffects elimd
     effectOracle k = case Map.lookup k ownEffects of

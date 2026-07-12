@@ -230,12 +230,19 @@ consumer. The three load-bearing conservatisms are pinned explicitly:
 
 > **Note (2026-07-13).** Dead-drop of a pure-*shaped* foreign call rests on a
 > premise this record left implicit and ADR-0096 §3 now pins as the **FFI
-> semantic contract**: a foreign whose reconstructed shape claims purity must
-> be observationally pure — its declared type is its effect contract. Hidden
-> mutation under a pure type is supported only for the compiler-known
-> linear-return `unsafe` class (`unsafeSetByte`, ADR-0052, where a dead result
-> has no observer); a pure-typed foreign mutating observable host state is
-> outside the supported FFI semantics and must be typed `Effect`.
+> semantic contract**, binding **per saturation level**: each `vsat = false`
+> in a foreign's reconstructed shape is the contract that *that* value's
+> exact saturation is observationally pure — `retVsat = true` marks only the
+> *next* saturation effectful and never licenses performing at the current
+> one (`log "x"`, `{ vsat: false, retVsat: true }`, must do nothing but build
+> its thunk — an eagerly-performing host implementation would be deleted by
+> this record's dead-drop). Effectful foreigns must carry an explicit
+> `Effect`/`ST`/`EffectFn{N}` head (a synonym hiding `Effect` is opaque to
+> FSR and silently claims the pure contract). Hidden mutation under a pure
+> shape is supported only for the compiler-known linear-return `unsafe` class
+> (`unsafeSetByte`, ADR-0052, where a dead result has no observer); a
+> pure-shaped foreign mutating observable host state is outside the supported
+> FFI semantics and must be typed `Effect`.
 
 ### 5. Verification
 

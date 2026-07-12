@@ -9,13 +9,21 @@
 -- | forms (`CLam`/`CCtor`/`CArray`/`CRecord`), pure dereference forms (`CAccessor`, non-pinned
 -- | `CPrim`, `CUpdate`). Pinned computations (calls, pinned prims, branches) never enter it.
 -- |
--- | The ADR-0095 **dead-only branch** is the one exception, and it is deliberately *not* verdict
--- | eligibility: a `CApp` whose effect facts prove it cannot perform (`eperfC` false) is marked
--- | **only when it is dead** (`usage = Nothing`) — the mark then eliminates it in place (a dead
--- | marked binder's value is bound, unused, and never reified). At any use count ≥ 1 a pure call
--- | stays pinned/ineligible: the ordinary mark *is* the sink (re-materialise at the use site next
--- | round), and purity facts license elimination when dead, never motion (ADR-0095 §3/§4 — the
--- | summary does not track mutable-memory reads).
+-- | The ADR-0095/0096 **call branch** is the one exception, and it is deliberately *not* verdict
+-- | eligibility (the verdict's multi-use clauses would duplicate calls). A `CApp` is marked in
+-- | exactly two cases:
+-- |
+-- |   * **drop** (ADR-0095): dead (`usage = Nothing`) and `eperfC` false — eliminated in place
+-- |     (the bound value is never reified);
+-- |   * **sink** (ADR-0096): live at exactly one use, captured at most by a branch, and
+-- |     `sinkableCall` — an exact saturation that neither performs nor touches the mutable
+-- |     store (`vsat = false ∧ mtouch = false`). The mark re-materialises the call at its sole
+-- |     use site (conditional execution when that site sits under a branch — the same
+-- |     partial-correctness class as dead-drop).
+-- |
+-- | Multi-use stays pinned (duplication); `CapClosure` stays pinned (multi-execution); a merely
+-- | *pure* call without the clean-store fact stays pinned (ADR-0095 §3/§4's boundary, licensed
+-- | away only by the strictly stronger `mtouch = false`).
 module Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Analysis
   ( inlineMarks
   , sizeExpr
@@ -33,7 +41,7 @@ import Data.Set (Set)
 import Data.Set as Set
 import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr(..), Expr(..), Rhs(..))
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (cfExpr, fvExpr)
-import Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis (EffectEnv, EffectGlobals, bindFact, bindUnknown, emptyEffectEnv, eperfC, extendGroupVars, vsumC)
+import Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis (EffectEnv, EffectGlobals, bindFact, bindUnknown, emptyEffectEnv, eperfC, extendGroupVars, sinkableCall, vsumC)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (binderVarsOrdered, pinnedPrim)
 
 -- --- usage ---------------------------------------------------------------------------------------
@@ -141,11 +149,14 @@ infoExpr env = case _ of
       marked = case classifyRhs c of
         Just f | verdict f rc.size usage -> Set.singleton x
         Just _ -> Set.empty
-        -- ADR-0095 §3, the dead-only branch: usage first — only a *dead* (`Nothing`) pure call
-        -- is marked (the drop mark); a live pure call stays pinned (motion needs memory-effect
-        -- facts this summary does not carry).
+        -- The call branch: usage first. Dead pure → drop (ADR-0095 §3); live single-use,
+        -- at most branch-captured, exact-saturated and store-clean → sink (ADR-0096 §2).
         Nothing -> case c, usage of
           CApp _ _, Nothing | not (eperfC env c) -> Set.singleton x
+          CApp _ _, Just u
+            | u.total == 1
+            , u.capture <= CapBranch
+            , sinkableCall env c -> Set.singleton x
           _, _ -> Set.empty
       merged = mergeI rc (dropVars [ x ] rr)
     in
