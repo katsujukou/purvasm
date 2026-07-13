@@ -804,9 +804,12 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
       let e = Ret (CApp (AtomForeign "Data.Ord.ordIntImpl") [ var "l", var "e", var "g", int 1, int 2 ])
       nbe e `shouldEqual` e
 
-    it "unfolds an Effect combinator's lambda at saturation (pureE = \\a $u -> a)" do
-      nbe (Ret (CApp (AtomForeign "Effect.pureE") [ var "a", var "u" ]))
-        `shouldEqual` Ret (CAtom (var "a"))
+    it "does NOT unfold a GER-owned Effect combinator: pureE left the structural rung (ADR-0099 §3)" do
+      -- `Effect.pureE`/`bindE` are GER-owned — the structural rung no longer serves them (Impurify
+      -- lowers them to `CPerform` ANF instead), so NbE leaves a saturated `Effect.pureE a u`
+      -- untouched for GER, rather than unfolding the guest term to `a`.
+      let e = Ret (CApp (AtomForeign "Effect.pureE") [ var "a", var "u" ])
+      nbe e `shouldEqual` e
 
     it "resolves the literal builtins (Prim.undefined) so superclass forcing β-reduces" do
       nbe

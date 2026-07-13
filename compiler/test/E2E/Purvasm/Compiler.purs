@@ -154,6 +154,26 @@ usesPrim op = goE
     A.Uncond e -> goE e
     A.Guarded gs -> Array.any (\g -> goE g.guard || goE g.rhs) gs
 
+-- | Does the expression contain a `CPerform` run-marker (GER, ADR-0099)?
+usesPerform :: A.Expr -> Boolean
+usesPerform = goE
+  where
+  goE = case _ of
+    A.Ret c -> goC c
+    A.Let _ c rest -> goC c || goE rest
+    A.LetRec bs rest -> Array.any (goE <<< _.rhs) bs || goE rest
+
+  goC = case _ of
+    A.CPerform _ -> true
+    A.CLam _ b -> goE b
+    A.CIf _ t e -> goE t || goE e
+    A.CCase _ alts -> Array.any goAlt alts
+    _ -> false
+
+  goAlt alt = case alt.result of
+    A.Uncond e -> goE e
+    A.Guarded gs -> Array.any (\g -> goE g.guard || goE g.rhs) gs
+
 refsName :: String -> A.Expr -> Boolean
 refsName n e = Set.member n (Set.union (fvExpr Set.empty e) (cfExpr e))
 
@@ -248,10 +268,12 @@ paritySpec = describe "ADR-0094 fold parity (sliced structural keys ride the uli
       offenders = Array.filter (\(Tuple _ fs) -> Array.any (\f -> Array.elem f sliced) fs) entries
     map fst offenders `shouldEqual` []
 
-  -- ADR-0098: a concrete-`Effect` do-block's `bind`/`pure`/`discard` dispatch devirtualizes all
-  -- the way through the mutually-recursive `Effect` instance group to the exposed `Effect.bindE` /
-  -- `Effect.pureE` structural foreigns (the GER-visibility prerequisite), on the real artifacts.
-  it "ADR-0098: Effect do-block dispatch exposes Effect.bindE / pureE through the real instance group" do
+  -- ADR-0099 Slice 2 (subsumes the ADR-0098 exposure fixture): a concrete-`Effect` do-block's
+  -- `bind`/`pure`/`discard` dispatch devirtualizes through the mutually-recursive `Effect` instance
+  -- group and GER lowers it all the way to canonical `CPerform` ANF — the exposed `Effect.bindE` /
+  -- `Effect.pureE` foreign is now a transient GER consumes (`early` dispatch recognition for
+  -- `bind`/`pure`, `close` for the `discard` two-hop NbE exposes), on the real artifacts.
+  it "ADR-0099 Slice 2: Effect do-block dispatch GER-lowers to canonical CPerform" do
     mods <- load [ "Data.Unit", "Type.Proxy", "Data.Functor", "Control.Apply", "Control.Applicative", "Control.Bind", "Control.Monad", "Effect" ]
     let
       out = optimizeProbe mods
@@ -260,11 +282,14 @@ paritySpec = describe "ADR-0094 fold parity (sliced structural keys ride the uli
         , Tuple "Parity.T.d"
             (A.Ret (A.CApp (avar "Control.Bind.discard") [ avar "Control.Bind.discardUnit", avar "Effect.bindEffect", avar "a", avar "k" ]))
         ]
-      exposes key name = Array.any (\(Tuple k e) -> k == key && refsName name e) out
-    -- each dispatch reaches the exposed foreign (bindE stays under-saturated, a GER-recognisable node)
-    exposes "Parity.T.p" "Effect.pureE" `shouldEqual` true
-    exposes "Parity.T.b" "Effect.bindE" `shouldEqual` true
-    exposes "Parity.T.d" "Effect.bindE" `shouldEqual` true
-    -- and the stalled dict-CAF projection / accessor is gone (dispatch fully devirtualized)
-    Array.any (\(Tuple _ e) -> refsName "Effect.bindEffect" e || refsName "Control.Bind.bind" e) out
-      `shouldEqual` false
+      performs key = Array.any (\(Tuple k e) -> k == key && usesPerform e) out
+      refsAny names = Array.any (\(Tuple _ e) -> Array.any (\n -> refsName n e) names) out
+    -- bind / discard reflect to an explicit run marker (they sequence effects)
+    performs "Parity.T.b" `shouldEqual` true
+    performs "Parity.T.d" `shouldEqual` true
+    -- pure lowers to a pure unit thunk — no run marker (nothing to perform)
+    performs "Parity.T.p" `shouldEqual` false
+    -- the exposed GER foreign is consumed (no residual structural foreign), and the dict-CAF
+    -- projection / accessor is fully devirtualized — nothing of the dispatch surface survives.
+    refsAny [ "Effect.pureE", "Effect.bindE" ] `shouldEqual` false
+    refsAny [ "Effect.bindEffect", "Effect.applicativeEffect", "Control.Bind.bind", "Control.Applicative.pure", "Control.Bind.discard" ] `shouldEqual` false
