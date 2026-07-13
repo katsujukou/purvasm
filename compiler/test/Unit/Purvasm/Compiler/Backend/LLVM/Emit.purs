@@ -11,6 +11,7 @@ import Purvasm.Compiler.Backend.LLVM.Emit (emitFunction)
 import Purvasm.Compiler.Backend.LLVM.Monad (makeCx, renderChunks, runCodegen)
 import Purvasm.Compiler.Backend.LLVM.Types (Lifted(..), LiftedBody(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..))
+import Purvasm.Compiler.Literal (Literal(..))
 import Data.Map as Map
 import Data.Maybe (Maybe(..))
 import Data.Set as Set
@@ -78,3 +79,28 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Emit" do
             <> "}\n"
             <> "\n"
         )
+
+    it "lowers a GER perform as the identical .ll to a one-argument unit call (ADR-0099)" do
+      -- `CPerform t` delegates to the `CApp t [unit]` path, so its emitted `.ll` must be
+      -- byte-identical to the explicit unit-argument call (reuses direct/musttail/pv_apply +
+      -- tail position). Comparing the two emissions locks the delegation without hardcoding
+      -- brittle `.ll` bytes.
+      let
+        emitLl body = renderChunks
+          ( _.md $ snd $ runCodegen
+              (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true })
+              ( emitFunction
+                  ( Lifted
+                      { name: "pv_g_Test_2ef"
+                      , params: [ "m" ]
+                      , captures: []
+                      , body: LBody body
+                      , selfName: Nothing
+                      , captureFns: []
+                      , exported: true
+                      }
+                  )
+              )
+          )
+      emitLl (Ret (CPerform (AtomVar "m")))
+        `shouldEqual` emitLl (Ret (CApp (AtomVar "m") [ AtomLit (LInt 0) ]))

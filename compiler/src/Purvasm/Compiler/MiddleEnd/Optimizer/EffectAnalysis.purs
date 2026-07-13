@@ -197,6 +197,7 @@ vsumC env = case _ of
   CRecord _ -> pureValue
   CUpdate _ _ -> pureValue
   CAccessor _ _ -> unknownValue -- a field may be any value, incl. an effectful function
+  CPerform _ -> unknownValue -- GER run point (ADR-0099): the performed result is opaque
   CIf _ t e -> joinSum (vsumExpr env t) (vsumExpr env e)
   CCase _ alts -> foldl (\acc a -> joinSum acc (altVsum env a)) pureValue alts
 
@@ -239,6 +240,7 @@ eperfC env = case _ of
       -- over-application (e.g. `(log s) u` in one node): the extra arguments force the produced
       -- value, and a summary tracks only one level below — conservatively may-perform.
       else true
+  CPerform _ -> true -- GER run point (ADR-0099): performing a thunk always may-perform
   CIf _ t e -> eperfExpr env t || eperfExpr env e
   CCase _ alts -> Array.any (altEperf env) alts
 
@@ -276,6 +278,7 @@ mtouchC env = case _ of
       if n < sf.arity then false -- constructing a PAP is clean
       else if n == sf.arity then sf.mtouch
       else true -- over-application: a two-level summary cannot see deeper
+  CPerform _ -> true -- GER run point (ADR-0099): performing a thunk may touch the store
   CIf _ t e -> mtouchExpr env t || mtouchExpr env e
   CCase _ alts -> Array.any (altMtouch env) alts
 

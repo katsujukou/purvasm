@@ -97,6 +97,19 @@ evalC env = case _ of
     SLit (LBool b) -> evalExpr env (if b then t else e)
     s -> SComp (NIf s (evalExpr env t) (evalExpr env e))
   CCase scruts alts -> evalCase env (map (evalAtom env) scruts) alts
+  CPerform a -> performSem (evalAtom env a)
+
+-- | Run an `Effect`/`ST` thunk (GER, ADR-0099). β fires **only** on a known unit-lambda
+-- | (`perform (\$u -> body) → body`, in place); a stuck computation is sequenced first (mirroring
+-- | `applySem`'s computation-head handling), and everything else — an unresolved reference, an
+-- | opaque global — stays a pinned `NPerform` marker so the head-based purity analysis never loses
+-- | which thunk gets performed (ADR-0099 §2). Deliberately **not** routed through `applySem`: a
+-- | performed `SRef` must not accumulate a unit into its spine and unfold through the gate.
+performSem :: Sem -> Sem
+performSem = case _ of
+  SLam ps body | Array.length ps == 1 -> body [ SLit (LInt 0) ]
+  SComp c -> SLet Nothing (SComp c) performSem
+  s -> SComp (NPerform s)
 
 evalAtom :: EvalEnv -> Atom -> Sem
 evalAtom env = case _ of

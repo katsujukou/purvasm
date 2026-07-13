@@ -145,5 +145,6 @@ language and are kept out of version control.)
 | [0096](0096-memory-effect-summaries-pure-call-sink.md) | Memory-effect summaries: `mayTouchMutable` through call summaries; single-use pure clean calls sink | Accepted |
 | [0097](0097-materialised-size-audit-multi-use-marks.md) | The materialised-size audit: multi-use re-materialising marks are gated on transitive size | Accepted |
 | [0098](0098-effect-instance-dict-visibility-grouped-projection.md) | Effect instance-dictionary visibility: folding method projections off recursive dictionary CAFs (the `bindE`/`pureE` exposure GER needs) | Accepted |
+| [0099](0099-generalized-effect-reflection-cperform.md) | Generalized effect reflection and impurification: an explicit `CPerform` run-marker and canonical `Effect`/`ST` lowering | Accepted |
 
 ## Scope

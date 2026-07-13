@@ -37,6 +37,10 @@ data CExpr
   | CUpdate Atom (Array { prop :: String, val :: Atom })
   | CIf Atom Expr Expr
   | CCase (Array Atom) (Array Alt)
+  -- | Run an `Effect`/`ST` thunk (GER, ADR-0099): `CPerform t ≃ CApp t [unit]`, but kept
+  -- | **distinct** on the optimiser seam as an explicit run marker so the head-based purity
+  -- | analysis never loses which thunk gets performed. Backends lower it to the unit application.
+  | CPerform Atom
 
 -- | A let-sequence ending in a tail computation.
 -- | `Let` binds a (non-recursive) computation;
@@ -95,6 +99,7 @@ mapAtoms f = goE
     CUpdate a ups -> CUpdate (f a) (map (\r -> r { val = f r.val }) ups)
     CIf a t e -> CIf (f a) (goE t) (goE e)
     CCase as alts -> CCase (map f as) (map goAlt alts)
+    CPerform a -> CPerform (f a)
 
   goAlt alt = alt { result = goRhs alt.result }
 

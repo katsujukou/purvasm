@@ -103,6 +103,11 @@ data Comp
   | NUpd Sem (Array { prop :: String, val :: Sem })
   | NIf Sem Sem Sem
   | NCase (Array Sem) (Array NAlt)
+  -- | An `Effect`/`ST` run point (GER, ADR-0099): performing a thunk that did not reduce to a known
+  -- | lambda. Pinned like `NApp` — a sequencing barrier the collapse must never move or drop; the
+  -- | `EffectAnalysis` arms for `CPerform` (conservative: may-perform, may-touch, not sinkable) keep
+  -- | the mark walk from relaxing it.
+  | NPerform Sem
 
 -- | A neutral `case` alternative: the binder shape (variable names are placeholders `Quote`
 -- | renames), the bound variable names in `binderVarsOrdered` order, and the right-hand side as a

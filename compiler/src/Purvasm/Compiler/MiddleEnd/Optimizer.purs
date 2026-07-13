@@ -26,6 +26,7 @@ module Purvasm.Compiler.MiddleEnd.Optimizer
   ( BuildEnv
   , LocalFacts
   , BuildSummary
+  , OuterKind(..)
   , emptyBuildEnv
   , localFactsOf
   , optimizeModule
@@ -48,10 +49,10 @@ import Effect.Console (warn)
 import Effect.Unsafe (unsafePerformEffect)
 import Purvasm.Compiler.Bytecode.Artifact (Summary)
 import Purvasm.Compiler.ForeignSig (ForeignShape)
-import Purvasm.Compiler.MiddleEnd.ANF (Expr)
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..))
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (cfExpr, fvExpr)
 import Purvasm.Compiler.Ffi (intrinsicPrim)
-import Purvasm.Compiler.MiddleEnd.Module (AnfModule, declKeys, mapDeclBodies)
+import Purvasm.Compiler.MiddleEnd.Module (AnfModule, Decl, declKeys, mapDeclBodies)
 import Purvasm.Compiler.MiddleEnd.Optimizer.DictElim (DictMachinery, dictElimExpr, emptyMachinery, intrinsicLift, machineryOf, mergeMachinery)
 import Data.Lazy (force)
 import Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis (EffectFact, liftShape, moduleEffects, moduleEffectsLazy)
@@ -91,7 +92,37 @@ type LocalFacts =
   -- | The module's **own** foreign shapes (ADR-0090), injected by the driver under `--opt`; empty from
   -- | `localFactsOf` (source-derived, not `AnfModule`-derived). For the optimiser's own-module effect analysis.
   , foreignSigs :: Map String ForeignShape
+  -- | Each top-level binding's **pre-optimisation** outer kind (ADR-0099 §4a), captured once from the
+  -- | raw translated `AnfModule` (before any optimiser pass, including `DictElim`) so it matches the
+  -- | `--no-opt` side and the ADR-0077 pre-opt call facts. `enforceOuterKinds` re-shares any binding an
+  -- | optimiser pass turned from a non-lambda CAF into a lambda, keeping the `.pmi` `ExportKind` /
+  -- | hash mode-stable. Fixpoint-stable (derives from the invariant original term).
+  , outerKinds :: Map String OuterKind
   }
+
+-- | The **outer kind** of a top-level binding body: a syntactic lambda (`Ret (CLam …)`) or not.
+data OuterKind = OKLambda | OKNonLambda
+
+derive instance Eq OuterKind
+
+outerKindOf :: Expr -> OuterKind
+outerKindOf = case _ of
+  Ret (CLam _ _) -> OKLambda
+  _ -> OKNonLambda
+
+-- | Enforce each binding's pre-optimisation outer kind on the optimised term (ADR-0099 §4a): a body
+-- | whose pre-opt kind was `OKNonLambda` but which optimised to a bare lambda (GER's `pureE a → \$u ->
+-- | a`, or an NbE CAF reduction) is re-shared as a CAF under the reserved `$q0` binder — the same
+-- | `preserveOuterShape` mechanism, relocated to module scope so its reference predates every
+-- | optimiser pass. Applied after `Specialize`, before the module output and summary are derived, so
+-- | both see the mode-stable shape (`.pmi` `ExportKind`/hash + ADR-0077 call facts). `$q0` is
+-- | collision-free: `Quote` mints `$q1`+ and `Specialize` mints `$spec$…`.
+enforceOuterKinds :: Map String OuterKind -> Array Decl -> Array Decl
+enforceOuterKinds kinds = map \d -> d { members = map guard d.members }
+  where
+  guard (Tuple k body) = case Map.lookup k kinds, body of
+    Just OKNonLambda, Ret lam@(CLam _ _) -> Tuple k (Let "$q0" lam (Ret (CAtom (AtomVar "$q0"))))
+    _, _ -> Tuple k body
 
 -- | What a compiled module contributes to its dependents' `BuildEnv`. Distinct from the persisted
 -- | `Artifact.Summary` (`.pmi`): this is the in-memory build fact; `persistedSummary` projects the subset
@@ -132,6 +163,9 @@ localFactsOf (BuildEnv env) am =
   { dict: machineryOf env.dict (Array.concatMap _.members am.decls)
   , gkeys: Set.fromFoldable (Array.concatMap declKeys am.decls)
   , foreignSigs: Map.empty -- source-derived; the driver injects the module's own shapes under --opt
+  -- captured from the raw `am` here — before `optimizeModule`'s `DictElim`/`Nbe`/`Specialize`.
+  , outerKinds: Map.fromFoldable
+      (Array.concatMap (\d -> map (\(Tuple k e) -> Tuple k (outerKindOf e)) d.members) am.decls)
   }
 
 -- | One pass of the real optimiser (ADR-0086 §3, the `--opt` leg): `Nbe ∘ DictElim` over the
@@ -183,11 +217,15 @@ optimizeModule (BuildEnv env) lf am =
     -- module the next round (and the summary below) derive from.
     localInlines = candidatesOf intrinsicPrim env.inlines optimised
     specialized = specializeModule am.name lf.gkeys (Map.union localInlines env.inlines) optimised
+    -- Binding-surface guard (ADR-0099 §4a): after Specialize, before the module output and summary
+    -- are derived, re-share any binding a pass turned from a pre-opt non-lambda CAF into a lambda —
+    -- both `module` and `summary` below derive from the mode-stable `guarded` decls.
+    guarded = enforceOuterKinds lf.outerKinds specialized
   in
-    { module: am { decls = specialized }
+    { module: am { decls = guarded }
     , summary:
         let
-          inlines = candidatesOf intrinsicPrim env.inlines specialized
+          inlines = candidatesOf intrinsicPrim env.inlines guarded
           -- own foreign shapes the candidate bodies reference — on either atom spelling (a foreign
           -- key rides `AtomForeign` or a plain qualified `AtomVar`); see `BuildSummary.foreignSigs`.
           referenced = Array.foldl
@@ -201,9 +239,9 @@ optimizeModule (BuildEnv env) lf am =
             , inlines
             , foreignSigs: Map.filterKeys (\k -> Set.member k referenced) lf.foreignSigs
             -- ADR-0086 §3: a summary derived from the *final* module reaches dependents — the
-            -- published effect facts are recomputed from the post-Specialize decls, not reused
-            -- from the pre-NbE `ownEffects` this pass consumed.
-            , effects: moduleEffects depEffects specialized
+            -- published effect facts are recomputed from the post-Specialize (guarded) decls, not
+            -- reused from the pre-NbE `ownEffects` this pass consumed.
+            , effects: moduleEffects depEffects guarded
             }
     }
 

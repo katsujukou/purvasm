@@ -76,6 +76,7 @@ quoteC s k = case s of
     NApp h args -> quoteAtom h \ha -> quoteAtoms args \as -> k (CApp ha as)
     NPrim op args -> quoteAtoms args \as -> k (CPrim op as)
     NAcc v f -> quoteAtom v \a -> k (CAccessor a f)
+    NPerform v -> quoteAtom v \a -> k (CPerform a)
     NUpd v ups -> quoteAtom v \a ->
       quoteAtoms (map _.val ups) \as ->
         k (CUpdate a (Array.zipWith (\u v' -> { prop: u.prop, val: v' }) ups as))

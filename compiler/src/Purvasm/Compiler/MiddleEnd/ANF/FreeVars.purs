@@ -73,6 +73,7 @@ fvCexpr bound = case _ of
   CAccessor a _ -> fvAtom bound a
   CUpdate a fs -> Set.union (fvAtom bound a) (fvAtoms bound (map _.val fs))
   CIf a t e -> Set.union (fvAtom bound a) (Set.union (fvExpr bound t) (fvExpr bound e))
+  CPerform a -> fvAtom bound a
   CCase scruts alts ->
     foldl (\acc alt -> Set.union acc (fvAlt bound alt)) (fvAtoms bound scruts) alts
 
@@ -111,6 +112,7 @@ cfCexpr = case _ of
   CUpdate a0 fs -> foldl (\s f -> Set.union s (cfAtom f.val)) (cfAtom a0) fs
   CAccessor a _ -> cfAtom a
   CIf a t e -> Set.union (cfAtom a) (Set.union (cfExpr t) (cfExpr e))
+  CPerform a -> cfAtom a
   CCase scruts alts -> foldl (\s alt -> Set.union s (cfAlt alt)) (cfAtoms scruts) alts
 
 cfAtom :: Atom -> Set String

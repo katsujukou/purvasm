@@ -151,6 +151,7 @@ nodeCount = countE
     CUpdate _ ups -> 1 + Array.length ups
     CIf _ t e -> 1 + countE t + countE e
     CCase ss alts -> 1 + Array.length ss + Array.foldl (\acc a -> acc + countAlt a) 0 alts
+    CPerform _ -> 2
   countAlt a = case a.result of
     Uncond e -> countE e
     Guarded gs -> Array.foldl (\acc g -> acc + countE g.guard + countE g.rhs) 0 gs
@@ -351,6 +352,28 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
                     (Let "$q6" (CLam [ "$q5" ] (Ret (CAtom (var "$q2")))) (Ret (CArray [ var "$q4", var "$q6" ])))
                 )
             )
+
+  describe "GER run marker: CPerform (ADR-0099 slice 1)" do
+    it "perform of a known unit-lambda β-reduces to the body in place" do
+      -- let t = \$u -> 42 in perform t  ==>  42
+      nbe (Let "t" (CLam [ "$u" ] (Ret (CAtom (int 42)))) (Ret (CPerform (var "t"))))
+        `shouldEqual` Ret (CAtom (int 42))
+
+    it "perform of an unknown thunk stays a pinned CPerform marker" do
+      -- \m -> perform m  stays  \m -> perform m  (never dissolved to `m unit`)
+      nbe (Ret (CLam [ "m" ] (Ret (CPerform (var "m")))))
+        `shouldEqual` Ret (CLam [ "$q1" ] (Ret (CPerform (var "$q1"))))
+
+    it "a neutral perform is sequenced in place and its result is usable" do
+      -- \m -> let r = perform m in r
+      nbe (Ret (CLam [ "m" ] (Let "r" (CPerform (var "m")) (Ret (CAtom (var "r"))))))
+        `shouldEqual`
+          Ret (CLam [ "$q1" ] (Let "$q2" (CPerform (var "$q1")) (Ret (CAtom (var "$q2")))))
+
+    it "a dead neutral perform is kept (a pinned effect barrier, not dropped)" do
+      -- let a = perform t in 1 — `a` is unused, but performing `t` is an effect that must run.
+      nbe (Let "a" (CPerform (var "t")) (Ret (CAtom (int 1))))
+        `shouldEqual` Let "$q1" (CPerform (var "t")) (Ret (CAtom (int 1)))
 
   describe "dead-drop with purity facts (ADR-0095 §3, the dead-only branch)" do
     it "fires: a dead pure call is dropped in place" do

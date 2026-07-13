@@ -19,7 +19,10 @@ import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
 import Purvasm.Compiler.MiddleEnd.Module (AnfModule, Decl)
 import Data.Map as Map
-import Purvasm.Compiler.MiddleEnd.Optimizer (emptyBuildEnv, extendSummary, localFactsOf, optimizeModule, persistedSummary, publishedForeignSigs)
+import Purvasm.Compiler.Backend.LLVM.Interface (gdefKindMap)
+import Purvasm.Compiler.Backend.LLVM.Program (classifyDecl)
+import Purvasm.Compiler.Bytecode.Artifact (kindToTag)
+import Purvasm.Compiler.MiddleEnd.Optimizer (OuterKind(..), emptyBuildEnv, extendSummary, localFactsOf, optimizeModule, persistedSummary, publishedForeignSigs)
 import Purvasm.Compiler.Primitive (PrimOp(..))
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
@@ -350,6 +353,39 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
         am = { name: "Test.M", decls: [ instanceDecl "Test.M.semiringInt" ] }
         r = optimizeModule emptyBuildEnv (localFactsOf emptyBuildEnv am) am
       isNothing (persistedSummary r.summary) `shouldEqual` true
+
+  describe "binding-surface guard (ADR-0099 §4a)" do
+    it "the module-level guard re-shares a lambda whose pre-opt kind was non-lambda" do
+      -- The raw body here is a lambda, but `outerKinds` is pinned to `OKNonLambda` — simulating
+      -- Slice 2, where `Impurify` turns a non-lambda CAF into this lambda *before* NbE, so
+      -- `nbeBinding`'s own guard sees a lambda input and does not fire; only the module-level
+      -- `enforceOuterKinds`, keyed on the pre-opt kind, catches it. (Deleting `enforceOuterKinds`
+      -- fails this test: the output stays a bare `Ret (CLam …)`.)
+      let
+        am :: AnfModule
+        am = { name: "Test.M", decls: [ nonrec "Test.M.f" (Ret (CLam [ "$u" ] (Ret (CAtom (AtomLit (LInt 1)))))) ] }
+        lf = (localFactsOf emptyBuildEnv am) { outerKinds = Map.singleton "Test.M.f" OKNonLambda }
+        r = optimizeModule emptyBuildEnv lf am
+        wrapped = Let "$q0" (CLam [ "$q1" ] (Ret (CAtom (AtomLit (LInt 1))))) (Ret (CAtom (var "$q0")))
+      map _.members r.module.decls `shouldEqual` [ [ "Test.M.f" /\ wrapped ] ]
+
+    it "keeps the .pmi ExportKind mode-stable: a CAF that optimises to a lambda stays Ecaf" do
+      -- f = let g = \x -> x in g — a non-lambda CAF (Ecaf) that NbE reduces to \x -> x; a guard
+      -- re-wraps it so its ExportKind stays Ecaf, matching `--no-opt` (the raw decls). Without a
+      -- guard the optimised body is a bare lambda → Efn, and the `.pmi` interface diverges by
+      -- mode. Compares the `--opt` ExportKind map against the `--no-opt` (raw) one.
+      let
+        am :: AnfModule
+        am =
+          { name: "Test.M"
+          , decls: [ nonrec "Test.M.f" (Let "g" (CLam [ "x" ] (Ret (CAtom (var "x")))) (Ret (CAtom (var "g")))) ]
+          }
+        optDecls = (optimizeModule emptyBuildEnv (localFactsOf emptyBuildEnv am) am).module.decls
+        kindTags decls =
+          map (\(k /\ g) -> k /\ kindToTag g)
+            (Map.toUnfoldable (gdefKindMap (map classifyDecl decls)))
+            :: Array _
+      kindTags optDecls `shouldEqual` kindTags am.decls
 
 -- --- round-growth backstop (ADR-0089 self-compile extension) -------------------------------------
 

@@ -174,6 +174,23 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis" do
       sinkableCall envF (CApp (var "opaque") [ var "a" ]) `shouldEqual` false -- unknown
       sinkableCall env0 (CApp (AtomForeign "Data.Show.showIntImpl") [ var "n" ]) `shouldEqual` false -- foreign: dirty lift
 
+  describe "CPerform run-marker equations (ADR-0099 §2, fully conservative initial slice)" do
+    it "eperfC / mtouchC are always true (performing a thunk may perform and may touch the store)" do
+      eperfC env0 (CPerform (var "t")) `shouldEqual` true
+      mtouchC env0 (CPerform (var "t")) `shouldEqual` true
+
+    it "vsumC is the opaque unknownValue" do
+      vsumC env0 (CPerform (var "t"))
+        `shouldEqual` { arity: 0, vsat: true, retVsat: true, mtouch: true, retMtouch: true }
+
+    it "sinkableCall is false (a run point never sinks)" do
+      sinkableCall env0 (CPerform (var "t")) `shouldEqual` false
+
+    it "a \\$u -> perform m thunk has vsat = true (saturating it performs)" do
+      -- the load-bearing case: were `eperfC (CPerform _)` false, this lambda's vsat would read
+      -- false and the existing dead-drop could delete a live effect.
+      (vsumC env0 (CLam [ "$u" ] (Ret (CPerform (var "m"))))).vsat `shouldEqual` true
+
   describe "moduleEffects (mtouch propagation)" do
     it "a point-free alias chain preserves the dirt" do
       let

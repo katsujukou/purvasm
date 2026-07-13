@@ -75,6 +75,7 @@ printCExprAt i = case _ of
   CArray args -> "[" <> joinWith ", " (map printAtom args) <> "]"
   CRecord fs -> record (fs <#> \f -> f.prop <> ": " <> printAtom f.val)
   CAccessor a p -> printAtom a <> "." <> p
+  CPerform a -> "perform(" <> printAtom a <> ")"
   CUpdate a ups -> printAtom a <> " " <> record (ups <#> \u -> u.prop <> " = " <> printAtom u.val)
   CIf c t e ->
     "if " <> printAtom c <> " then\n"

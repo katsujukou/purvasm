@@ -35,6 +35,13 @@ spec = describe "Purvasm.Compiler.Bytecode.Lower" do
       lowerCexpr true (CApp (AtomVar "f") [ aInt 1 ])
         `shouldEqual` [ Load "f", PushInt 1, TailCall 1 ]
 
+    it "lowers a GER perform as a one-argument (unit) call, tail-aware (ADR-0099)" do
+      -- perform f ≃ f unit; unit is the immediate 0 (ADR-0064).
+      lowerCexpr false (CPerform (AtomVar "f"))
+        `shouldEqual` [ Load "f", PushInt 0, Call 1 ]
+      lowerCexpr true (CPerform (AtomVar "f"))
+        `shouldEqual` [ Load "f", PushInt 0, TailCall 1 ]
+
     it "ends a tail value with Return, and a non-tail value without one" do
       lowerCexpr true (CAtom (aInt 5)) `shouldEqual` [ PushInt 5, Return ]
       lowerCexpr false (CAtom (aInt 5)) `shouldEqual` [ PushInt 5 ]

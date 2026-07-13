@@ -317,6 +317,9 @@ directTarget env f nargs = case f of
 cexpr :: Env -> Boolean -> CExpr -> Codegen (Maybe String)
 cexpr env tail = case _ of
   CAtom a -> atom env a >>= finish tail
+  -- GER run point (ADR-0099): `perform t ≃ t unit`. Delegate to the `CApp` path so the direct /
+  -- `musttail` / generic `pv_apply` machinery (and tail position) is reused unchanged.
+  CPerform t -> cexpr env tail (CApp t [ AtomLit (LInt 0) ])
   CPrim op args -> do
     -- A primop consumes its operands' *values* (e.g. `RecordGet` on a by-need dict), so force them.
     ops <- evalAtoms true env args

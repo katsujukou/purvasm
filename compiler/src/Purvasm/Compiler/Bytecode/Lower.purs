@@ -76,6 +76,11 @@ lowerCexpr' tail = case _ of
       -- each branch leaves a value; `then` jumps over `else` to the join point
       else (lowerAtom a : JumpUnless (List.length tc + 1) : tc) <> (Jump (List.length ec) : ec)
   CCase scruts alts -> List.fromFoldable (lowerCase tail scruts alts)
+  -- GER run point (ADR-0099): `perform t ≃ t unit` — a one-argument (unit) call, tail-aware so a
+  -- self-tail `perform` still loops.
+  CPerform t ->
+    (lowerAtom t : List.singleton (lowerAtom (AtomLit (L.LInt 0))))
+      <> List.singleton (if tail then TailCall 1 else Call 1)
   c -> let v = lowerValue' c in if tail then v <> List.singleton Return else v
 
 -- | The non-control computations: each leaves exactly one value on the stack.

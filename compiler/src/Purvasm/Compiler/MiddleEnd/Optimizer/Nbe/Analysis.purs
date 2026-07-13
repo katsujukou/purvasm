@@ -260,6 +260,8 @@ auditStrip markUsages term marks = Set.difference marks (auditE Map.empty term).
     CAtom a -> atom env a
     -- a call owns `CapBranch`; everything else owns `CapClosure` and inherits its operands' caps.
     CApp h as -> atomsFrom env CapBranch 1 (Array.cons h as)
+    -- a run point performs — treated like a call for motion (`CapBranch`).
+    CPerform a -> atomsFrom env CapBranch 1 [ a ]
     CPrim _ as -> atomsFrom env CapClosure 1 as
     CCtor _ _ as -> atomsFrom env CapClosure 1 as
     CArray as -> atomsFrom env CapClosure 1 as
@@ -384,6 +386,7 @@ infoC env = case _ of
   CUpdate a ups -> bump (mergeI (useAtom a) (useAtoms (map _.val ups)))
   CIf a t e -> bump (mergeI (useAtom a) (capAt CapBranch (mergeI (infoExpr env t) (infoExpr env e))))
   CCase scruts alts -> bump (mergeI (useAtoms scruts) (capAt CapBranch (foldl (\i alt -> mergeI i (infoAlt env alt)) emptyI alts)))
+  CPerform a -> bump (useAtom a)
   where
   bump i = i { size = i.size + 1 }
 

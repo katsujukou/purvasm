@@ -363,6 +363,7 @@ argUsesOf ps body = ps <#> \p -> goE p { total: 0, projected: 0, appliedHead: 0 
     CUpdate a us -> hits p (hit p u a) (map _.val us)
     CIf a t e -> goE p (goE p (hit p u a) t) e
     CCase ss alts -> Array.foldl (goAlt p) (Array.foldl (proj p) u ss) alts
+    CPerform a -> hd p u a
 
   goAlt p u alt = case alt.result of
     Uncond e -> goE p u e
@@ -573,6 +574,7 @@ deferMarks nbe = goE Set.empty
         CUpdate a us -> adds (add u a) (map _.val us)
         CIf a t e -> goUE true (goUE true (add u a) t) e
         CCase ss alts -> Array.foldl (goUAlt) (adds u ss) alts
+        CPerform a -> add u a
 
       goUAlt u alt = case alt.result of
         Uncond e -> goUE true u e
