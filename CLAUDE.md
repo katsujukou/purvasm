@@ -13,6 +13,8 @@
   - Comments should explain **why** something is done, not **what** it does.
     Code should be written to be as self-descriptive as possible, making "what" comments unnecessary in principle.
     However, when an implementation must be made unusually complex due to performance optimizations, workarounds for bugs in external dependencies, or other unavoidable reasons, comments should explain the rationale behind such implementations.
+  - Do not misinterpret this comment guideline as a loophole to justify implementing ad-hoc workarounds.
+    Workarounds are permitted only for bugs in **external dependencies** or other **unavoidable** reasons; writing a comment does not grant blanket permission to use them. In any event, if you find yourself compelled to consider such an approach, you must first explain the situation to a human maintainer and justify why the workaround is necessary.
   - Use the host language's **documentation-comment** form for the documentation of a *declaration* — a module's purpose (a preamble comment at the top of the file) and its public types, values, record fields, and variant constructors. In OCaml this is `(** ... *)` (in PureScript, `-- |`); place it in a valid documentation position (before the item, or trailing for a field/constructor). These feed generated docs (odoc) and editor hover, which ordinary comments do not.
     Reserve ordinary comments (`(* ... *)`) for implementation/"why" notes inside a definition; those are not interface documentation. (The OCaml dev build treats a misplaced documentation comment — warning 50 — as an error, so a `(**` comment must sit in a valid position.)
 
@@ -33,7 +35,7 @@
 
 - As a direct implcation of the above, unit tests should not be limited to representative inputs used in examples. Whenever practical, they should also cover edge cases, boundary conditions, invalid inputs, and other scenarios that are prone to subtle implementation errors.
 
-- This project includes a number of examples and benchmarks for demonstration purposes. Examples are intended to illustrate typical usage and provide a quick sanity check of expected behaviour. Benchmarks are intended solely for performance evaluation.
+- This project includes a number of examples and benchmarks for demonstration purposes. Examples are intended to illustrate typical usage and provide a quick sanity check of expected behaviour. Benchmarks are intended solely for performance evaluation. Therefore, examples should not include untypical code, such as edge cases or massive datasets for stress testing. Furthermore, it is inappropriate to consider the tests passed merely because the examples run successfully.
 
 ## Technical
 
