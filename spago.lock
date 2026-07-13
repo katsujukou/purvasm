@@ -33,6 +33,21 @@
           "dependencies": []
         }
       },
+      "bench-effect-ref": {
+        "path": "benchmarks/bench-effect-ref",
+        "core": {
+          "dependencies": [
+            "bench-common",
+            "console",
+            "effect",
+            "prelude",
+            "refs"
+          ]
+        },
+        "test": {
+          "dependencies": []
+        }
+      },
       "bench-fib": {
         "path": "benchmarks/bench-fib",
         "core": {
