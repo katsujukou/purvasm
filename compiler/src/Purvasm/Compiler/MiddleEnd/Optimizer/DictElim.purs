@@ -198,9 +198,11 @@ type ForeignLift = String -> Boolean
 -- | whole-program `dict_elim.ml` gets from running *after* link (the resolver has materialised these
 -- | as spine bindings, so `Hashtbl.mem tbl` accepts them); without it every `ulib` instance impl
 -- | (`{ add: Purvasm.Int.add, … }`) is unliftable and `DictElim` silently does nothing on overlaid
--- | programs. Deliberately **intrinsic-only, not the whole resolver ladder**: a lifted *structural*
--- | foreign (`Effect.bindE`) is materialisable only by the VM's link resolver — the LLVM backend's
--- | `readVar` has no lowering for it (structural impls would need an inline-the-guest-term design).
+-- | programs. Deliberately **intrinsic-only, not the whole resolver ladder** (`isJust <<< intrinsicPrim`):
+-- | a *structural* foreign (`Effect.bindE`) is GER-owned (ADR-0099 — `Impurify` lowers its dispatch to a
+-- | `CPerform`) and is materialised as a guest-term gdef by both backends (native `synthForeignGdefs`, VM
+-- | link resolver), so folding it into the dispatch *here* — bypassing that lowering — would be wrong; the
+-- | dispatch is left standing for GER.
 intrinsicLift :: ForeignLift
 intrinsicLift = isJust <<< intrinsicPrim
 

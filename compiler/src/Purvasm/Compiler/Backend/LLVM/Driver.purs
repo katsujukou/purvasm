@@ -30,11 +30,11 @@ import PureScript.CoreFn.Module (Module) as CF
 import Purvasm.Compiler (Backend, ForeignSigMap)
 import Purvasm.Compiler.Backend.LLVM.Interface (interfaceOfAnf)
 import Purvasm.Compiler.Backend.LLVM.Monad (MakeCxOptions)
-import Purvasm.Compiler.Backend.LLVM.Program (classifyDecl, classifyNonrec, entryLl, gdefKeys, moduleLl, surfaceFn)
+import Purvasm.Compiler.Backend.LLVM.Program (classifyDecl, classifyNonrec, entryLl, gdefInitKey, gdefKeys, moduleLl, surfaceFn)
 import Purvasm.Compiler.Backend.LLVM.Types (CallFact(..), Gdef(..))
 import Purvasm.Compiler.CESK.AST (Term(..))
 import Purvasm.Compiler.CESK.Translate (qualifiedKey)
-import Purvasm.Compiler.Ffi (intrinsicTerm, resolver)
+import Purvasm.Compiler.Ffi (resolver)
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), mapAtoms)
 import Purvasm.Compiler.MiddleEnd.Module (AnfModule, declsOfModule, mapDeclBodies)
 import Purvasm.Compiler.MiddleEnd.Normalize (normalize)
@@ -96,8 +96,9 @@ type LlvmContext =
 -- | is a plain literal (`Prim.undefined` and `Data.Unit.unit`, both the immediate `0`, ADR-0038) — to
 -- | their literal atom, so `Prim.undefined` no longer reaches codegen as an unbound `AtomVar`. These are
 -- | representation choices (a `Unit`/absurd placeholder), *not* FFI: unlike a primop (category B, the
--- | optimiser's `intrinsicPrim`) or a structural higher-order foreign (category C, headed for a `ulib`
--- | native `.c`), they carry no code. boot resolves them at link (before its `dict_elim`), so rewriting
+-- | optimiser's `intrinsicPrim`) or a structural higher-order foreign (category C, a guest term
+-- | `synthForeignGdefs` materialises as a gdef, ADR-0071 §6), they carry no code. boot resolves them at
+-- | link (before its `dict_elim`), so rewriting
 -- | to a literal atom here — not at codegen `readVar` (which would leave it an `AtomVar` that `evalAtoms`
 -- | may root, unlike boot's immediate) — keeps the rooting boot-identical. Runs before the `DictElim`
 -- | bridge to match boot's phase order (resolve → dict-elim).
@@ -108,24 +109,34 @@ resolveLitBuiltins = mapAtoms case _ of
     _ -> a
   a -> a
 
--- | Materialise a module's **compiler-kept intrinsic** foreign imports as synthesised gdefs (boot's link
--- | `runtimeMembers`, ADR-0038): for each `foreign import f` whose key `M.f` resolves to a non-literal
--- | intrinsic term (`Ffi.intrinsicTerm` — primop etas, `charId`/`intDegree`, `unsafeCoerce`), emit a gdef
--- | `M.f = <normalised term>` in **this** module's object (matching boot's `module_of_key` placement).
--- | Literal builtins (`unit`/`undefined`) are excluded — inlined by `resolveLitBuiltins`; structural
--- | higher-order foreigns are excluded by `intrinsicTerm` (category C → `ulib` `.c`). Under `--opt` the
--- | optimiser inlines a saturated intrinsic call, so the gdef is dead-stripped; under `--no-opt` the call
--- | stays and resolves to this gdef — the byte-identity reference (boot synthesises the same gdef).
--- | Reads only the CoreFn `source`, so it is row-polymorphic over its input — the whole-program `context`
--- | (a `ContextModule`) and the per-module lowering (a `LoweredModule`) both feed it (ADR-0090).
+-- | Materialise a module's **compiler-resolved** foreign imports as synthesised gdefs (boot's link
+-- | `foreign_groups`, ADR-0038 / ADR-0071 §6): for each `foreign import f` whose key `M.f` the resolver
+-- | binds to a non-literal guest term, emit a gdef `M.f = <normalised term>` in **this** module's object
+-- | (matching boot's `module_of_key` placement). This covers **both** rungs boot resolves at link:
+-- | the compiler-kept **intrinsics** (primop etas, `charId`/`intDegree`, `unsafeCoerce`) *and* the
+-- | **structural higher-order** guest terms (the `Effect`/`ST` monad glue, `Effect.Ref`/`STRef` as a
+-- | one-cell mutable array over the array primops — ADR-0071 §6 / ADR-0072 §9, `Fn*`/`ST*` uncurried
+-- | adapters, `Record.Builder`, `Data.Number.fromString`). boot draws no line between the two — every
+-- | `resolver`-resolved foreign is a link-time `foreign_group` — so neither does the native backend; a
+-- | structural foreign is a guest term substituted before codegen, **not** a host `.c` leaf. Literal
+-- | builtins (`unit`/`undefined`) are excluded — inlined by `resolveLitBuiltins`; genuine native leaves
+-- | (`resolver k = Nothing`) are excluded too — they lower to a `@pvf_` symbol (`resolveNativeForeigns`).
+-- |
+-- | The gdefs are emitted in **key order** and (at the call sites) **before** the module's own decls,
+-- | mirroring boot's `foreign_groups` (sorted by key, ADR link.ml) prepended to `module_reached`. Under
+-- | `--opt` the optimiser inlines/impurifies a saturated call, so the gdef is dead-stripped; under
+-- | `--no-opt` the call stays and resolves to this gdef — the byte-identity reference (boot synthesises
+-- | the same gdef). Reads only the CoreFn `source`, so it is row-polymorphic over its input — the
+-- | whole-program `context` (a `ContextModule`) and the per-module lowering (a `LoweredModule`) both feed
+-- | it (ADR-0090).
 synthForeignGdefs :: forall r. { source :: CF.Module | r } -> Array Gdef
-synthForeignGdefs lm = Array.mapMaybe synth lm.source.foreignNames
+synthForeignGdefs lm = Array.sortWith gdefInitKey (Array.mapMaybe synth lm.source.foreignNames)
   where
   synth fn =
     let
       key = qualifiedKey lm.source.name fn
     in
-      case intrinsicTerm key of
+      case resolver key of
         Just t | not (isLit t) -> Just (classifyNonrec key (normalize t))
         _ -> Nothing
 
@@ -201,7 +212,9 @@ llvmBackend opts =
   , lowerModule: \ctx lm ->
       let
         leaves = nativeLeafArities lm.foreignSigs
-        gdefs = map classifyDecl (bridgeModule ctx leaves lm.module).decls <> synthForeignGdefs lm
+        -- Foreign gdefs first (boot's `foreign_groups`, key-sorted by `synthForeignGdefs`), then the
+        -- module's own decls — the per-module view of boot's `foreign_groups @ module_reached`.
+        gdefs = synthForeignGdefs lm <> map classifyDecl (bridgeModule ctx leaves lm.module).decls
         defined = Set.fromFoldable (Array.concatMap gdefKeys gdefs)
       in
         moduleLl (ctx.cxOpts { foreignArity = leaves }) defined gdefs
@@ -209,8 +222,13 @@ llvmBackend opts =
       let
         -- the entry object's leaf set spans every module's leaves (the entry stub reaches any of them).
         allLeaves = foldl (\acc lm -> Map.union (nativeLeafArities lm.foreignSigs) acc) Map.empty input.modules
+        -- Match boot's linked spine `foreign_groups @ module_reached`: **all** foreign gdefs across the
+        -- program, sorted by key, precede **all** module decls (in dependency-spine order). `reachableGdefs`
+        -- then prunes to the entry's closure, preserving this order for `pv_init_all`.
+        allForeigns = Array.sortWith gdefInitKey (Array.concatMap synthForeignGdefs input.modules)
+        allDecls = Array.concatMap (\lm -> map classifyDecl (bridgeModule ctx (nativeLeafArities lm.foreignSigs) lm.module).decls) input.modules
       in
         entryLl (ctx.cxOpts { foreignArity = allLeaves }) ctx.isEffect ctx.heapWords
-          (Array.concatMap (\lm -> map classifyDecl (bridgeModule ctx (nativeLeafArities lm.foreignSigs) lm.module).decls <> synthForeignGdefs lm) input.modules)
+          (allForeigns <> allDecls)
           (nativeByteIdentityBridgeDictElim ctx allLeaves input.entry)
   }

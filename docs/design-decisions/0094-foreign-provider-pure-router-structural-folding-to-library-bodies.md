@@ -7,7 +7,7 @@
 
 The compiler's foreign provider (`Purvasm.Compiler.Ffi`, ported from boot's
 `Ffi`) resolves a foreign identifier through a ladder: `resolver key =
-intrinsicTerm key <|> structural key`. Two of these rungs carry very different
+Map.lookup key intrinsics <|> Map.lookup key structural`. Two of these rungs carry very different
 kinds of thing:
 
 - **`intrinsics`** — eta-expanded primops (`Purvasm.Int.add` → `\a b -> Prim(AddInt,[a,b])`),

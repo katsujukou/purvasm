@@ -163,9 +163,11 @@ spec = describe "Purvasm.Compiler.MiddleEnd.DictElim" do
       dictElimExpr intrinsicLift Set.empty full call
         `shouldEqual` Ret (CApp (AtomVar "Purvasm.Int.add") [ AtomVar "m", AtomVar "f" ])
 
-    it "declines a *structural*-foreign impl — only the VM's link resolver could materialise it" do
-      -- `Effect.bindE` is a structural (guest-term) foreign: the LLVM backend has no lowering for a
-      -- lifted reference to it (`readVar` unbound), so `liftable` must refuse — the dispatch stays.
+    it "declines a *structural*-foreign impl — it is GER-owned, not an intrinsic primop" do
+      -- `Effect.bindE` is a structural (guest-term) foreign, not an intrinsic primop, so `intrinsicLift`
+      -- (`isJust <<< intrinsicPrim`) refuses to fold it into the dispatch — it stays for GER (`Impurify`)
+      -- to lower to `CPerform`. (The guest-term body is now materialised as a gdef by both backends —
+      -- native `synthForeignGdefs`, VM link resolver — not folded here.)
       let
         m = machineryOf emptyMachinery
           [ Tuple "Control.Bind.bind" (accessor "bind")

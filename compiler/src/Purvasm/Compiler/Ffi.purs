@@ -6,7 +6,7 @@
 -- | native `TmForeign` exactly as it drops an unresolved name (host-resolved at run), so
 -- | for producing `app.pvm` the two are indistinguishable. Hand-written CESK terms; they
 -- | must match boot's verbatim for byte-identical linked images.
-module Purvasm.Compiler.Ffi (resolver, intrinsicPrim, intrinsicTerm) where
+module Purvasm.Compiler.Ffi (resolver, intrinsicPrim) where
 
 import Prelude
 
@@ -333,13 +333,6 @@ structural = Map.fromFoldable
 -- | The link resolver: intrinsic rung, then structural rung (first match).
 resolver :: String -> Maybe Term
 resolver key = Map.lookup key intrinsics <|> Map.lookup key structural
-
--- | The **intrinsic** rung only (not structural) — the compiler-kept foreigns (`Purvasm.*`/registry
--- | primops, `charId`/`intDegree`, `unsafeCoerce`, the literal builtins) whose definition the native
--- | backend materialises as a synthesised gdef (boot's link `runtimeMembers`). Structural higher-order
--- | foreigns (category C) are deliberately excluded — they head for a `ulib` native `.c`.
-intrinsicTerm :: String -> Maybe Term
-intrinsicTerm key = Map.lookup key intrinsics
 
 -- | The compile-time view of the intrinsic rung: the primop (and its arity) a foreign key
 -- | eta-expands to, or `Nothing` for non-eta intrinsics (constants, `charId`, `intDegree`),

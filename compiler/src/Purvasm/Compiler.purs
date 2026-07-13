@@ -51,7 +51,6 @@ import Purvasm.Compiler.Bytecode.Artifact (Interface)
 import Purvasm.Compiler.CESK.AST (Term(..))
 import Purvasm.Compiler.CESK.Translate (nameKey, qualifiedKey)
 import Purvasm.Compiler.ForeignSig (ForeignShape)
-import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Expr)
 import Purvasm.Compiler.MiddleEnd.Module (AnfModule, declsOfModule)
 import Purvasm.Compiler.MiddleEnd.Normalize (normalize)
@@ -285,15 +284,14 @@ topoOrder mods = Array.fromFoldable (List.reverse (snd (foldl visit (Set.empty /
 
   localDeps m = Array.filter (\n -> Map.member n mods) (importNames m)
 
--- | The program entry expression: an `Effect` entry (`isEffect`) is `<entry>.<name>` applied to unit (the
--- | `0` convention), run for effects; a bare value is read directly and printed.
+-- | The program entry expression: the **bare** `<entry>.<name>` reference, for both run modes — matching
+-- | boot's LLVM entry (the linked spine's `Var entry_key`, `link.ml`). The `isEffect` distinction is
+-- | carried by the flag threaded to `lowerEntry`, **not** by the entry expression: the `Effect` entry stub
+-- | hands this thunk to `pv_run_effect`, which itself applies it to unit (`run_effect main = apply main
+-- | [unit]`, ADR-0067 §2). Applying to unit *here* as well would double-perform — the effect runs during
+-- | the entry-expr eval, then `pv_run_effect` re-applies its (immediate) `Unit` result and faults.
 entryExprOf :: Options -> Expr
-entryExprOf opts =
-  let
-    key = opts.entryModule <> "." <> opts.entryName
-  in
-    if opts.isEffect then normalize (TmApp (TmVar key) (TmLit (LInt 0)))
-    else normalize (TmVar key)
+entryExprOf opts = normalize (TmVar (opts.entryModule <> "." <> opts.entryName))
 
 -- | The per-module fold state: the threaded optimiser env, and the emitted artifacts / optimised modules
 -- | accumulated in dependency order.
