@@ -142,5 +142,8 @@ language and are kept out of version control.)
 | [0093](0093-dictionary-specialization.md) | Dictionary specialization on the optimiser seam | Accepted |
 | [0094](0094-foreign-provider-pure-router-structural-folding-to-library-bodies.md) | Foreign provider is a pure router; structural folding moves to library bodies | Accepted |
 | [0095](0095-effect-analysis-on-the-optimizer-seam.md) | Effect analysis on the optimiser seam: purity facts unlock dead-drop of pure neutral calls | Accepted |
+| [0096](0096-memory-effect-summaries-pure-call-sink.md) | Memory-effect summaries: `mayTouchMutable` through call summaries; single-use pure clean calls sink | Accepted |
+| [0097](0097-materialised-size-audit-multi-use-marks.md) | The materialised-size audit: multi-use re-materialising marks are gated on transitive size | Accepted |
+| [0098](0098-effect-instance-dict-visibility-grouped-projection.md) | Effect instance-dictionary visibility: folding method projections off recursive dictionary CAFs (the `bindE`/`pureE` exposure GER needs) | Accepted |
 
 ## Scope
