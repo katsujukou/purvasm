@@ -57,10 +57,15 @@ type DictMachinery =
   { accessors :: Map String String
   , instances :: Map String (Map String Atom)
   , identities :: Set String
+  -- | Instance-dict keys the GER effect-family validator (ADR-0099 Slice 3, sidenote 0014) admitted
+  -- | as belonging to the `Effect` `Monad`-hierarchy group. `machineryOf` leaves this empty (it sees
+  -- | flattened members, not Rec groups); `localFactsOf` fills it from the raw `AnfModule` decls, and
+  -- | `mergeMachinery` unions dependencies' sets so a consumer sees the imported `Effect` family.
+  , effectFamily :: Set String
   }
 
 emptyMachinery :: DictMachinery
-emptyMachinery = { accessors: Map.empty, instances: Map.empty, identities: Set.empty }
+emptyMachinery = { accessors: Map.empty, instances: Map.empty, identities: Set.empty, effectFamily: Set.empty }
 
 -- | Union two machineries (a module's own over the imported env; keys are qualified so disjoint).
 mergeMachinery :: DictMachinery -> DictMachinery -> DictMachinery
@@ -68,6 +73,7 @@ mergeMachinery a b =
   { accessors: Map.union a.accessors b.accessors
   , instances: Map.union a.instances b.instances
   , identities: Set.union a.identities b.identities
+  , effectFamily: Set.union a.effectFamily b.effectFamily
   }
 
 -- | The newtype dict wrapper lowers to the identity `\x -> x`; see through it.
@@ -174,7 +180,10 @@ machineryOf imported pairs =
           entries
       )
   in
-    { accessors, instances, identities }
+    -- `effectFamily` is a module-**own** fact filled by `localFactsOf` (it needs the Rec-group
+    -- structure this function's flattened `pairs` input has lost); empty here, unioned with
+    -- dependencies' at `mergeMachinery`.
+    { accessors, instances, identities, effectFamily: Set.empty }
 
 -- | The policy axis on which the two `DictElim` call sites diverge (the split ADR-0086 §3 explicitly
 -- | sanctions, realised as a parameter rather than two definitions): may a *foreign-key* `AtomVar`

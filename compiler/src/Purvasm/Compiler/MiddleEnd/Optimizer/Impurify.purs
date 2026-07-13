@@ -22,6 +22,7 @@
 module Purvasm.Compiler.MiddleEnd.Optimizer.Impurify
   ( ownedKeys
   , structuralExclusions
+  , effectFamilyOf
   , impurifyExpr
   ) where
 
@@ -37,9 +38,10 @@ import Data.Set (Set)
 import Data.Set as Set
 import Data.String (Pattern(..), stripPrefix)
 import Data.Traversable (traverse)
-import Data.Tuple (Tuple(..))
+import Data.Tuple (Tuple(..), fst)
 import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.MiddleEnd.Module (Decl)
 import Purvasm.Compiler.MiddleEnd.Optimizer.DictElim (DictMachinery)
 
 -- | The GER-semantic role of a key, **orthogonal to its provider form** (a structural guest term,
@@ -49,8 +51,10 @@ import Purvasm.Compiler.MiddleEnd.Optimizer.DictElim (DictMachinery)
 -- | no structural-rung exclusion (unfolding it to `e unit` re-hides nothing). `unsafePerformEffect`
 -- | is currently a `ulib` shadow whose *use sites* this pass lowers; the `foreign import` flip is a
 -- | follow-up (ADR-0099 Correction), so the role — not the provider form — is what the descriptor
--- | records.
-data GerOrigin = StructuralGuest | EffectEliminator
+-- | records. `DerivedMethod` — a `Functor`/`Apply` method (`map`/`apply`) recognised on an
+-- | Effect-family dict (Slice 3); it has no owned foreign key and is never in the descriptor table
+-- | (synthesised by `recognize`), so it never anchors a family or leaves the structural rung.
+data GerOrigin = StructuralGuest | EffectEliminator | DerivedMethod
 
 derive instance Eq GerOrigin
 
@@ -101,6 +105,41 @@ lowerUnsafePerform = case _ of
   [ e ] -> pure (CPerform e)
   _ -> unsafeCrashWith "Impurify.lowerUnsafePerform: expected exactly 1 argument"
 
+-- | `functorEffect.map f m → \$u -> let a = perform m in f a` (ADR-0099 §5(a), Slice 3).
+lowerMap :: Array Atom -> Fresh CExpr
+lowerMap = case _ of
+  [ f, m ] -> do
+    u <- fresh
+    a <- fresh
+    pure (CLam [ u ] (Let a (CPerform m) (Ret (CApp f [ AtomVar a ]))))
+  _ -> unsafeCrashWith "Impurify.lowerMap: expected exactly 2 arguments"
+
+-- | `applyEffect.apply mf ma → \$u -> let f = perform mf in let a = perform ma in f a` (§5(a)).
+lowerApply :: Array Atom -> Fresh CExpr
+lowerApply = case _ of
+  [ mf, ma ] -> do
+    u <- fresh
+    f <- fresh
+    a <- fresh
+    pure (CLam [ u ] (Let f (CPerform mf) (Let a (CPerform ma) (Ret (CApp (AtomVar f) [ AtomVar a ])))))
+  _ -> unsafeCrashWith "Impurify.lowerApply: expected exactly 2 arguments"
+
+-- | The synthetic descriptors for the `Functor`/`Apply` methods, emitted by `recognize` when the
+-- | dispatch dict is Effect-family (Slice 3). Not in the descriptor table (no owned foreign key):
+-- | `origin = DerivedMethod`, so they never anchor a family or leave the structural rung.
+mapDescriptor :: GerDescriptor
+mapDescriptor = { key: "Effect.functorEffect.map", semanticArity: 2, origin: DerivedMethod, lowering: lowerMap }
+
+applyDescriptor :: GerDescriptor
+applyDescriptor = { key: "Effect.applyEffect.apply", semanticArity: 2, origin: DerivedMethod, lowering: lowerApply }
+
+-- | The `DerivedMethod` descriptor for a `Functor`/`Apply` method field name, else `Nothing`.
+methodDescriptor :: String -> Maybe GerDescriptor
+methodDescriptor = case _ of
+  "map" -> Just mapDescriptor
+  "apply" -> Just applyDescriptor
+  _ -> Nothing
+
 -- | The GER descriptor table (ADR-0099 Slice 2 keys). `pureE`/`bindE` are `StructuralGuest`;
 -- | `unsafePerformEffect` is an `EffectEliminator` (currently `ulib`-shadow-backed; see `GerOrigin`).
 descriptorList :: Array GerDescriptor
@@ -121,6 +160,63 @@ ownedKeys = Set.fromFoldable (map _.key descriptorList)
 structuralExclusions :: Set String
 structuralExclusions = Set.fromFoldable (map _.key (Array.filter (\d -> d.origin == StructuralGuest) descriptorList))
 
+-- | The GER **Effect-family** classifier (ADR-0099 Slice 3, sidenote 0014, fail-closed): from a
+-- | module's raw decls, the instance-dict keys of any recursive group whose whole shape matches the
+-- | `Effect` `Monad`-hierarchy structural ABI. This validates the compiler-owned `Effect` module's
+-- | instance-group shape — **not** a type-derived proof — so it is deliberately strict and
+-- | fail-closed: a mis-shaped or third-party group is never admitted (GER then leaves `map`/`apply`
+-- | to the slower-but-correct Slice-2 collapse).
+-- |
+-- | A recursive group is admitted **iff**: it has exactly five members, each a dict in
+-- | `machinery.instances`; the five roles below are each present exactly once (by their method
+-- | field, robust to `purs`'s superclass-accessor renaming); and the `Applicative`/`Bind` members
+-- | hold the `Effect.pureE` / `Effect.bindE` `StructuralGuest` anchors directly. More than one
+-- | matching group in a module fails closed (never expected).
+-- |
+-- | Roles (field-name sets, verified against the compiled `Effect` corefn): `Functor` `{map}`,
+-- | `Apply` `{apply, _sc}`, `Applicative` `{pure, _sc}`, `Bind` `{bind, _sc}`, `Monad`
+-- | `{_sc, _sc}` (no method).
+effectFamilyOf :: Array Decl -> DictMachinery -> Set String
+effectFamilyOf decls machinery =
+  case Array.mapMaybe admit recGroups of
+    [ ks ] -> ks
+    _ -> Set.empty -- zero admitted, or (never expected) more than one → fail closed
+  where
+  recGroups :: Array (Array String)
+  recGroups = Array.mapMaybe (\d -> if d.recursive then Just (map fst d.members) else Nothing) decls
+
+  admit :: Array String -> Maybe (Set String)
+  admit keys
+    | Array.length keys /= 5 = Nothing
+    | otherwise = case traverse (\k -> Map.lookup k machinery.instances) keys of
+        Nothing -> Nothing -- a member is not a known dict
+        Just fieldMaps ->
+          if Array.sort (map roleOf fieldMaps) == [ "Ap", "App", "B", "F", "M" ] then Just (Set.fromFoldable keys)
+          else Nothing
+
+  -- The role of an instance dict by its field set; `"invalid"` for anything off the expected shape
+  -- (a duplicate or invalid role makes the sorted-roles equality fail, so the group is rejected).
+  roleOf :: Map String Atom -> String
+  roleOf fm =
+    let
+      fields = Set.fromFoldable (Map.keys fm)
+      n = Set.size fields
+      -- the class methods present; each role admits *exactly one* method (plus superclass fields),
+      -- so a mis-shaped dict like `{ apply, map }` (two methods) is rejected — not read as `Apply`.
+      methodFields = Set.intersection fields (Set.fromFoldable [ "map", "apply", "pure", "bind" ])
+      oneMethod x = methodFields == Set.singleton x
+      fieldKey x = case Map.lookup x fm of
+        Just (AtomForeign k) -> k
+        Just (AtomVar k) -> k
+        _ -> ""
+    in
+      if fields == Set.singleton "map" then "F"
+      else if oneMethod "apply" && n == 2 then "Ap"
+      else if oneMethod "pure" && n == 2 && fieldKey "pure" == "Effect.pureE" then "App"
+      else if oneMethod "bind" && n == 2 && fieldKey "bind" == "Effect.bindE" then "B"
+      else if Set.isEmpty methodFields && n == 2 then "M"
+      else "invalid"
+
 -- | A key's descriptor, on either atom spelling (a foreign rides `AtomForeign` or a plain qualified
 -- | `AtomVar`, ADR-0096 review).
 descriptorOf :: Atom -> Maybe GerDescriptor
@@ -130,18 +226,25 @@ descriptorOf = case _ of
   _ -> Nothing
 
 -- | Recognise a computation as a GER application, returning its descriptor and the value arguments
--- | (after the dictionary, for a dispatch). Two shapes (ADR-0099 §5/§6): a bare GER foreign applied to
--- | args, or a statically-known `Effect` dispatch `accessor dict args` resolved through the machinery.
+-- | (after the dictionary, for a dispatch). Three shapes: a bare GER foreign applied to args
+-- | (ADR-0099 §5), a statically-known `Effect` dispatch `accessor dict args` whose impl is a GER key
+-- | (§6), and — Slice 3 — a `map`/`apply` dispatch on an **Effect-family** dict (`§5(a)`), whose impl
+-- | is the generic `liftA1`/`ap` (not a GER key) but whose canonical Effect `map`/`apply` GER emits
+-- | directly. The field-name is only the *selector*; the `effectFamily` membership is the gate (a
+-- | `map` on a non-family dict is left alone).
 recognize :: DictMachinery -> Atom -> Array Atom -> Maybe (Tuple GerDescriptor (Array Atom))
 recognize machinery head args = case descriptorOf head of
   Just desc -> Just (Tuple desc args)
   Nothing -> case head, Array.uncons args of
-    AtomVar acc, Just { head: AtomVar d, tail: rest } -> do
-      field <- Map.lookup acc machinery.accessors
-      fields <- Map.lookup d machinery.instances
-      impl <- Map.lookup field fields
-      desc <- descriptorOf impl
-      Just (Tuple desc rest)
+    AtomVar acc, Just { head: AtomVar d, tail: rest } -> case Map.lookup acc machinery.accessors of
+      Nothing -> Nothing
+      Just field ->
+        case Map.lookup d machinery.instances >>= Map.lookup field >>= descriptorOf of
+          Just desc -> Just (Tuple desc rest) -- impl is a GER foreign
+          Nothing
+            | Set.member d machinery.effectFamily
+            , Just desc <- methodDescriptor field -> Just (Tuple desc rest)
+            | otherwise -> Nothing
     _, _ -> Nothing
 
 -- | The canonical placement of a recognised GER application: `pre` = `let`-bindings to emit ahead of
@@ -231,6 +334,14 @@ impurifyExpr machinery e0 = evalState (goE e0) (maxGe e0)
     CRecord fs -> do
       h <- hoistAtoms (map _.val fs)
       pure { pre: h.pre, comp: CRecord (Array.zipWith (\f a -> f { val = a }) fs h.atoms) }
+    -- The `map`/`apply` **field projected off an Effect-family dict** (Slice 3): NbE turns the
+    -- `Data.Functor.map functorEffect` dispatch into this runtime projection (the group-recursive
+    -- `map` field never folds, ADR-0098), so the dispatch arm of `recognize` never sees it. Replace
+    -- the projection with the canonical Effect `map`/`apply` function (η-expanded); the enclosing
+    -- application reduces in the next NbE round.
+    CAccessor (AtomVar d) field
+      | Set.member d machinery.effectFamily
+      , Just desc <- methodDescriptor field -> applyGer desc []
     CAccessor a l -> do
       h <- hoistAtom a
       pure { pre: h.pre, comp: CAccessor h.atom l }

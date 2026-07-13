@@ -56,7 +56,7 @@ import Purvasm.Compiler.MiddleEnd.Module (AnfModule, Decl, declKeys, mapDeclBodi
 import Purvasm.Compiler.MiddleEnd.Optimizer.DictElim (DictMachinery, dictElimExpr, emptyMachinery, intrinsicLift, machineryOf, mergeMachinery)
 import Data.Lazy (force)
 import Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis (EffectFact, liftShape, moduleEffects, moduleEffectsLazy)
-import Purvasm.Compiler.MiddleEnd.Optimizer.Impurify (impurifyExpr)
+import Purvasm.Compiler.MiddleEnd.Optimizer.Impurify (effectFamilyOf, impurifyExpr)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe (candidatesOf, nbeBinding, nbeEnvOf)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Analysis (sizeExpr)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (InlineCandidate)
@@ -161,7 +161,13 @@ emptyBuildEnv = BuildEnv { dict: emptyMachinery, gkeys: Set.empty, inlines: Map.
 -- | dependency facts, so the self-pollution invariant is untouched.
 localFactsOf :: BuildEnv -> AnfModule -> LocalFacts
 localFactsOf (BuildEnv env) am =
-  { dict: machineryOf env.dict (Array.concatMap _.members am.decls)
+  { dict:
+      let
+        d0 = machineryOf env.dict (Array.concatMap _.members am.decls)
+      in
+        -- fill the module-own `effectFamily` (ADR-0099 Slice 3): `machineryOf` cannot — it lost the
+        -- Rec-group structure — so the validator runs here over the raw `am.decls` + `d0.instances`.
+        d0 { effectFamily = effectFamilyOf am.decls d0 }
   , gkeys: Set.fromFoldable (Array.concatMap declKeys am.decls)
   , foreignSigs: Map.empty -- source-derived; the driver injects the module's own shapes under --opt
   -- captured from the raw `am` here — before `optimizeModule`'s `DictElim`/`Nbe`/`Specialize`.

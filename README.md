@@ -54,12 +54,30 @@ The immediate goals are:
 
 Together, these steps produce a native compiler written in PureScript.
 
-Optimization is intentionally still modest. The current Level 1 compiler applies only a small set of
-optimizations, and the Level 2-and-later compilers do not yet optimize at all. Once the Level 2 compiler can
-compile PureScript applications to native code, optimization work will be guided by measured JS / ES /
-Purvasm three-way comparisons rather than by guesswork. The examples differential gate described in
-[ADR-0074](docs/design-decisions/0074-examples-multi-backend-differential-gate.md) is the first step toward
-making those comparisons routine.
+The LLVM native backend of the Level 1 compiler has largely been ported to Level 2, and it is verified by
+byte-for-byte identity against the `.ll` IR that the Level 1 compiler produces under the same optimization
+settings. For now, programs that compute only pure values can be compiled to native code by the Level 2
+compiler and run. `Effect` codegen is not yet supported because it depends on the effect analysis and
+impurification carried out in the upstream MiddleEnd.
+
+The most active area of development right now is the MiddleEnd optimization pipeline. To reach the goal of
+self-hosting the Level 2 compiler as quickly as possible, the Level 1 compiler has a simplified MiddleEnd
+and performs almost no advanced optimization. Because of this, byte-for-byte identity with the binaries
+emitted by Level 1 cannot serve as a reliable gate for the correctness of the optimization pipeline that
+Level 2 is ultimately meant to have. In addition, for the reason noted above, general programs that use
+`Effect` cannot be compiled to native code via LLVM until the MiddleEnd's effect-lowering machinery is
+complete.
+
+For this reason, work on the optimization pipeline currently compiles to bytecode rather than native code,
+and progresses by measuring the effect of each optimization against the deterministic metrics of the VM —
+allocation counts and instruction step counts. The current five-benchmark corpus executes about 55% fewer VM instructions on average under Level2 with optimizer enabled than under unopttimized Level 2
+
+- [x] Dictionary elimination
+- [x] NbE general inliner (thanks to the great prior art of purescript-backend-optimizer)
+- [x] Dictionary specialization (à la GHC)
+- [x] Effect analysis and memory-effect summaries
+- [ ] *WIP* ... Effect reflection / Impurification
+- [ ] Higher-order specialization
 
 ## Development Guide
 

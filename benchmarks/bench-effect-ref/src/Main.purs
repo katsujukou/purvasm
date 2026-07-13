@@ -2,7 +2,9 @@
 -- | `forE` loop whose body is an `Effect` do-block reading and writing a `Ref`. Unlike `count-state`
 -- | (whose hot loop is `State`/`Identity` dictionary dispatch), this is the **`Effect`-thunk** cost
 -- | centre — the `bind`/`discard`/`pure` glue GER collapses, plus the `Ref` reads/writes and the
--- | `forE` structural combinator. The printed final accumulator (= `n·(n-1)/2`) is the self-check.
+-- | `forE` structural combinator. Only even `i` are added, so the printed accumulator is
+-- | `m·(m-1)` where `m = ⌈n/2⌉` (the count of even `i` in `[0,n)`) — e.g. `249500` for `n = 1000` —
+-- | the self-check.
 module Bench.EffectRef.Main where
 
 import Prelude

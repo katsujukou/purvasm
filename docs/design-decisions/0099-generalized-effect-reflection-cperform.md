@@ -134,6 +134,48 @@
 > serves `--no-opt`; the `foreign import` flip + forced facts + `resolver` fallback are the
 > follow-up.
 
+> **Progress (2026-07-13): effect-hot benchmark + Slice-3 measurement.** The GER track had no
+> effect-thunk instrument (the ADR §Verification prerequisite): added `benchmarks/bench-effect-ref`
+> (`Bench.EffectRef.Main` — a `forE` loop whose body is `when (even i) (void (Ref.modify (_+i)
+> acc))`, spanning `bind`/`discard`/`when`/`void`/`map` + `Ref` + `forE`), registered in the
+> `--opt-effect` gate. It builds and runs correctly (VM `--opt`, output `249500` for `n=1000`),
+> `--opt` ratio **1.199** (16.6% reduction); the full gate stays green (fib 3.131 / count-state
+> 1.801 / effect-ref 1.199 / map-fold 1.896 / quicksort 1.869 / json 2.980; self-compile `size×`
+> 1.126; all `time×` < 4.0). **Measurement-driven Slice-3 scoping** (maintainer chose
+> measure-first): inspecting `Bench.EffectRef.Main.pmo` at `--opt` shows `bind`/`discard`/`pure`/
+> `when`/`unless` **already collapse** (Slice 2 + NbE — `discard` is byte-identical to the `bindE`
+> `CPerform` tree; `when`'s `else` is `pureE unit → \$u -> unit`), while **`map`/`apply` do not**:
+> `void` survives as a per-use `Effect.functorEffect` `map`-field projection. So Slice 3 reduces to
+> the §5(a) `functorEffect.map` / `applyEffect.apply` **direct rewrite** (maintainer scope: map/apply
+> only — `discard`/`when`/`unless` need no dedicated handling). The recognition of the `Effect`
+> `Functor`/`Apply` instances **without name hardcoding** is non-trivial (the `map` impl is generic
+> `liftA1` and its superclass link is a cross-module-opaque local); the design options are analysed
+> in [sidenote 0014](sidenotes/0014-ger-map-apply-recognition-design.md), which recommends the
+> **Rec-group anchor**, fail-closed (a full structural-ABI match of the five-dict `Effect`
+> `Monad`-hierarchy shape, anchored on the `pureE`/`bindE` fields).
+
+> **Progress (2026-07-13): Slice 3 implemented** (`map`/`apply` direct rewrite). `DictMachinery`
+> gains `effectFamily :: Set String` (`mergeMachinery` unions it); `localFactsOf` fills the module's
+> own set via `Impurify.effectFamilyOf` — the fail-closed structural-ABI validator (sidenote 0014,
+> review round 2: exactly five members, the field-set multiset `{map}`/`{apply,_}`/`{pure,_}`/
+> `{bind,_}`/`{_,_}`, and the `{pure,_}`/`{bind,_}` members holding `Effect.pureE`/`bindE`
+> directly — surplus/deficit/duplicate/missing-anchor all reject). `Impurify.recognize` gains two
+> arms gated on `effectFamily`: a `Data.Functor.map`/`Control.Apply.apply` **dispatch**
+> (`map functorEffect f m`, seen at `early`) and — since NbE turns that dispatch into a runtime
+> `functorEffect.map` **projection** for the group-recursive dict (ADR-0098, never folds), so
+> `early`/the dispatch arm never sees it — a `CAccessor dict field` **projection** arm (caught at
+> `close`), both emitting `map f m → \$u -> let a = perform m in f a` / `apply mf ma → \$u -> let f
+> = perform mf in let a = perform ma in f a`. `discard`/`when`/`unless` are untouched (they already
+> collapse via Slice 2, as measured). **Gates:** 354 unit (12 new `Impurify` fixtures — the
+> validator's positive + five fail-closed negatives (incl. a two-method `{ apply, map }` shape),
+> the map/apply dispatch + projection rewrites (both `map` and `apply` projection), the
+> non-Effect-family no-ops) + 9 E2E green (new Slice-3 fixture: real-artifact `map`/`void` GER-
+> lower to `CPerform`, no residual `functorEffect` projection); `purs-tidy` clean. **Measured (the
+> Slice-3 payoff on `bench-effect-ref`):** the `--opt` ratio rises **1.199 → 1.965** (`--opt`
+> instructions 100 217 → 61 134) — `void` no longer projects `functorEffect.map`, it collapses to
+> `\m -> \$u -> perform m; unit`; the other benchmarks are unchanged, self-compile `size×` 1.126,
+> all `time×` < 4.0; `effect-ref` VM `--opt` output stays correct (`249500`). Uncommitted.
+
 ## Context
 
 [ADR-0098](0098-effect-instance-dict-visibility-grouped-projection.md) closed the

@@ -293,3 +293,20 @@ paritySpec = describe "ADR-0094 fold parity (sliced structural keys ride the uli
     -- projection / accessor is fully devirtualized — nothing of the dispatch surface survives.
     refsAny [ "Effect.pureE", "Effect.bindE" ] `shouldEqual` false
     refsAny [ "Effect.bindEffect", "Effect.applicativeEffect", "Control.Bind.bind", "Control.Applicative.pure", "Control.Bind.discard" ] `shouldEqual` false
+
+  it "ADR-0099 Slice 3: Effect map/void GER-lower to CPerform (no functorEffect dict projection)" do
+    mods <- load [ "Data.Unit", "Type.Proxy", "Data.Functor", "Control.Apply", "Control.Applicative", "Control.Bind", "Control.Monad", "Effect" ]
+    let
+      out = optimizeProbe mods
+        -- `map`: recognised at `early` as a dispatch (`Effect.functorEffect` ∈ effectFamily);
+        -- `void`: NbE inlines it to a `functorEffect.map` projection, caught at `close`.
+        [ Tuple "Parity.T.m" (A.Ret (A.CApp (avar "Data.Functor.map") [ avar "Effect.functorEffect", avar "f", avar "m" ]))
+        , Tuple "Parity.T.v" (A.Ret (A.CApp (avar "Data.Functor.void") [ avar "Effect.functorEffect", avar "m" ]))
+        ]
+      performs key = Array.any (\(Tuple k e) -> k == key && usesPerform e) out
+      refsAny names = Array.any (\(Tuple _ e) -> Array.any (\n -> refsName n e) names) out
+    -- both reflect the mapped/voided effect to an explicit run marker
+    performs "Parity.T.m" `shouldEqual` true
+    performs "Parity.T.v" `shouldEqual` true
+    -- and the `functorEffect` dict projection / the `Data.Functor.*` dispatch is fully gone
+    refsAny [ "Effect.functorEffect", "Data.Functor.map", "Data.Functor.void" ] `shouldEqual` false
