@@ -3,6 +3,43 @@
 - Status: ~~Proposed~~ **Accepted** _(2026-07-13: accepted by the maintainer after five review rounds)_
 - Date: 2026-07-13
 
+> **Correction (2026-07-13, Slice 2 implementation — reviewer-directed).** Two refinements
+> to the pass structure and `unsafePerformEffect`, folded during Slice 2:
+>
+> 1. **`Impurify` runs at two points, as the same idempotent pass** — `early` and `close`
+>    — around the reduction core:
+>    ```
+>    DictElim → Impurify(early) → EffectAnalysis → NbE → Specialize → Impurify(close)
+>             → enforceOuterKinds → summary
+>    ```
+>    `early` lowers the GER atoms **already exposed** *and* the **known `Effect` dispatch**
+>    recognised directly via `DictMachinery` (`Control.Bind.bind Effect.bindEffect m k` →
+>    canonical, §6 — the *main* path; waiting for NbE to expose the bare foreign is the
+>    auxiliary path, not the primary one). `close` collects any GER atom that NbE's grouped
+>    projection / `Specialize` newly exposed *this* round. Because no optimisation runs after
+>    `close`, a freshly-produced `CPerform` reaches codegen as a conservative barrier — and
+>    **no GER-owned structural foreign can leak to the backend even at `--opt-max-iter 1`**
+>    (the earlier plan, relying only on the next round's `early`, left a bare `Effect.bindE`
+>    for codegen when the fixpoint was capped at one round). NbE is **not** moved before
+>    `Impurify`: `Impurify`'s job is to raise the `CPerform` run-boundary *before* NbE may
+>    move or drop the term, so the analysis sees it.
+> 2. **`unsafePerformEffect` is a compiler-known effect *eliminator*.** Its GER descriptor
+>    `origin` is a distinct **`EffectEliminator`** — a GER-semantic role *separate* from
+>    provider form (do not overload one enum) — and `--opt` lowers `unsafePerformEffect e` to
+>    `CPerform e`. **Current state (Slice 2): the `ulib` PS shadow (`(unsafeCoerce eff) unit`)
+>    is retained** — `Impurify` recognises and lowers the shadow's *use sites*, and the shadow
+>    body itself is the correct `--no-opt` fallback. **The ownership flip — replacing the shadow
+>    with a `foreign import unsafePerformEffect :: Effect a -> a` + a `resolver` guest term
+>    `\e -> e unit` fallback + forced effect facts (`vsat = true, mtouch = true` at exact
+>    saturation, since FSR mis-classifies `Effect a -> a` as pure — the argument, not the
+>    result, carries the effect) — is deferred to a follow-up** (maintainer decision; see the
+>    `unsafePerformEffect` Progress note). The shadow leaking the run representation into
+>    PureScript source is the *reason* the flip is wanted, not yet done.
+>
+> The `GerDescriptor.origin` enum is therefore `StructuralGuest | EffectEliminator`;
+> `structuralExclusions` (§3) stays the `StructuralGuest` subset (`pureE` / `bindE`), and
+> `EffectEliminator` keys carry no structural-rung exclusion.
+
 > **Progress (2026-07-13): Slice 1 implemented** (semantic scaffolding). `CPerform Atom`
 > added to the ANF (`mapAtoms` / `FreeVars` / `Pretty`), `NPerform Sem` to the NbE `Comp`
 > domain — `Eval.performSem` β-reduces `perform (\$u -> body)` in place and pins every
@@ -36,6 +73,66 @@
 >   neutered); and the `.pmi` `ExportKind` mode-stability check (a real CAF `let g = \x ->
 >   x in g` reduces to a lambda yet stays `Ecaf` under `--opt`, matching the `--no-opt`
 >   raw decls — via `classifyDecl`/`gdefKindMap`).
+
+> **Progress (2026-07-13): Slice 2 core implemented** (`pureE` / `bindE` canonical lowering).
+> New `Optimizer/Impurify.purs`: the `GerDescriptor` table (`Effect.pureE` / `Effect.bindE`
+> `StructuralGuest`, `Effect.Unsafe.unsafePerformEffect` `EffectEliminator`), `ownedKeys` /
+> `structuralExclusions` derived from it, and `impurifyExpr machinery` — recognising a bare
+> GER foreign at any saturation *and* a known `Effect` dispatch resolved through
+> `DictMachinery` (§6, the main path), η-expanding under-applications and splicing a `let`
+> for over-applications. Wired at **two points** (Correction): `early` (before
+> `EffectAnalysis`/NbE) and `close` (after `Specialize`). `Effect.pureE`/`bindE` leave the
+> NbE structural rung (§3, `Nbe.structural` guard) while the link-time `resolver` keeps them
+> for `--no-opt`. Bare GER keys in **value positions** (a `CAtom`, an argument, a record /
+> array / constructor field, a scrutinee) are η-expanded and (except at a `CAtom`)
+> `let`-hoisted — not only applied heads — so no GER-owned structural foreign survives as a
+> data reference (review round 1, P1-A); the `$ge` fresh supply seeds above the highest `$ge`
+> already in the body (`maxGe`) so a second-point / next-round run cannot capture a prior
+> `$ge` binder (P1-B). **Gates:** 342 unit (12 `Impurify` fixtures — pure/bind/unsafePerform
+> lowering, dispatch-via-machinery, η-expansion, over-application splice, idempotency,
+> non-GER pass-through; bare-`CAtom` / record-field / call-argument value-position hoisting;
+> `$ge` non-capture) + 8 E2E green (the ADR-0098 fixture is rewritten as the Slice 2
+> end-to-end: a real-artifact `Effect` do-block's `pure`/`bind`/`discard` dispatch GER-lowers
+> to canonical `CPerform`, no residual `Effect.bindE`/`pureE`/dispatch); `purs-tidy` clean;
+> `--opt-effect` — the 5 micro-benchmarks each drop a uniform **−11 instructions** at `--opt`
+> (their `main :: Effect …` entry's glue now GER-lowers), ratios/`size×` otherwise unchanged,
+> `time×` < 4.0; **VM self-compile completes** (the compiler is itself `Effect`-heavy, so
+> this exercises GER lowering on real `Effect` code — no non-convergence), `size×` 1.126.
+>
+> **End-to-end verification (real `Effect` program, `examples/effect-ref` — do-block
+> `bind`/`discard`, `Ref`, `whileE`, `whenM`).** On the **VM** at `--opt` (default
+> `--opt-max-iter` 10): builds and runs correctly (`The final result is 16`), output
+> **identical to `--no-opt`** (the `--opt == --no-opt == oracle` differential the ADR
+> requires) — GER's use-site lowering is behaviour-preserving and iteration-safe (the
+> `close` pass catches use sites regardless of round count). On the **LLVM backend**, the
+> P1-A value-position hoisting **resolved the original `Effect.bindE` crash**: the `Effect`
+> module — whose exported `bindEffect = { bind: Effect.bindE, … }` dictionary field is now
+> η-expanded and hoisted, not a bare foreign — **emits successfully** (mod_37; it previously
+> crashed at mod_28). The build now stops later, on a **different** structural foreign,
+> `Effect.Ref._new` (a `Ref` combinator GER Slice 2 does not own). That residual reproduces
+> **identically at `--no-opt`** (which runs none of GER) and is the **pre-existing
+> [effect-track] blocker generalised**: Level-2 LLVM cannot materialise *any* bare structural
+> foreign referenced from an exported binding (`Effect.Ref.*`, the loop combinators, …), a
+> **backend concern** — not GER's optimiser-seam lowering, not a Slice-2 regression, not
+> iteration-related. Fully compiling `Effect` on Level-2 LLVM belongs to the **backend
+> team's track** (synthesising structural-foreign gdefs, boot's `runtimeMembers` analogue);
+> whatever GER cannot reach as a *use site* (the `Ref` / loop keys land in Slices 4–5) still
+> needs that backend materialisation for exported data references. Uncommitted.
+>
+> **`unsafePerformEffect` finding (Slice 2, deferred sub-decision).** The `EffectEliminator`
+> descriptor is in place and **already lowers `unsafePerformEffect e` uses to `CPerform e`**
+> on the plain-`AtomVar` spelling (the `ulib` shadow's call sites) at `--opt`, with the shadow
+> body (`(unsafeCoerce eff) unit ≡ eff unit ≡ perform eff`) serving as the correct `--no-opt`
+> fallback — verified by a unit fixture and self-compile. The reviewer-directed **flip to a
+> `foreign import` + `resolver` fallback + forced effect facts** is therefore an *ownership*
+> refinement (stop the shadow leaking the run representation into PureScript source), not a
+> correctness fix — and it newly requires overriding FSR's shape (it classifies
+> `Effect a -> a` as `Opaque`/pure, since the result — not the argument — carries the
+> effect) plus a `ulib` rebuild + 3-backend verification. **Maintainer decision (2026-07-13):
+> deferred to a follow-up.** Slice 2 keeps the current state — the `EffectEliminator`
+> descriptor stays and lowers `unsafePerformEffect` *uses* to `CPerform` at `--opt`, the shadow
+> serves `--no-opt`; the `foreign import` flip + forced facts + `resolver` fallback are the
+> follow-up.
 
 ## Context
 
@@ -229,9 +326,13 @@ per key is the source of truth, with four fields:
   (`unsafePerformEffect` has no trailing unit at all — it already *takes* a thunk — so
   a uniform "subtract one" would be wrong; anchoring the definition to "arguments the
   rewrite needs" makes constructor and eliminator uniform.)
-- **`origin`** — `StructuralGuest` (the key has a `Ffi.structural` guest term:
-  `pureE` / `bindE` / `forE` / `whileE` / …) or `NativeForeign` (a native foreign with
-  no `Ffi.structural` entry: `unsafePerformEffect`).
+- **`origin`** — the key's **GER-semantic role**, orthogonal to its provider form.
+  `StructuralGuest` (a monad-glue combinator with an `Ffi.structural` guest term: `pureE`
+  / `bindE` / `forE` / `whileE` / …) or `EffectEliminator` (runs a thunk and yields its
+  value: `unsafePerformEffect`). The eliminator's provider form is a follow-up decision
+  (currently a `ulib` shadow whose use sites GER lowers; the `foreign import` flip is
+  deferred — see the Correction and the `unsafePerformEffect` Progress note); its `origin`
+  is `EffectEliminator` regardless.
 - **`lowering`** — the canonical GER rewrite (§5) that `Impurify` applies once the key
   is recognised at `semanticArity` (η-expanding an under-saturated occurrence first).
   Keeping it in the descriptor is what makes it the single source of truth — the
@@ -243,8 +344,8 @@ same set:
 - **`ownedKeys` = *all* landed descriptors** — every key `Impurify` recognises and
   lowers.
 - **`structuralExclusions` = the landed `StructuralGuest` descriptors only** — the
-  keys removed from `NbeEnv.structural`. A `NativeForeign` descriptor is owned (so it
-  is recognised and lowered) but has nothing in the structural rung to exclude.
+  keys removed from `NbeEnv.structural`. An `EffectEliminator` descriptor is owned (so it
+  is recognised and lowered) but carries no structural-rung exclusion.
 
 So recognition and lowering land together for every owned key; structural-rung
 exclusion happens only for the structural-backed subset. `semanticArity` is still
@@ -296,9 +397,14 @@ declined.
 - a canonical thunk is not double-wrapped;
 - re-applying the pass to the same module leaves the term unchanged.
 
-Like purs-wasm's `Impurify`, the walk must be **stack-safe** on compiler-sized modules
-(purs-wasm uses a `Trampoline`); purvasm's implementation must not consume the native
-stack on the self-compile corpus.
+Like purs-wasm's `Impurify`, the walk should ultimately be **constant-stack** on
+compiler-sized modules (purs-wasm uses a `Trampoline`). **Re-adjudicated at Slice 2
+implementation:** the shipped pass is ordinary structural recursion (depth = control-flow
+/ `let`-spine nesting), which meets the concrete bar — *no native-stack overflow on the
+self-compile corpus* (verified) — but the fully iterative / trampolined hardening is
+**owed, deferred** to match the sibling seam passes (`Quote`, `FreeVars`, which are also
+ordinary recursion with the same deferral). Promoting it is tracked with theirs, not a
+Slice-2 blocker.
 
 ### 4a. Binding-surface stability across `Impurify`
 
@@ -521,7 +627,7 @@ memory optimisation is a separate decision (see the mutation/ownership research 
 Each slice below lands its keys' `GerDescriptor`s (recognition + η-expansion +
 lowering) **and** removes that slice's `StructuralGuest` keys — the structural-backed
 subset, `structuralExclusions` (§3) — from `NbeEnv.structural` together (the atomic
-per-slice rule); a `NativeForeign` key is owned with no exclusion, and no key is
+per-slice rule); an `EffectEliminator` key is owned with no exclusion, and no key is
 excluded before its slice.
 
 ### Slice 2 — core `Effect` glue
@@ -592,8 +698,9 @@ purs-wasm has.
 **Performance / safety.**
 
 - VM instruction ratio; closure allocation / force count; `Effect`-loop
-  constant-stack behaviour; the self-compile `size×` / `time×` gate; stack-safe
-  traversal on compiler-sized terms (the trampoline discipline).
+  constant-stack behaviour; the self-compile `size×` / `time×` gate; no native-stack
+  overflow of the `Impurify` walk on the self-compile corpus (the fully trampolined
+  traversal is owed/deferred with the sibling passes — §4).
 
 An **effect-hot benchmark** is a prerequisite instrument: the current corpus has no
 `Effect`-thunk hot path (count-state's hot loop is `State` / `Identity` dictionaries).
