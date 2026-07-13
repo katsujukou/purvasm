@@ -36,6 +36,7 @@ import Data.Tuple (Tuple(..))
 import Data.Tuple.Nested (type (/\))
 import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.Compiler.Ffi (resolver)
+import Purvasm.Compiler.MiddleEnd.Optimizer.Impurify (structuralExclusions)
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (cfExpr, fvExpr)
 import Purvasm.Compiler.MiddleEnd.Normalize (normalize)
@@ -427,8 +428,11 @@ nbeEnvOf intrinsic deps decls =
     , nbe: { externs: Map.empty, intrinsic, structural: \_ -> Nothing }
     }
 
+  -- GER-owned `StructuralGuest` keys (`Effect.pureE`/`bindE`, ADR-0099 §3) leave the rung so NbE
+  -- cannot unfold them back to the guest term and re-hide the node `Impurify` lowers; the link-time
+  -- `resolver` still serves them for `--no-opt`.
   structural k =
-    if isJust (intrinsic k) then Nothing
+    if isJust (intrinsic k) || Set.member k structuralExclusions then Nothing
     else resolver k <#> \term ->
       let
         body = normalize term

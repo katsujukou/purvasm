@@ -56,6 +56,7 @@ import Purvasm.Compiler.MiddleEnd.Module (AnfModule, Decl, declKeys, mapDeclBodi
 import Purvasm.Compiler.MiddleEnd.Optimizer.DictElim (DictMachinery, dictElimExpr, emptyMachinery, intrinsicLift, machineryOf, mergeMachinery)
 import Data.Lazy (force)
 import Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis (EffectFact, liftShape, moduleEffects, moduleEffectsLazy)
+import Purvasm.Compiler.MiddleEnd.Optimizer.Impurify (impurifyExpr)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe (candidatesOf, nbeBinding, nbeEnvOf)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Analysis (sizeExpr)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (InlineCandidate)
@@ -185,7 +186,11 @@ optimizeModule (BuildEnv env) lf am =
     full = mergeMachinery lf.dict env.dict
     gkeys = Set.union lf.gkeys env.gkeys
     elimd = map (mapDeclBodies (dictElimExpr intrinsicLift gkeys full)) am.decls
-    nbe = nbeEnvOf intrinsicPrim env.inlines elimd
+    -- Impurify `early` (GER, ADR-0099 §4/§6): raise the `Effect` glue already exposed and the
+    -- statically-known `Effect` dispatch (via `full` machinery) to canonical `CPerform` ANF *before*
+    -- `EffectAnalysis`/NbE, so the run-boundary is visible when facts are computed and the term moved.
+    early = map (mapDeclBodies (impurifyExpr full)) elimd
+    nbe = nbeEnvOf intrinsicPrim env.inlines early
     -- The ADR-0095 effect-fact oracle. Dependency facts (their published summaries, their foreign
     -- shapes) and the module's own foreign shapes are stable; the module's own **binding**
     -- summaries are pass-local — recomputed here from the post-DictElim term each round (never
@@ -199,7 +204,7 @@ optimizeModule (BuildEnv env) lf am =
         Just s -> Just s
         Nothing -> liftShape <$> Map.lookup k env.foreignSigs
     -- own summaries stay lazy: only the callees the mark walk actually consults are computed.
-    ownEffects = moduleEffectsLazy depEffects elimd
+    ownEffects = moduleEffectsLazy depEffects early
     effectOracle k = case Map.lookup k ownEffects of
       Just s -> Just (force s)
       Nothing -> depEffects k
@@ -210,17 +215,22 @@ optimizeModule (BuildEnv env) lf am =
     -- to dependents. The growth floor keeps legitimate small-binding unfolds (a 5-node CAF
     -- normalising to a 20-node lambda) out of the backstop's reach; the blow-up class it exists
     -- for sits orders of magnitude above it.
-    optimised = elimd <#> \d ->
+    optimised = early <#> \d ->
       d { members = d.members <#> \(Tuple k e) -> Tuple k (backstop k e (nbeBinding nbe effectOracle k e)) }
     -- Dictionary specialization (ADR-0093): `Specialize ∘ Nbe ∘ DictElim` per round. Discovery on
     -- the (post-backstop) NbE output; emitted clones and rewritten sites become part of the
     -- module the next round (and the summary below) derive from.
     localInlines = candidatesOf intrinsicPrim env.inlines optimised
     specialized = specializeModule am.name lf.gkeys (Map.union localInlines env.inlines) optimised
-    -- Binding-surface guard (ADR-0099 §4a): after Specialize, before the module output and summary
-    -- are derived, re-share any binding a pass turned from a pre-opt non-lambda CAF into a lambda —
-    -- both `module` and `summary` below derive from the mode-stable `guarded` decls.
-    guarded = enforceOuterKinds lf.outerKinds specialized
+    -- Impurify `close` (GER, ADR-0099 Correction): a second, idempotent application after NbE /
+    -- grouped projection / `Specialize` may have exposed a bare GER foreign this round. No optimiser
+    -- pass runs after it, so a freshly-produced `CPerform` reaches codegen as a conservative barrier
+    -- — and no GER-owned foreign leaks to the backend even at `--opt-max-iter 1`.
+    closed = map (mapDeclBodies (impurifyExpr full)) specialized
+    -- Binding-surface guard (ADR-0099 §4a): after Specialize/close, before the module output and
+    -- summary are derived, re-share any binding a pass turned from a pre-opt non-lambda CAF into a
+    -- lambda — both `module` and `summary` below derive from the mode-stable `guarded` decls.
+    guarded = enforceOuterKinds lf.outerKinds closed
   in
     { module: am { decls = guarded }
     , summary:
