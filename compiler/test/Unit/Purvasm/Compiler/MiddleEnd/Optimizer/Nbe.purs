@@ -7,6 +7,7 @@ module Test.Unit.Purvasm.Compiler.MiddleEnd.Optimizer.Nbe where
 
 import Prelude
 
+import Data.Array as Array
 import Data.Map as Map
 import Data.Maybe (Maybe(..))
 import Data.Tuple.Nested ((/\))
@@ -32,6 +33,127 @@ int = AtomLit <<< LInt
 
 nonrec :: String -> Expr -> Decl
 nonrec k e = { recursive: false, members: [ k /\ e ] }
+
+-- ADR-0097 blow-up chains (all levels live; each level uses the previous twice) ------------------
+
+-- v1 = x + x; vN = v(N-1) + v(N-1); ret vN.
+primDiamond :: Int -> Expr
+primDiamond n = go 1
+  where
+  v i = var ("v" <> show i)
+  go i
+    | i > n = Ret (CAtom (v n))
+    | otherwise =
+        let
+          prev = if i == 1 then var "x" else v (i - 1)
+        in
+          Let ("v" <> show i) (CPrim AddInt [ prev, prev ]) (go (i + 1))
+
+-- w_i = v(i-1); v_i = w_i + w_i — the doubling veiled behind a transparent alias.
+aliasDiamond :: Int -> Expr
+aliasDiamond n = go 1
+  where
+  v i = var ("v" <> show i)
+  w i = var ("w" <> show i)
+  go i
+    | i > n = Ret (CAtom (v n))
+    | otherwise =
+        let
+          prev = if i == 1 then var "x" else v (i - 1)
+        in
+          Let ("w" <> show i) (CAtom prev)
+            (Let ("v" <> show i) (CPrim AddInt [ w i, w i ]) (go (i + 1)))
+
+-- l1 = \a -> a + x; l_i = \a -> Pair(l(i-1), l(i-1)) — small non-closed lambdas over the chain.
+lamDiamond :: Int -> Expr
+lamDiamond n = go 1
+  where
+  l i = var ("l" <> show i)
+  go i
+    | i > n = Ret (CAtom (l n))
+    | otherwise =
+        let
+          rhs =
+            if i == 1 then CLam [ "a" ] (Ret (CPrim AddInt [ var "a", var "x" ]))
+            else CLam [ "a" ] (Ret (CCtor "Pair" 2 [ l (i - 1), l (i - 1) ]))
+        in
+          Let ("l" <> show i) rhs (go (i + 1))
+
+-- P1 (alias laundering): v_i = { a: prev, b: prev } (KnownSize, single-use → marked); w_i = v_i
+-- (Trivial alias, used twice by v_{i+1}). Each v_i's direct use count is 1 (only w_i), so the
+-- KnownSize single-use exemption applies — but the alias carries the fan-out. Without policy
+-- inheritance (ShareOnly), the alias re-exposes the record as multi-use and the chain is 2^depth.
+knownAliasDiamond :: Int -> Expr
+knownAliasDiamond n = go 1
+  where
+  recOf a = CRecord [ { prop: "a", val: a }, { prop: "b", val: a } ]
+  go i
+    | i > n = Ret (CAtom (var ("w" <> show n)))
+    | otherwise =
+        let
+          prev = if i == 1 then var "x" else var ("w" <> show (i - 1))
+        in
+          Let ("v" <> show i) (recOf prev)
+            (Let ("w" <> show i) (CAtom (var ("v" <> show i))) (go (i + 1)))
+
+-- P2: a small **non-closed** lambda (references free `x`) whose body re-materialises a
+-- param-dependent inner small-deref `t = a + a` six times. Its syntactic size is under 16 (the
+-- free-var-only `M` keeps it), but its **materialised** body is over 16, so the recursive `M` must
+-- strip it when it is used more than once — sharing the lambda instead of duplicating it.
+p2Lambda :: Expr
+p2Lambda =
+  Let "l"
+    ( CLam [ "a" ]
+        ( Let "t" (CPrim AddInt [ var "a", var "a" ])
+            (Ret (CArray [ var "t", var "t", var "t", var "t", var "t", var "t", var "x" ]))
+        )
+    )
+    (Ret (CArray [ var "l", var "l" ]))
+
+-- A clean (pure, store-untouching) single-use call for the ADR-0096 sink oracle.
+cleanCallFact :: EffectFact
+cleanCallFact = { arity: 1, vsat: false, retVsat: false, mtouch: false, retMtouch: false }
+
+-- Count `CLam` nodes: a lambda that was shared appears once; a duplicated one appears N times.
+countLams :: Expr -> Int
+countLams = goE
+  where
+  goE = case _ of
+    Ret c -> goC c
+    Let _ c rest -> goC c + goE rest
+    LetRec bs rest -> Array.foldl (\acc b -> acc + goE b.rhs) 0 bs + goE rest
+  goC = case _ of
+    CLam _ b -> 1 + goE b
+    CIf _ t e -> goE t + goE e
+    CCase _ alts -> Array.foldl (\acc a -> acc + goAlt a) 0 alts
+    _ -> 0
+  goAlt a = case a.result of
+    Uncond e -> goE e
+    Guarded gs -> Array.foldl (\acc g -> acc + goE g.guard + goE g.rhs) 0 gs
+
+-- A local node counter for the linear-size ceilings (independent of the engine's own size pass).
+nodeCount :: Expr -> Int
+nodeCount = countE
+  where
+  countE = case _ of
+    Ret c -> countC c
+    Let _ c rest -> 1 + countC c + countE rest
+    LetRec bs rest -> 1 + Array.foldl (\acc b -> acc + countE b.rhs) 0 bs + countE rest
+  countC = case _ of
+    CAtom _ -> 1
+    CLam _ b -> 1 + countE b
+    CApp _ as -> 1 + Array.length as
+    CPrim _ as -> 1 + Array.length as
+    CCtor _ _ as -> 1 + Array.length as
+    CArray as -> 1 + Array.length as
+    CRecord fs -> 1 + Array.length fs
+    CAccessor _ _ -> 2
+    CUpdate _ ups -> 1 + Array.length ups
+    CIf _ t e -> 1 + countE t + countE e
+    CCase ss alts -> 1 + Array.length ss + Array.foldl (\acc a -> acc + countAlt a) 0 alts
+  countAlt a = case a.result of
+    Uncond e -> countE e
+    Guarded gs -> Array.foldl (\acc g -> acc + countE g.guard + countE g.rhs) 0 gs
 
 -- Normalise one body with no module siblings…
 nbe :: Expr -> Expr
@@ -121,6 +243,114 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
     it "a dead neutral call is kept absent purity facts (the conservative default)" do
       nbe (Let "a" (CApp (var "f") [ var "x" ]) (Ret (CAtom (int 1))))
         `shouldEqual` Let "$q1" (CApp (var "f") [ var "x" ]) (Ret (CAtom (int 1)))
+
+  describe "materialised-size audit (ADR-0097 §4)" do
+    -- The prim-version of the diamond: vN = v(N-1) + v(N-1), every level live. The small-deref
+    -- clause marks each level for re-materialisation; without the audit the marks compound
+    -- `2^depth` and quote stack-overflows (crashed at depth 12). The audit strips the over-budget
+    -- multi-use marks, restoring the kept/stripped/kept alternation.
+    it "the depth-3 diamond alternates kept/stripped/kept exactly" do
+      -- v1 kept (M=3): materialised as the two `x+x`; v2 stripped (M=7≥5): the shared `$q3`;
+      -- v3 kept: re-materialised into the tail as `$q3 + $q3` (= v2 + v2).
+      nbe (primDiamond 3)
+        `shouldEqual`
+          Let "$q1" (CPrim AddInt [ var "x", var "x" ])
+            ( Let "$q2" (CPrim AddInt [ var "x", var "x" ])
+                ( Let "$q3" (CPrim AddInt [ var "$q1", var "$q2" ])
+                    (Ret (CPrim AddInt [ var "$q3", var "$q3" ]))
+                )
+            )
+
+    it "the depth-4 diamond shares the doubling node instead of copying it 2^depth times" do
+      -- v2 shared as `$q3`; v3 kept, re-materialised twice (`$q4`, `$q5`) into v4's two uses.
+      nbe (primDiamond 4)
+        `shouldEqual`
+          Let "$q1" (CPrim AddInt [ var "x", var "x" ])
+            ( Let "$q2" (CPrim AddInt [ var "x", var "x" ])
+                ( Let "$q3" (CPrim AddInt [ var "$q1", var "$q2" ])
+                    ( Let "$q4" (CPrim AddInt [ var "$q3", var "$q3" ])
+                        ( Let "$q5" (CPrim AddInt [ var "$q3", var "$q3" ])
+                            (Ret (CPrim AddInt [ var "$q4", var "$q5" ]))
+                        )
+                    )
+                )
+            )
+
+    it "positive control: a one-level multi-use small prim still re-materialises (M=3 < 5)" do
+      -- let v1 = x + x in v1 + v1 — the small-deref clause's intended win, preserved: v1 is
+      -- inlined at both use sites (never shared) because its materialised size stays under bound.
+      nbe (Let "v1" (CPrim AddInt [ var "x", var "x" ]) (Ret (CPrim AddInt [ var "v1", var "v1" ])))
+        `shouldEqual`
+          Let "$q1" (CPrim AddInt [ var "x", var "x" ])
+            (Let "$q2" (CPrim AddInt [ var "x", var "x" ]) (Ret (CPrim AddInt [ var "$q1", var "$q2" ])))
+
+    -- The crash regressions: at these depths the pre-audit engine 2^depth-materialises and
+    -- stack-overflows *the whole suite* inside quote — a loud pin. Post-audit the term stays
+    -- linear in depth, so a small linear ceiling proves the exponential is gone.
+    it "the prim diamond at depth 20 normalises to a linear-size term (never 2^depth)" do
+      (nodeCount (nbe (primDiamond 20)) < 8 * 20) `shouldEqual` true
+
+    it "the alias-veiled diamond is caught through the rename (transparency)" do
+      -- w_i = v(i-1); v_i = w_i + w_i — the doubling hides behind an alias, yet M(w)=M(v(i-1))
+      -- carries the size through, so the audit strips at the same nodes.
+      (nodeCount (nbe (aliasDiamond 20)) < 8 * 20) `shouldEqual` true
+
+    it "the lambda-clause diamond stays bounded (small non-closed lambdas over marked binders)" do
+      -- l_i = \a -> Pair(l(i-1), l(i-1)) — the small-lambda clause's version of the same chain.
+      (nodeCount (nbe (lamDiamond 20)) < 16 * 20) `shouldEqual` true
+
+    it "P1: a KnownSize construction laundered through aliases stays linear (policy inheritance)" do
+      -- w_i = v_i (alias) carries the fan-out that v_i's single-use exemption dodges; the alias must
+      -- inherit v_i's ShareOnly policy and strip at multi-use, or the record chain re-explodes 2^depth.
+      (nodeCount (nbe (knownAliasDiamond 20)) < 8 * 20) `shouldEqual` true
+
+    it "P1: a single-use clean call is not duplicated through a multi-use alias" do
+      -- x = clean(a) (single-use → ADR-0096 sink); w = x; T(w, w). The alias inherits the call's
+      -- ShareOnly policy and is shared, so the call materialises once — never duplicated at both uses.
+      nbeFacts (Map.singleton "M.clean" cleanCallFact)
+        ( Let "x" (CApp (var "M.clean") [ var "a" ])
+            (Let "w" (CAtom (var "x")) (Ret (CCtor "T" 2 [ var "w", var "w" ])))
+        )
+        `shouldEqual`
+          Let "$q1" (CApp (var "M.clean") [ var "a" ])
+            (Ret (CCtor "T" 2 [ var "$q1", var "$q1" ]))
+
+    it "P2: a small non-closed lambda whose materialised body exceeds the bound is shared, not copied" do
+      -- \a -> let t = a+a in [t×6, x]: syntactic size < 16 but the materialised body is larger, and
+      -- the lambda is used twice. The recursive materialised size (not the free-var approximation)
+      -- strips the mark, so the optimised term holds the lambda once (shared), not two copies.
+      countLams (nbe p2Lambda) `shouldEqual` 1
+
+    it "P1(motion): a call embedded in a value used twice is shared, not duplicated (same capture)" do
+      -- x = clean(a) (single-use); p = x.field; [p, p]. `p` embeds the call, so it inherits the
+      -- call's CapBranch motion cap and is stripped at multi-use even at CapNone — else the call
+      -- would execute once per `p` copy. The call is bound once; `p` is the shared projection.
+      nbeFacts (Map.singleton "M.clean" cleanCallFact)
+        ( Let "x" (CApp (var "M.clean") [ var "a" ])
+            (Let "p" (CAccessor (var "x") "field") (Ret (CArray [ var "p", var "p" ])))
+        )
+        `shouldEqual`
+          Let "$q1" (CApp (var "M.clean") [ var "a" ])
+            (Let "$q2" (CAccessor (var "$q1") "field") (Ret (CArray [ var "$q2", var "$q2" ])))
+
+    it "P1(motion): a call embedded in a value used inside a lambda stays shared outside it" do
+      -- x = clean(a); r = {value: x}; l = \u -> r; [l, l]. Not an alias — `r` embeds the call. The
+      -- record inherits the call's ShareOnly + CapBranch motion cap; `r` is used at CapClosure
+      -- (inside l), which exceeds CapBranch, so `r` is shared *outside* the lambda. The call is bound
+      -- once at the top (never duplicated, never moved into the closure — the ADR-0096 boundary).
+      nbeFacts (Map.singleton "M.clean" cleanCallFact)
+        ( Let "x" (CApp (var "M.clean") [ var "a" ])
+            ( Let "r" (CRecord [ { prop: "value", val: var "x" } ])
+                (Let "l" (CLam [ "u" ] (Ret (CAtom (var "r")))) (Ret (CArray [ var "l", var "l" ])))
+            )
+        )
+        `shouldEqual`
+          Let "$q1" (CApp (var "M.clean") [ var "a" ])
+            ( Let "$q2" (CRecord [ { prop: "value", val: var "$q1" } ])
+                ( Let "$q4" (CLam [ "$q3" ] (Ret (CAtom (var "$q2"))))
+                    (Let "$q6" (CLam [ "$q5" ] (Ret (CAtom (var "$q2")))) (Ret (CArray [ var "$q4", var "$q6" ])))
+                )
+            )
 
   describe "dead-drop with purity facts (ADR-0095 §3, the dead-only branch)" do
     it "fires: a dead pure call is dropped in place" do
