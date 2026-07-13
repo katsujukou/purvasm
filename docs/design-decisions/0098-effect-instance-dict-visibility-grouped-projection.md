@@ -12,6 +12,30 @@
 > substituted or dropped (see *The publication rule*). A **computation-chain
 > non-publication** negative fixture is added to Verification.
 
+> **Progress (2026-07-13): implemented** (after the concurrent NbE bug-fix, ADR-0097,
+> landed). One clause in `candidatesOf`'s grouped arm (`pureRecordTail` nullary Rec
+> member → `arity: Just 0` grouped candidate) plus the `pureRecordTail` helper; no
+> `Eval` change. Fixtures: 5 unit (`describe "nullary Rec-group dict CAF projection
+> (ADR-0098)"` — positive `bindE`/`pureE` fold, GER-un-unfolded under-saturated node,
+> `Apply0` sibling-refusal + re-run stability, whole-dict-stays-a-reference,
+> computation-let non-publication) → **318/318**; 1 E2E (real `output/Effect` through
+> the `optimizeProbe` seam: `pure`/`bind`/`discard` expose `Effect.pureE`/`bindE`, the
+> dict-CAF/accessor gone) → **8/8**. `purs-tidy` clean.
+>
+> **Measured (opt-effect gate).** Deterministic metrics healthy: every benchmark
+> drops a uniform **−21 instructions** at `--opt` (a small real devirtualization win
+> — a recursive dict-group projection now folds; ratios and `--no-opt` unchanged),
+> per-benchmark `size×` unchanged (±0.001), self-compile `size×` 1.109 → 1.122 (well
+> under the 1.5 gate — more devirtualization enlarges the `--opt` output slightly).
+> The wall-clock `time×` gate **passes (harness exit 0) on an idle machine** —
+> confirmed re-run: fib 3.38 / count-state 3.45 / map-fold 3.04 / quicksort 3.13 /
+> json 3.42, all under the 4.0 gate. Earlier breaches (quicksort 4.5–5.4) were
+> **machine-load noise**: a same-machine A/B with the change *reverted* measured
+> *higher* `time×` (quicksort 13.0, fib 8.2), and quicksort swung 4.5→13.0→3.1 across
+> runs as load changed — the instruction counts (deterministic) never moved. All
+> gates now green (instructions −21, `size×` ≤ 1.122 < 1.5, `time×` < 4.0).
+> Uncommitted (maintainer does git).
+
 ## Context
 
 Impurification (GER, ADR-0034) needs a concrete-`Effect` `do`-block to appear as
