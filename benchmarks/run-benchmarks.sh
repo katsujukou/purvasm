@@ -203,6 +203,41 @@ if [ "$OPT_EFFECT" = "1" ]; then
     fi
     printf '%-16s %-10s %14s %14s %8s %7s %7s %7s%s\n' "$name" "$start" "$oi" "$ni" "$ratio" "$red" "$sizer" "$timer" "$gate" | tee -a "$optsum"
   done
+  # The self-compile size leg (ADR-0089 self-compile extension): the compiler's own closure is
+  # the regression gate for the inliner blow-up class the five bench closures cannot see
+  # (measured before the fix: whole-closure 1.666, CST.Parser x14.5). Stack posture is
+  # diagnostic for now — the bytecode lowering is not stack-safe (its own work item), so this
+  # leg runs with explicit headroom and asserts SIZE only; the default-stack completion assert
+  # arrives when that item closes.
+  if [ -z "$ONLY" ]; then
+    sdir="$OUT/opt/self-compile"
+    rm -rf "$sdir"
+    mkdir -p "$sdir/opt" "$sdir/noopt"
+    sc_ok=1
+    PURVASM_LIB="$ULIB" node --stack-size=16384 "$L2_ENTRY" run --corefn-dir output \
+      --outdir "$sdir/noopt" --entry Purvasm.CLI.Main --no-opt >"$sdir/noopt.log" 2>&1 || sc_ok=0
+    PURVASM_LIB="$ULIB" node --stack-size=16384 "$L2_ENTRY" run --corefn-dir output \
+      --outdir "$sdir/opt" --entry Purvasm.CLI.Main >"$sdir/opt.log" 2>&1 || sc_ok=0
+    if [ "$sc_ok" = "0" ]; then
+      printf '%-16s %-10s %14s\n' "self-compile" "-" "COMPILE-FAILED" | tee -a "$optsum"
+      touch "$OUT/.opt-failed"
+    else
+      sso=$(pmo_bytes "$sdir/opt")
+      ssn=$(pmo_bytes "$sdir/noopt")
+      if [ "$sso" = "0" ] || [ "$ssn" = "0" ]; then
+        printf '%-16s %-10s %14s\n' "self-compile" "-" "NO-PMO-EMITTED" | tee -a "$optsum"
+        touch "$OUT/.opt-failed"
+      else
+        ssr=$(awk -v a="$sso" -v b="$ssn" 'BEGIN { printf "%.3f", a / b }')
+        sgate=""
+        if awk -v r="$ssr" -v m="$SIZE_RATIO_MAX" 'BEGIN { exit !(r > m) }'; then
+          sgate=" SIZE-GATE-EXCEEDED(>$SIZE_RATIO_MAX)"
+          touch "$OUT/.opt-failed"
+        fi
+        printf '%-16s %-10s %14s %14s %8s %7s %7s %7s%s\n' "self-compile" "-" "$sso" "$ssn" "-" "-" "$ssr" "-" "$sgate" | tee -a "$optsum"
+      fi
+    fi
+  fi
   echo
   echo "opt-effect summary → $optsum  (ratio = noopt/opt instructions; size×/time× = opt/noopt emitted-.pmo bytes and compile wall time, gated at $SIZE_RATIO_MAX/$TIME_RATIO_MAX per ADR-0089 §7)"
   # ratio bar chart next to the 4-way wall-clock PNGs. Note the scope difference: those graphs are
