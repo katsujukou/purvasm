@@ -247,3 +247,24 @@ paritySpec = describe "ADR-0094 fold parity (sliced structural keys ride the uli
       sliced = [ "arrayMap", "eqArrayImpl", "ordIntImpl", "ordNumberImpl", "ordStringImpl", "ordCharImpl", "ordBooleanImpl" ]
       offenders = Array.filter (\(Tuple _ fs) -> Array.any (\f -> Array.elem f sliced) fs) entries
     map fst offenders `shouldEqual` []
+
+  -- ADR-0098: a concrete-`Effect` do-block's `bind`/`pure`/`discard` dispatch devirtualizes all
+  -- the way through the mutually-recursive `Effect` instance group to the exposed `Effect.bindE` /
+  -- `Effect.pureE` structural foreigns (the GER-visibility prerequisite), on the real artifacts.
+  it "ADR-0098: Effect do-block dispatch exposes Effect.bindE / pureE through the real instance group" do
+    mods <- load [ "Data.Unit", "Type.Proxy", "Data.Functor", "Control.Apply", "Control.Applicative", "Control.Bind", "Control.Monad", "Effect" ]
+    let
+      out = optimizeProbe mods
+        [ Tuple "Parity.T.p" (A.Ret (A.CApp (avar "Control.Applicative.pure") [ avar "Effect.applicativeEffect", avar "x" ]))
+        , Tuple "Parity.T.b" (A.Ret (A.CApp (avar "Control.Bind.bind") [ avar "Effect.bindEffect", avar "m", avar "k" ]))
+        , Tuple "Parity.T.d"
+            (A.Ret (A.CApp (avar "Control.Bind.discard") [ avar "Control.Bind.discardUnit", avar "Effect.bindEffect", avar "a", avar "k" ]))
+        ]
+      exposes key name = Array.any (\(Tuple k e) -> k == key && refsName name e) out
+    -- each dispatch reaches the exposed foreign (bindE stays under-saturated, a GER-recognisable node)
+    exposes "Parity.T.p" "Effect.pureE" `shouldEqual` true
+    exposes "Parity.T.b" "Effect.bindE" `shouldEqual` true
+    exposes "Parity.T.d" "Effect.bindE" `shouldEqual` true
+    -- and the stalled dict-CAF projection / accessor is gone (dispatch fully devirtualized)
+    Array.any (\(Tuple _ e) -> refsName "Effect.bindEffect" e || refsName "Control.Bind.bind" e) out
+      `shouldEqual` false

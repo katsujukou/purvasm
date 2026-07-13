@@ -11,8 +11,12 @@
 -- | outer `optimizeModule` fixpoint (ADR-0087) resolves local chains one link per round, deeper
 -- | cross-module chains degrade to neutral calls, and the construction stays acyclic (no knot to
 -- | tie, and a multi-reference body is still evaluated at most once per round via its `Lazy`).
--- | Recursive decls are never published (a recursive reference stays a call — ADR-0089 §5), and a
--- | non-recursive binding cannot reference itself, so no self-stop is needed.
+-- | Recursive *function* decls are never published (a recursive reference stays a call — ADR-0089
+-- | §5). The exception is **dictionary-shaped** Rec-group members — parameterized builders
+-- | (`\dict -> {…}`, ADR-0089's Accepted extension) and nullary dictionary CAFs (`{…}`, ADR-0098) —
+-- | which are published as grouped candidates and evaluate **group-stopped** (`entryFromCandidate`
+-- | removes the whole group from scope), so re-entry is impossible and a projection folds only a
+-- | group-free field.
 module Purvasm.Compiler.MiddleEnd.Optimizer.Nbe
   ( candidatesOf
   , nbeBinding
@@ -109,9 +113,15 @@ preserveOuterShape input output = case input, output of
 -- |     `length args < arity` — the residual arity is published. A **saturated** (or
 -- |     unknown-arity) CAF application is a computation executed once at init and is **never**
 -- |     published: inlining it would re-execute it per use site.
+-- |   * a **dictionary-shaped Rec-group member** (`groupedBuilders`): a parameterized builder
+-- |     `\dict -> {…}` (ADR-0089's Accepted parameterized-instance extension) or a nullary
+-- |     dictionary CAF `{…}` (ADR-0098) — published carrying its whole group's key set. The
+-- |     consumer's entry evaluates **group-stopped** and a projection folds only a group-free field.
 -- |
--- | Recursive decls are never published (a recursive reference stays a call, ADR-0089 §5); the
--- | bound (`< 64`, the gate's largest size threshold) keeps the in-memory summary small.
+-- | A recursive *function* is never published (a recursive reference stays a call, ADR-0089 §5) —
+-- | the dictionary-shaped members above are the only Rec-group exception, and they need the
+-- | group-stopped self-stop (`entryFromCandidate`). The bound (`< 64`, the gate's largest size
+-- | threshold) keeps the in-memory summary small.
 candidatesOf
   :: (String -> Maybe { op :: PrimOp, arity :: Int })
   -> Map String InlineCandidate
@@ -158,11 +168,45 @@ candidatesOf intrinsic deps decls =
                     , group
                     , body: e
                     }
+              -- A **nullary** Rec-group dictionary CAF (ADR-0098): a *pure-value* `let` chain
+              -- whose tail is a record — the mutually-recursive instance shape `Effect`'s
+              -- `bindEffect` / `applicativeEffect` take (they Rec through
+              -- `applyEffect = { apply: ap monadEffect }`). Published as an `arity: Just 0` grouped
+              -- candidate carrying the whole group, so a bare reference (spine 0) rides the existing
+              -- `groupedProject` trigger (`spine length == arity == 0`): the body evaluates
+              -- group-stopped and a projection commits only on a **group-free** field
+              -- (`bindEffect.bind → Effect.bindE`; a sibling-referencing `Apply0` refuses and the
+              -- projection stays put). This is the last hop of an `Effect` do-block accessor chain
+              -- that otherwise stalls (GER's `bindE`/`pureE`-visibility prerequisite). The
+              -- predicate is **`pureRecordTail`, not `recordTail`**: `entryFromCandidate` marks
+              -- every outer chain binder, so a computation RHS in the chain would be
+              -- substituted/dropped behind an unrelated group-free commit — only pure-value RHSs
+              -- (`pureValueRhs`) are admissible.
+              _
+                | pureRecordTail e, sizeExpr e < publishBound, noSpecRefs e -> Just $ Tuple k
+                    { arity: Just 0
+                    , size: sizeExpr e
+                    , cxLeqDeref: false
+                    , closed: false
+                    , argUses: []
+                    , group
+                    , body: e
+                    }
               _ -> Nothing
     )
 
   recordTail = case _ of
     Let _ _ rest -> recordTail rest
+    Ret (CRecord _) -> true
+    _ -> false
+
+  -- The **soundness-load-bearing** variant of `recordTail` for the nullary grouped CAF (ADR-0098):
+  -- every `let` in the chain must bind a pure value (`pureValueRhs` — alias / lambda / ctor /
+  -- array / record), never a computation (`CApp` / prim / accessor / branch). `recordTail` alone
+  -- skips every RHS unconditionally, which for a candidate whose chain binders are all marked would
+  -- let a group-free projection commit while a computation binding was substituted or dropped.
+  pureRecordTail = case _ of
+    Let _ rhs rest -> pureValueRhs rhs && pureRecordTail rest
     Ret (CRecord _) -> true
     _ -> false
 

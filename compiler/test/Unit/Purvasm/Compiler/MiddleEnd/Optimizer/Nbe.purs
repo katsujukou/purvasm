@@ -1203,6 +1203,67 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
         (Let "q" (CApp (var "M.self") [ var "d0" ]) (Ret (CAccessor (var "q") "go")))
         `shouldEqual` stable
 
+  describe "nullary Rec-group dict CAF projection (ADR-0098)" do
+    let
+      -- The real optimized `Effect` instance shape: a *nullary* mutually-recursive dict group
+      -- (no dict parameter, unlike the parameterized builders above). `bindD` carries the
+      -- group-free foreign method fields (`bind`/`pure`) plus a superclass thunk `Apply0` that
+      -- references the group sibling `applyD`; `applyD` closes the cycle back to `bindD`.
+      dictGroup =
+        [ { recursive: true
+          , members:
+              [ "M.bindD" /\
+                  Let "t" (CLam [ "u" ] (Ret (CAtom (var "M.applyD"))))
+                    ( Ret
+                        ( CRecord
+                            [ { prop: "bind", val: AtomForeign "Effect.bindE" }
+                            , { prop: "pure", val: AtomForeign "Effect.pureE" }
+                            , { prop: "Apply0", val: var "t" }
+                            ]
+                        )
+                    )
+              , "M.applyD" /\ Ret (CRecord [ { prop: "apply", val: var "M.bindD" } ])
+              ]
+          }
+        ]
+      -- Same shape but the chain carries a *computation* binding (`r = M.eff x`): `pureRecordTail`
+      -- must reject it, so the CAF is never published and its projection cannot fold.
+      compGroup =
+        [ { recursive: true
+          , members:
+              [ "M.cbindD" /\
+                  Let "r" (CApp (var "M.eff") [ var "x" ])
+                    (Ret (CRecord [ { prop: "bind", val: AtomForeign "Effect.bindE" }, { prop: "self", val: var "M.cbindD" } ]))
+              ]
+          }
+        ]
+
+    it "positive: a group-free method field folds to its structural foreign (bindE / pureE)" do
+      nbeCross dictGroup [] (Ret (CAccessor (var "M.bindD") "bind"))
+        `shouldEqual` Ret (CAtom (AtomForeign "Effect.bindE"))
+      nbeCross dictGroup [] (Ret (CAccessor (var "M.bindD") "pure"))
+        `shouldEqual` Ret (CAtom (AtomForeign "Effect.pureE"))
+
+    it "GER un-unfolded: an under-saturated exposed bindE stays a recognisable node (not the thunk term)" do
+      -- `bindE` is arity 3 (the structural guest term); an `Effect` do-block applies only 2, so the
+      -- structural rung must NOT unfold it — the residual is the `Effect.bindE m k` node GER reads.
+      nbeCross dictGroup []
+        (Let "f" (CAccessor (var "M.bindD") "bind") (Ret (CApp (var "f") [ var "m", var "k" ])))
+        `shouldEqual` Ret (CApp (AtomForeign "Effect.bindE") [ var "m", var "k" ])
+
+    it "sibling-referencing field (Apply0) refuses the commit and stays the original projection" do
+      let stable = Ret (CAccessor (var "M.bindD") "Apply0")
+      nbeCross dictGroup [] stable `shouldEqual` stable
+      nbeCross dictGroup [] stable `shouldEqual` stable -- term stability on re-run
+
+    it "whole-dict demand stays a reference (the record is never inlined)" do
+      let e = Ret (CApp (var "someConsumer") [ var "M.bindD" ])
+      nbeCross dictGroup [] e `shouldEqual` e
+
+    it "computation-let non-publication (the P1 predicate): a computation-chain CAF never folds" do
+      let e = Ret (CAccessor (var "M.cbindD") "bind")
+      nbeCross compGroup [] e `shouldEqual` e
+
   describe "scrutinised-known-arg 64-tier + backstop (ADR-0089 self-compile extension)" do
     let
       -- Pad a body with dead pure lets so the candidate sits in the 16..63 band (below 16 the
