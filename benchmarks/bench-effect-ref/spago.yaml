@@ -1,0 +1,8 @@
+package:
+  name: bench-effect-ref
+  dependencies:
+    - bench-common
+    - console
+    - effect
+    - prelude
+    - refs

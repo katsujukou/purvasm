@@ -71,6 +71,7 @@ done
 BENCH_TABLE="
 fib             Bench.Fib.Main           250    8388608
 count-state     Bench.CountState.Main    1000   8388608
+effect-ref      Bench.EffectRef.Main     1000   8388608
 map-fold-array  Bench.MapFoldArray.Main  4000   33554432
 quicksort       Bench.Quicksort.Main     1000   33554432
 json-parse      Bench.JsonParse.Main     500    33554432
