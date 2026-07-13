@@ -5,13 +5,16 @@ module Test.Unit.Purvasm.Compiler.MiddleEnd.Optimizer.Impurify where
 
 import Prelude
 
+import Data.Array as Array
 import Data.Map as Map
 import Data.Set as Set
 import Data.Tuple (Tuple(..))
+import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..))
 import Purvasm.Compiler.MiddleEnd.Module (Decl)
 import Purvasm.Compiler.MiddleEnd.Optimizer.DictElim (DictMachinery, emptyMachinery)
-import Purvasm.Compiler.MiddleEnd.Optimizer.Impurify (effectFamilyOf, impurifyExpr)
+import Purvasm.Compiler.MiddleEnd.Optimizer.Impurify (effectFamilyOf, impurifyExpr, structuralExclusions)
+import Purvasm.Compiler.Primitive (PrimOp(..))
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
 
@@ -20,6 +23,10 @@ var = AtomVar
 
 foreign_ :: String -> Atom
 foreign_ = AtomForeign
+
+-- The unit value (Int immediate 0).
+u0 :: Atom
+u0 = AtomLit (LInt 0)
 
 -- Impurify with no dictionary machinery (bare-foreign recognition only).
 imp :: Expr -> Expr
@@ -247,3 +254,136 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Impurify" do
                     )
                 )
             )
+
+  describe "structural loop combinators → LetRec/CIf ANF (ADR-0099 §5, Slice 4)" do
+    it "untilE f → \\$u -> letrec go _ = if perform f then unit else go unit in go unit" do
+      imp (Ret (CApp (foreign_ "Effect.untilE") [ var "f" ]))
+        `shouldEqual`
+          Ret
+            ( CLam [ "$ge1" ]
+                ( LetRec
+                    [ { var: "$ge2"
+                      , rhs: Ret
+                          ( CLam [ "$ge3" ]
+                              ( Let "$ge4" (CPerform (var "f"))
+                                  (Ret (CIf (var "$ge4") (Ret (CAtom u0)) (Ret (CApp (var "$ge2") [ u0 ]))))
+                              )
+                          )
+                      }
+                    ]
+                    (Ret (CApp (var "$ge2") [ u0 ]))
+                )
+            )
+
+    it "forE lo hi f → the counted LetRec loop with perform (f i) and go (i+1)" do
+      imp (Ret (CApp (foreign_ "Effect.forE") [ var "lo", var "hi", var "f" ]))
+        `shouldEqual`
+          Ret
+            ( CLam [ "$ge1" ]
+                ( LetRec
+                    [ { var: "$ge2"
+                      , rhs: Ret
+                          ( CLam [ "$ge3" ]
+                              ( Let "$ge4" (CPrim LtInt [ var "$ge3", var "hi" ])
+                                  ( Ret
+                                      ( CIf (var "$ge4")
+                                          ( Let "$ge5" (CApp (var "f") [ var "$ge3" ])
+                                              ( Let "$ge6" (CPerform (var "$ge5"))
+                                                  ( Let "$ge7" (CPrim AddInt [ var "$ge3", AtomLit (LInt 1) ])
+                                                      (Ret (CApp (var "$ge2") [ var "$ge7" ]))
+                                                  )
+                                              )
+                                          )
+                                          (Ret (CAtom u0))
+                                      )
+                                  )
+                              )
+                          )
+                      }
+                    ]
+                    (Ret (CApp (var "$ge2") [ var "lo" ]))
+                )
+            )
+
+    it "whileE cond body → perform cond, then perform body + recurse only on the true branch" do
+      imp (Ret (CApp (foreign_ "Effect.whileE") [ var "c", var "b" ]))
+        `shouldEqual`
+          Ret
+            ( CLam [ "$ge1" ]
+                ( LetRec
+                    [ { var: "$ge2"
+                      , rhs: Ret
+                          ( CLam [ "$ge3" ]
+                              ( Let "$ge4" (CPerform (var "c"))
+                                  ( Ret
+                                      ( CIf (var "$ge4")
+                                          (Let "$ge5" (CPerform (var "b")) (Ret (CApp (var "$ge2") [ u0 ])))
+                                          (Ret (CAtom u0))
+                                      )
+                                  )
+                              )
+                          )
+                      }
+                    ]
+                    (Ret (CApp (var "$ge2") [ u0 ]))
+                )
+            )
+
+    it "foreachE as f → length outside the loop, index + perform (f el) + i+1 on the true branch" do
+      imp (Ret (CApp (foreign_ "Effect.foreachE") [ var "as", var "f" ]))
+        `shouldEqual`
+          Ret
+            ( CLam [ "$ge1" ]
+                ( Let "$ge2" (CPrim LengthArray [ var "as" ])
+                    ( LetRec
+                        [ { var: "$ge3"
+                          , rhs: Ret
+                              ( CLam [ "$ge4" ]
+                                  ( Let "$ge5" (CPrim LtInt [ var "$ge4", var "$ge2" ])
+                                      ( Ret
+                                          ( CIf (var "$ge5")
+                                              ( Let "$ge6" (CPrim IndexArray [ var "as", var "$ge4" ])
+                                                  ( Let "$ge7" (CApp (var "f") [ var "$ge6" ])
+                                                      ( Let "$ge8" (CPerform (var "$ge7"))
+                                                          ( Let "$ge9" (CPrim AddInt [ var "$ge4", AtomLit (LInt 1) ])
+                                                              (Ret (CApp (var "$ge3") [ var "$ge9" ]))
+                                                          )
+                                                      )
+                                                  )
+                                              )
+                                              (Ret (CAtom u0))
+                                          )
+                                      )
+                                  )
+                              )
+                          }
+                        ]
+                        (Ret (CApp (var "$ge3") [ AtomLit (LInt 0) ]))
+                    )
+                )
+            )
+
+    it "the ST loop twins use the same lowering as their Effect versions" do
+      imp (Ret (CApp (foreign_ "Control.Monad.ST.Internal.for") [ var "lo", var "hi", var "f" ]))
+        `shouldEqual` imp (Ret (CApp (foreign_ "Effect.forE") [ var "lo", var "hi", var "f" ]))
+      imp (Ret (CApp (foreign_ "Control.Monad.ST.Internal.while") [ var "c", var "b" ]))
+        `shouldEqual` imp (Ret (CApp (foreign_ "Effect.whileE") [ var "c", var "b" ]))
+      imp (Ret (CApp (foreign_ "Control.Monad.ST.Internal.foreach") [ var "as", var "f" ]))
+        `shouldEqual` imp (Ret (CApp (foreign_ "Effect.foreachE") [ var "as", var "f" ]))
+
+    it "is idempotent: a lowered loop re-impurifies unchanged" do
+      let once = imp (Ret (CApp (foreign_ "Effect.whileE") [ var "c", var "b" ]))
+      imp once `shouldEqual` once
+
+    it "all seven loop-combinator keys leave the NbE structural rung (structuralExclusions)" do
+      let
+        keys =
+          [ "Effect.forE"
+          , "Effect.whileE"
+          , "Effect.untilE"
+          , "Effect.foreachE"
+          , "Control.Monad.ST.Internal.for"
+          , "Control.Monad.ST.Internal.while"
+          , "Control.Monad.ST.Internal.foreach"
+          ]
+      Array.all (\k -> Set.member k structuralExclusions) keys `shouldEqual` true

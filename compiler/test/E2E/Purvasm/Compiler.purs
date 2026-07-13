@@ -310,3 +310,15 @@ paritySpec = describe "ADR-0094 fold parity (sliced structural keys ride the uli
     performs "Parity.T.v" `shouldEqual` true
     -- and the `functorEffect` dict projection / the `Data.Functor.*` dispatch is fully gone
     refsAny [ "Effect.functorEffect", "Data.Functor.map", "Data.Functor.void" ] `shouldEqual` false
+
+  it "ADR-0099 Slice 4: Effect.forE lowers to an inline loop with CPerform (no structural foreign)" do
+    mods <- load [ "Data.Unit", "Effect" ]
+    let
+      out = optimizeProbe mods
+        [ Tuple "Loop.T.f" (A.Ret (A.CApp (avar "Effect.forE") [ avar "lo", avar "hi", avar "body" ])) ]
+      performs = Array.any (\(Tuple _ e) -> usesPerform e) out
+      refsForE = Array.any (\(Tuple _ e) -> refsName "Effect.forE" e) out
+    -- forE is lowered in-place (the loop body's `perform (body i)` is an explicit run marker) and the
+    -- structural foreign is gone — nothing left for the linker/backend to materialise.
+    performs `shouldEqual` true
+    refsForE `shouldEqual` false

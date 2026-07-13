@@ -176,6 +176,32 @@
 > `\m -> \$u -> perform m; unit`; the other benchmarks are unchanged, self-compile `size×` 1.126,
 > all `time×` < 4.0; `effect-ref` VM `--opt` output stays correct (`249500`). Uncommitted.
 
+> **Progress (2026-07-14): Slice 4 implemented** (structural loop combinators). `Impurify` gains
+> `lowerFor`/`lowerWhile`/`lowerUntil`/`lowerForeach` — the `Ffi` guest terms (`effFor`/…) rewritten
+> as `LetRec`/`CIf` ANF with `CPerform` at each thunk force — and descriptors (all `StructuralGuest`,
+> so `structuralExclusions` auto-removes them from the NbE rung; the link-time `resolver` keeps the
+> guest terms for `--no-opt`) for `Effect.forE`(3)/`whileE`(2)/`untilE`(1)/`foreachE`(2) and the
+> `Control.Monad.ST.Internal.for`/`while`/`foreach` twins (same guest terms → same lowerings).
+> **Gates:** 361 unit (7 new — `untilE`/`forE`/`whileE`/`foreachE` exact-IR lowerings, the three `ST`
+> loop twins sharing the `Effect` lowerings, loop idempotency, and all seven loop-combinator keys ∈
+> `structuralExclusions`) + 10 E2E (new Slice-4 fixture: `Effect.forE` lowers in-place, `usesPerform`,
+> no residual structural foreign); `purs-tidy` clean; the `--opt-effect` gate passes (harness exit 0):
+> `effect-ref` `Effect.forE` is now **inlined** (0 residual foreign calls in `Main.pmo`, was a
+> `ld Effect.forE; ca 3` link-time call) — the VM instruction count is unchanged (the linker had
+> materialised the same loop) and the `time×` gate passes on re-run (an isolated 4.052 was
+> machine-load noise; the full-gate re-run measured 3.012, all benches < 4.0), self-compile `size×`
+> 1.126, VM `--opt` output correct. **LLVM:** the `Effect` module now emits fully (mod_63; Slice 3
+> got it past `bindE`, Slice 4 past `forE`) — the `--opt` build then reached `Effect.Ref._new`, a
+> **structural** foreign (the one-cell mutable `Ref` array over the array primops, ADR-0071 §6 / ADR-0072
+> §9 — *not* a leaf, not a loop combinator, not GER-owned): the same pre-existing structural-foreign
+> materialisation gap on the backend track, **now closed** — the native backend materialises every
+> `resolver`-resolved foreign (intrinsic *and* structural) as a link-time guest-term gdef
+> (`Driver.synthForeignGdefs`). **§7 self-tail perform fusion deferred** (justified):
+> no manual-recursive `Effect` loop in the corpus to measure, and the Slice-1 tail-aware `CPerform`
+> lowering (`CPerform t` → `TailCall` in tail position) already gives `let t = self args in perform
+> t` its TCE / stack-safety, so §7 is a perf-only optimisation (elides the intermediate thunk
+> allocation), revisited if a manual-`Effect`-recursion hot path appears. Uncommitted.
+
 ## Context
 
 [ADR-0098](0098-effect-instance-dict-visibility-grouped-projection.md) closed the
@@ -606,6 +632,17 @@ and having `Impurify` consume the dispatch directly keeps the responsibility cle
 
 ### 7. Self-tail `perform` fusion
 
+> **Correction (2026-07-14, Slice 4): deferred until a measurement target appears.** This section's
+> premise — that the naïve `let t = self args in perform t` "can lose tail recursion" — does **not**
+> hold given Slice 1's tail-aware `CPerform` lowering: `CPerform t` in tail position emits a
+> `TailCall` (VM) / the `CApp t [unit]` tail path (LLVM), so the self-tail `perform` already gets
+> TCE and the loop is constant-stack **without** this fusion. What the fusion still buys is *perf* —
+> eliding the intermediate `self args` thunk allocation per iteration — not correctness. As the GER
+> track is measurement-driven and the corpus has **no manual-recursive `Effect` loop** to measure
+> against (`bench-effect-ref` uses the `forE` combinator, now lowered in Slice 4), the fusion is
+> **deferred**; it is revisited if a manual-`Effect`-recursion hot path appears. The rule below is
+> retained as the design of record for that future work.
+
 A tail-recursive `Effect` loop of the general shape
 
 ```text
@@ -613,10 +650,13 @@ let t = self args
 perform t
 ```
 
-lowers naïvely to two calls (build the thunk via `self`, then run it), which can lose
-tail recursion. Following purs-wasm's item-3 recommendation, the fix is **not** a
-general purity strip of `Perform`; it is recognising the explicit self-tail shape of
-the *same recursive group* directly:
+lowers to two calls per iteration — build the thunk via `self`, then run it. Tail
+recursion is **not** lost (the Correction above: Slice 1's tail-aware `CPerform` makes the
+final `perform t` a `TailCall`, and `self args` returns its thunk shallowly before it, so
+the loop is already constant-stack); what remains is the *cost* of the two calls and the
+intermediate thunk allocation per iteration. Fusing them away — following purs-wasm's
+item-3 recommendation — is **not** a general purity strip of `Perform`; it is recognising
+the explicit self-tail shape of the *same recursive group* directly:
 
 ```text
 let t = self args
@@ -697,9 +737,12 @@ excluded before its slice.
 ### Slice 4 — structural combinator lowering
 
 - `GerDescriptor`s for `forE` / `foreachE` / `whileE` / `untilE` → `LetRec` / `CIf`
-  ANF; self-tail perform fusion (§7); these keys (and their `ST` loop twins, if landed
-  here) leave `NbeEnv.structural` in this slice.
+  ANF; these keys **and their `ST` loop twins** (`Control.Monad.ST.Internal.for`/`while`/
+  `foreach`, sharing the guest terms) leave `NbeEnv.structural` in this slice.
 - Measure `Effect`-loop closure / force overhead and stack behaviour here.
+- **self-tail perform fusion (§7) is deferred** — see the §7 Correction (2026-07-14):
+  Slice 1's tail-aware `CPerform` already gives the loop TCE, so the fusion is a perf-only
+  optimisation with no current measurement target.
 
 ### Slice 5 — `ST`
 
@@ -731,7 +774,8 @@ purs-wasm has.
   survives; known-thunk `CPerform` β-reduces in place; a **live** effectful
   `CPerform` survives even when its result is unused; the pass is idempotent;
   `forE` / `whileE` → `LetRec` / `CIf`; no `Perform` marker dissolves into a plain
-  call except via the self-tail rule (§7).
+  call (the self-tail-rule exception of §7 is deferred — see the §7 Correction — so no
+  `Perform` marker dissolves at all in the shipped passes).
 - **No residual structural foreign (P1-B):** a bare / under-applied `Effect.bindE` /
   `Effect.pureE` / combinator is η-expanded and lowered, so no GER-owned structural
   foreign survives `Impurify` to the backend at `--opt` (VM **and** LLVM); the

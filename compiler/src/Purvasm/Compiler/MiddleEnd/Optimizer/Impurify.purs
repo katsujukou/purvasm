@@ -40,9 +40,11 @@ import Data.String (Pattern(..), stripPrefix)
 import Data.Traversable (traverse)
 import Data.Tuple (Tuple(..), fst)
 import Partial.Unsafe (unsafeCrashWith)
+import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
 import Purvasm.Compiler.MiddleEnd.Module (Decl)
 import Purvasm.Compiler.MiddleEnd.Optimizer.DictElim (DictMachinery)
+import Purvasm.Compiler.Primitive (PrimOp(..))
 
 -- | The GER-semantic role of a key, **orthogonal to its provider form** (a structural guest term,
 -- | a `ulib` shadow, or a foreign leaf — independent of role). `StructuralGuest` — a monad-glue
@@ -140,13 +142,179 @@ methodDescriptor = case _ of
   "apply" -> Just applyDescriptor
   _ -> Nothing
 
--- | The GER descriptor table (ADR-0099 Slice 2 keys). `pureE`/`bindE` are `StructuralGuest`;
--- | `unsafePerformEffect` is an `EffectEliminator` (currently `ulib`-shadow-backed; see `GerOrigin`).
+-- | The unit value (`Int` immediate 0, matching `Ffi.unitLit`).
+unitAtom :: Atom
+unitAtom = AtomLit (LInt 0)
+
+-- | The `Effect`/`ST` **structural loop combinators** (ADR-0099 §5, Slice 4) lowered to ordinary
+-- | `LetRec`/`CIf` ANF with `CPerform` at each thunk force — the `Ffi` guest terms
+-- | (`effFor`/`effWhile`/`effUntil`/`effForeach`), with the unit-application force replaced by the
+-- | run marker so the loop's effects are explicit and no `Effect.forE`-class structural foreign
+-- | survives to the backend. `$u` is the (unused) run binder the combinator's thunk takes.
+
+-- | `untilE f → \$u -> letrec go _ = if perform f then unit else go unit in go unit`.
+lowerUntil :: Array Atom -> Fresh CExpr
+lowerUntil = case _ of
+  [ f ] -> do
+    u <- fresh
+    go <- fresh
+    g <- fresh
+    b <- fresh
+    pure
+      ( CLam [ u ]
+          ( LetRec
+              [ { var: go
+                , rhs: Ret
+                    ( CLam [ g ]
+                        ( Let b (CPerform f)
+                            (Ret (CIf (AtomVar b) (Ret (CAtom unitAtom)) (Ret (CApp (AtomVar go) [ unitAtom ]))))
+                        )
+                    )
+                }
+              ]
+              (Ret (CApp (AtomVar go) [ unitAtom ]))
+          )
+      )
+  _ -> unsafeCrashWith "Impurify.lowerUntil: expected exactly 1 argument"
+
+-- | `whileE cond body → \$u -> letrec go _ = if perform cond then (let _ = perform body in go unit)
+-- | else unit in go unit`.
+lowerWhile :: Array Atom -> Fresh CExpr
+lowerWhile = case _ of
+  [ cond, body ] -> do
+    u <- fresh
+    go <- fresh
+    g <- fresh
+    b <- fresh
+    dropv <- fresh
+    pure
+      ( CLam [ u ]
+          ( LetRec
+              [ { var: go
+                , rhs: Ret
+                    ( CLam [ g ]
+                        ( Let b (CPerform cond)
+                            ( Ret
+                                ( CIf (AtomVar b)
+                                    (Let dropv (CPerform body) (Ret (CApp (AtomVar go) [ unitAtom ])))
+                                    (Ret (CAtom unitAtom))
+                                )
+                            )
+                        )
+                    )
+                }
+              ]
+              (Ret (CApp (AtomVar go) [ unitAtom ]))
+          )
+      )
+  _ -> unsafeCrashWith "Impurify.lowerWhile: expected exactly 2 arguments"
+
+-- | `forE lo hi f → \$u -> letrec go i = if i < hi then (let _ = perform (f i) in go (i+1)) else unit
+-- | in go lo`.
+lowerFor :: Array Atom -> Fresh CExpr
+lowerFor = case _ of
+  [ lo, hi, f ] -> do
+    u <- fresh
+    go <- fresh
+    i <- fresh
+    cmp <- fresh
+    fi <- fresh
+    dropv <- fresh
+    i1 <- fresh
+    pure
+      ( CLam [ u ]
+          ( LetRec
+              [ { var: go
+                , rhs: Ret
+                    ( CLam [ i ]
+                        ( Let cmp (CPrim LtInt [ AtomVar i, hi ])
+                            ( Ret
+                                ( CIf (AtomVar cmp)
+                                    ( Let fi (CApp f [ AtomVar i ])
+                                        ( Let dropv (CPerform (AtomVar fi))
+                                            ( Let i1 (CPrim AddInt [ AtomVar i, AtomLit (LInt 1) ])
+                                                (Ret (CApp (AtomVar go) [ AtomVar i1 ]))
+                                            )
+                                        )
+                                    )
+                                    (Ret (CAtom unitAtom))
+                                )
+                            )
+                        )
+                    )
+                }
+              ]
+              (Ret (CApp (AtomVar go) [ lo ]))
+          )
+      )
+  _ -> unsafeCrashWith "Impurify.lowerFor: expected exactly 3 arguments"
+
+-- | `foreachE as f → \$u -> let n = length as in letrec go i = if i < n then (let _ = perform
+-- | (f as[i]) in go (i+1)) else unit in go 0`.
+lowerForeach :: Array Atom -> Fresh CExpr
+lowerForeach = case _ of
+  [ as, f ] -> do
+    u <- fresh
+    n <- fresh
+    go <- fresh
+    i <- fresh
+    cmp <- fresh
+    el <- fresh
+    fi <- fresh
+    dropv <- fresh
+    i1 <- fresh
+    pure
+      ( CLam [ u ]
+          ( Let n (CPrim LengthArray [ as ])
+              ( LetRec
+                  [ { var: go
+                    , rhs: Ret
+                        ( CLam [ i ]
+                            ( Let cmp (CPrim LtInt [ AtomVar i, AtomVar n ])
+                                ( Ret
+                                    ( CIf (AtomVar cmp)
+                                        ( Let el (CPrim IndexArray [ as, AtomVar i ])
+                                            ( Let fi (CApp f [ AtomVar el ])
+                                                ( Let dropv (CPerform (AtomVar fi))
+                                                    ( Let i1 (CPrim AddInt [ AtomVar i, AtomLit (LInt 1) ])
+                                                        (Ret (CApp (AtomVar go) [ AtomVar i1 ]))
+                                                    )
+                                                )
+                                            )
+                                        )
+                                        (Ret (CAtom unitAtom))
+                                    )
+                                )
+                            )
+                        )
+                    }
+                  ]
+                  (Ret (CApp (AtomVar go) [ AtomLit (LInt 0) ]))
+              )
+          )
+      )
+  _ -> unsafeCrashWith "Impurify.lowerForeach: expected exactly 2 arguments"
+
+-- | The GER descriptor table — the owned keys landed across slices. `StructuralGuest`: the glue
+-- | `pureE`/`bindE` (Slice 2) and the structural loop combinators `forE`/`whileE`/`untilE`/`foreachE`
+-- | + their `Control.Monad.ST.Internal` twins (Slice 4). `EffectEliminator`: `unsafePerformEffect`
+-- | (Slice 2, currently `ulib`-shadow-backed; see `GerOrigin`). The `Functor`/`Apply` `map`/`apply`
+-- | rewrites (Slice 3) are **not** here — they carry no owned foreign key and are synthesised by
+-- | `recognize` on an Effect-family dict (`mapDescriptor`/`applyDescriptor`, `DerivedMethod`).
 descriptorList :: Array GerDescriptor
 descriptorList =
   [ { key: "Effect.pureE", semanticArity: 1, origin: StructuralGuest, lowering: lowerPure }
   , { key: "Effect.bindE", semanticArity: 2, origin: StructuralGuest, lowering: lowerBind }
   , { key: "Effect.Unsafe.unsafePerformEffect", semanticArity: 1, origin: EffectEliminator, lowering: lowerUnsafePerform }
+  -- structural loop combinators (Slice 4): lowered to `LetRec`/`CIf` ANF. The `ST` loop twins
+  -- share the guest terms (`Ffi.structural`) and so the same lowerings.
+  , { key: "Effect.untilE", semanticArity: 1, origin: StructuralGuest, lowering: lowerUntil }
+  , { key: "Effect.whileE", semanticArity: 2, origin: StructuralGuest, lowering: lowerWhile }
+  , { key: "Effect.forE", semanticArity: 3, origin: StructuralGuest, lowering: lowerFor }
+  , { key: "Effect.foreachE", semanticArity: 2, origin: StructuralGuest, lowering: lowerForeach }
+  , { key: "Control.Monad.ST.Internal.while", semanticArity: 2, origin: StructuralGuest, lowering: lowerWhile }
+  , { key: "Control.Monad.ST.Internal.for", semanticArity: 3, origin: StructuralGuest, lowering: lowerFor }
+  , { key: "Control.Monad.ST.Internal.foreach", semanticArity: 2, origin: StructuralGuest, lowering: lowerForeach }
   ]
 
 gerDescriptors :: Map String GerDescriptor
