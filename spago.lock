@@ -204,6 +204,7 @@
           "dependencies": [
             "node-buffer",
             "node-fs",
+            "node-process",
             "spec",
             "spec-node"
           ]

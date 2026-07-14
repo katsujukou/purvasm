@@ -19,3 +19,4 @@ package:
       - spec-node
       - node-fs
       - node-buffer
+      - node-process
