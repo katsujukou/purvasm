@@ -78,6 +78,23 @@ jobs:
       - name: Test (ulib-tools unit)
         run: spago test -p ulib-tools -m Test.Unit.Purvasm.UlibTools
 
+      # ADR-0101: the committed Data.String.Internal.CaseMap.purs must match what `unicode-gen`
+      # regenerates from the pinned UCD version/sha256 — catches a stale regeneration or a hand
+      # edit. Scope: only this one ADR-0101 regression check, not the broader `ulib-tools`
+      # build/verify/test pipeline over all of `ulib/**`, which stays deferred to
+      # `ulib-tools/prepare-release.sh` (see the `changes` job comment above) — this step is cheap
+      # (one small cached download plus pure computation), unlike that pipeline's upstream-suite
+      # git clones.
+      - name: Check (ulib-tools unicode-gen --check)
+        run: node ulib-tools/index.js unicode-gen --check
+
+      # ADR-0101: exercises the ACTUAL COMPILED Data.String.Internal.CaseMap / Data.String.Common
+      # (the rendered table literals, the binary search, and the two-pass UTF-8 byte-length
+      # rebuild) against the real registry + ulib + in-repo-package tree — not just the
+      # generator's own self-check, which never touches the compiled PureScript.
+      - name: Test (case-mapping E2E)
+        run: ulib/strings/test/E2E/verify-case-mapping.sh
+
       - name: Test (compiler unit)
         run: spago test -p compiler -m Test.Unit.Purvasm.Compiler
 
