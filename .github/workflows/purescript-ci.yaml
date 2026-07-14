@@ -95,12 +95,17 @@ jobs:
       - name: Test (case-mapping E2E)
         run: ulib/strings/test/E2E/verify-case-mapping.sh
 
+      - name: Install ulib
+        run: node ulib-tools/index.js build --out purvasm_lib/ulib
+
       - name: Test (compiler unit)
         run: spago test -p compiler -m Test.Unit.Purvasm.Compiler
 
       # The byte-identity oracle: in-process and fixture-based, no boot shell-out.
       - name: Test (compiler E2E)
         run: spago test -p compiler -m Test.E2E.Purvasm.Compiler
+        env:
+          PURVASM_LIB: "${{ github.workspace }}/purvasm_lib/ulib"
 
       # Fails if any tracked .purs is not purs-tidy-clean (profile pinned to purs-tidy-0.10.0 in
       # flake.nix). `ulib/**` is excluded — those patches are formatted/verified by ulib-tools.
