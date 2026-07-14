@@ -1,0 +1,7 @@
+package:
+  name: ex-string-case-demo
+  dependencies:
+    - console
+    - effect
+    - prelude
+    - strings

@@ -308,6 +308,20 @@
           "dependencies": []
         }
       },
+      "ex-string-case-demo": {
+        "path": "examples/string-case-demo",
+        "core": {
+          "dependencies": [
+            "console",
+            "effect",
+            "prelude",
+            "strings"
+          ]
+        },
+        "test": {
+          "dependencies": []
+        }
+      },
       "ex-transformer": {
         "path": "examples/transformer",
         "core": {
@@ -431,6 +445,7 @@
             "fmt",
             "foldable-traversable",
             "foreign-object",
+            "integers",
             "maybe",
             "node-process",
             "ordered-collections",

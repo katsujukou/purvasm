@@ -54,6 +54,7 @@ recursive-value  Example.RecursiveValue.Main
 transformer      Example.Transformer.Main
 rust-ffi         Example.RustFFI.Main LLVM-ONLY
 regex-demo       Example.RegexDemo.Main
+string-case-demo Example.StringCaseDemo.Main
 "
 
 if [ ! -x "$PURVM" ]; then
