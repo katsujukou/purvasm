@@ -322,3 +322,29 @@ paritySpec = describe "ADR-0094 fold parity (sliced structural keys ride the uli
     -- structural foreign is gone — nothing left for the linker/backend to materialise.
     performs `shouldEqual` true
     refsForE `shouldEqual` false
+
+  it "ADR-0099 Slice 5: ST glue / eliminator / ref combinators lower to ANF (no structural foreign)" do
+    mods <- load [ "Data.Unit" ]
+    let
+      out = optimizeProbe mods
+        [ Tuple "STm.T.r" (A.Ret (A.CApp (avar "Control.Monad.ST.Internal.run") [ avar "st" ]))
+        , Tuple "STm.T.b" (A.Ret (A.CApp (avar "Control.Monad.ST.Internal.bind_") [ avar "m", avar "k" ]))
+        , Tuple "STm.T.nw" (A.Ret (A.CApp (avar "Control.Monad.ST.Internal.new") [ avar "v" ]))
+        , Tuple "STm.T.md" (A.Ret (A.CApp (avar "Control.Monad.ST.Internal.modifyImpl") [ avar "f", avar "ref" ]))
+        ]
+      performs key = Array.any (\(Tuple k e) -> k == key && usesPerform e) out
+      usesP key op = Array.any (\(Tuple k e) -> k == key && usesPrim op e) out
+      refsAny names = Array.any (\(Tuple _ e) -> Array.any (\n -> refsName n e) names) out
+    -- `run` forces the thunk; `bind_` sequences the performs — both carry an explicit run marker.
+    performs "STm.T.r" `shouldEqual` true
+    performs "STm.T.b" `shouldEqual` true
+    -- `new` / `modifyImpl` are the mutation thunk *bodies* (no inner thunk to force → no CPerform),
+    -- lowered to the `STRef`-cell array primops; the structural foreign is gone in every case.
+    usesP "STm.T.nw" Po.NewArray `shouldEqual` true
+    usesP "STm.T.md" Po.SetArray `shouldEqual` true
+    refsAny
+      [ "Control.Monad.ST.Internal.run"
+      , "Control.Monad.ST.Internal.bind_"
+      , "Control.Monad.ST.Internal.new"
+      , "Control.Monad.ST.Internal.modifyImpl"
+      ] `shouldEqual` false

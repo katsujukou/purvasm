@@ -428,7 +428,7 @@ nbeEnvOf intrinsic deps decls =
     , nbe: { externs: Map.empty, intrinsic, structural: \_ -> Nothing }
     }
 
-  -- GER-owned `StructuralGuest` keys (`Effect.pureE`/`bindE`, ADR-0099 §3) leave the rung so NbE
+  -- GER-owned `structuralExclusions` keys (`Effect.pureE`/`bindE`, ADR-0099 §3) leave the rung so NbE
   -- cannot unfold them back to the guest term and re-hide the node `Impurify` lowers; the link-time
   -- `resolver` still serves them for `--no-opt`.
   structural k =
