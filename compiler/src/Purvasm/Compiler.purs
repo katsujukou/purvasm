@@ -144,10 +144,12 @@ type EntryInput = { modules :: Array LoweredModule, entry :: Expr }
 -- | and an internal whole-program context `c` it derives once. Deliberately effect-free: link — the one
 -- | effectful, non-shareable step — is left to CLI finalization (§4), so this record is trivially testable.
 -- |
--- |   * `context` — derive the whole-program facts (the native `gkeys`/cross-module surface, stable under
--- |     the seam) from the **pre-optimisation** modules (as `ContextModule`s — CoreFn source + lowered ANF,
--- |     so the surface can read each module's `exports`, but **no** foreign shapes: FSR has not run yet),
--- |     once, before the fold.
+-- |   * `context` — derive the whole-program facts (the native `gkeys`/cross-module surface) from the
+-- |     **pre-optimisation** modules (as `ContextModule`s — CoreFn source + lowered ANF, so the surface can
+-- |     read each module's `exports`, but **no** foreign shapes: FSR has not run yet), once, before the fold.
+-- |     These `gkeys` are the stable *base* set of existing source declarations, **not** the complete final
+-- |     set: the optimiser's Specialize pass (ADR-0089) adds post-opt top-level keys (`$spec$` clones), so
+-- |     `lowerModule`/`lowerEntry` complete `gkeys` with each object's final gdef keys before codegen.
 -- |   * `interfaceOf` — the module's `.pmi` from its optimised ANF + CoreFn surface (backend-neutral in
 -- |     result — byte-identical to the bytecode deriver — but the `ExportKind` classification is the
 -- |     backend's).

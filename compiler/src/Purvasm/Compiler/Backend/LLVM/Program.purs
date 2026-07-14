@@ -275,7 +275,14 @@ xfnDecls = do
 moduleLl :: MakeCxOptions -> Set String -> Array Gdef -> String
 moduleLl opts defined gdefs =
   let
-    Tuple parts ctx = runCodegen (makeCx opts) do
+    -- The optimiser's Specialize pass (ADR-0089) materialises caller-homed `$spec$` clones as new
+    -- module-local top-level gdefs *during* optimisation, so they are absent from the pre-optimisation
+    -- whole-program `gkeys` derived in `context`. Fold this module's own post-optimiser gdef keys
+    -- (`defined`, which includes those clones) into `gkeys` so `readVar` resolves a clone reference to a
+    -- local `$root` load instead of crashing as unbound. `externGlobalDecls defined` still subtracts
+    -- `defined`, so a locally-defined clone is never wrongly declared `external`; under `--no-opt` there are
+    -- no clones and `defined ⊆ opts.gkeys`, so the union is a no-op (the byte-identity gate is unaffected).
+    Tuple parts ctx = runCodegen (makeCx (opts { gkeys = Set.union opts.gkeys defined })) do
       emitGdefs gdefs
       emitPending
       extern <- externGlobalDecls defined
@@ -302,8 +309,13 @@ moduleLl opts defined gdefs =
 entryLl :: MakeCxOptions -> Boolean -> Int -> Array Gdef -> Expr -> String
 entryLl opts isEffect heapWords gdefs entry =
   let
-    reach = reachableGdefs opts.gkeys entry gdefs
-    Tuple parts ctx = runCodegen (makeCx opts) do
+    -- Fold every emitted gdef's key (incl. optimiser `$spec$` clones, see `moduleLl`) into `gkeys` so both
+    -- reachability (`pv_init_all` must call a referenced clone's `$init`, else its `$root` stays the `0`
+    -- sentinel) and `readVar` see them. A no-op under `--no-opt` (no clones; keys ⊆ `opts.gkeys`).
+    gkeys' = Set.union opts.gkeys (Set.fromFoldable (Array.concatMap gdefKeys gdefs))
+    opts' = opts { gkeys = gkeys' }
+    reach = reachableGdefs gkeys' entry gdefs
+    Tuple parts ctx = runCodegen (makeCx opts') do
       emitInitAll reach
       entryBody <- emitEntryStub isEffect heapWords entry
       emitPending

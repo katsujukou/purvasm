@@ -20,6 +20,7 @@ import Test.Unit.Purvasm.Compiler.Backend.LLVM.Interface as Backend.LLVM.Interfa
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Mangle as Backend.LLVM.Mangle
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Monad as Backend.LLVM.Monad
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Prim as Backend.LLVM.Prim
+import Test.Unit.Purvasm.Compiler.Backend.LLVM.Program as Backend.LLVM.Program
 import Test.Unit.Purvasm.Compiler.Backend.Bytecode as Backend.Bytecode
 import Test.Unit.Purvasm.Compiler.Build as Build
 import Test.Unit.Purvasm.Compiler.CESK.Translate as CESK.Translate
@@ -58,6 +59,7 @@ main = runSpecAndExitProcess [ consoleReporter ] do
   Backend.LLVM.Monad.spec
   Backend.LLVM.Abi.spec
   Backend.LLVM.Prim.spec
+  Backend.LLVM.Program.spec
   MiddleEnd.ANF.FreeVars.spec
   Backend.LLVM.Interface.spec
   Backend.LLVM.Emit.spec
