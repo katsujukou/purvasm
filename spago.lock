@@ -117,6 +117,21 @@
           "dependencies": []
         }
       },
+      "bench-st-ref": {
+        "path": "benchmarks/bench-st-ref",
+        "core": {
+          "dependencies": [
+            "bench-common",
+            "console",
+            "effect",
+            "prelude",
+            "st"
+          ]
+        },
+        "test": {
+          "dependencies": []
+        }
+      },
       "cli": {
         "path": "cli",
         "core": {

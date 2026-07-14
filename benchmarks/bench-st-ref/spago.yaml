@@ -1,0 +1,8 @@
+package:
+  name: bench-st-ref
+  dependencies:
+    - bench-common
+    - console
+    - effect
+    - prelude
+    - st
