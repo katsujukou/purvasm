@@ -1,18 +1,36 @@
 -- | ulib SHADOW of `strings`' `Data.String.Common` (ADR-0038 / ADR-0006), targeting strings 6.0.1.
 -- |
--- | The structural foreigns — `replace` / `replaceAll` / `split` / `joinWith` / `trim` — are
--- | reimplemented in PureScript over the byte-level `Purvasm.String` primitives (UTF-8, code-point
--- | semantics, ADR-0006), so they run standalone on purvasm. `trim`'s whitespace set is the finite
--- | ECMAScript `WhiteSpace` + `LineTerminator` set, hard-coded.
+-- | The structural foreigns — `replace` / `replaceAll` / `split` / `joinWith` / `trim` / `toLower` /
+-- | `toUpper` — are all reimplemented in PureScript over the byte-level `Purvasm.String` primitives
+-- | (UTF-8, code-point semantics, ADR-0006), so they run standalone on purvasm — VM, OCaml-native,
+-- | and LLVM alike, not only wherever a JS host happens to be present. `trim`'s whitespace set is
+-- | the finite ECMAScript `WhiteSpace` + `LineTerminator` set, hard-coded.
 -- |
--- | `toLower` / `toUpper` / `_localeCompare` are KEPT as foreign imports: full Unicode case mapping
--- | (~1400 entries) and locale collation (CLDR) need large host data, so they stay a JS host import
--- | (ADR-0006 — host-data-dependent operations fall back to JS; a program using them runs under the
--- | loader). The public interface is unchanged, so this shadows the registry module.
+-- | `toLower` / `toUpper` walk code points via `Data.String.Internal.Utf8` and remap each one through
+-- | `Data.String.Internal.CaseMap`'s generated table of Unicode's **simple** (1:1) case mappings —
+-- | UnicodeData.txt's `Simple_Uppercase_Mapping` / `Simple_Lowercase_Mapping` fields, parsed directly
+-- | by `ulib-tools unicode-gen` (ADR-0101) from a fetched, sha256-pinned copy of that file
+-- | (`ulib/strings/gen/unicode-data.json` — `UnicodeData.txt` itself is never vendored/committed),
+-- | NOT derived from a host case-folding routine (which would apply `SpecialCasing.txt`'s *full*
+-- | mapping instead — see `Purvasm.UlibTools.UnicodeData`'s doc comment for why that distinction
+-- | matters and how it silently differs for code points like U+0130). The one precisely-scoped,
+-- | documented divergence (`ulib/strings/ulib.json`'s `test.xfail`) is `SpecialCasing.txt`'s *own*
+-- | content: a handful of code points (e.g. U+00DF `ß`, whose only uppercase form is the
+-- | two-character `SS`) have no simple mapping in a given direction at all and so pass through
+-- | unchanged, and any locale-*conditional*
+-- | rule (Turkish/Azeri dotted `I`, Lithuanian dot retention) is out of scope by construction — simple
+-- | mapping, and this function's signature, carry no locale. This is narrower than it may sound: e.g.
+-- | U+0130 `İ` **is** correctly mapped (to U+0069 `i`, its real simple lowercase), even though that
+-- | differs from `SpecialCasing.txt`'s context-free full form (U+0069 U+0307).
 -- |
--- | NOTE: the UTF-8 byte codec (`decodeAt` / `sliceBytes` / `byteIndexOf`) is shared with the
--- | `Data.String.CodeUnits` shadow via `Data.String.Internal.Utf8` (ADR-0038); only `blit`
--- | stays local to this module.
+-- | `localeCompare` reuses the byte-wise `Ord String` order (`Data.Ord.compareStringImpl`, itself
+-- | code-point order per ADR-0006 §3) rather than true CLDR locale collation — also a documented
+-- | divergence (`test.xfail`): nothing in this project's demand calls it, and full CLDR is grossly
+-- | disproportionate to that. The public interface is unchanged, so this shadows the registry module.
+-- |
+-- | NOTE: the UTF-8 byte codec (`decodeAt` / `sliceBytes` / `byteIndexOf` / `putCp` / `utf8Len`) is
+-- | shared with the `Data.String.CodeUnits` shadow via `Data.String.Internal.Utf8` (ADR-0038); only
+-- | `blit` stays local to this module.
 module Data.String.Common
   ( null
   , localeCompare
@@ -27,7 +45,8 @@ module Data.String.Common
 
 import Prelude
 
-import Data.String.Internal.Utf8 (byteIndexOf, decodeAt, sliceBytes)
+import Data.String.Internal.CaseMap as CaseMap
+import Data.String.Internal.Utf8 (byteIndexOf, decodeAt, putCp, sliceBytes, utf8Len)
 import Data.String.Pattern (Pattern(..), Replacement(..))
 import Purvasm.Array as PA
 import Purvasm.String as PS
@@ -64,17 +83,10 @@ isWhitespace cp =
 null :: String -> Boolean
 null s = s == ""
 
--- | Compare two strings in a locale-aware fashion (kept foreign — needs host CLDR collation data).
+-- | Compare two strings (byte/code-point order — see the module doc comment's documented
+-- | divergence from true locale-aware CLDR collation).
 localeCompare :: String -> String -> Ordering
-localeCompare = _localeCompare LT EQ GT
-
-foreign import _localeCompare
-  :: Ordering
-  -> Ordering
-  -> Ordering
-  -> String
-  -> String
-  -> Ordering
+localeCompare = compare
 
 -- | Replaces the first occurence of the pattern with the replacement string.
 replace :: Pattern -> Replacement -> String -> String
@@ -158,11 +170,33 @@ split (Pattern sep) s =
     cpCount o k = if o >= sn then k else cpCount (decodeAt s o).next (k + 1)
     go o k out = if o >= sn then out else let d = decodeAt s o in go d.next (k + 1) (PA.unsafeSet out k (sliceBytes s o d.next))
 
--- | Returns the argument converted to lowercase (kept foreign — needs host Unicode case tables).
-foreign import toLower :: String -> String
+-- | Returns the argument converted to lowercase (simple 1:1 Unicode mapping — see the module doc
+-- | comment's documented `SpecialCasing.txt` exclusion).
+toLower :: String -> String
+toLower = mapCase CaseMap.toLowerCp
 
--- | Returns the argument converted to uppercase (kept foreign — needs host Unicode case tables).
-foreign import toUpper :: String -> String
+-- | Returns the argument converted to uppercase (simple 1:1 Unicode mapping — see the module doc
+-- | comment's documented `SpecialCasing.txt` exclusion).
+toUpper :: String -> String
+toUpper = mapCase CaseMap.toUpperCp
+
+-- | Remap every code point of `s` through `f`, two-pass (size, then build) since a simple case
+-- | mapping's UTF-8 length can change per code point even though it never changes code-point count
+-- | (e.g. U+017F 'ſ' (2 bytes) uppercases to U+0053 'S', 1 byte).
+mapCase :: (Int -> Int) -> String -> String
+mapCase f s = build 0 0 (PS.unsafeNew total)
+  where
+  n = PS.byteLength s
+  total = sumLen 0 0
+  sumLen o acc = if o >= n then acc else let d = decodeAt s o in sumLen d.next (acc + utf8Len (f d.cp))
+  build o off out =
+    if o >= n then out
+    else
+      let
+        d = decodeAt s o
+        mapped = f d.cp
+      in
+        build d.next (off + utf8Len mapped) (putCp out off mapped)
 
 -- | Removes leading and trailing whitespace (ECMAScript `WhiteSpace` + `LineTerminator`).
 trim :: String -> String
