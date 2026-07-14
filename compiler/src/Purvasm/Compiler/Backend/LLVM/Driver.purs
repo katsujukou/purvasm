@@ -43,8 +43,10 @@ import Purvasm.Compiler.MiddleEnd.Optimizer.DictElim (DictMachinery, dictElimExp
 
 -- | One CoreFn module → its native `Gdef`s: lower to the neutral `AnfModule` (`declsOfModule`, shared
 -- | middle-end) then classify each `Decl` (`classifyDecl`, ADR-0086 §4 — a backend concern that runs after
--- | the seam). Used for the pre-optimisation program facts (cross-module surface / `gkeys`), which are
--- | stable under the seam's body rewrites, and by the interface differential test.
+-- | the seam). Used for the pre-optimisation program facts (cross-module surface / `gkeys`) — a stable
+-- | *base* set of existing source declarations, which the seam's body rewrites do not disturb. It is **not**
+-- | the complete final key set: Specialize (ADR-0089) adds post-opt `$spec$` clones; `moduleLl`/`entryLl`
+-- | therefore complete `gkeys` from each object's final gdef keys. Also used by the interface differential test.
 gdefsOfModule :: CF.Module -> Array Gdef
 gdefsOfModule = map classifyDecl <<< _.decls <<< declsOfModule
 
