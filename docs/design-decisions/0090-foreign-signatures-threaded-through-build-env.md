@@ -44,10 +44,12 @@ for its dependents.
 ### 1. The threaded fact is the whole `ForeignShape`, not arity
 
 The build fact flowed is `Map String ForeignShape` (`ForeignShape = { arity, vsat, retVsat }`, qualified key
-→ shape, `Purvasm.Compiler.ForeignSig`) — the **whole shape**, one source of truth: arity for codegen
-(`shape.arity`), `vsat`/`ret_vsat` for the optimiser's effect analysis (ADR-0034). The standalone
-arity-only `foreignArity` path is subsumed: codegen reads `arity` from the threaded shapes; the ulib
-manifest is retained **only for `.c` linking** (its `sources` paths), not for arity. *Where* the shapes are
+→ shape, `Purvasm.Compiler.ForeignSig`) — the **whole shape**, one source of truth: the shape for codegen
+(which *derives* the leaf's physical closure arity from it — `Backend.LLVM.Driver.leafClosureArity`, **not**
+the raw semantic `shape.arity`; they differ for a nullary `Effect` leaf, ADR-0080 §2), `vsat`/`ret_vsat`
+for the optimiser's effect analysis (ADR-0034, which needs the **semantic** `shape.arity` verbatim). The
+standalone arity-only `foreignArity` path is subsumed: codegen derives the closure arity from the threaded
+shapes; the ulib manifest is retained **only for `.c` linking** (its `sources` paths), not for arity. *Where* the shapes are
 threaded — a build-driver fact in every mode, additionally surfaced to the optimiser under `--opt` — is
 §3.
 
@@ -103,9 +105,11 @@ avoids the loss above by not making `LocalFacts` the primary carrier.
 
 `LoweredModule` gains `foreignSigs :: Map String ForeignShape` — the module's **visible** shapes
 (`ForeignFacts` deps ∪ own), assembled by the driver and populated in **both** modes (§3), so
-`Backend.lowerModule` / `lowerEntry` read `arity` (for `AForeign` lowering + native-leaf recognition) from
-it under `--no-opt` and `--opt` alike. The `LlvmBackendOptions.foreignArity` / manifest-arity input to
-`llvmBackend` is retired for arity (the shapes supply it); the manifest stays only as the `.c` link plan.
+`Backend.lowerModule` / `lowerEntry` read the **shape** (for native-leaf recognition, and to derive the
+`AForeign` lowering's physical closure arity via `leafClosureArity` — *not* the raw semantic `shape.arity`,
+ADR-0080 §2) from it under `--no-opt` and `--opt` alike. The `LlvmBackendOptions.foreignArity` /
+manifest-arity input to `llvmBackend` is retired for arity (the shapes supply it); the manifest stays only
+as the `.c` link plan.
 
 ## Consequences
 

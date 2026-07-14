@@ -50,9 +50,14 @@ import PureScript.CST (RecoveredParserResult(..), parseModule)
 import PureScript.CST.Errors (printParseError)
 import PureScript.CST.Types (Declaration(..), Foreign(..), Module(..), Type(..)) as CST
 
--- | A foreign's calling shape (ADR-0080 §2), the ADR-0034 dual summary: the `AForeign`
--- | lowering wants `arity`, and the effect-placement analysis wants `vsat` (saturating
--- | performs) and `retVsat` (the saturated result is a later-forced effect thunk).
+-- | A foreign's calling shape (ADR-0080 §2), the ADR-0034 dual summary. `arity` is the **semantic**
+-- | arity — the source **arrow count** — consumed *verbatim* by the effect-placement analysis (ADR-0034;
+-- | a nullary `Effect a` leaf is semantic arity 0). It is deliberately **not** the *physical* closure
+-- | arity: a native `Effect`/`ST` leaf is a thunk, so a nullary one *is* the effect action and its
+-- | closure takes the unit-run (physical arity 1). The `AForeign` lowering derives that physical arity
+-- | from the shape (`Backend.LLVM.Driver.leafClosureArity`); the correction lives **there**, not here —
+-- | folding it back into `arity` would hand EffectAnalysis the wrong semantic arity. `vsat` (saturating
+-- | performs) / `retVsat` (the saturated result is a later-forced effect thunk) are the effect bits.
 type ForeignShape = { arity :: Int, vsat :: Boolean, retVsat :: Boolean }
 
 -- | One module's reconstructed foreign surface: the header's module name (dotted) and the

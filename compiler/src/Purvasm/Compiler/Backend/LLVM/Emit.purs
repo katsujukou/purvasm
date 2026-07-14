@@ -122,10 +122,12 @@ atom env = case _ of
     pure t
   AtomForeign k -> do
     -- A native foreign leaf resolves by link-time symbol (ADR-0073 §3): reference its `AbiCodeFn`
-    -- `@pvf_<mangle key>` and wrap it in a no-capture closure of the leaf's arity. The arity is the
-    -- FSR-reconstructed shape (ADR-0090 makes the shape the single source of truth), so a missing entry
-    -- is a wiring bug — crash at compile time rather than default to a wrong closure arity (which would
-    -- link but under/over-apply at runtime).
+    -- `@pvf_<mangle key>` and wrap it in a no-capture closure of the leaf's **physical closure arity**.
+    -- That is `foreignArity` — which the driver derives from the FSR shape (`Driver.leafClosureArity`),
+    -- **not** the raw semantic `ForeignShape.arity`: a nullary `Effect` leaf is physical arity 1 (it *is*
+    -- the thunk), while its semantic arity is 0. ADR-0090 makes the shape the single source of truth, so a
+    -- missing entry is a wiring bug — crash at compile time rather than default to a wrong closure arity
+    -- (which would link but under/over-apply at runtime).
     modify_ \c -> c { foreigns = Set.insert k c.foreigns }
     arity <- gets (Map.lookup k <<< _.foreignArity) >>= case _ of
       Just a -> pure a

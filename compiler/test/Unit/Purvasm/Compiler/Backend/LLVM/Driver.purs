@@ -30,6 +30,7 @@ import Data.Map as Map
 import Data.Maybe (Maybe(..), fromMaybe)
 import Data.String (Pattern(..))
 import Data.String as String
+import Data.Tuple (Tuple(..))
 import Effect.Aff (Aff)
 import Effect.Class (liftEffect)
 import Effect.Ref as Ref
@@ -37,7 +38,7 @@ import Node.Encoding (Encoding(..))
 import Node.FS.Sync (readTextFile)
 import PureScript.CoreFn.Decode (decodeModule)
 import PureScript.CoreFn.Module (Module)
-import Purvasm.Compiler (LoadResult(..), Options, build, defaultHooks)
+import Purvasm.Compiler (ForeignSigMap, LoadResult(..), Options, build, defaultHooks)
 import Purvasm.Compiler.Backend.LLVM.Driver (llvmBackend)
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (fail, shouldEqual)
@@ -46,11 +47,11 @@ parseModule :: String -> Either String Module
 parseModule src = jsonParser src >>= (lmap printJsonDecodeError <<< decodeModule)
 
 -- | Build a single-module program through the neutral driver + LLVM backend, capturing the emitted module
--- | object IR(s) and the init/entry object IR. `foreignSigsOf` is stubbed empty (ADR-0090): the fixtures'
--- | only foreign is `Effect.Ref._new`, a *structural* term the resolver materialises without a shape, so
--- | no native-leaf arity is ever demanded.
+-- | object IR(s) and the init/entry object IR. `foreignSigs` stubs the ADR-0090 FSR channel: the structural
+-- | fixtures pass `Map.empty` (`Effect.Ref._new` is a *structural* term the resolver materialises without a
+-- | shape), while the native-leaf fixture supplies its leaf's reconstructed `ForeignShape`.
 buildIR
-  :: { name :: String, mod :: Module }
+  :: { name :: String, mod :: Module, foreignSigs :: ForeignSigMap }
   -> Options
   -> Aff { mods :: Array String, entry :: Maybe String }
 buildIR fixture opts = do
@@ -62,7 +63,7 @@ buildIR fixture opts = do
       { workdir: "."
       , maxOptimizeIter: 1
       , loadModule: \name -> pure (if name == fixture.name then Loaded { path: fixture.name, mod: fixture.mod } else Missing)
-      , foreignSigsOf: \_ -> pure (Right Map.empty)
+      , foreignSigsOf: \_ -> pure (Right fixture.foreignSigs)
       , emitFile: \artifact -> Ref.modify_ (\a -> Array.snoc a artifact.backendIR) modBuf $> "mod.ll"
       , emitEntry: \o -> Ref.write (Just o) entryBuf $> "entry.ll"
       , hooks: defaultHooks
@@ -89,7 +90,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Driver" do
           -- `Slice1` imports `Prim`, reported `Missing` (skipped), so the closure is exactly `[Slice1]`.
           -- The entry `Slice1.identInt` (a bare `--value` entry); `isEffect: false` / `opt: false` matches
           -- boot's `--no-opt` reference.
-          out <- buildIR { name: "Slice1", mod }
+          out <- buildIR { name: "Slice1", mod, foreignSigs: Map.empty }
             { entryModule: "Slice1", entryName: "identInt", isEffect: false, opt: false }
           out.mods `shouldEqual` [ expectedMod ]
           out.entry `shouldEqual` Just expectedEntry
@@ -101,7 +102,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Driver" do
       case parseModule src of
         Left err -> fail ("CoreFn decode failed: " <> err)
         Right mod -> do
-          out <- buildIR { name: "Effect.Ref", mod }
+          out <- buildIR { name: "Effect.Ref", mod, foreignSigs: Map.empty }
             { entryModule: "Effect.Ref", entryName: "newRef", isEffect: false, opt: false }
           let ir = fromMaybe "" (Array.head out.mods)
           -- (a) `_new` is synthesised at all — its root-handle global exists.
@@ -141,7 +142,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Driver" do
       case parseModule src of
         Left err -> fail ("CoreFn decode failed: " <> err)
         Right mod -> do
-          out <- buildIR { name: "Slice1", mod }
+          out <- buildIR { name: "Slice1", mod, foreignSigs: Map.empty }
             { entryModule: "Slice1", entryName: "identInt", isEffect: true, opt: false }
           let entryIr = fromMaybe "" out.entry
           -- exactly one performance …
@@ -155,3 +156,29 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Driver" do
             (fail ("the entry must not pre-apply the bare Effect thunk (found a direct entry call); entry IR:\n" <> entryIr))
           when (String.contains (Pattern "call i64 @pv_apply(") entryIr)
             (fail ("the entry must not pre-apply the bare Effect thunk (found a pv_apply call); entry IR:\n" <> entryIr))
+
+    -- A nullary `Effect` native leaf (FSR `arity 0, retVsat` — e.g. `argvImpl :: Effect (Array String)`)
+    -- must lower to an **arity-1** leaf closure (it *is* the effect thunk; boot's `Ffi.foreign_arity`).
+    -- Reverting `leafClosureArity` to the raw `s.arity` builds it at arity 0, so `run`'s unit application
+    -- over-applies the already-fired leaf onto its own result — the `argvImpl` "not callable (kind Array)"
+    -- heap corruption that blocked `bench-effect-ref`.
+    it "builds a nullary-Effect native leaf closure at arity 1 (not the raw FSR arity 0)" do
+      src <- liftEffect (readTextFile UTF8 "compiler/test/fixtures/nullary-effect-leaf/corefn.json")
+      case parseModule src of
+        Left err -> fail ("CoreFn decode failed: " <> err)
+        Right mod -> do
+          -- The test supplies the FSR shape a nullary `Effect` leaf reconstructs to (`arity 0, retVsat`).
+          let sigs = Map.fromFoldable [ Tuple "Test.Ffi.getThing" { arity: 0, vsat: false, retVsat: true } ]
+          out <- buildIR { name: "Test.Ffi", mod, foreignSigs: sigs }
+            { entryModule: "Test.Ffi", entryName: "answer", isEffect: false, opt: false }
+          let ir = fromMaybe "" (Array.head out.mods)
+          -- the leaf is referenced by its link-time `@pvf_` symbol …
+          unless (String.contains (Pattern "ptrtoint ptr @pvf_Test_2eFfi_2egetThing to i64") ir)
+            (fail ("expected the @pvf_ leaf reference; module IR:\n" <> ir))
+          -- … wrapped in exactly one no-capture closure (the sole `make_closure` here), at **arity 1**
+          -- (the trailing `i64 1` is the immediate-unit env sentinel). The revert emits `i32 0` here.
+          countOccurrences "call i64 @pv_make_closure(" ir `shouldEqual` 1
+          unless (String.contains (Pattern ", i32 1, i64 1)") ir)
+            (fail ("the nullary-Effect leaf closure must be arity 1; module IR:\n" <> ir))
+          when (String.contains (Pattern ", i32 0, i64 1)") ir)
+            (fail ("the nullary-Effect leaf closure must not be arity 0 (over-applies on run); module IR:\n" <> ir))

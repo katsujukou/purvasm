@@ -9,8 +9,11 @@ Level-2 foreign signatures reconstructed from source via the embedded CST parser
 
 ## Context
 
-A foreign's **calling shape** — its arity, and whether it is an effectful leaf — steers three
-different consumers: the native backend's `AForeign` lowering builds a closure of that arity
+A foreign's **calling shape** — its (semantic) arity, and whether it is an effectful leaf — steers three
+different consumers: the native backend's `AForeign` lowering builds a closure of the leaf's **physical
+closure arity**, which it *derives* from the shape (a nullary `Effect a` leaf is semantic arity 0 but
+physical arity 1 — it *is* the effect thunk; the derivation is `Backend.LLVM.Driver.leafClosureArity`, and
+must stay backend-side — see §2)
 ([0073](0073-ulib-shipped-native-foreign-and-link-time-resolution.md) §3); the effect-placement
 analysis ([0034](0034-effect-analysis-impurification.md)'s `foreign_arity`/`effectful_leaf` inputs) decides
 *where* an effect fires, the named minefield of that record; and diagnostics want to say what a
@@ -115,10 +118,18 @@ node), but a synonym can hide an effect head (`type Eff = Effect`, or aliasing a
 bits false) rather than guessed effectful.
 
 The interpretation is validated by a **consistency differential**: for every key both boot's
-registry and the reconstruction know, the `(arity, vsat, ret_vsat)` triple must agree — a
-standing tooling test, so the two sources cannot drift while boot remains in the build path.
-Boot's registry carries a single effectful bit, which is `ret_vsat` (it provides no uncurried
-`EffectFn` leaf, so `vsat` is always `false` on that side); the differential normalises
+registry and the reconstruction know, the shapes must agree — a standing tooling test, so the two
+sources cannot drift while boot remains in the build path. Two normalisations are applied before the
+compare, because the two sides speak different dialects. (i) **Arity is semantic vs physical.** Boot's
+registry carries the **physical** `foreign_arity` (the closure arity), while the reconstruction carries
+the **semantic** arrow count — and they *differ* for a nullary `Effect` leaf (`argvImpl`: reconstruction
+`arity 0, retVsat`, boot `foreign_arity 1`). So the differential maps the reconstructed shape through the
+same physical-arity conversion the backend uses — `if retVsat then max arity 1 else arity` — before
+comparing to boot's arity; it does **not** compare the raw reconstructed arity, which would spuriously
+disagree. (This conversion is applied only *at the comparison* and in the backend lowering; it is **not**
+folded into the reconstructed `arity`, which stays semantic for ADR-0034's effect analysis.) (ii) **The
+effect bit.** Boot's registry carries a single effectful bit, which is `ret_vsat` (it provides no
+uncurried `EffectFn` leaf, so `vsat` is always `false` on that side); the differential normalises
 accordingly.
 
 ### 3. Where the shapes flow

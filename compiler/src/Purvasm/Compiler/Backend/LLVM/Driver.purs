@@ -35,6 +35,7 @@ import Purvasm.Compiler.Backend.LLVM.Types (CallFact(..), Gdef(..))
 import Purvasm.Compiler.CESK.AST (Term(..))
 import Purvasm.Compiler.CESK.Translate (qualifiedKey)
 import Purvasm.Compiler.Ffi (resolver)
+import Purvasm.Compiler.ForeignSig (ForeignShape)
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), mapAtoms)
 import Purvasm.Compiler.MiddleEnd.Module (AnfModule, declsOfModule, mapDeclBodies)
 import Purvasm.Compiler.MiddleEnd.Normalize (normalize)
@@ -146,12 +147,26 @@ synthForeignGdefs lm = Array.sortWith gdefInitKey (Array.mapMaybe synth lm.sourc
 
 -- | The **native leaves** among a module's (accumulated own ∪ deps) foreign shapes (ADR-0090): the
 -- | foreign keys the compiler does NOT itself resolve (`resolver k = Nothing` — not a primop/`unsafeCoerce`
--- | intrinsic, not a literal builtin, not a structural higher-order term), mapped to their FSR closure
--- | arity. These are the genuine host-provided leaves (a `ulib` `.c` like `Data.Show.showNumberImpl`, or a
--- | runtime `pvf_` like `Purvasm.String.byteLength`) that lower to a `@pvf_<key>` link-time symbol. An
--- | intrinsic foreign is materialised as a gdef by `synthForeignGdefs` instead, so it is excluded here.
+-- | intrinsic, not a literal builtin, not a structural higher-order term), mapped to their **physical
+-- | closure arity** — `leafClosureArity` of the FSR shape, *not* the raw semantic `shape.arity` (which
+-- | differs for a nullary `Effect` leaf; see `leafClosureArity`). These are the genuine host-provided
+-- | leaves (a `ulib` `.c` like `Data.Show.showNumberImpl`, or a runtime `pvf_` like
+-- | `Purvasm.String.byteLength`) that lower to a `@pvf_<key>` link-time symbol. An intrinsic foreign is
+-- | materialised as a gdef by `synthForeignGdefs` instead, so it is excluded here.
 nativeLeafArities :: ForeignSigMap -> Map String Int
-nativeLeafArities = Map.mapMaybeWithKey \k s -> if isNothing (resolver k) then Just s.arity else Nothing
+nativeLeafArities = Map.mapMaybeWithKey \k s -> if isNothing (resolver k) then Just (leafClosureArity s) else Nothing
+
+-- | The **leaf closure arity** — the arity of the no-capture closure the backend builds for a native leaf
+-- | reference (`Emit.atom` `AForeign`), matching boot's `Ffi.foreign_arity`. This is **not** the raw FSR
+-- | arrow count (`ForeignShape.arity`): a native `Effect`/`ST` leaf is a **thunk**, so a *nullary* one — an
+-- | `Effect a` with no preceding arrow (`Purvasm.System.Process.argvImpl :: Effect (Array String)`, FSR
+-- | `arity 0, retVsat`) — *is* the effect action, and its closure takes the unit-run: arity 1. A leaf with
+-- | ≥ 1 data arg returns a *fresh* effect thunk when saturated (`leaf_write_line` builds a `\$u -> …`
+-- | closure), so its closure arity stays the data-arg count. Building a nullary `Effect` leaf at arity 0
+-- | makes `run`'s unit application **over-apply** an already-fired leaf onto its own result — e.g. `argv
+-- | unit` applies `unit` to the returned `Array`, a "not callable (kind Array)" fault / heap corruption.
+leafClosureArity :: ForeignShape -> Int
+leafClosureArity s = if s.retVsat then max s.arity 1 else s.arity
 
 -- | Resolve a **native leaf** free reference from `AtomVar` to `AtomForeign`, so codegen emits its
 -- | `@pvf_<key>` symbol + a no-capture closure of its arity. Runs before the `DictElim` bridge (boot
