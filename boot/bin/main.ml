@@ -765,13 +765,16 @@ let native_cmd =
   let backend =
     Arg.(
       value
-      & opt (enum [ "ocaml", "ocaml"; "llvm", "llvm" ]) "ocaml"
+      & opt (enum [ "ocaml", "ocaml"; "llvm", "llvm" ]) "llvm"
       & info
           [ "backend" ]
           ~docv:"BACKEND"
           ~doc:
-            "Native backend: $(b,ocaml) (OCaml source + ocamlopt) or $(b,llvm) (LLVM IR \
-             + clang, linked with the runtime staticlib).")
+            "Native backend (default $(b,llvm)): $(b,llvm) (LLVM IR + clang, linked with \
+             the runtime staticlib) or $(b,ocaml) (OCaml source + ocamlopt). The \
+             $(b,ocaml) backend is a legacy path with a known value-representation \
+             defect on newtype + derived-instance composition (e.g. \
+             $(b,ArgParse.Basic)); prefer $(b,llvm).")
   in
   let runtime_lib =
     Arg.(
@@ -830,8 +833,8 @@ let native_cmd =
     (Cmd.info
        "native"
        ~doc:
-         "Compile a CoreFn dir to a native executable via the $(b,ocaml) (ocamlopt) or \
-          $(b,llvm) (clang + runtime staticlib) backend.")
+         "Compile a CoreFn dir to a native executable via the $(b,llvm) (clang + runtime \
+          staticlib, default) or $(b,ocaml) (ocamlopt, legacy) backend.")
     Term.(
       const native_action
       $ backend

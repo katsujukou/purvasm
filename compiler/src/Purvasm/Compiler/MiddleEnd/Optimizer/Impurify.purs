@@ -5,12 +5,12 @@
 -- |
 -- | A single `GerDescriptor` per key is the source of truth: its `key`, its `semanticArity` (the
 -- | source/FSR exact-saturation arguments the canonical rewrite needs — *not* the trailing run unit),
--- | its `origin` (a GER-semantic classification, orthogonal to provider form), and its `lowering`.
--- | `ownedKeys` is every descriptor; `structuralExclusions` is the `StructuralGuest` subset that leaves
--- | the NbE structural rung (ADR-0099 §3 — so NbE never re-hides the node by unfolding it to the guest
--- | term). The `--no-opt` fallback differs by provider form: the `StructuralGuest` keys keep their
--- | link-time `resolver` guest terms (`Effect.pureE`/`bindE`), whereas the `EffectEliminator`
--- | `unsafePerformEffect` is (currently) a `ulib` PS shadow that `--no-opt` compiles normally.
+-- | its `leavesRung` flag (§3 rung exclusion), and its `lowering`. `ownedKeys` is every descriptor;
+-- | `structuralExclusions` is the `leavesRung` subset that leaves the NbE structural rung (ADR-0099 §3
+-- | — so NbE never re-hides the node by unfolding it to the guest term). The `--no-opt` fallback
+-- | tracks the same bit: a `leavesRung` key is structural-backed and keeps its link-time `resolver`
+-- | guest term (`Effect.pureE`/`bindE`), whereas a non-`leavesRung` key (`unsafePerformEffect`) is a
+-- | `ulib` PS shadow that `--no-opt` compiles normally.
 -- |
 -- | The pass recognises a GER key **two ways** (ADR-0099 §5/§6): a bare GER foreign atom at any
 -- | saturation, *and* a statically-known `Effect` dispatch (`accessor dict args`) resolved directly
@@ -46,26 +46,24 @@ import Purvasm.Compiler.MiddleEnd.Module (Decl)
 import Purvasm.Compiler.MiddleEnd.Optimizer.DictElim (DictMachinery)
 import Purvasm.Compiler.Primitive (PrimOp(..))
 
--- | The GER-semantic role of a key, **orthogonal to its provider form** (a structural guest term,
--- | a `ulib` shadow, or a foreign leaf — independent of role). `StructuralGuest` — a monad-glue
--- | combinator with an `Ffi.structural` guest term (`pureE` / `bindE`); it leaves the NbE structural
--- | rung. `EffectEliminator` — runs a thunk and yields its value (`unsafePerformEffect`); it carries
--- | no structural-rung exclusion (unfolding it to `e unit` re-hides nothing). `unsafePerformEffect`
--- | is currently a `ulib` shadow whose *use sites* this pass lowers; the `foreign import` flip is a
--- | follow-up (ADR-0099 Correction), so the role — not the provider form — is what the descriptor
--- | records. `DerivedMethod` — a `Functor`/`Apply` method (`map`/`apply`) recognised on an
--- | Effect-family dict (Slice 3); it has no owned foreign key and is never in the descriptor table
--- | (synthesised by `recognize`), so it never anchors a family or leaves the structural rung.
-data GerOrigin = StructuralGuest | EffectEliminator | DerivedMethod
-
-derive instance Eq GerOrigin
-
 -- | A GER-owned key's rewrite spec. `lowering` receives **exactly** `semanticArity` atoms (the pass
 -- | guarantees it, η-expanding fewer and splicing more) and returns the canonical computation.
+-- |
+-- | `leavesRung` is the one **operational** classification the pass acts on (it is *not* a semantic
+-- | role): does this key leave the NbE structural rung (ADR-0099 §3)? A key leaves the rung **iff** it
+-- | is structural-backed — provided as an `Ffi.structural` guest term that NbE would otherwise unfold,
+-- | re-hiding the `CPerform` (all the `Effect`/`ST` glue, loops, `ST` reference combinators, and `ST`
+-- | `run`). `run` *eliminates* semantically yet still `leavesRung`, because the deciding fact is
+-- | provider form (structural-backed), not what the combinator does — so a future descriptor sets
+-- | `leavesRung` from "is there a structural guest term to hide behind", nothing else.
+-- | `unsafePerformEffect` is **not** structural-backed (a `ulib` PS shadow), so `leavesRung = false`;
+-- | its `foreign import` flip is a follow-up (ADR-0099 Correction). The synthesised `Functor`/`Apply`
+-- | `map`/`apply` descriptors (Slice 3, `recognize` on an Effect-family dict) are never in the table
+-- | and own no foreign key, so they carry `leavesRung = false` and never touch `structuralExclusions`.
 type GerDescriptor =
   { key :: String
   , semanticArity :: Int
-  , origin :: GerOrigin
+  , leavesRung :: Boolean
   , lowering :: Array Atom -> Fresh CExpr
   }
 
@@ -127,15 +125,15 @@ lowerApply = case _ of
   _ -> unsafeCrashWith "Impurify.lowerApply: expected exactly 2 arguments"
 
 -- | The synthetic descriptors for the `Functor`/`Apply` methods, emitted by `recognize` when the
--- | dispatch dict is Effect-family (Slice 3). Not in the descriptor table (no owned foreign key):
--- | `origin = DerivedMethod`, so they never anchor a family or leave the structural rung.
+-- | dispatch dict is Effect-family (Slice 3). Not in the descriptor table (no owned foreign key), and
+-- | `leavesRung = false` — they own no structural key, so they never touch `structuralExclusions`.
 mapDescriptor :: GerDescriptor
-mapDescriptor = { key: "Effect.functorEffect.map", semanticArity: 2, origin: DerivedMethod, lowering: lowerMap }
+mapDescriptor = { key: "Effect.functorEffect.map", semanticArity: 2, leavesRung: false, lowering: lowerMap }
 
 applyDescriptor :: GerDescriptor
-applyDescriptor = { key: "Effect.applyEffect.apply", semanticArity: 2, origin: DerivedMethod, lowering: lowerApply }
+applyDescriptor = { key: "Effect.applyEffect.apply", semanticArity: 2, leavesRung: false, lowering: lowerApply }
 
--- | The `DerivedMethod` descriptor for a `Functor`/`Apply` method field name, else `Nothing`.
+-- | The synthetic `map`/`apply` descriptor for a `Functor`/`Apply` method field name, else `Nothing`.
 methodDescriptor :: String -> Maybe GerDescriptor
 methodDescriptor = case _ of
   "map" -> Just mapDescriptor
@@ -295,26 +293,110 @@ lowerForeach = case _ of
       )
   _ -> unsafeCrashWith "Impurify.lowerForeach: expected exactly 2 arguments"
 
--- | The GER descriptor table — the owned keys landed across slices. `StructuralGuest`: the glue
--- | `pureE`/`bindE` (Slice 2) and the structural loop combinators `forE`/`whileE`/`untilE`/`foreachE`
--- | + their `Control.Monad.ST.Internal` twins (Slice 4). `EffectEliminator`: `unsafePerformEffect`
--- | (Slice 2, currently `ulib`-shadow-backed; see `GerOrigin`). The `Functor`/`Apply` `map`/`apply`
--- | rewrites (Slice 3) are **not** here — they carry no owned foreign key and are synthesised by
--- | `recognize` on an Effect-family dict (`mapDescriptor`/`applyDescriptor`, `DerivedMethod`).
+-- | `run e → perform e` (ADR-0099 §5/§9): the `ST` eliminator forces the thunk and yields its value
+-- | — like `unsafePerformEffect`, so no `\$u` wrapper — but, being an `Ffi.structural` guest
+-- | (`stRun = \f -> f unit`), it has `leavesRung = true` (else NbE unfolds it and re-hides the run as a
+-- | plain unit-application). `run` eliminates semantically yet leaves the rung on the provider-form
+-- | fact alone — the `leavesRung` flag is not a semantic role (see `GerDescriptor`).
+lowerRun :: Array Atom -> Fresh CExpr
+lowerRun = case _ of
+  [ e ] -> pure (CPerform e)
+  _ -> unsafeCrashWith "Impurify.lowerRun: expected exactly 1 argument"
+
+-- | `ST` reference combinators (ADR-0099 §9, Slice 5) — the `STRef` cell is a one-element array (the
+-- | same model as `Effect.Ref`, ADR-0023): the mutation happens in the `\$u` thunk body, so no
+-- | `CPerform` appears here (there is no inner thunk to force); the run boundary is supplied by the
+-- | enclosing `bind_`/`run`. `read`/`modifyImpl` read the cell with `IndexArray`, which
+-- | `EffectAnalysis.mtouchC` already pins as `mtouch = true` (`pinnedPrim`) — so the ADR-0096 §2 motion
+-- | hazard directly forbids sinking / reordering the read across a `SetArray`; ordering is *not*
+-- | reliant on the surrounding `CPerform`. What stays deferred (region-local track) is the *precise
+-- | relaxation* that would let a provably region-local read move. The adversarial gate exercises the
+-- | end-to-end lowering behaviour, not this ordering (which the pin already guarantees).
+
+-- | `new val → \$u -> let arr = newArray 1 in setArray arr 0 val` (the cell is the mutated array).
+lowerNew :: Array Atom -> Fresh CExpr
+lowerNew = case _ of
+  [ val ] -> do
+    u <- fresh
+    arr <- fresh
+    pure (CLam [ u ] (Let arr (CPrim NewArray [ AtomLit (LInt 1) ]) (Ret (CPrim SetArray [ AtomVar arr, AtomLit (LInt 0), val ]))))
+  _ -> unsafeCrashWith "Impurify.lowerNew: expected exactly 1 argument"
+
+-- | `read ref → \$u -> indexArray ref 0`.
+lowerRead :: Array Atom -> Fresh CExpr
+lowerRead = case _ of
+  [ ref ] -> do
+    u <- fresh
+    pure (CLam [ u ] (Ret (CPrim IndexArray [ ref, AtomLit (LInt 0) ])))
+  _ -> unsafeCrashWith "Impurify.lowerRead: expected exactly 1 argument"
+
+-- | `write val ref → \$u -> let _ = setArray ref 0 val in val` — the `ST` `write` returns the written
+-- | value (unlike `Effect.Ref.write`, which returns unit).
+lowerWrite :: Array Atom -> Fresh CExpr
+lowerWrite = case _ of
+  [ val, ref ] -> do
+    u <- fresh
+    dropv <- fresh
+    pure (CLam [ u ] (Let dropv (CPrim SetArray [ ref, AtomLit (LInt 0), val ]) (Ret (CAtom val))))
+  _ -> unsafeCrashWith "Impurify.lowerWrite: expected exactly 2 arguments"
+
+-- | `modifyImpl f ref → \$u -> let old = indexArray ref 0 in let t = f old in let s = t.state in
+-- | let _ = setArray ref 0 s in t.value`.
+lowerModify :: Array Atom -> Fresh CExpr
+lowerModify = case _ of
+  [ f, ref ] -> do
+    u <- fresh
+    old <- fresh
+    t <- fresh
+    s <- fresh
+    dropv <- fresh
+    pure
+      ( CLam [ u ]
+          ( Let old (CPrim IndexArray [ ref, AtomLit (LInt 0) ])
+              ( Let t (CApp f [ AtomVar old ])
+                  ( Let s (CAccessor (AtomVar t) "state")
+                      ( Let dropv (CPrim SetArray [ ref, AtomLit (LInt 0), AtomVar s ])
+                          (Ret (CAccessor (AtomVar t) "value"))
+                      )
+                  )
+              )
+          )
+      )
+  _ -> unsafeCrashWith "Impurify.lowerModify: expected exactly 2 arguments"
+
+-- | The GER descriptor table — the owned keys landed across slices, every one structural-backed
+-- | (`leavesRung = true`) except `unsafePerformEffect`. By semantic grouping (documentation only —
+-- | the pass acts on `leavesRung`, not the grouping): the glue `pureE`/`bindE` (Slice 2); the
+-- | structural loop combinators `forE`/`whileE`/`untilE`/`foreachE` + their `Control.Monad.ST.Internal`
+-- | twins (Slice 4); the rest of `Control.Monad.ST.Internal`'s glue / eliminator / reference
+-- | combinators `pure_`/`bind_`/`run`/`new`/`read`/`write`/`modifyImpl` (Slice 5; `ST r a` is the same
+-- | unit thunk, ADR-0099 §9); and `unsafePerformEffect` (Slice 2, `ulib`-shadow-backed → `leavesRung
+-- | = false`). The `Functor`/`Apply` `map`/`apply` rewrites (Slice 3) are **not** here — they carry no
+-- | owned foreign key and are synthesised by `recognize` on an Effect-family dict. `ST`'s `map_`/`apply`
+-- | are out of Slice 5's §9 scope (`map_` stays structural; `apply` is the generic `ap`); the
+-- | `Control.Monad.ST.Uncurried` `STFnN` adapters are deferred (ADR-0099 §9 Correction).
 descriptorList :: Array GerDescriptor
 descriptorList =
-  [ { key: "Effect.pureE", semanticArity: 1, origin: StructuralGuest, lowering: lowerPure }
-  , { key: "Effect.bindE", semanticArity: 2, origin: StructuralGuest, lowering: lowerBind }
-  , { key: "Effect.Unsafe.unsafePerformEffect", semanticArity: 1, origin: EffectEliminator, lowering: lowerUnsafePerform }
+  [ { key: "Effect.pureE", semanticArity: 1, leavesRung: true, lowering: lowerPure }
+  , { key: "Effect.bindE", semanticArity: 2, leavesRung: true, lowering: lowerBind }
+  , { key: "Effect.Unsafe.unsafePerformEffect", semanticArity: 1, leavesRung: false, lowering: lowerUnsafePerform }
   -- structural loop combinators (Slice 4): lowered to `LetRec`/`CIf` ANF. The `ST` loop twins
   -- share the guest terms (`Ffi.structural`) and so the same lowerings.
-  , { key: "Effect.untilE", semanticArity: 1, origin: StructuralGuest, lowering: lowerUntil }
-  , { key: "Effect.whileE", semanticArity: 2, origin: StructuralGuest, lowering: lowerWhile }
-  , { key: "Effect.forE", semanticArity: 3, origin: StructuralGuest, lowering: lowerFor }
-  , { key: "Effect.foreachE", semanticArity: 2, origin: StructuralGuest, lowering: lowerForeach }
-  , { key: "Control.Monad.ST.Internal.while", semanticArity: 2, origin: StructuralGuest, lowering: lowerWhile }
-  , { key: "Control.Monad.ST.Internal.for", semanticArity: 3, origin: StructuralGuest, lowering: lowerFor }
-  , { key: "Control.Monad.ST.Internal.foreach", semanticArity: 2, origin: StructuralGuest, lowering: lowerForeach }
+  , { key: "Effect.untilE", semanticArity: 1, leavesRung: true, lowering: lowerUntil }
+  , { key: "Effect.whileE", semanticArity: 2, leavesRung: true, lowering: lowerWhile }
+  , { key: "Effect.forE", semanticArity: 3, leavesRung: true, lowering: lowerFor }
+  , { key: "Effect.foreachE", semanticArity: 2, leavesRung: true, lowering: lowerForeach }
+  , { key: "Control.Monad.ST.Internal.while", semanticArity: 2, leavesRung: true, lowering: lowerWhile }
+  , { key: "Control.Monad.ST.Internal.for", semanticArity: 3, leavesRung: true, lowering: lowerFor }
+  , { key: "Control.Monad.ST.Internal.foreach", semanticArity: 2, leavesRung: true, lowering: lowerForeach }
+  -- `ST` glue / eliminator / reference combinators (Slice 5): the same unit-thunk model as `Effect`.
+  , { key: "Control.Monad.ST.Internal.pure_", semanticArity: 1, leavesRung: true, lowering: lowerPure }
+  , { key: "Control.Monad.ST.Internal.bind_", semanticArity: 2, leavesRung: true, lowering: lowerBind }
+  , { key: "Control.Monad.ST.Internal.run", semanticArity: 1, leavesRung: true, lowering: lowerRun }
+  , { key: "Control.Monad.ST.Internal.new", semanticArity: 1, leavesRung: true, lowering: lowerNew }
+  , { key: "Control.Monad.ST.Internal.read", semanticArity: 1, leavesRung: true, lowering: lowerRead }
+  , { key: "Control.Monad.ST.Internal.write", semanticArity: 2, leavesRung: true, lowering: lowerWrite }
+  , { key: "Control.Monad.ST.Internal.modifyImpl", semanticArity: 2, leavesRung: true, lowering: lowerModify }
   ]
 
 gerDescriptors :: Map String GerDescriptor
@@ -324,9 +406,9 @@ gerDescriptors = Map.fromFoldable (map (\d -> Tuple d.key d) descriptorList)
 ownedKeys :: Set String
 ownedKeys = Set.fromFoldable (map _.key descriptorList)
 
--- | The keys that leave the NbE structural rung (ADR-0099 §3): the `StructuralGuest` subset only.
+-- | The keys that leave the NbE structural rung (ADR-0099 §3): the `leavesRung` subset only.
 structuralExclusions :: Set String
-structuralExclusions = Set.fromFoldable (map _.key (Array.filter (\d -> d.origin == StructuralGuest) descriptorList))
+structuralExclusions = Set.fromFoldable (map _.key (Array.filter _.leavesRung descriptorList))
 
 -- | The GER **Effect-family** classifier (ADR-0099 Slice 3, sidenote 0014, fail-closed): from a
 -- | module's raw decls, the instance-dict keys of any recursive group whose whole shape matches the
@@ -338,7 +420,7 @@ structuralExclusions = Set.fromFoldable (map _.key (Array.filter (\d -> d.origin
 -- | A recursive group is admitted **iff**: it has exactly five members, each a dict in
 -- | `machinery.instances`; the five roles below are each present exactly once (by their method
 -- | field, robust to `purs`'s superclass-accessor renaming); and the `Applicative`/`Bind` members
--- | hold the `Effect.pureE` / `Effect.bindE` `StructuralGuest` anchors directly. More than one
+-- | hold the `Effect.pureE` / `Effect.bindE` structural-guest anchors directly. More than one
 -- | matching group in a module fails closed (never expected).
 -- |
 -- | Roles (field-name sets, verified against the compiled `Effect` corefn): `Functor` `{map}`,

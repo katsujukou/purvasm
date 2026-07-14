@@ -39,6 +39,11 @@
 > The `GerDescriptor.origin` enum is therefore `StructuralGuest | EffectEliminator`;
 > `structuralExclusions` (§3) stays the `StructuralGuest` subset (`pureE` / `bindE`), and
 > `EffectEliminator` keys carry no structural-rung exclusion.
+>
+> *(Superseded by the 2026-07-14 Correction in §3: the `origin` enum was replaced by the
+> operational `leavesRung :: Boolean` field. The **decisions** above stand — `unsafePerformEffect`
+> is a non-rung-excluded eliminator, `pureE`/`bindE` leave the rung — only the descriptor
+> encoding changed. Retained as the Slice-1 record.)*
 
 > **Progress (2026-07-13): Slice 1 implemented** (semantic scaffolding). `CPerform Atom`
 > added to the ANF (`mapAtoms` / `FreeVars` / `Pretty`), `NPerform Sem` to the NbE `Comp`
@@ -201,6 +206,34 @@
 > lowering (`CPerform t` → `TailCall` in tail position) already gives `let t = self args in perform
 > t` its TCE / stack-safety, so §7 is a perf-only optimisation (elides the intermediate thunk
 > allocation), revisited if a manual-`Effect`-recursion hot path appears. Uncommitted.
+
+> **Progress (2026-07-14): Slice 5 implemented** (`ST`). `Impurify` gains `lowerRun`/`lowerNew`/
+> `lowerRead`/`lowerWrite`/`lowerModify` and descriptors (all `leavesRung = true`, auto-excluded from
+> the NbE rung; the `resolver` keeps the guest terms for `--no-opt`) for `Control.Monad.ST.Internal`'s
+> `pure_`(1)/`bind_`(2) (reusing the `Effect` `pureE`/`bindE` lowerings — same unit-thunk model),
+> `run`(1) (the eliminator → `CPerform e`, no `\$u`; `leavesRung` because it *is* an `Ffi.structural`
+> guest, so it must leave the rung — on the provider-form fact, not its eliminate semantics; see the
+> `GerDescriptor` note on the `leavesRung` refactor that replaced the misleading `GerOrigin` role
+> enum), and the `STRef` combinators `new`(1)/`read`(1)/`write`(2)/`modifyImpl`(2) → the one-cell array
+> primops (`NewArray`/`IndexArray`/`SetArray`) inside a `\$u` thunk (`write` returns the written value;
+> `modifyImpl` reads-applies-writes-returns `.value`). The loop twins landed in Slice 4. **Deferred
+> (out of §9's ST list):** `map_` (stays structural — `ST` `void`/`map` unfold to `stMap`, correct but
+> unoptimised) and the `Control.Monad.ST.Uncurried` `STFnN` adapters (§9 Correction 2026-07-14).
+> **Ordering (not a hazard):** `read`/`modifyImpl` lower to `IndexArray`, which `EffectAnalysis.mtouchC`
+> already pins as `mtouch = true` (`pinnedPrim`) — so the ADR-0096 §2 motion hazard *directly* forbids
+> sinking / reordering the read across a `SetArray`; ordering is not reliant on the surrounding
+> `CPerform`. What stays deferred (region-local track) is only the *precise relaxation* that would let a
+> provably region-local read move. **Gates:** 375 unit (**9 new `it`s / 11 assertions** — `pure_`/`bind_`
+> share the `Effect` lowerings, `run`/`new`/`read`/`write`/`modifyImpl` exact-IR, a `bind_` dispatch
+> through the `ST` `Bind` dict, `new`/`modifyImpl` idempotency, and the seven `ST.Internal` keys ∈
+> `structuralExclusions`) + 11 E2E (new Slice-5 fixture: `run`/`bind_` carry `CPerform`, `new`/`modifyImpl`
+> emit the cell primops, no residual structural foreign); `purs-tidy` clean. **Behaviour gate (the new
+> `bench-st-ref` STRef twin — read-modify-write of an `STRef` in an `ST.for` loop, identical `m·(m-1)`
+> oracle to `effect-ref`):** `--opt == --no-opt == oracle` on VM (`249500` at n=1000, `6247500` at
+> n=5000) **and** native LLVM (`249500` both modes) — 4/4 configs; plus an explicit interleaved
+> read/write/modify chain (`200`, VM both modes). The `--opt-effect` gate passes: `st-ref` ratio
+> **1.522** (34.3% instruction reduction — GER collapses the `ST` glue), size× 0.918, time× 2.818
+> (< 1.5/4.0); `effect-ref` unchanged (1.965). Uncommitted.
 
 ## Context
 
@@ -394,13 +427,16 @@ per key is the source of truth, with four fields:
   (`unsafePerformEffect` has no trailing unit at all — it already *takes* a thunk — so
   a uniform "subtract one" would be wrong; anchoring the definition to "arguments the
   rewrite needs" makes constructor and eliminator uniform.)
-- **`origin`** — the key's **GER-semantic role**, orthogonal to its provider form.
-  `StructuralGuest` (a monad-glue combinator with an `Ffi.structural` guest term: `pureE`
-  / `bindE` / `forE` / `whileE` / …) or `EffectEliminator` (runs a thunk and yields its
-  value: `unsafePerformEffect`). The eliminator's provider form is a follow-up decision
-  (currently a `ulib` shadow whose use sites GER lowers; the `foreign import` flip is
-  deferred — see the Correction and the `unsafePerformEffect` Progress note); its `origin`
-  is `EffectEliminator` regardless.
+- **`leavesRung`** — a single **operational** `Boolean`: does this key leave the NbE
+  structural rung (§3)? It is `true` **iff** the key is *structural-backed* — provided as an
+  `Ffi.structural` guest term that NbE would otherwise unfold, re-hiding the `CPerform` (all the
+  `Effect`/`ST` glue `pureE` / `bindE` / `pure_` / `bind_`, the loops `forE` / `whileE` / …, the
+  `ST` reference combinators, and `ST.run`). It is *not* a semantic role: `ST.run` *eliminates*
+  yet `leavesRung = true`, because the deciding fact is provider form, not what the combinator
+  does. `unsafePerformEffect` is `leavesRung = false` — a `ulib` PS shadow, not structural-backed
+  (its `foreign import` flip is a deferred follow-up; see the `unsafePerformEffect` Progress note).
+  *(This replaced an earlier `origin :: GerOrigin` semantic-role enum that broke on `ST.run`; see
+  the superseded Slice-1 Correction above.)*
 - **`lowering`** — the canonical GER rewrite (§5) that `Impurify` applies once the key
   is recognised at `semanticArity` (η-expanding an under-saturated occurrence first).
   Keeping it in the descriptor is what makes it the single source of truth — the
@@ -411,13 +447,13 @@ same set:
 
 - **`ownedKeys` = *all* landed descriptors** — every key `Impurify` recognises and
   lowers.
-- **`structuralExclusions` = the landed `StructuralGuest` descriptors only** — the
-  keys removed from `NbeEnv.structural`. An `EffectEliminator` descriptor is owned (so it
-  is recognised and lowered) but carries no structural-rung exclusion.
+- **`structuralExclusions` = the landed `leavesRung` descriptors only** — the keys
+  removed from `NbeEnv.structural`. A non-`leavesRung` descriptor (`unsafePerformEffect`) is
+  owned (so it is recognised and lowered) but carries no structural-rung exclusion.
 
 So recognition and lowering land together for every owned key; structural-rung
-exclusion happens only for the structural-backed subset. `semanticArity` is still
-written once (in the descriptor) for both purposes.
+exclusion happens only for the structural-backed (`leavesRung`) subset. `semanticArity` is
+still written once (in the descriptor) for both purposes.
 
 **The link-time `resolver` guest terms stay.** They remain the faithful `--no-opt`
 implementation (which never runs `Impurify`) and the link-time fallback. This is the
@@ -427,11 +463,17 @@ scope here** — it is a separate later step, and is sound only once the `--no-o
 has a replacement (a minimal always-on lowering, or a pure-PS shadow). Until then the
 provider retains them; GER only stops NbE from *unfolding* them.
 
-Because consumer (b) still resolves a bare GER key, a residual `Effect.bindE` would
-lower correctly on the **VM** (the linker materialises it) but **not** on **LLVM** (no
-lowering for a bare structural `AtomVar` — the ADR-0095 blocker). So the `--opt` path
-must additionally guarantee that **no bare GER-owned foreign survives `Impurify`** —
-which is why §5 η-expands them rather than declining (below).
+Consumer (b) still resolves a bare GER key, and **both** backends now materialise a
+residual one: the VM linker materialises it, and the LLVM backend synthesises a link-time
+guest-term gdef for every `resolver`-resolved foreign — structural included
+(`Driver.synthForeignGdefs`, the gap ADR-0095 once flagged, since closed). So `no bare
+GER-owned foreign survives Impurify` is **not** a backend-correctness requirement. It is an
+**optimisation / ownership invariant**: a residual bare `Effect.bindE` would silently *fall
+back* to the guest-term representation instead of the collapsed `CPerform` ANF — GER would
+have bought nothing for that occurrence — and it is the standing guarantee that lets the
+guest terms eventually retire from the provider (ADR-0094). That is why §5 η-expands an
+under-applied GER key rather than declining (below): to keep the collapse total, not to
+avoid a codegen crash.
 
 ### 4. The GER / Impurify pass and its place in the pipeline
 
@@ -613,9 +655,12 @@ first-class verification target (§8).
 ### 6. Consumption is direct — `DictElim` is not widened
 
 `DictElim.intrinsicLift` deliberately declines structural foreigns (a bare
-`Effect.bindE` `AtomVar` has no LLVM lowering and no guarantee a later pass consumes
-it — DictElim.purs:191–194). **This ADR does not change that.** Widening
-`intrinsicLift` to the whole structural resolver would break the backend seam.
+`Effect.bindE` `AtomVar` would fall back to its guest-term representation with no
+guarantee a later pass collapses it — DictElim.purs:191–194). **This ADR does not
+change that.** Widening `intrinsicLift` to the whole structural resolver would produce
+bare structural `AtomVar`s that codegen materialises to the *uncollapsed* guest term —
+defeating GER for those occurrences — so the lift stays declined and `Impurify` owns the
+consumption instead.
 
 Instead, `Impurify` consults `DictMachinery` itself and converts a **known** `Effect`
 dispatch **directly to canonical ANF**, never emitting a transient bare
@@ -690,6 +735,19 @@ mutation and its pure `run` boundary are **not** exploited for motion / eliminat
 this ADR — `ST` lands as the same conservative barrier as `Effect`; region-local
 memory optimisation is a separate decision (see the mutation/ownership research track).
 
+> **Correction (2026-07-14, Slice 5 landing):** the `Control.Monad.ST.Uncurried` `STFnN`
+> adapters (`mkSTFn`/`runSTFn`, ADR-0039) named above are **deferred** — Slice 5 lands the
+> `Control.Monad.ST.Internal.*` glue / eliminator / reference keys only. Reason: the `STFnN`
+> adapters live in a *different* module (`Control.Monad.ST.Uncurried`, not `.Internal`) and are
+> the `ST` twins of the `Data.Function.Uncurried` `FnN` family, which GER does **not** own either;
+> lowering them is an n-ary-adapter concern orthogonal to the monad-glue collapse, best landed with
+> (or after) a decision on the `FnN` adapters as a whole. No correctness cost: unlowered, they keep
+> their `Ffi.structural` guest terms on the `--no-opt`-parity `resolver` (`runEff (appArgs …)`),
+> and any `ST` code that goes through them stays correct, only unoptimised. **Future fixture pinned:**
+> when they land, an `--opt` E2E asserting `mkSTFn1 (\x -> …) ; runSTFn1 g x` lowers with no residual
+> `Control.Monad.ST.Uncurried.*` foreign (mirroring the Slice-4 `forE`-inlined fixture), plus a
+> differential gate on an `STFnN`-using program (`--opt == --no-opt == oracle`).
+
 ## Implementation slices
 
 ### Slice 1 — explicit force marker (semantic scaffolding)
@@ -707,17 +765,19 @@ memory optimisation is a separate decision (see the mutation/ownership research 
   (`f = pure x`, `main = …`).
 
 Each slice below lands its keys' `GerDescriptor`s (recognition + η-expansion +
-lowering) **and** removes that slice's `StructuralGuest` keys — the structural-backed
+lowering) **and** removes that slice's `leavesRung` keys — the structural-backed
 subset, `structuralExclusions` (§3) — from `NbeEnv.structural` together (the atomic
-per-slice rule); an `EffectEliminator` key is owned with no exclusion, and no key is
-excluded before its slice.
+per-slice rule); a non-`leavesRung` key (`unsafePerformEffect`) is owned with no exclusion,
+and no key is excluded before its slice.
 
 ### Slice 2 — core `Effect` glue
 
 - `GerDescriptor`s for `pureE`, `bindE`, `unsafePerformEffect`. `pureE` / `bindE`
-  leave `NbeEnv.structural` in this slice; `unsafePerformEffect` is a native foreign
-  **not** present in `Ffi.structural`, so it is *owned as a descriptor* (recognised +
-  lowered to `CPerform e`) but produces **no** structural-rung exclusion.
+  leave `NbeEnv.structural` in this slice; `unsafePerformEffect` is a `ulib` PS shadow
+  (**not** a native foreign, and **not** present in `Ffi.structural`), so it is *owned as a
+  descriptor* (its use sites recognised + lowered to `CPerform e`) but produces **no**
+  structural-rung exclusion (`leavesRung = false`). The `foreign import` ownership flip is a
+  deferred follow-up.
 - An **unresolved dispatch** (concrete instance not yet exposed) is left as the
   higher-level dispatch and retried next round; a **bare / under-applied** GER-owned
   foreign is **η-expanded and lowered** (§5), never declined — so no bare structural
@@ -746,9 +806,14 @@ excluded before its slice.
 
 ### Slice 5 — `ST`
 
-- Reuse the marker; `GerDescriptor`s for `run` / loop / ref combinators → ordinary
-  ANF; these `Control.Monad.ST.Internal.*` keys leave `NbeEnv.structural` in this
-  slice. Region-local optimisation deferred.
+- Reuse the marker; `GerDescriptor`s for `pure_` / `bind_` / `run` / ref combinators
+  (`new` / `read` / `write` / `modifyImpl`) → ordinary ANF (the loop combinators landed in
+  Slice 4); these `Control.Monad.ST.Internal.*` keys leave `NbeEnv.structural` in this
+  slice. `map_` (stays structural) and the `Control.Monad.ST.Uncurried` `STFnN` adapters are
+  out of scope here (the `STFnN` deferral is the §9 Correction 2026-07-14). The ref
+  combinators' `IndexArray` read is already `mtouch`-pinned (ADR-0096 forbids its motion);
+  what is deferred is only the region-local *relaxation* that would let a provably
+  region-local read move.
 
 ## Verification
 
@@ -837,9 +902,11 @@ not ported). The residual risk purvasm inherits is item 3's discipline — never
   already return `Effect` thunks at saturation; reflecting them again in value
   position introduces double-thunking and saturation drift against `ForeignShape`.
 - **Widen `DictElim.intrinsicLift` to the structural resolver** so `Effect.bindE`
-  surfaces as a bare foreign for a later pass. Rejected (§6): breaks the backend seam
-  (no LLVM lowering for a bare structural `AtomVar`) and re-opens the ADR-0098 hazard
-  of NbE's structural rung unfolding the exposed key back to the thunk guest term.
+  surfaces as a bare foreign for a later pass. Rejected (§6): a bare structural `AtomVar`
+  codegens to its *uncollapsed* guest term (both backends materialise it — no crash, but no
+  GER benefit either), and it re-opens the ADR-0098 hazard of NbE's structural rung unfolding
+  the exposed key back to the thunk guest term. Letting `Impurify` consume the dispatch
+  directly keeps the collapse total and the ownership clean.
 - **Reuse `CApp t [unit]` instead of a distinct `CPerform`.** Rejected (§1–2): a plain
   application loses the run marker, and once the marker is gone the head-based purity
   analysis cannot see which higher-order argument is performed — exactly the trap

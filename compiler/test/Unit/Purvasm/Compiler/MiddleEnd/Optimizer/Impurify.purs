@@ -387,3 +387,86 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Impurify" do
           , "Control.Monad.ST.Internal.foreach"
           ]
       Array.all (\k -> Set.member k structuralExclusions) keys `shouldEqual` true
+
+  describe "ST glue / eliminator / reference combinators → ordinary ANF (ADR-0099 §9, Slice 5)" do
+    it "pure_ / bind_ share the Effect pureE / bindE lowering (same unit-thunk model)" do
+      imp (Ret (CApp (foreign_ "Control.Monad.ST.Internal.pure_") [ var "a" ]))
+        `shouldEqual` imp (Ret (CApp (foreign_ "Effect.pureE") [ var "a" ]))
+      imp (Ret (CApp (foreign_ "Control.Monad.ST.Internal.bind_") [ var "m", var "k" ]))
+        `shouldEqual` imp (Ret (CApp (foreign_ "Effect.bindE") [ var "m", var "k" ]))
+
+    it "run e → perform e (the ST eliminator forces the thunk, no \\$u)" do
+      imp (Ret (CApp (foreign_ "Control.Monad.ST.Internal.run") [ var "e" ]))
+        `shouldEqual` Ret (CPerform (var "e"))
+
+    it "new val → \\$u -> let arr = newArray 1 in setArray arr 0 val" do
+      imp (Ret (CApp (foreign_ "Control.Monad.ST.Internal.new") [ var "val" ]))
+        `shouldEqual`
+          Ret
+            ( CLam [ "$ge1" ]
+                ( Let "$ge2" (CPrim NewArray [ AtomLit (LInt 1) ])
+                    (Ret (CPrim SetArray [ var "$ge2", AtomLit (LInt 0), var "val" ]))
+                )
+            )
+
+    it "read ref → \\$u -> indexArray ref 0" do
+      imp (Ret (CApp (foreign_ "Control.Monad.ST.Internal.read") [ var "ref" ]))
+        `shouldEqual` Ret (CLam [ "$ge1" ] (Ret (CPrim IndexArray [ var "ref", AtomLit (LInt 0) ])))
+
+    it "write val ref → \\$u -> let _ = setArray ref 0 val in val (returns the written value)" do
+      imp (Ret (CApp (foreign_ "Control.Monad.ST.Internal.write") [ var "val", var "ref" ]))
+        `shouldEqual`
+          Ret
+            ( CLam [ "$ge1" ]
+                ( Let "$ge2" (CPrim SetArray [ var "ref", AtomLit (LInt 0), var "val" ])
+                    (Ret (CAtom (var "val")))
+                )
+            )
+
+    it "modifyImpl f ref → \\$u -> read; apply f; write back .state; return .value" do
+      imp (Ret (CApp (foreign_ "Control.Monad.ST.Internal.modifyImpl") [ var "f", var "ref" ]))
+        `shouldEqual`
+          Ret
+            ( CLam [ "$ge1" ]
+                ( Let "$ge2" (CPrim IndexArray [ var "ref", AtomLit (LInt 0) ])
+                    ( Let "$ge3" (CApp (var "f") [ var "$ge2" ])
+                        ( Let "$ge4" (CAccessor (var "$ge3") "state")
+                            ( Let "$ge5" (CPrim SetArray [ var "ref", AtomLit (LInt 0), var "$ge4" ])
+                                (Ret (CAccessor (var "$ge3") "value"))
+                            )
+                        )
+                    )
+                )
+            )
+
+    it "recognises a bind_ dispatch through the ST Bind dict (accessor dict m k)" do
+      let
+        stMachinery = emptyMachinery
+          { accessors = Map.fromFoldable [ Tuple "Control.Bind.bind" "bind" ]
+          , instances = Map.fromFoldable
+              [ Tuple "Control.Monad.ST.Internal.bindST"
+                  (dict [ Tuple "bind" (foreign_ "Control.Monad.ST.Internal.bind_"), Tuple "Apply0" (var "loc") ])
+              ]
+          }
+      impurifyExpr stMachinery
+        (Ret (CApp (var "Control.Bind.bind") [ var "Control.Monad.ST.Internal.bindST", var "m", var "k" ]))
+        `shouldEqual` imp (Ret (CApp (foreign_ "Control.Monad.ST.Internal.bind_") [ var "m", var "k" ]))
+
+    it "is idempotent: a lowered new / modifyImpl re-impurifies unchanged" do
+      let n1 = imp (Ret (CApp (foreign_ "Control.Monad.ST.Internal.new") [ var "val" ]))
+      imp n1 `shouldEqual` n1
+      let m1 = imp (Ret (CApp (foreign_ "Control.Monad.ST.Internal.modifyImpl") [ var "f", var "ref" ]))
+      imp m1 `shouldEqual` m1
+
+    it "all seven ST.Internal glue / eliminator / ref keys leave the NbE structural rung" do
+      let
+        keys =
+          [ "Control.Monad.ST.Internal.pure_"
+          , "Control.Monad.ST.Internal.bind_"
+          , "Control.Monad.ST.Internal.run"
+          , "Control.Monad.ST.Internal.new"
+          , "Control.Monad.ST.Internal.read"
+          , "Control.Monad.ST.Internal.write"
+          , "Control.Monad.ST.Internal.modifyImpl"
+          ]
+      Array.all (\k -> Set.member k structuralExclusions) keys `shouldEqual` true
