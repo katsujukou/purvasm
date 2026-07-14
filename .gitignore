@@ -11,6 +11,7 @@ _build
 /dist
 /target
 /.ulib-test-cache
+/.unicode-cache
 /cli/bin
 /.bin
 purvasm_lib

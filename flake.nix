@@ -84,6 +84,9 @@
               pnpm
               gnuplot
 
+              # `ulib-tools unicode-gen` (ADR-0101) shells out to `curl` to fetch UnicodeData.txt.
+              curl
+
               # Rust toolchain — the v1 native runtime (ADR-0063: unsafe GC island + safe shell).
               # NB: Miri (ADR-0063 §4) needs a nightly toolchain + the `miri` component, which stable
               # nixpkgs `rustc` does not provide; adopt oxalica/rust-overlay when we start Miri-testing
