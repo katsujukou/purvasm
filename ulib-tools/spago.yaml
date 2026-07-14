@@ -12,6 +12,7 @@ package:
     - fmt
     - foldable-traversable
     - foreign-object
+    - integers
     - maybe
     - node-process
     - ordered-collections

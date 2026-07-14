@@ -21,6 +21,7 @@ import Purvasm.CLI.Node (defaultLoggerConfig, nodeEnvHandler, nodeFsHandler, nod
 import Purvasm.UlibTools.Build as Build
 import Purvasm.UlibTools.Options as Options
 import Purvasm.UlibTools.Test as Test
+import Purvasm.UlibTools.UnicodeGen as UnicodeGen
 import Purvasm.UlibTools.Verify as Verify
 import Purvasm.UlibTools.VerifyDeps as VerifyDeps
 import Run (EFFECT, Run, runBaseEffect)
@@ -38,6 +39,7 @@ main = do
       Options.Verify opts -> Verify.cmd opts
       Options.VerifyDeps opts -> VerifyDeps.cmd opts
       Options.Test opts -> Test.cmd opts
+      Options.UnicodeGen opts -> UnicodeGen.cmd opts
   where
   run program = do
     res <- runNode program

@@ -7,10 +7,14 @@ import Test.Spec.Reporter (consoleReporter)
 import Test.Spec.Runner.Node (runSpecAndExitProcess)
 import Test.Unit.Purvasm.UlibTools.Manifest as Manifest
 import Test.Unit.Purvasm.UlibTools.Stage as Stage
+import Test.Unit.Purvasm.UlibTools.UnicodeData as UnicodeData
+import Test.Unit.Purvasm.UlibTools.UnicodeGen as UnicodeGen
 import Test.Unit.Purvasm.UlibTools.Verify as Verify
 
 main :: Effect Unit
 main = runSpecAndExitProcess [ consoleReporter ] do
   Manifest.spec
   Stage.spec
+  UnicodeData.spec
+  UnicodeGen.spec
   Verify.spec

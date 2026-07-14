@@ -7,6 +7,7 @@ import ArgParse.Basic as ArgParser
 import Data.Either (Either)
 import Purvasm.UlibTools.Build as Build
 import Purvasm.UlibTools.Test as Test
+import Purvasm.UlibTools.UnicodeGen as UnicodeGen
 import Purvasm.UlibTools.Verify as Verify
 import Purvasm.UlibTools.VerifyDeps as VerifyDeps
 
@@ -15,6 +16,7 @@ data Command
   | Verify Verify.Options
   | VerifyDeps VerifyDeps.Options
   | Test Test.Options
+  | UnicodeGen UnicodeGen.Options
 
 command :: ArgParser Command
 command =
@@ -31,6 +33,9 @@ command =
     , ArgParser.command [ "test" ]
         "Run ulib behaviour tests by representation-seam fidelity."
         ((Test <$> Test.options) <* ArgParser.flagHelp)
+    , ArgParser.command [ "unicode-gen" ]
+        "Fetch, pin, and generate Data.String.Internal.CaseMap from UnicodeData.txt (ADR-0101)."
+        ((UnicodeGen <$> UnicodeGen.options) <* ArgParser.flagHelp)
     ]
     <* ArgParser.flagHelp
 
