@@ -76,6 +76,12 @@ pub extern "C" fn pv_runtime_new(local_words: usize) -> *mut Heap {
 pub unsafe extern "C" fn pv_runtime_free(ctx: *mut Heap) {
     guard(|| {
         if !ctx.is_null() {
+            // ADR-0102 §3: the one-shot summary line, emitted only when stats are enabled — read
+            // before the drop below frees the context. A leaked context (never freed) loses its
+            // summary; that is acceptable for this diagnostic slice.
+            if let Some(stats) = heap(ctx).stats() {
+                eprintln!("{}", stats.format());
+            }
             drop(Box::from_raw(ctx));
         }
     })
@@ -92,6 +98,11 @@ pub unsafe extern "C" fn pv_runtime_free(ctx: *mut Heap) {
 pub unsafe extern "C" fn pv_apply(ctx: *mut Heap, f: u64, args: *const u64, nargs: usize) -> u64 {
     guard(|| {
         let h = heap(ctx);
+        // ADR-0102 §3: the *only* site that counts `pv_apply_entries` — not every `Heap::apply`
+        // activation, since `pv_settle`'s slow path and internal helpers reach `apply` directly.
+        if let Some(s) = h.stats_mut() {
+            s.pv_apply_entries = s.pv_apply_entries.saturating_add(1);
+        }
         let argv = args_slice(args, nargs);
         h.apply(TaggedWord::from_bits(f), argv).to_bits()
     })
@@ -128,8 +139,23 @@ pub unsafe extern "C" fn pv_settle(ctx: *mut Heap, r: u64) -> u64 {
     guard(|| {
         let h = heap(ctx);
         match h.take_pending_tail() {
-            None => r,
-            Some((f, args)) => h.apply(f, &args).to_bits(),
+            None => {
+                if let Some(s) = h.stats_mut() {
+                    s.pv_settle_fast = s.pv_settle_fast.saturating_add(1);
+                }
+                r
+            }
+            Some((f, args)) => {
+                // ADR-0102 §3: `pending_tail_settle_takes` and `pv_settle_slow` are tautologically
+                // identical here — `pv_settle` has exactly one pending-tail take site — but land as
+                // two schema fields per the ADR (one narrative bucket is "who took it", the other is
+                // "what pv_settle did"). This is an intentional fusion, not a bug to deduplicate.
+                if let Some(s) = h.stats_mut() {
+                    s.pending_tail_settle_takes = s.pending_tail_settle_takes.saturating_add(1);
+                    s.pv_settle_slow = s.pv_settle_slow.saturating_add(1);
+                }
+                h.apply(f, &args).to_bits()
+            }
         }
     })
 }
@@ -832,5 +858,238 @@ mod tests {
             assert_eq!(TaggedWord::from_bits(r).as_int(), 42);
             pv_runtime_free(ctx);
         }
+    }
+
+    // --- ADR-0102 §3 stats fixtures (address-path-only: `pv_tailcall`/`pv_settle`/env parsing are
+    // never exercised on the index/Miri path — hence this module's `not(miri)` gate) -------------
+
+    #[test]
+    fn stats_count_tailcall_write_and_apply_loop_take() {
+        // Reuses `tailcall_composes_with_over_application`'s scenario, adding counter assertions:
+        // `f` (arity 1) over-applied to [3,4] tail-calls `mk`; the enclosing `pv_apply` loop (not
+        // `pv_settle`) takes the stash.
+        let ctx = pv_runtime_new(1 << 12);
+        unsafe {
+            heap(ctx).enable_stats_for_test();
+            let f = pv_make_closure(ctx, f_tail as usize as u64, 1, TaggedWord::unit().to_bits());
+            let argv = [TaggedWord::int(3).to_bits(), TaggedWord::int(4).to_bits()];
+            let r = pv_apply(ctx, f, argv.as_ptr(), argv.len());
+            assert_eq!(TaggedWord::from_bits(r).as_int(), 7);
+
+            let s = *heap(ctx).stats().unwrap();
+            assert_eq!(s.pv_apply_entries, 1);
+            assert_eq!(s.over_apply, 1, "f (arity 1) is over-applied to [3, 4]");
+            assert_eq!(s.pv_tailcall_writes, 1);
+            assert_eq!(
+                s.pending_tail_apply_takes, 1,
+                "the enclosing pv_apply loop takes the stash"
+            );
+            assert_eq!(
+                s.pending_tail_settle_takes, 0,
+                "pv_settle is never called on this path"
+            );
+            assert_eq!(
+                s.closure_exact_dispatches, 2,
+                "the mk dispatch and the resolved adder call"
+            );
+            pv_runtime_free(ctx);
+        }
+    }
+
+    #[test]
+    fn stats_pv_settle_fast_path_when_no_tail_was_stashed() {
+        // A direct (non-`pv_apply`) call to a body that returns a real value with no `pv_tailcall` —
+        // the settle call site every non-`musttail` direct call site makes (ADR-0076 §3).
+        let ctx = pv_runtime_new(1 << 12);
+        unsafe {
+            heap(ctx).enable_stats_for_test();
+            let argv = [TaggedWord::int(3).to_bits(), TaggedWord::int(4).to_bits()];
+            let raw = add2(ctx, TaggedWord::unit().to_bits(), argv.as_ptr(), argv.len());
+            let settled = pv_settle(ctx, raw);
+            assert_eq!(TaggedWord::from_bits(settled).as_int(), 7);
+
+            let s = *heap(ctx).stats().unwrap();
+            assert_eq!(s.pv_settle_fast, 1);
+            assert_eq!(s.pv_settle_slow, 0);
+            assert_eq!(s.pending_tail_settle_takes, 0);
+            pv_runtime_free(ctx);
+        }
+    }
+
+    #[test]
+    fn stats_pv_settle_slow_path_resolves_a_stashed_tail() {
+        // A direct call to `f_tail`'s body (bypassing `pv_apply`): it stashes a tail call to `mk` and
+        // returns a dummy; `pv_settle` must take and resolve it.
+        let ctx = pv_runtime_new(1 << 12);
+        unsafe {
+            heap(ctx).enable_stats_for_test();
+            let argv = [TaggedWord::int(3).to_bits()];
+            let raw = f_tail(ctx, TaggedWord::unit().to_bits(), argv.as_ptr(), argv.len());
+            let settled = pv_settle(ctx, raw);
+            assert!(
+                TaggedWord::from_bits(settled).is_pointer(),
+                "mk(3) returns an adder closure value"
+            );
+
+            let s = *heap(ctx).stats().unwrap();
+            assert_eq!(s.pv_settle_slow, 1);
+            assert_eq!(s.pending_tail_settle_takes, 1);
+            assert_eq!(s.pv_settle_fast, 0);
+            pv_runtime_free(ctx);
+        }
+    }
+
+    /// `\_ -> 42` — an arity-1 leaf ignoring its arg, for the by-need-suspension divergence fixture
+    /// below (`force` always calls a suspension with exactly one `unit` arg, ADR-0070's convention).
+    extern "C" fn const_leaf(_ctx: *mut Heap, _clo: u64, _args: *const u64, _nargs: usize) -> u64 {
+        TaggedWord::int(42).to_bits()
+    }
+
+    #[test]
+    fn stats_pv_apply_entries_excludes_internal_apply_activations() {
+        // `pv_force` forces a `ByNeed` cell via `Heap::force`, which internally calls `Heap::apply`
+        // on the suspension WITHOUT going through `pv_apply` — this must count as a
+        // `heap_apply_activations` increment but NOT a `pv_apply_entries` increment.
+        let ctx = pv_runtime_new(1 << 12);
+        unsafe {
+            heap(ctx).enable_stats_for_test();
+            let susp = pv_make_closure(
+                ctx,
+                const_leaf as usize as u64,
+                1,
+                TaggedWord::unit().to_bits(),
+            );
+            let cell = pv_new_byneed(ctx, susp);
+            let forced = pv_force(ctx, cell);
+            assert_eq!(TaggedWord::from_bits(forced).as_int(), 42);
+
+            // One real `pv_apply` call too, for contrast.
+            let clo = pv_make_closure(ctx, add2 as usize as u64, 2, TaggedWord::unit().to_bits());
+            let argv = [TaggedWord::int(3).to_bits(), TaggedWord::int(4).to_bits()];
+            let r = pv_apply(ctx, clo, argv.as_ptr(), argv.len());
+            assert_eq!(TaggedWord::from_bits(r).as_int(), 7);
+
+            let s = *heap(ctx).stats().unwrap();
+            assert_eq!(
+                s.pv_apply_entries, 1,
+                "only the direct pv_apply call counts"
+            );
+            assert_eq!(
+                s.heap_apply_activations, 2,
+                "force's internal apply on the suspension, plus the real pv_apply's apply"
+            );
+            pv_runtime_free(ctx);
+        }
+    }
+
+    // --- `PURVASM_STATS` process-level behavior (subprocess-isolated: env mutation must not race
+    // parallel `cargo test` threads) -------------------------------------------------------------
+
+    /// Re-invoke this same test binary running exactly one test (by fully-qualified name), with the
+    /// given environment overrides (`None` removes a var that may be set in the ambient environment)
+    /// plus a private marker var, capturing its stdout/stderr and exit status. The named test checks
+    /// the marker at its own top and runs its real body instead of re-exec'ing — the standard
+    /// hand-rolled env-isolation trick (ADR-0102 §3 Verification), since this crate has no `[[bin]]`
+    /// and adds no new dev-dependency for it.
+    fn run_isolated(test_name: &str, env: &[(&str, Option<&str>)]) -> std::process::Output {
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg(test_name).arg("--exact").arg("--nocapture");
+        cmd.env("__PURVASM_ABI_TEST_CHILD", "1");
+        for (k, v) in env {
+            match v {
+                Some(v) => {
+                    cmd.env(k, v);
+                }
+                None => {
+                    cmd.env_remove(k);
+                }
+            }
+        }
+        cmd.output().expect("spawn current_exe as a child")
+    }
+
+    /// The shared child body every `PURVASM_STATS` subprocess test re-execs into: build a context,
+    /// run one real `pv_apply`, free it. What differs is the parent's `PURVASM_STATS` and what it
+    /// asserts about the child's stderr/exit status afterward.
+    unsafe fn stats_smoke_child() {
+        let ctx = pv_runtime_new(1 << 12);
+        let clo = pv_make_closure(ctx, add2 as usize as u64, 2, TaggedWord::unit().to_bits());
+        let argv = [TaggedWord::int(3).to_bits(), TaggedWord::int(4).to_bits()];
+        let r = pv_apply(ctx, clo, argv.as_ptr(), argv.len());
+        assert_eq!(TaggedWord::from_bits(r).as_int(), 7);
+        pv_runtime_free(ctx);
+    }
+
+    #[test]
+    fn purvasm_stats_absent_emits_no_line() {
+        if std::env::var_os("__PURVASM_ABI_TEST_CHILD").is_some() {
+            unsafe { stats_smoke_child() };
+            return;
+        }
+        let out = run_isolated(
+            "abi::tests::purvasm_stats_absent_emits_no_line",
+            &[("PURVASM_STATS", None)],
+        );
+        assert!(out.status.success(), "child failed: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("purvasm-stats:"),
+            "unexpected stats line with PURVASM_STATS absent: {stderr}"
+        );
+    }
+
+    #[test]
+    fn purvasm_stats_one_emits_exactly_one_well_formed_line() {
+        if std::env::var_os("__PURVASM_ABI_TEST_CHILD").is_some() {
+            unsafe { stats_smoke_child() };
+            return;
+        }
+        let out = run_isolated(
+            "abi::tests::purvasm_stats_one_emits_exactly_one_well_formed_line",
+            &[("PURVASM_STATS", Some("1"))],
+        );
+        assert!(out.status.success(), "child failed: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let lines: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.starts_with("purvasm-stats:v1 "))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "expected exactly one stats line, got stderr: {stderr}"
+        );
+        let mut seen = std::collections::HashSet::new();
+        for pair in lines[0].trim_start_matches("purvasm-stats:v1 ").split(' ') {
+            let (key, _) = pair
+                .split_once('=')
+                .unwrap_or_else(|| panic!("malformed key=value pair: {pair}"));
+            assert!(seen.insert(key), "duplicate key in schema line: {key}");
+        }
+        let expected: std::collections::HashSet<&str> =
+            crate::stats::SCHEMA_KEYS.iter().copied().collect();
+        assert_eq!(seen, expected, "schema key set mismatch");
+    }
+
+    #[test]
+    fn purvasm_stats_other_value_aborts_runtime_creation() {
+        if std::env::var_os("__PURVASM_ABI_TEST_CHILD").is_some() {
+            let _ctx = pv_runtime_new(1 << 12); // must abort before returning
+            unreachable!("pv_runtime_new should have aborted on a malformed PURVASM_STATS");
+        }
+        let out = run_isolated(
+            "abi::tests::purvasm_stats_other_value_aborts_runtime_creation",
+            &[("PURVASM_STATS", Some("0"))],
+        );
+        assert!(
+            !out.status.success(),
+            "child should have aborted, got: {out:?}"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("PURVASM_STATS"),
+            "expected the parse_stats_env diagnostic on stderr, got: {stderr}"
+        );
     }
 }

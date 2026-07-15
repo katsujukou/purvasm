@@ -20,8 +20,10 @@
 
 use crate::apply::CodeFn;
 use crate::heap::{Color, Header, HeapPtr, Kind};
+use crate::stats::{parse_stats_env, Stats};
 use crate::word::TaggedWord;
 use core::ptr::NonNull;
+use std::time::Instant;
 
 /// Bytes per heap word.
 const WORD: usize = core::mem::size_of::<u64>();
@@ -141,6 +143,11 @@ pub struct Heap {
     /// (`new_native`) heap only — the compiled binary reads it, so any program can be traced with
     /// `PURVASM_TRACE=1 ./app` without recompiling. Always `false` on a `lib`/Miri heap.
     trace: bool,
+    /// Opt-in dynamic-apply/GC counters (ADR-0102 §3). `Some` iff `PURVASM_STATS=1` on a native
+    /// (`new_native`) heap, or a test enabled it directly ([`enable_stats_for_test`](Heap::enable_stats_for_test));
+    /// `None` (the default) means every instrumentation point below is a single flag check and
+    /// nothing else — no formatting, clock reads, or counter writes on the hot path.
+    stats: Option<Stats>,
 }
 
 // ADR-0079 §1: the header IS offset 0 of the context pointer.
@@ -199,6 +206,7 @@ impl Heap {
             code_is_address: false,
             pending_tail: None,
             trace: false,
+            stats: None,
         }
     }
 
@@ -206,13 +214,61 @@ impl Heap {
     /// closure's `code` word is a **real `extern "C"` fn address** (`apply` calls it directly) rather
     /// than a [`code_table`](Heap::code_table) index. The `extern "C"` boundary (`pv_runtime_new`) builds
     /// heaps this way; hand-written `CodeFn` tests / Miri use [`Heap::new`].
+    ///
+    /// # Panics
+    /// If `PURVASM_STATS` is present and not exactly `"1"` (ADR-0102 §3) — a present-but-malformed
+    /// value is a diagnosable configuration error, not silently ignored. Across the `pv_runtime_new`
+    /// ABI entry this becomes a process abort (`guard`'s panic containment); a direct Rust-level call
+    /// (tests) just unwinds.
     pub fn new_native(words_per_space: usize) -> Heap {
         let mut h = Heap::new(words_per_space);
         h.code_is_address = true;
         // Opt-in value-flow tracing for the compiled binary; read here (not in `new`) so `lib`/Miri
         // heaps never touch the environment (ADR-0072 §11).
         h.trace = std::env::var_os("PURVASM_TRACE").is_some();
+        // Opt-in apply/GC counters (ADR-0102 §3); same rationale — read only on the native path. A
+        // present non-Unicode value cannot be `"1"`, so it folds into the same "other present value"
+        // rejection as a present-but-wrong string.
+        let stats_raw = std::env::var_os("PURVASM_STATS");
+        let parsed = match &stats_raw {
+            None => parse_stats_env(None),
+            Some(v) => match v.to_str() {
+                Some(s) => parse_stats_env(Some(s)),
+                None => Err(format!(
+                    "PURVASM_STATS: expected absent or \"1\", got non-UTF-8 value {v:?}"
+                )),
+            },
+        };
+        h.stats = match parsed {
+            Ok(true) => Some(Stats::default()),
+            Ok(false) => None,
+            Err(msg) => panic!("{msg}"),
+        };
         h
+    }
+
+    /// Force apply/GC counters on for this heap without touching the environment — **test-only**
+    /// (ADR-0102 §3 Verification): lets an in-process fixture assert deterministic counter values on
+    /// a hand-built [`Heap::new`]/[`Heap::new_native`] heap with no `PURVASM_STATS` env-mutation race
+    /// against parallel `cargo test` threads.
+    #[cfg(test)]
+    pub(crate) fn enable_stats_for_test(&mut self) {
+        self.stats = Some(Stats::default());
+    }
+
+    /// The current apply/GC counters (ADR-0102 §3), or `None` if stats are disabled for this
+    /// context. Read by `pv_runtime_free` to decide whether to emit the summary line.
+    #[inline]
+    pub(crate) fn stats(&self) -> Option<&Stats> {
+        self.stats.as_ref()
+    }
+
+    /// Mutable access to the apply/GC counters (ADR-0102 §3) for the instrumentation points in
+    /// sibling modules (`apply`, `abi`) — `stats` itself stays private, matching the
+    /// [`trace_on`](Heap::trace_on)/[`code_is_address`](Heap::code_is_address) accessor convention.
+    #[inline]
+    pub(crate) fn stats_mut(&mut self) -> Option<&mut Stats> {
+        self.stats.as_mut()
     }
 
     /// Whether debug tracing is on (the `PURVASM_TRACE` env var, native heaps only).
@@ -257,6 +313,9 @@ impl Heap {
         );
         self.pending_tail = Some((f, args));
         self.header.pending_tail = 1; // the ADR-0079 fast-path flag mirrors the Option
+        if let Some(s) = self.stats.as_mut() {
+            s.pv_tailcall_writes = s.pv_tailcall_writes.saturating_add(1);
+        }
     }
 
     /// Take the pending-tail `(f, args)`, clearing the slot (ADR-0071 §4). `None` = the body returned a
@@ -1107,6 +1166,11 @@ impl Heap {
     /// Fed by disjoint field borrows — `self.space`/`self.reserve`/`self.top` are `Copy`, `self.roots`
     /// is borrowed mutably — so there is no `mem::take` window in which the root set is empty.
     fn gc(&mut self) {
+        // ADR-0102 §3: clocks are read only around a collection, and only when stats are enabled —
+        // a disabled heap performs zero `Instant` calls here. `Instant::now` itself is the entire
+        // per-collection cost; `elapsed()` below is read after the whole invocation (collection, swap,
+        // and the object-start rebuild), matching "total GC time" as the ADR defines it.
+        let start = self.stats.is_some().then(Instant::now);
         // A transient `&mut [TaggedWord]` view of the shadow-stack region for the collector
         // (`TaggedWord` is `repr(transparent)` over `u64`). Raw-parent -> temporary unique view ->
         // back to raw-parent is the sanctioned borrow shape: the view dies before any further
@@ -1124,6 +1188,17 @@ impl Heap {
         // (same slots, new values).
         core::mem::swap(&mut self.space, &mut self.reserve);
         self.rebuild_starts();
+        if let Some(start) = start {
+            // ADR-0102 §3 / `Stats`' doc comment: every counter is unsigned *saturating* — a GC pause
+            // long enough to overflow `u64` nanoseconds (~584 years) is not realistic, but `as` would
+            // silently wrap rather than saturate, breaking that contract. `try_from` + `unwrap_or(MAX)`
+            // saturates instead.
+            let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let live_words = self.top as u64;
+            if let Some(s) = self.stats.as_mut() {
+                s.record_gc(ns, live_words);
+            }
+        }
     }
 
     /// Rebuild [`starts_bits`](Heap::starts_bits) for the (post-swap) active space: zero the bitmap,
@@ -1667,6 +1742,51 @@ mod tests {
         let keep2 = unsafe { HeapPtr::from_word(h.get(kr)) };
         assert_eq!(f64::from_bits(h.read_raw(keep2, 0)), 3.5);
         h.pop_frame(frame);
+    }
+
+    #[test]
+    fn gc_stats_count_real_overflow_collections_not_test_only_collect() {
+        // ADR-0102 §3 Verification: a tiny-heap fixture that forces real `alloc`-on-overflow
+        // collections (not the `#[cfg(test)]`-only explicit-root `collect`, which must stay
+        // uninstrumented) and asserts the GC counters' shape rather than exact values.
+        let mut h = Heap::new(8);
+        h.enable_stats_for_test();
+        let frame = h.frame();
+        let keep = h.new_number(3.5);
+        let kr = h.root(keep.as_word());
+        for _ in 0..20 {
+            let _ = h.new_number(1.0); // unrooted; overflows the 8-word semi-space repeatedly
+        }
+        let keep2 = unsafe { HeapPtr::from_word(h.get(kr)) };
+        assert_eq!(
+            f64::from_bits(h.read_raw(keep2, 0)),
+            3.5,
+            "the rooted survivor must relocate intact"
+        );
+        h.pop_frame(frame);
+
+        let s = h.stats().expect("stats were enabled");
+        assert!(s.gc_collections >= 1, "expected at least one collection");
+        assert!(
+            s.gc_max_live_words > 0,
+            "a live collection must report nonzero max live words"
+        );
+        assert!(
+            s.gc_copied_words >= s.gc_max_live_words,
+            "accumulated copied words must be at least the single-collection max"
+        );
+        // `gc_total_ns` is a plain `u64` — any value it can hold is valid; no exact-time assertion.
+        let _ = s.gc_total_ns;
+
+        // The explicit-root test-only `collect` path must never touch the counters.
+        let before = *h.stats().unwrap();
+        let mut roots: [TaggedWord; 0] = [];
+        h.collect(&mut roots);
+        assert_eq!(
+            *h.stats().unwrap(),
+            before,
+            "test-only `collect` must not bump GC counters"
+        );
     }
 
     #[test]

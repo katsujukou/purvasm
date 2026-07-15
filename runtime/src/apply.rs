@@ -74,6 +74,12 @@ impl Heap {
     /// leftover still deferred on `conts`. On the index path the slot is always `None`, so this reduces
     /// to the plain over-application loop (push-then-immediately-pop).
     pub fn apply(&mut self, f: Value, args: &[Value]) -> Value {
+        // ADR-0102 §3: once per activation, regardless of caller (`pv_apply`, `pv_settle`, `force`,
+        // or any other internal helper) — the counter this function's own doc comment on
+        // `heap_apply_activations` in `stats.rs` describes.
+        if let Some(s) = self.stats_mut() {
+            s.heap_apply_activations = s.heap_apply_activations.saturating_add(1);
+        }
         if self.trace_on() {
             self.trace_value(&format!("apply f (nargs={})", args.len()), f);
             for (i, a) in args.iter().enumerate() {
@@ -98,6 +104,14 @@ impl Heap {
                 // in-flight `args` are rooted across it and reloaded (`f` is replaced by the result;
                 // `conts` roots are independent and untouched).
                 Kind::ByNeed => {
+                    // `force` (below) internally re-enters `apply` on the suspension, so this single
+                    // by-need dispatch also produces a *nested* `heap_apply_activations` increment in
+                    // addition to this one and to the outer activation's — intentional per ADR-0102
+                    // §3 ("regardless of whether the caller was … another runtime helper/internal
+                    // operation"), not a double-count bug.
+                    if let Some(s) = self.stats_mut() {
+                        s.byneed_dispatch = s.byneed_dispatch.saturating_add(1);
+                    }
                     let frame = self.frame();
                     let mut arg_roots: Vec<Root> = Vec::with_capacity(args.len());
                     for a in &args {
@@ -112,6 +126,9 @@ impl Heap {
                 // that as a closure. `remaining_arity` (payload word 1) is redundant here — the
                 // closure's own arity drives the split — so it is not read.
                 Kind::Pap => {
+                    if let Some(s) = self.stats_mut() {
+                        s.pap_dispatch = s.pap_dispatch.saturating_add(1);
+                    }
                     let function = self.read_field_unchecked(p, 0);
                     let size = self.header_unchecked(p).size_words();
                     let mut combined: Vec<Value> =
@@ -125,6 +142,9 @@ impl Heap {
                     if args.len() < arity {
                         // Under-apply: a PAP capturing the args supplied so far — the current call's
                         // value. `new_pap` self-roots `f`/`args` across its own allocation (ADR-0066 §3).
+                        if let Some(s) = self.stats_mut() {
+                            s.under_apply = s.under_apply.saturating_add(1);
+                        }
                         let remaining = (arity - args.len()) as u32;
                         let pap = self.new_pap(f, remaining, &args).as_word();
                         match self.resolve_cont(&mut conts) {
@@ -143,10 +163,15 @@ impl Heap {
                     // is deferred correctly whether the call returns a value or tail-bounces.
                     let call_args: Vec<Value> = args[..arity].to_vec();
                     if args.len() > arity {
+                        if let Some(s) = self.stats_mut() {
+                            s.over_apply = s.over_apply.saturating_add(1);
+                        }
                         let frame = self.frame();
                         let roots: Vec<Root> =
                             args[arity..].iter().map(|a| self.root(*a)).collect();
                         conts.push((frame, roots));
+                    } else if let Some(s) = self.stats_mut() {
+                        s.record_closure_exact(arity as u32);
                     }
                     let code_word = self.read_raw_unchecked(p, 0);
                     let result = self.call_code(code_word, f, &call_args);
@@ -157,6 +182,10 @@ impl Heap {
                         // Tail bounce (ADR-0071 §4): continue with the stashed callee; the just-pushed
                         // leftover stays on `conts`, deferred behind this new chain.
                         Some((nf, nargs)) => {
+                            if let Some(s) = self.stats_mut() {
+                                s.pending_tail_apply_takes =
+                                    s.pending_tail_apply_takes.saturating_add(1);
+                            }
                             f = nf;
                             args = nargs;
                         }
@@ -411,5 +440,118 @@ mod tests {
         let mut roots: [Value; 0] = []; // drop everything — `stale` now addresses the idle reserve
         h.collect(&mut roots);
         h.apply(stale, &[Value::int(1), Value::int(2)]);
+    }
+
+    // --- ADR-0102 §3 stats fixtures (deterministic counter values, index-path, Miri-safe) ----------
+
+    /// A nullary leaf, for the zero-arity exact-dispatch fixture.
+    fn nullary_leaf(_h: &mut Heap, _clo: Value, _args: &[Value]) -> Value {
+        Value::int(99)
+    }
+
+    /// A by-need suspension (arity-1, the ADR-0070 convention `force` always calls with one `unit`
+    /// arg) that returns the arity-2 `add2` leaf when forced.
+    fn suspend_add2(h: &mut Heap, _clo: Value, _args: &[Value]) -> Value {
+        h.new_closure(add2, 2, Value::unit()).as_word()
+    }
+
+    #[test]
+    fn stats_count_under_over_pap_and_exact_positive_dispatch() {
+        let mut h = Heap::new(64);
+        h.enable_stats_for_test();
+
+        // Under-apply then saturate through the PAP (reuses `apply_under_builds_a_pap_then_saturates`'s
+        // shape): one `under_apply`, then a PAP-flatten exact-positive dispatch.
+        let clo = h.new_closure(add2, 2, Value::unit());
+        let pap = h.apply(clo.as_word(), &[Value::int(3)]);
+        let r1 = h.apply(pap, &[Value::int(4)]);
+        assert_eq!(r1.as_int(), 7);
+
+        // Over-apply (reuses `apply_over_applies_through_the_result`'s shape): one `over_apply`, then
+        // an exact-positive dispatch on the resolved continuation.
+        let f = h.new_closure(make_adder, 1, Value::unit());
+        let r2 = h.apply(f.as_word(), &[Value::int(3), Value::int(4)]);
+        assert_eq!(r2.as_int(), 7);
+
+        let s = h.stats().unwrap();
+        assert_eq!(s.under_apply, 1);
+        assert_eq!(s.over_apply, 1);
+        assert_eq!(
+            s.pap_dispatch, 1,
+            "the PAP-flatten re-dispatch in the first scenario"
+        );
+        assert_eq!(
+            s.closure_exact_dispatches, 2,
+            "the PAP-flattened add2 call and the over-apply's resolved inner-adder call"
+        );
+        assert_eq!(s.closure_exact_positive, 2);
+        assert_eq!(s.closure_exact_zero, 0);
+        assert_eq!(
+            s.entry_exact_fast_hits, 0,
+            "the fast path is out of scope for this slice"
+        );
+    }
+
+    #[test]
+    fn stats_count_pap_reflattening_when_still_under_applied() {
+        // Reuses `apply_pap_re_under_applied_across_three_args`'s shape: feeding an arity-3 closure
+        // one arg at a time exercises the flatten → *re*-under-apply → re-Pap path.
+        let mut h = Heap::new(64);
+        h.enable_stats_for_test();
+        let f = h.new_closure(add3, 3, Value::unit());
+
+        let p1 = h.apply(f.as_word(), &[Value::int(1)]); // under_apply → Pap
+        let p2 = h.apply(p1, &[Value::int(2)]); // Pap dispatch → flatten → still short → re-Pap
+        let r = h.apply(p2, &[Value::int(3)]); // Pap dispatch → flatten → exact
+        assert_eq!(r.as_int(), 6);
+
+        let s = h.stats().unwrap();
+        assert_eq!(
+            s.pap_dispatch, 2,
+            "p1->p2 and p2->result each flatten a Pap"
+        );
+        assert_eq!(
+            s.under_apply, 2,
+            "the initial apply and the p1->p2 re-under-apply"
+        );
+        assert_eq!(
+            s.closure_exact_dispatches, 1,
+            "only the final call saturates"
+        );
+    }
+
+    #[test]
+    fn stats_count_zero_arity_exact_dispatch() {
+        let mut h = Heap::new(64);
+        h.enable_stats_for_test();
+        let clo = h.new_closure(nullary_leaf, 0, Value::unit());
+        let r = h.apply(clo.as_word(), &[]);
+        assert_eq!(r.as_int(), 99);
+        let s = h.stats().unwrap();
+        assert_eq!(s.closure_exact_zero, 1);
+        assert_eq!(s.closure_exact_positive, 0);
+        assert_eq!(s.closure_exact_dispatches, 1);
+    }
+
+    #[test]
+    fn stats_count_byneed_dispatch_and_nested_activation() {
+        let mut h = Heap::new(64);
+        h.enable_stats_for_test();
+        let suspension = h.new_closure(suspend_add2, 1, Value::unit());
+        let cell = h.new_byneed(suspension.as_word());
+        let r = h.apply(cell.as_word(), &[Value::int(3), Value::int(4)]);
+        assert_eq!(r.as_int(), 7);
+
+        let s = h.stats().unwrap();
+        assert_eq!(s.byneed_dispatch, 1);
+        // `force` re-enters `apply` on the suspension as a distinct call: this top-level activation,
+        // plus `force`'s own nested `apply(suspension, [unit])` — 2 activations total (both within
+        // the *same* top-level call still count as one activation each; `force`'s call is the only
+        // nested one here, per the ADR-0102 §3 note on the `Kind::ByNeed` arm).
+        assert_eq!(s.heap_apply_activations, 2);
+        // both the nested arity-1 suspension dispatch and the re-dispatched arity-2 `add2` call are
+        // exact-saturated positive-arity dispatches.
+        assert_eq!(s.closure_exact_dispatches, 2);
+        assert_eq!(s.closure_exact_positive, 2);
     }
 }
