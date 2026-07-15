@@ -117,6 +117,23 @@
           "dependencies": []
         }
       },
+      "bench-run-state-except": {
+        "path": "benchmarks/bench-run-state-except",
+        "core": {
+          "dependencies": [
+            "bench-common",
+            "console",
+            "effect",
+            "lists",
+            "prelude",
+            "run",
+            "tuples"
+          ]
+        },
+        "test": {
+          "dependencies": []
+        }
+      },
       "bench-st-ref": {
         "path": "benchmarks/bench-st-ref",
         "core": {
