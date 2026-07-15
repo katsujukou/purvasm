@@ -6,10 +6,14 @@
 > **Progress (2026-07-15):** §3 (the `PURVASM_STATS` apply/GC counters), §2 (the allocation-free
 > exact-saturated closure fast path), and §4 (the `PURVASM_HEAP_WORDS` heap-size override) have all
 > landed, in that order, per the ADR's own required sequence — `runtime/src/stats.rs`, `apply.rs`,
-> and `heap_words.rs` respectively, wired through `gc.rs`/`abi.rs`. The formal paired-A/B
-> wall-clock/counter measurement required by §5 is a separate follow-up — no checked-in
-> paired-interleaved-runs script exists yet (sidenote 0011's discipline was applied by hand in the
-> original investigation, not automated).
+> and `heap_words.rs` respectively, wired through `gc.rs`/`abi.rs`. §5's paired-A/B measurement is
+> also done: a new `benchmarks/paired-ab.sh` (paired-interleaved-runs, min-of-K, filling the gap
+> sidenote 0011 flagged) measured the fast path against the pre-§2 baseline on
+> `benchmarks/bench-run-state-except` — full method and numbers in [sidenote
+> 0016](sidenotes/0016-adr-0102-fast-path-paired-ab-measurement.md) (headline: 1.38–1.45x wall-clock
+> on this machine, one quiet run; every apply/GC counter identical between legs except
+> `entry_exact_fast_hits`, which the fast path now accounts for on ~63–64% of exact dispatches). The
+> `Bench.STRef.Main --no-opt --emit-llvm` self-host completion/timeout gate remains open and separate.
 
 ## Abstract
 
