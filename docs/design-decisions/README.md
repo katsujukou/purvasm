@@ -147,5 +147,6 @@ language and are kept out of version control.)
 | [0098](0098-effect-instance-dict-visibility-grouped-projection.md) | Effect instance-dictionary visibility: folding method projections off recursive dictionary CAFs (the `bindE`/`pureE` exposure GER needs) | Accepted |
 | [0099](0099-generalized-effect-reflection-cperform.md) | Generalized effect reflection and impurification: an explicit `CPerform` run-marker and canonical `Effect`/`ST` lowering | Accepted |
 | [0101](0101-ulib-tools-unicode-gen-command.md) | `ulib-tools unicode-gen`: fetch, pin, and generate the Unicode simple-case-mapping table, replacing `gen/gen_casemap.py` | Accepted |
+| [0102](0102-runtime-v1-1-performance-baseline-for-dynamic-apply.md) | Runtime v1.1 performance baseline for dynamic apply | Accepted |
 
 ## Scope
