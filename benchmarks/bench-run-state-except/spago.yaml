@@ -1,0 +1,10 @@
+package:
+  name: bench-run-state-except
+  dependencies:
+    - bench-common
+    - console
+    - effect
+    - lists
+    - prelude
+    - run
+    - tuples
