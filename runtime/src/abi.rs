@@ -1145,4 +1145,123 @@ mod tests {
             "expected the parse_stats_env diagnostic on stderr, got: {stderr}"
         );
     }
+
+    // --- `PURVASM_HEAP_WORDS` process-level behavior (subprocess-isolated, reusing `run_isolated`
+    // above: env mutation must not race parallel `cargo test` threads) ------------------------------
+
+    unsafe fn heap_words_absent_child() {
+        let ctx = pv_runtime_new(4096);
+        assert_eq!(
+            heap(ctx).cap_for_test(),
+            4096,
+            "absent must leave the codegen-provided default unchanged"
+        );
+        pv_runtime_free(ctx);
+    }
+
+    unsafe fn heap_words_override_child() {
+        let ctx = pv_runtime_new(4096); // the codegen default this override must replace
+        assert_eq!(
+            heap(ctx).cap_for_test(),
+            1024,
+            "a valid override must replace the codegen-provided default"
+        );
+        pv_runtime_free(ctx);
+    }
+
+    /// Shared child body for every malformed-`PURVASM_HEAP_WORDS` abort test: creation must abort
+    /// (via `guard`'s panic containment) before ever returning a context.
+    unsafe fn heap_words_abort_child() {
+        let _ctx = pv_runtime_new(4096);
+        unreachable!("pv_runtime_new should have aborted on a malformed PURVASM_HEAP_WORDS");
+    }
+
+    /// Shared parent-side assertion for every malformed-`PURVASM_HEAP_WORDS` abort test.
+    fn assert_heap_words_aborts(test_name: &str, bad_value: &str) {
+        let out = run_isolated(test_name, &[("PURVASM_HEAP_WORDS", Some(bad_value))]);
+        assert!(
+            !out.status.success(),
+            "child should have aborted, got: {out:?}"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("PURVASM_HEAP_WORDS"),
+            "expected the parse_heap_words_env diagnostic on stderr, got: {stderr}"
+        );
+    }
+
+    #[test]
+    fn purvasm_heap_words_absent_uses_codegen_default() {
+        if std::env::var_os("__PURVASM_ABI_TEST_CHILD").is_some() {
+            unsafe { heap_words_absent_child() };
+            return;
+        }
+        let out = run_isolated(
+            "abi::tests::purvasm_heap_words_absent_uses_codegen_default",
+            &[("PURVASM_HEAP_WORDS", None)],
+        );
+        assert!(out.status.success(), "child failed: {out:?}");
+    }
+
+    #[test]
+    fn purvasm_heap_words_valid_override_replaces_default() {
+        if std::env::var_os("__PURVASM_ABI_TEST_CHILD").is_some() {
+            unsafe { heap_words_override_child() };
+            return;
+        }
+        let out = run_isolated(
+            "abi::tests::purvasm_heap_words_valid_override_replaces_default",
+            &[("PURVASM_HEAP_WORDS", Some("1024"))],
+        );
+        assert!(out.status.success(), "child failed: {out:?}");
+    }
+
+    #[test]
+    fn purvasm_heap_words_empty_aborts_runtime_creation() {
+        if std::env::var_os("__PURVASM_ABI_TEST_CHILD").is_some() {
+            unsafe { heap_words_abort_child() };
+            return;
+        }
+        assert_heap_words_aborts(
+            "abi::tests::purvasm_heap_words_empty_aborts_runtime_creation",
+            "",
+        );
+    }
+
+    #[test]
+    fn purvasm_heap_words_zero_aborts_runtime_creation() {
+        if std::env::var_os("__PURVASM_ABI_TEST_CHILD").is_some() {
+            unsafe { heap_words_abort_child() };
+            return;
+        }
+        assert_heap_words_aborts(
+            "abi::tests::purvasm_heap_words_zero_aborts_runtime_creation",
+            "0",
+        );
+    }
+
+    #[test]
+    fn purvasm_heap_words_malformed_aborts_runtime_creation() {
+        if std::env::var_os("__PURVASM_ABI_TEST_CHILD").is_some() {
+            unsafe { heap_words_abort_child() };
+            return;
+        }
+        assert_heap_words_aborts(
+            "abi::tests::purvasm_heap_words_malformed_aborts_runtime_creation",
+            "12a",
+        );
+    }
+
+    #[test]
+    fn purvasm_heap_words_overflow_aborts_runtime_creation() {
+        if std::env::var_os("__PURVASM_ABI_TEST_CHILD").is_some() {
+            unsafe { heap_words_abort_child() };
+            return;
+        }
+        let too_big = format!("9{}", usize::MAX);
+        assert_heap_words_aborts(
+            "abi::tests::purvasm_heap_words_overflow_aborts_runtime_creation",
+            &too_big,
+        );
+    }
 }

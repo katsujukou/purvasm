@@ -20,6 +20,7 @@
 
 use crate::apply::CodeFn;
 use crate::heap::{Color, Header, HeapPtr, Kind};
+use crate::heap_words::parse_heap_words_env;
 use crate::stats::{parse_stats_env, Stats};
 use crate::word::TaggedWord;
 use core::ptr::NonNull;
@@ -216,11 +217,34 @@ impl Heap {
     /// heaps this way; hand-written `CodeFn` tests / Miri use [`Heap::new`].
     ///
     /// # Panics
-    /// If `PURVASM_STATS` is present and not exactly `"1"` (ADR-0102 §3) — a present-but-malformed
+    /// If `PURVASM_STATS` is present and not exactly `"1"` (ADR-0102 §3), or `PURVASM_HEAP_WORDS` is
+    /// present and not a non-empty positive decimal `usize` (ADR-0102 §4) — a present-but-malformed
     /// value is a diagnosable configuration error, not silently ignored. Across the `pv_runtime_new`
     /// ABI entry this becomes a process abort (`guard`'s panic containment); a direct Rust-level call
     /// (tests) just unwinds.
     pub fn new_native(words_per_space: usize) -> Heap {
+        // Heap-size override (ADR-0102 §4): absent means "use the codegen-provided default"
+        // (`words_per_space`, unchanged); a present value replaces it outright. This is scoped to
+        // measurement/robustness — it removes the need to rebuild or relink a native compiler just to
+        // test whether an OOM or GC cliff is heap-size-related; it is not heap growth or a GC design
+        // change. Read here (not in `new`) so `lib`/Miri heaps never touch the environment, matching
+        // the `PURVASM_TRACE`/`PURVASM_STATS` precedent below.
+        let heap_words_raw = std::env::var_os("PURVASM_HEAP_WORDS");
+        let heap_words_parsed = match &heap_words_raw {
+            None => parse_heap_words_env(None),
+            Some(v) => match v.to_str() {
+                Some(s) => parse_heap_words_env(Some(s)),
+                None => Err(format!(
+                    "PURVASM_HEAP_WORDS: expected a non-empty positive decimal integer, got non-UTF-8 \
+                     value {v:?}"
+                )),
+            },
+        };
+        let words_per_space = match heap_words_parsed {
+            Ok(None) => words_per_space,
+            Ok(Some(override_words)) => override_words,
+            Err(msg) => panic!("{msg}"),
+        };
         let mut h = Heap::new(words_per_space);
         h.code_is_address = true;
         // Opt-in value-flow tracing for the compiled binary; read here (not in `new`) so `lib`/Miri
@@ -245,6 +269,17 @@ impl Heap {
             Err(msg) => panic!("{msg}"),
         };
         h
+    }
+
+    /// This heap's semi-space word count — **test-only** (ADR-0102 §4 Verification): lets a
+    /// subprocess fixture confirm `PURVASM_HEAP_WORDS` actually replaced (or left unchanged) the
+    /// codegen-provided default, without a public capacity accessor on the real API. Its only callers
+    /// are `abi.rs`'s address-path subprocess tests, which are themselves `not(miri)`-gated (Miri
+    /// cannot spawn subprocesses) — matching that gate here, not just `#[cfg(test)]`, keeps a Miri
+    /// build from seeing this as dead code.
+    #[cfg(all(test, not(miri)))]
+    pub(crate) fn cap_for_test(&self) -> usize {
+        self.cap
     }
 
     /// Force apply/GC counters on for this heap without touching the environment — **test-only**

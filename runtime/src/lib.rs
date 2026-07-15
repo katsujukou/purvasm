@@ -26,9 +26,11 @@
 //! ADR-0071: the `staticlib` surface LLVM-generated code links — `pv_*` apply/tailcall trampoline over
 //! real-address code words, rooting, constructors, field access — with the `lib` API retaining the Miri
 //! path), the **allocation-free exact-saturated closure fast path** inside [`Heap::apply`]
-//! (ADR-0102 §2), and opt-in dynamic-apply/GC counters ([`stats`], ADR-0102 §3: the `PURVASM_STATS`
-//! measurement baseline that judges it). The direct known-arity *call-site* fast path (ADR-0076,
-//! `musttail`) and `PURVASM_HEAP_WORDS` (ADR-0102 §4) land in following increments.
+//! (ADR-0102 §2), opt-in dynamic-apply/GC counters ([`stats`], ADR-0102 §3: the `PURVASM_STATS`
+//! measurement baseline that judges it), and a **heap-size override** ([`heap_words`],
+//! ADR-0102 §4: the `PURVASM_HEAP_WORDS` env var lets an OOM/GC-cliff experiment change the semi-space
+//! word count without relinking). The direct known-arity *call-site* fast path (ADR-0076, `musttail`)
+//! lands in a following increment.
 //!
 //! Scope reminder (ADR-0064 §0): v1 is **single-capability, sequential, 64-bit, boot-parity**; the
 //! whole cross-capability side is v2.
@@ -39,6 +41,7 @@ pub mod byneed;
 pub mod effect;
 pub mod gc;
 pub mod heap;
+pub mod heap_words;
 pub mod leaf;
 pub mod prim;
 pub mod record;
