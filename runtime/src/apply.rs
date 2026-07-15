@@ -1,10 +1,12 @@
 //! The v1 eval/apply calling convention (ADR-0064 §3).
 //!
-//! [`Heap::apply`] is the single generic entry all v1 calls go through (the direct known-arity fast
-//! path is deferred). It dispatches on the callee's arity: **saturate** (exactly enough args → call
-//! the code), **over-apply** (too many → call, then `apply` the result to the rest), or
-//! **under-apply** (too few → build a `PAP`). Tail calls and over-application chains run as a
-//! **trampoline** (v1 TCE, ADR-0064 §4; `musttail` is deferred with the direct fast path).
+//! [`Heap::apply`] is the single generic entry all v1 calls go through (the *direct*, statically
+//! known-arity call-site fast path is a separate, deferred mechanism — ADR-0076's `musttail`). It
+//! dispatches on the callee's arity: **saturate** (exactly enough args → call the code, ADR-0102 §2's
+//! allocation-free fast path handles the common case inline), **over-apply** (too many → call, then
+//! `apply` the result to the rest), or **under-apply** (too few → build a `PAP`). Tail calls and
+//! over-application chains run as a **trampoline** (v1 TCE, ADR-0064 §4) in
+//! [`apply_loop`](Heap::apply_loop).
 //!
 //! **Rooting (ADR-0066 §3), per-function.** `alloc` is a safepoint, so each function roots the
 //! values *it* holds across a safepoint — the same discipline codegen emits per generated function,
@@ -65,14 +67,14 @@ impl Heap {
     /// [`Closure`](Kind::Closure) or a [`Pap`](Kind::Pap); applying anything else is a codegen bug and
     /// panics.
     ///
-    /// **Trampoline (ADR-0071 §4).** The loop is the trampoline. `conts` is this activation's
-    /// continuation stack — leftover-arg groups still owed application (from over-application),
-    /// innermost-last, applied once the current `(f, args)` chain yields a *real* value. It is a local,
-    /// never shared through the `Heap`, so a callee's nested `apply` cannot pop *this* activation's
-    /// leftovers. A tail call (address path) is a body's `pv_tailcall` stashing the pending-tail slot;
-    /// after `code`, [`take_pending_tail`](Heap::take_pending_tail) drives the bounce with the just-pushed
-    /// leftover still deferred on `conts`. On the index path the slot is always `None`, so this reduces
-    /// to the plain over-application loop (push-then-immediately-pop).
+    /// **Fast path then trampoline (ADR-0102 §2 / ADR-0071 §4).** An exact-saturated `Closure` call
+    /// (`args.len == arity`) is handled inline, with zero host allocations, before falling into
+    /// [`apply_loop`](Heap::apply_loop) — the owned trampoline — only if it stashes a pending tail.
+    /// Every other case (under/over-application, `Pap`, `ByNeed`) falls into `apply_loop` directly.
+    /// `apply_loop`'s continuation stack is a local, never shared through the `Heap`, so a callee's
+    /// nested `apply` cannot pop *this* activation's leftovers. A tail call (address path) is a body's
+    /// `pv_tailcall` stashing the pending-tail slot; [`take_pending_tail`](Heap::take_pending_tail)
+    /// drives the bounce. On the index path the slot is always `None`.
     pub fn apply(&mut self, f: Value, args: &[Value]) -> Value {
         // ADR-0102 §3: once per activation, regardless of caller (`pv_apply`, `pv_settle`, `force`,
         // or any other internal helper) — the counter this function's own doc comment on
@@ -86,11 +88,68 @@ impl Heap {
                 self.trace_value(&format!("  arg{i}"), *a);
             }
         }
-        let mut f = f;
-        let mut args: Vec<Value> = args.to_vec();
-        // Each group is rooted on the shadow stack (LIFO with the frame mark), so it survives every
-        // subsequent `code` safepoint until consumed.
-        let mut conts: Vec<(RootFrame, Vec<Root>)> = Vec::new();
+
+        // ADR-0102 §2: the allocation-free exact-saturated closure fast path, checked *before*
+        // materialising the owned `Vec`/`conts` the generic trampoline needs. Same release-validation
+        // tier as the loop below — `checked_ptr` still rejects a stale, foreign, forwarded,
+        // non-pointer, or non-callable callee before any unchecked header/code-word access, so this
+        // is a shortcut for a case the existing loop already accepts, not a weaker entry. Nothing
+        // allocates between the checks below and `call_code`, so handing `code` the original
+        // *borrowed* `args` slice (not a copy) is sound under the same per-function rooting
+        // discipline `CodeFn`'s doc comment describes: `apply` still doesn't root `f` or the
+        // saturated args on the callee's behalf, and a stashed pending tail already carries its own
+        // owned arguments through the existing `take_pending_tail` protocol.
+        let p = self.checked_ptr(f);
+        if self.header_unchecked(p).kind() == Kind::Closure {
+            let arity = self.read_raw_unchecked(p, 1) as usize;
+            if args.len() == arity {
+                if let Some(s) = self.stats_mut() {
+                    s.entry_exact_fast_hits = s.entry_exact_fast_hits.saturating_add(1);
+                    s.record_closure_exact(arity as u32);
+                }
+                let code_word = self.read_raw_unchecked(p, 0);
+                let result = self.call_code(code_word, f, args);
+                if self.trace_on() {
+                    self.trace_value(&format!("  = code 0x{code_word:x} returned"), result);
+                }
+                return match self.take_pending_tail() {
+                    // The common case: a real value, zero `Vec` allocations end to end.
+                    None => result,
+                    // A tail bounce: fall into the existing owned trampoline with the stashed callee.
+                    // `conts` starts empty — this was the first dispatch, so there is no over-apply
+                    // leftover to carry.
+                    Some((nf, nargs)) => {
+                        if let Some(s) = self.stats_mut() {
+                            s.pending_tail_apply_takes =
+                                s.pending_tail_apply_takes.saturating_add(1);
+                        }
+                        self.apply_loop(nf, nargs, Vec::new())
+                    }
+                };
+            }
+        }
+        // Fast-path miss (not a `Closure`, or an under/over-application): the existing generic loop,
+        // unchanged.
+        self.apply_loop(f, args.to_vec(), Vec::new())
+    }
+
+    /// The owned generic trampoline (ADR-0071 §4): under-application/PAP-flattening/by-need-forcing/
+    /// over-application/tail-bounce handling. Unchanged by ADR-0102 §2 except for the ADR-0102 §3
+    /// counters it already carried — entered either directly (an [`apply`](Heap::apply) fast-path
+    /// miss) or after the fast path's own exact call stashes a pending tail.
+    ///
+    /// `conts` is this activation's continuation stack — leftover-arg groups still owed application
+    /// (from over-application), innermost-last, applied once the current `(f, args)` chain yields a
+    /// *real* value. Each group is rooted on the shadow stack (LIFO with the frame mark), so it
+    /// survives every subsequent `code` safepoint until consumed. Callers start it empty: [`apply`]
+    /// on both its own paths (a fast-path miss has no leftover yet; a fast-path tail-bounce is still
+    /// the first dispatch of this activation, so it has none either).
+    fn apply_loop(
+        &mut self,
+        mut f: Value,
+        mut args: Vec<Value>,
+        mut conts: Vec<(RootFrame, Vec<Root>)>,
+    ) -> Value {
         loop {
             // `apply` is safe public API. A non-pointer, foreign/forged, stale, or forwarded callee
             // would make the header deref below — and the code-word call — UB. `checked_ptr`
@@ -401,11 +460,16 @@ mod tests {
         // input across a collection it triggers, and the result is correct. A missed root here would be
         // a use-after-move Miri catches.
         let mut h = Heap::new(8);
+        h.enable_stats_for_test();
         let clo = h.new_closure(add_one_across_gc, 1, Value::unit());
         let n = h.new_number(41.0);
         let r = h.apply(clo.as_word(), &[n.as_word()]);
         let rp = unsafe { HeapPtr::from_word(r) };
         assert_eq!(f64::from_bits(h.read_raw(rp, 0)), 42.0);
+        // ADR-0102 §2 Verification: this exact-saturated call (arity 1, 1 arg) goes through the new
+        // fast path, and a callee that roots its own heap-pointer arg across a GC it triggers still
+        // works correctly from there.
+        assert_eq!(h.stats().unwrap().entry_exact_fast_hits, 1);
     }
 
     #[test]
@@ -456,6 +520,28 @@ mod tests {
     }
 
     #[test]
+    fn fast_path_hits_on_a_plain_exact_call() {
+        // ADR-0102 §2 Verification: the primary "the fast path actually fires" proof — a plain
+        // exact-saturated call with no tail bounce goes through the new allocation-free entry, not
+        // the generic loop.
+        let mut h = Heap::new(64);
+        h.enable_stats_for_test();
+        let clo = h.new_closure(add2, 2, Value::unit());
+        let r = h.apply(clo.as_word(), &[Value::int(3), Value::int(4)]);
+        assert_eq!(r.as_int(), 7);
+
+        let s = h.stats().unwrap();
+        assert_eq!(s.entry_exact_fast_hits, 1);
+        assert_eq!(s.closure_exact_dispatches, 1);
+        assert_eq!(s.closure_exact_positive, 1);
+        assert_eq!(s.heap_apply_activations, 1);
+        assert_eq!(
+            s.pending_tail_apply_takes, 0,
+            "no tail was stashed (index path)"
+        );
+    }
+
+    #[test]
     fn stats_count_under_over_pap_and_exact_positive_dispatch() {
         let mut h = Heap::new(64);
         h.enable_stats_for_test();
@@ -488,7 +574,9 @@ mod tests {
         assert_eq!(s.closure_exact_zero, 0);
         assert_eq!(
             s.entry_exact_fast_hits, 0,
-            "the fast path is out of scope for this slice"
+            "neither top-level call is an exact match at entry: the first is under-applied (1 arg vs \
+             arity 2), the second over-applied (2 args vs arity 1) — both exact dispatches here are \
+             reached only after PAP-flatten/over-apply-resolve inside apply_loop, not at apply()'s entry"
         );
     }
 
@@ -518,6 +606,12 @@ mod tests {
             s.closure_exact_dispatches, 1,
             "only the final call saturates"
         );
+        assert_eq!(
+            s.entry_exact_fast_hits, 0,
+            "every call here starts from a Pap (kind mismatch) or an under-applied arity, so the \
+             entry check always misses; the one exact dispatch is reached via PAP-flatten re-loop \
+             inside apply_loop, never at apply()'s entry"
+        );
     }
 
     #[test]
@@ -531,6 +625,8 @@ mod tests {
         assert_eq!(s.closure_exact_zero, 1);
         assert_eq!(s.closure_exact_positive, 0);
         assert_eq!(s.closure_exact_dispatches, 1);
+        // ADR-0102 §2: a zero-arity exact call (`args == &[]`) is still an exact match at entry.
+        assert_eq!(s.entry_exact_fast_hits, 1);
     }
 
     #[test]
@@ -553,5 +649,9 @@ mod tests {
         // exact-saturated positive-arity dispatches.
         assert_eq!(s.closure_exact_dispatches, 2);
         assert_eq!(s.closure_exact_positive, 2);
+        // ADR-0102 §2: the *nested* `force`-triggered `apply(suspension, [unit])` call is itself an
+        // exact match at its own entry (arity 1, 1 arg) and fast-path hits; the outer top-level call
+        // does not (its callee is `Kind::ByNeed`, not `Closure`), so the total is 1, not 2.
+        assert_eq!(s.entry_exact_fast_hits, 1);
     }
 }

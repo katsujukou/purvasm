@@ -1,6 +1,6 @@
-//! Opt-in dynamic-apply/GC counters (ADR-0102 §3): a fixed, machine-readable baseline so the
-//! exact-saturated closure fast path (ADR-0102 §2, a later increment) can be judged by measured
-//! event-mix deltas rather than guessed. Disabled by default; enabled per [`crate::gc::Heap`]
+//! Opt-in dynamic-apply/GC counters (ADR-0102 §3): a fixed, machine-readable event mix so the
+//! exact-saturated closure fast path ([`crate::apply`], ADR-0102 §2) can be judged by measured
+//! before/after deltas rather than guessed. Disabled by default; enabled per [`crate::gc::Heap`]
 //! context via the `PURVASM_STATS` environment variable ([`parse_stats_env`]).
 //!
 //! This module is pure (no `Heap`/environment access) so [`Stats`] and its formatting are unit-tested
@@ -24,9 +24,13 @@ pub(crate) struct Stats {
     pub closure_exact_zero: u64,
     /// The positive-arity subset of [`closure_exact_dispatches`](Stats::closure_exact_dispatches).
     pub closure_exact_positive: u64,
-    /// Hits of the pre-loop borrowed-slice exact-saturated fast path (ADR-0102 §2). Always `0` in
-    /// this slice — the fast path itself is a later increment; the field exists now so the schema
-    /// is stable across it.
+    /// Hits of the pre-loop borrowed-slice exact-saturated fast path
+    /// ([`Heap::apply`](crate::gc::Heap::apply), ADR-0102 §2): an exact-saturated call served with
+    /// zero host `Vec` allocations, without entering [`apply_loop`](crate::gc::Heap::apply_loop) at
+    /// all (unless it stashes a pending tail). A subset of
+    /// [`closure_exact_dispatches`](Stats::closure_exact_dispatches) — the rest of that total is
+    /// exact dispatches `apply_loop` itself serves (after PAP-flattening or a tail bounce, or when
+    /// the entry check misses because the initial callee wasn't a bare `Closure`).
     pub entry_exact_fast_hits: u64,
     /// `Kind::Closure` dispatches with `args.len < arity` (under-application, builds a `Pap`).
     pub under_apply: u64,

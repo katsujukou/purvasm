@@ -25,9 +25,10 @@
 //! recursive `Monad Effect` dictionary), and the **codegen↔runtime `extern "C"` boundary** ([`abi`],
 //! ADR-0071: the `staticlib` surface LLVM-generated code links — `pv_*` apply/tailcall trampoline over
 //! real-address code words, rooting, constructors, field access — with the `lib` API retaining the Miri
-//! path), and opt-in dynamic-apply/GC counters ([`stats`], ADR-0102 §3: the `PURVASM_STATS`
-//! measurement baseline for the exact-saturated closure fast path that follows). The direct
-//! known-arity fast path (and `musttail`) land in following increments.
+//! path), the **allocation-free exact-saturated closure fast path** inside [`Heap::apply`]
+//! (ADR-0102 §2), and opt-in dynamic-apply/GC counters ([`stats`], ADR-0102 §3: the `PURVASM_STATS`
+//! measurement baseline that judges it). The direct known-arity *call-site* fast path (ADR-0076,
+//! `musttail`) and `PURVASM_HEAP_WORDS` (ADR-0102 §4) land in following increments.
 //!
 //! Scope reminder (ADR-0064 §0): v1 is **single-capability, sequential, 64-bit, boot-parity**; the
 //! whole cross-capability side is v2.

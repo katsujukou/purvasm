@@ -892,6 +892,55 @@ mod tests {
                 s.closure_exact_dispatches, 2,
                 "the mk dispatch and the resolved adder call"
             );
+            assert_eq!(
+                s.entry_exact_fast_hits, 0,
+                "f is over-applied (2 args vs arity 1) at entry, so the fast path always misses here \
+                 — both exact dispatches are reached via apply_loop's own tail-bounce/leftover-resolve, \
+                 never at apply()'s entry"
+            );
+            pv_runtime_free(ctx);
+        }
+    }
+
+    #[test]
+    fn fast_path_hit_then_tailcall_falls_into_trampoline() {
+        // ADR-0102 §2 Verification: a callee whose FIRST call is exact-saturated (hits the new
+        // pre-loop fast path) and stashes a pending tail must still resolve correctly through the
+        // existing trampoline (`apply_loop`) — unlike `stats_count_tailcall_write_and_apply_loop_take`
+        // above, which over-applies at entry and therefore never reaches the fast path at all.
+        let ctx = pv_runtime_new(1 << 12);
+        unsafe {
+            heap(ctx).enable_stats_for_test();
+            let f = pv_make_closure(ctx, f_tail as usize as u64, 1, TaggedWord::unit().to_bits());
+            let argv = [TaggedWord::int(3).to_bits()]; // exact: arity 1, 1 arg
+            let r = pv_apply(ctx, f, argv.as_ptr(), argv.len()); // fast-path hit -> tailcall -> apply_loop
+                                                                 // r is `mk(3)` = adder{env=[3]}, a closure; apply it once more (also exact) to check the
+                                                                 // captured value survived the fast-path-to-trampoline handoff.
+            let argv2 = [TaggedWord::int(39).to_bits()];
+            let r2 = pv_apply(ctx, r, argv2.as_ptr(), argv2.len());
+            assert_eq!(TaggedWord::from_bits(r2).as_int(), 42);
+
+            let s = *heap(ctx).stats().unwrap();
+            assert_eq!(
+                s.entry_exact_fast_hits, 2,
+                "both pv_apply calls are exact-saturated at entry"
+            );
+            assert_eq!(s.pv_tailcall_writes, 1);
+            assert_eq!(
+                s.pending_tail_apply_takes, 1,
+                "taken by the fast path's own take, which falls into apply_loop with the stash"
+            );
+            assert_eq!(
+                s.pending_tail_settle_takes, 0,
+                "pv_settle is never called on this path"
+            );
+            assert_eq!(
+                s.closure_exact_dispatches, 3,
+                "the fast-path mk dispatch, apply_loop's resolved adder dispatch, and the second \
+                 fast-path call"
+            );
+            assert_eq!(s.under_apply, 0);
+            assert_eq!(s.over_apply, 0);
             pv_runtime_free(ctx);
         }
     }
@@ -978,6 +1027,10 @@ mod tests {
                 s.heap_apply_activations, 2,
                 "force's internal apply on the suspension, plus the real pv_apply's apply"
             );
+            // ADR-0102 §2: both activations are exact matches at their own entry (the nested
+            // force-triggered call on the arity-1 suspension, and the real pv_apply's arity-2 add2
+            // call), so both fast-path hit — independent of which one is a `pv_apply_entries`.
+            assert_eq!(s.entry_exact_fast_hits, 2);
             pv_runtime_free(ctx);
         }
     }

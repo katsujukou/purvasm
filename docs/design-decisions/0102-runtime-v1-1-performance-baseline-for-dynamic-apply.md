@@ -3,6 +3,13 @@
 - Status: ~~Proposed~~ **Accepted** _(2026-07-15: accepted by the maintainer)_
 - Date: 2026-07-15
 
+> **Progress (2026-07-15):** §3 (the `PURVASM_STATS` apply/GC counters) and §2 (the allocation-free
+> exact-saturated closure fast path) have landed in `runtime/src/stats.rs`/`gc.rs`/`apply.rs`/`abi.rs`,
+> in that order, per the ADR's own required sequence. §4 (`PURVASM_HEAP_WORDS`) has not landed yet.
+> The formal paired-A/B wall-clock/counter measurement required by §5 is a separate follow-up — no
+> checked-in paired-interleaved-runs script exists yet (sidenote 0011's discipline was applied by hand
+> in the original investigation, not automated).
+
 ## Abstract
 
 Define "runtime v1.1" as a narrow performance increment over the accepted v1 native runtime: keep the
