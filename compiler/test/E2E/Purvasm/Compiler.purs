@@ -15,6 +15,7 @@ import Data.Tuple (Tuple(..), fst, snd)
 import Effect.Class (liftEffect)
 import Node.Encoding (Encoding(..))
 import Node.FS.Sync (exists, readTextFile, readdir) as FSSync
+import Node.Process (lookupEnv) as Process
 import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..)) as A
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (cfExpr, fvExpr)
@@ -94,15 +95,37 @@ spec = do
 
 -- --- ADR-0094 fold parity: sliced structural keys ride the ulib shadow bodies --------------------
 
+-- | The ulib overlay directory candidates, in ADR-0055 precedence order: `$PURVASM_LIB` if set
+-- | (the CI/launcher case — an absolute path, tried as-is), else the cwd-relative dev default
+-- | `dist/ulib` (tried at both the process cwd and one level up, since `spago test`'s cwd differs
+-- | between a workspace-root run and a `compiler`-relative run). Shared by every ADR-0094 parity
+-- | check below, so the resolution rule can't drift between them.
+resolveUlibRoots :: Effect (Array String)
+resolveUlibRoots = do
+  mLib <- Process.lookupEnv "PURVASM_LIB"
+  pure case mLib of
+    Just lib -> [ lib ]
+    Nothing -> [ "dist/ulib", "../dist/ulib" ]
+
+-- | The first of `roots` that exists, or the last one if none do — letting the caller's own next
+-- | operation on it (e.g. `readdir`) fail there with a natural, self-explanatory error rather than
+-- | this helper swallowing "nothing exists" silently.
+firstExistingDir :: Array String -> Effect String
+firstExistingDir roots = case Array.uncons roots of
+  Nothing -> pure "dist/ulib" -- unreachable: resolveUlibRoots never returns []
+  Just { head, tail: [] } -> pure head
+  Just { head, tail } -> FSSync.exists head >>= if _ then pure head else firstExistingDir tail
+
 -- | Load a real corefn artifact by the build's own resolution rule (ulib overlay first, then the
 -- | workspace output) — the parity harness must fold the artifacts programs actually compile.
 loadReal :: String -> Effect (Maybe CFM.Module)
-loadReal name = go roots
+loadReal name = do
+  ulibRoots <- resolveUlibRoots
+  go (map (\root -> root <> "/" <> name <> "/corefn.json") ulibRoots <> outputRoots)
   where
-  roots = do
+  outputRoots = do
     base <- [ "", "../" ]
-    root <- [ "dist/ulib/", "output/" ]
-    pure (base <> root <> name <> "/corefn.json")
+    pure (base <> "output/" <> name <> "/corefn.json")
 
   go = Array.uncons >>> case _ of
     Nothing -> pure Nothing
@@ -249,7 +272,7 @@ paritySpec = describe "ADR-0094 fold parity (sliced structural keys ride the uli
     -- Data.Ord's shadow drops the *Impl names entirely; Data.Eq/Data.Functor keep them as
     -- ordinary PS bindings. In neither case may any overlay corefn declare them as FOREIGN.
     entries <- liftEffect do
-      base <- FSSync.exists "dist/ulib" >>= if _ then pure "dist/ulib" else pure "../dist/ulib"
+      base <- resolveUlibRoots >>= firstExistingDir
       dirs <- FSSync.readdir base
       map Array.concat $ traverse
         ( \d -> do
