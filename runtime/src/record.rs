@@ -22,10 +22,13 @@ pub fn fnv1a_64(bytes: &[u8]) -> u64 {
 }
 
 impl Heap {
-    /// The label id of a dynamic `String` key: `fnv1a_64` over its `Str` bytes (ADR-0069 §2).
+    /// The label id of a dynamic `String` key: `fnv1a_64` over its bytes, borrowed in place —
+    /// no copy-out, both string kinds accepted (ADR-0069 §2 / ADR-0103 §4). Pure reads only, so
+    /// the borrow never spans an allocation.
     pub fn str_label_id(&self, key: Value) -> u64 {
-        // SAFETY: `key` is a `Str` pointer; `str_read` validates the object header / kind.
-        fnv1a_64(self.str_read(unsafe { HeapPtr::from_word(key) }).as_bytes())
+        // SAFETY: `key` is a string pointer word; `str_view` validates the object / kind / range.
+        let v = self.str_view(unsafe { HeapPtr::from_word(key) });
+        fnv1a_64(self.view_bytes(&v))
     }
 
     /// Binary-search a validated record for `id`: `(index, present)`. On absent, `index` is the sorted

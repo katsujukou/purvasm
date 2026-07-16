@@ -762,6 +762,32 @@ mod tests {
         }
     }
 
+    /// The FFI string read side accepts BOTH string kinds (ADR-0103 §4: `pv_str_len`/`pv_str_copy`
+    /// are kind-transparent via the view normalisation) — a `.c` foreign must see identical
+    /// length/bytes whether the value word is a packed `Str` or a `StrSlice`.
+    #[test]
+    fn string_accessors_read_both_kinds() {
+        let ctx = pv_runtime_new(1 << 12);
+        unsafe {
+            let bytes = b"hello, world";
+            let packed = pv_new_str(ctx, bytes.as_ptr(), bytes.len());
+            let sliced = heap(ctx)
+                .str_slice_bytes(TaggedWord::from_bits(packed), 7, 12)
+                .to_bits();
+            assert_eq!(pv_str_len(ctx, packed), 12);
+            assert_eq!(pv_str_len(ctx, sliced), 5);
+            let mut buf = [0u8; 16];
+            let n = pv_str_copy(ctx, packed, buf.as_mut_ptr(), buf.len());
+            assert_eq!(&buf[..n], b"hello, world");
+            let n = pv_str_copy(ctx, sliced, buf.as_mut_ptr(), buf.len());
+            assert_eq!(&buf[..n], b"world");
+            // capped copy-out still truncates identically on a slice.
+            let n = pv_str_copy(ctx, sliced, buf.as_mut_ptr(), 3);
+            assert_eq!(&buf[..n], b"wor");
+            pv_runtime_free(ctx);
+        }
+    }
+
     /// `\y -> env[0] + y` — an env-capturing leaf (arity 1); reads its captured `Int` from the closure.
     extern "C" fn adder(ctx: *mut Heap, clo: u64, args: *const u64, nargs: usize) -> u64 {
         let h = unsafe { heap(ctx) };

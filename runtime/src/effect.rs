@@ -87,7 +87,8 @@ impl Heap {
     /// is captured by the shell in the boot e2e differential, not by the sink, so that gate is
     /// unaffected either way.) A write failure is a fatal abort, as for `pv_drain_output`.
     pub fn stdio_write_line(&mut self, s: Value) -> Value {
-        // SAFETY: `s` is a `Str` pointer; `str_read` validates the object header / kind.
+        // SAFETY: `s` is a string (`Str | StrSlice`) pointer; `str_read` normalises through the
+        // view and validates the object header / kind (ADR-0103).
         let line = self.str_read(unsafe { HeapPtr::from_word(s) });
         if self.code_is_address() {
             use std::io::Write;
@@ -230,7 +231,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "non-Str")]
+    #[should_panic(expected = "non-string")]
     fn stdio_write_line_rejects_non_str_argument() {
         // The leaf is safe public API: handed a non-`Str` value it must reject the kind (release-on),
         // not read a bogus length and slice out of bounds.

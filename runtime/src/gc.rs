@@ -29,6 +29,22 @@ use std::time::Instant;
 /// Bytes per heap word.
 const WORD: usize = core::mem::size_of::<u64>();
 
+/// The `StrSlice.cp_len` "not yet counted" sentinel (ADR-0103 §2). A real count never reaches it
+/// (`cp_len <= byte_len`, and a byte length near `u64::MAX` cannot be allocated).
+pub(crate) const CP_UNKNOWN: u64 = u64::MAX;
+
+/// A normalised view of a string value (ADR-0103 §1): the packed backing `Str`, the byte range
+/// within it, and the code-point count when the object carries one (`None` for a bare `Str` and
+/// for an un-memoised slice). Produced by [`Heap::str_view`], which release-validates the shape.
+/// Holds the backing *pointer* — stale after any allocation; re-derive, never store.
+#[derive(Clone, Copy)]
+pub(crate) struct StrView {
+    pub base: HeapPtr,
+    pub off: usize,
+    pub len: usize,
+    pub cp: Option<usize>,
+}
+
 /// `ByNeed` cell `state` word (ADR-0070 §1). `pub(crate)`: shared with the `force` operation.
 pub(crate) const BYNEED_UNFORCED: u64 = 0;
 pub(crate) const BYNEED_BUILDING: u64 = 1;
@@ -755,12 +771,14 @@ impl Heap {
         p
     }
 
-    /// The byte length of a `Str`. **Release-checked** (this is reachable from the safe public API, so
-    /// the checks are not `debug`-only): asserts the object is a `Str` and that its stored `len` fits
-    /// the allocated byte words, so a non-`Str` object or a `len` word corrupted via the public
-    /// `write_raw` cannot drive [`str_read`](Self::str_read) into an out-of-bounds slice (UB).
+    /// The byte length of a **packed** `Str` (the raw-layout read; string *values* go through
+    /// [`str_view`](Self::str_view)/[`str_len`](Self::str_len), which also accept a `StrSlice`).
+    /// **Release-checked** (this is reachable from the safe public API, so the checks are not
+    /// `debug`-only): asserts the object is a `Str` and that its stored `len` fits the allocated
+    /// byte words, so a non-`Str` object or a `len` word corrupted via the public `write_raw`
+    /// cannot drive a reader into an out-of-bounds slice (UB).
     #[inline]
-    pub fn str_len(&self, s: HeapPtr) -> usize {
+    pub(crate) fn packed_str_len(&self, s: HeapPtr) -> usize {
         let hdr = self.header(s); // checked: validates `s` is a live object header
         assert_eq!(hdr.kind(), Kind::Str, "str_len on a non-Str object");
         let len = self.read_raw(s, 0) as usize;
@@ -771,6 +789,61 @@ impl Heap {
             "Str length {len} exceeds its allocated byte capacity {byte_capacity} (corrupt Str)"
         );
         len
+    }
+
+    /// The normalised view of a string value — a packed `Str` or a `StrSlice` (ADR-0103 §1), as
+    /// `{ base, off, len }` over the packed backing. **Release-checked** (every string reader
+    /// funnels through here): the kind must be `Str`/`StrSlice`; a slice's `base` must be a packed
+    /// `Str` (never nested), its byte range must lie within the backing, and its `cp_len` must be
+    /// the `CP_UNKNOWN` sentinel or `<= byte_len`. Any violation is a fault, never UB.
+    ///
+    /// The view carries the backing *pointer*: a caller that allocates re-derives the view after
+    /// (the moving-GC discipline, ADR-0063 §2 — no borrowed bytes across a safepoint).
+    pub(crate) fn str_view(&self, s: HeapPtr) -> StrView {
+        let hdr = self.header(s); // checked: validates `s` is a live object header
+        match hdr.kind() {
+            Kind::Str => StrView {
+                base: s,
+                off: 0,
+                len: self.packed_str_len(s),
+                cp: None,
+            },
+            Kind::StrSlice => {
+                let base_w = self.read_field(s, 0);
+                assert!(
+                    base_w.is_pointer(),
+                    "StrSlice base is not a pointer (corrupt slice)"
+                );
+                // SAFETY: `base_w` is a pointer-tagged word out of a validated slice's value slot;
+                // `header`/`packed_str_len` re-validate the target object.
+                let base = unsafe { HeapPtr::from_word(base_w) };
+                let base_len = self.packed_str_len(base); // asserts the backing is a packed Str
+                let off = self.read_raw(s, 1) as usize;
+                let len = self.read_raw(s, 2) as usize;
+                assert!(
+                    off <= base_len && len <= base_len - off,
+                    "StrSlice range [{off}, {off}+{len}) exceeds its backing (len {base_len})"
+                );
+                let cp_raw = self.read_raw(s, 3);
+                let cp = if cp_raw == CP_UNKNOWN {
+                    None
+                } else {
+                    assert!(
+                        cp_raw as usize <= len,
+                        "StrSlice cp_len {cp_raw} exceeds its byte length {len} (corrupt slice)"
+                    );
+                    Some(cp_raw as usize)
+                };
+                StrView { base, off, len, cp }
+            }
+            k => panic!("string view of a non-string object (kind {k:?})"),
+        }
+    }
+
+    /// The logical byte length of a string value (`Str` or `StrSlice`).
+    #[inline]
+    pub fn str_len(&self, s: HeapPtr) -> usize {
+        self.str_view(s).len
     }
 
     /// The raw IEEE-754 bit pattern of a boxed `Number` — the read side of `pv_number_bits` (ADR-0073 §2),
@@ -812,17 +885,24 @@ impl Heap {
         hdr.size_words()
     }
 
-    /// Copy a `Str`'s bytes out to an owned `String`. Copies (never borrows into the moving heap,
-    /// ADR-0063 §2); valid UTF-8 by the `new_str` invariant.
+    /// Copy a string value's bytes out to an owned `String` (`Str` or `StrSlice`). Copies (never
+    /// hands a borrow into the moving heap outward, ADR-0063 §2); valid UTF-8 by the `new_str`
+    /// invariant plus the slice builders' boundary validation (ADR-0103 §1).
     pub fn str_read(&self, s: HeapPtr) -> String {
-        // Release-checked: `str_len` asserts `s` is a `Str` and `len <= byte_capacity`, so the slice
-        // below is within the object's allocation.
-        let len = self.str_len(s);
-        // SAFETY: `len` bytes live at payload word 1 (`2 * WORD` bytes into the object) and, by the
-        // `str_len` bound, stay within the object's allocated byte words; `s` is a validated header.
-        let bytes =
-            unsafe { core::slice::from_raw_parts((s.as_ptr() as *const u8).add(2 * WORD), len) };
+        let v = self.str_view(s); // release-checked: kind, range, backing
+                                  // SAFETY: `str_view` bounds `[off, off+len)` within the backing's validated byte region.
+        let bytes = unsafe { core::slice::from_raw_parts(self.view_ptr(&v), v.len) };
         String::from_utf8(bytes.to_vec()).expect("Str invariant: valid UTF-8")
+    }
+
+    /// The first byte's address of a view — a **borrow into the moving heap**: the caller must not
+    /// allocate while any pointer/slice derived from it is live (ADR-0063 §2), and must re-derive
+    /// the view after any safepoint. `pub(crate)`, island-internal by design.
+    #[inline]
+    pub(crate) fn view_ptr(&self, v: &StrView) -> *const u8 {
+        // SAFETY (of the arithmetic): `str_view` validated `off + len` within the backing's bytes,
+        // which start at payload word 1 (`2 * WORD` into the object).
+        unsafe { (v.base.as_ptr() as *const u8).add(2 * WORD + v.off) }
     }
 
     /// A fresh **zero-filled** `len`-byte `Str` — `Purvasm.String.unsafeNew` (ADR-0052). The linear
@@ -840,18 +920,19 @@ impl Heap {
         p
     }
 
-    /// Byte `i` of a `Str` — `Purvasm.String.byteAt`. Release-checked (reachable from the safe leaf API):
-    /// [`str_len`] validates the object and its length, and `i` is bounds-checked against it.
+    /// Byte `i` of a string value (`Str` or `StrSlice`, view-relative) — `Purvasm.String.byteAt`.
+    /// Release-checked (reachable from the safe leaf API): [`str_view`](Self::str_view) validates
+    /// the object and its range, and `i` is bounds-checked against the view length.
     #[inline]
     pub(crate) fn str_byte_get(&self, s: HeapPtr, i: usize) -> u8 {
-        let len = self.str_len(s);
+        let v = self.str_view(s);
         assert!(
-            i < len,
-            "byteAt: index {i} out of bounds (Str length {len})"
+            i < v.len,
+            "byteAt: index {i} out of bounds (Str length {len})",
+            len = v.len
         );
-        // SAFETY: byte `i < len` lies in the `len` bytes at payload word 1 (`2 * WORD` into the object),
-        // within the allocation `str_len` bounded; `s` is a validated header.
-        unsafe { *(s.as_ptr() as *const u8).add(2 * WORD + i) }
+        // SAFETY: byte `i < v.len` lies in the view's validated byte range.
+        unsafe { *self.view_ptr(&v).add(i) }
     }
 
     /// Write byte `i` of a `Str` in place — `Purvasm.String.unsafeSetByte` (ADR-0052 linear build).
@@ -862,7 +943,9 @@ impl Heap {
     /// complete — the same discipline as the `boot` reference, ADR-0052).
     #[inline]
     pub(crate) fn str_byte_set(&mut self, s: HeapPtr, i: usize, b: u8) {
-        let len = self.str_len(s);
+        // ADR-0103 §1: in-place byte writes stay confined to freshly built packed `Str`s — a
+        // `StrSlice` (or any other kind) is rejected before the length read.
+        let len = self.packed_str_len(s);
         assert!(
             i < len,
             "unsafeSetByte: index {i} out of bounds (Str length {len})"
@@ -872,6 +955,282 @@ impl Heap {
         unsafe {
             *(s.as_ptr() as *mut u8).add(2 * WORD + i) = b;
         }
+    }
+
+    // --- StrSlice views and the bulk string operations (ADR-0103) -----------
+
+    /// The bytes of a view, as a slice whose lifetime ties to `&self` — allocation needs
+    /// `&mut self`, so the borrow checker itself enforces "no allocation while borrowed"
+    /// (ADR-0063 §2). The remaining discipline is the caller's: a `StrView` is `Copy`, so never
+    /// reuse one derived *before* an allocation — re-derive via [`str_view`](Self::str_view).
+    #[inline]
+    pub(crate) fn view_bytes<'a>(&'a self, v: &StrView) -> &'a [u8] {
+        // SAFETY: `str_view` bounded `[off, off+len)` within the backing's validated byte region.
+        unsafe { core::slice::from_raw_parts(self.view_ptr(v), v.len) }
+    }
+
+    /// Interpret an inbound string *value word* (the ABI boundary trust model: the tag bit is
+    /// taken on faith, shape/liveness release-validated at the deref — `lib.rs`' pointer-word
+    /// invariant).
+    #[inline]
+    fn str_ptr(w: TaggedWord) -> HeapPtr {
+        assert!(w.is_pointer(), "string operation on a non-pointer word");
+        // SAFETY: a pointer-tagged word; every consumer re-validates via `header`/`str_view`.
+        unsafe { HeapPtr::from_word(w) }
+    }
+
+    /// Build a string value over the **view-relative** byte range `[off, off+len)` of `s` — the
+    /// ADR-0103 §1 bounded-retention rule, in one place for every slice builder:
+    ///
+    ///   * `len = 0` → the empty packed `Str`;
+    ///   * the full backing → the backing itself (no wrapper; a full-range slice of a slice
+    ///     re-bases the same way);
+    ///   * `B <= 4·len` (B = the packed backing's byte length) → a `StrSlice`;
+    ///   * otherwise → materialise a packed `Str`.
+    ///
+    /// `cp` is the result's code-point count when the caller *genuinely* knows it (ADR-0103 §2's
+    /// per-operation rules); `None` stores the `CP_UNKNOWN` sentinel. Constructing either result
+    /// allocates, so the backing is **rooted across the allocation and re-read** before it is
+    /// stored/copied (the ADR-0066 §3 self-rooting-constructor obligation — a pre-allocation
+    /// `HeapPtr` must never survive the `alloc`).
+    pub(crate) fn build_str_view(
+        &mut self,
+        s: TaggedWord,
+        off: usize,
+        len: usize,
+        cp: Option<usize>,
+    ) -> TaggedWord {
+        let sv = self.str_view(Self::str_ptr(s));
+        assert!(
+            off <= sv.len && len <= sv.len - off,
+            "string slice range [{off}, {off}+{len}) exceeds the value's length {vlen}",
+            vlen = sv.len
+        );
+        let abs_off = sv.off + off;
+        let base_len = self.packed_str_len(sv.base);
+        if len == 0 {
+            return self.new_str(b"").as_word();
+        }
+        if abs_off == 0 && len == base_len {
+            return sv.base.as_word();
+        }
+        let frame = self.frame();
+        let bslot = frame.len;
+        self.root(sv.base.as_word());
+        if base_len <= 4 * len {
+            let p = self.alloc(Kind::StrSlice, 4, Color::White);
+            let b = self.root_slot(bslot);
+            self.write_field_unchecked(p, 0, b);
+            self.write_raw_unchecked(p, 1, abs_off as u64);
+            self.write_raw_unchecked(p, 2, len as u64);
+            self.write_raw_unchecked(p, 3, cp.map_or(CP_UNKNOWN, |c| c as u64));
+            self.pop_frame(frame);
+            p.as_word()
+        } else {
+            let p = self.new_str_uninit(len);
+            let b = self.root_slot(bslot);
+            // SAFETY: `b` is the *current* (post-allocation) backing pointer; `abs_off + len` was
+            // validated within its bytes, and `p` was just allocated with `len` bytes' capacity.
+            // The regions are distinct objects, so non-overlapping.
+            unsafe {
+                let src = (HeapPtr::from_word(b).as_ptr() as *const u8).add(2 * WORD + abs_off);
+                let dst = (p.as_ptr() as *mut u8).add(2 * WORD);
+                core::ptr::copy_nonoverlapping(src, dst, len);
+            }
+            self.pop_frame(frame);
+            p.as_word()
+        }
+    }
+
+    /// `Purvasm.String.byteSlice from to s` — the `[from, to)` **view-relative** byte range,
+    /// release-validated (ADR-0103 §1/§5): in range, no wraparound (the signed inputs are checked
+    /// non-negative before widening), and both endpoints on UTF-8 boundaries, extending `new_str`'s
+    /// valid-UTF-8 ownership to every view. The result's code-point count is unknown (§2).
+    pub fn str_slice_bytes(&mut self, s: TaggedWord, from: i64, to: i64) -> TaggedWord {
+        let v = self.str_view(Self::str_ptr(s));
+        assert!(
+            0 <= from && from <= to && (to as usize) <= v.len,
+            "byteSlice: range [{from}, {to}) invalid for a string of length {len}",
+            len = v.len
+        );
+        let (f, t) = (from as usize, to as usize);
+        {
+            let bytes = self.view_bytes(&v);
+            assert!(
+                utf8_is_boundary(bytes, f) && utf8_is_boundary(bytes, t),
+                "byteSlice: endpoint not on a UTF-8 code-point boundary"
+            );
+        }
+        self.build_str_view(s, f, t - f, None)
+    }
+
+    /// `Purvasm.String.dropCodePoints k s` — drop the first `k` code points (`k` clamped to
+    /// `[0, count]`). The result's `cp_len` follows ADR-0103 §2's rule: parent count known ⇒
+    /// `parent − consumed`; traversal reached the end ⇒ `0`; otherwise unknown.
+    pub fn str_drop_cp(&mut self, s: TaggedWord, k: i64) -> TaggedWord {
+        let v = self.str_view(Self::str_ptr(s));
+        let w = cp_walk(self.view_bytes(&v), k.max(0) as usize);
+        let cp = if let Some(n) = v.cp {
+            Some(n - w.consumed) // consumed <= n: the walk stops at the end, and cp_len is validated
+        } else if w.off == v.len {
+            Some(0)
+        } else {
+            None
+        };
+        self.build_str_view(s, w.off, v.len - w.off, cp)
+    }
+
+    /// `Purvasm.String.takeCodePoints k s` — keep the first `k` code points (`k` clamped). The
+    /// retained count is what the walk actually consumed, so the result's `cp_len` is always known.
+    pub fn str_take_cp(&mut self, s: TaggedWord, k: i64) -> TaggedWord {
+        let v = self.str_view(Self::str_ptr(s));
+        let w = cp_walk(self.view_bytes(&v), k.max(0) as usize);
+        self.build_str_view(s, 0, w.off, Some(w.consumed))
+    }
+
+    /// `Purvasm.String.codePointLength s` — ADR-0103 §2's contract: O(1) when known or memoised;
+    /// the first demand on an `unknown` slice counts **the slice's own bytes** and memoises into
+    /// the raw `cp_len` word (a v1-only idempotent write into an immutable object — the §2 sharing
+    /// precondition guards v2); a bare `Str` count is a walk, never memoised.
+    pub fn str_cp_length(&mut self, s: TaggedWord) -> usize {
+        let p = Self::str_ptr(s);
+        let v = self.str_view(p);
+        if let Some(n) = v.cp {
+            return n;
+        }
+        let n = cp_walk(self.view_bytes(&v), usize::MAX).consumed;
+        if self.header(p).kind() == Kind::StrSlice {
+            self.write_raw_unchecked(p, 3, n as u64);
+        }
+        n
+    }
+
+    /// `Purvasm.String.codePointAt i s` — the `i`-th code point, or `-1` out of range.
+    pub fn str_cp_at(&self, s: TaggedWord, i: i64) -> i64 {
+        if i < 0 {
+            return -1;
+        }
+        let v = self.str_view(Self::str_ptr(s));
+        let bytes = self.view_bytes(&v);
+        let w = cp_walk(bytes, i as usize);
+        if w.consumed < i as usize || w.off >= bytes.len() {
+            return -1;
+        }
+        utf8_decode(bytes, w.off) as i64
+    }
+
+    /// `Purvasm.String.byteIndexOf hay needle from` — the first **view-relative** byte offset
+    /// `>= from` at which `needle`'s bytes occur in `hay`, or `-1`. Byte semantics mirror the ulib
+    /// `Utf8.byteIndexOf` this replaces (an empty needle matches at any in-range `from`); UTF-8 is
+    /// self-synchronising, so a valid needle's match always lands on a code-point boundary.
+    pub fn str_byte_index_of(&self, hay: TaggedWord, needle: TaggedWord, from: i64) -> i64 {
+        let hv = self.str_view(Self::str_ptr(hay));
+        let nv = self.str_view(Self::str_ptr(needle));
+        let (h, n) = (self.view_bytes(&hv), self.view_bytes(&nv));
+        let mut i = from.max(0) as usize;
+        while i + n.len() <= h.len() {
+            if &h[i..i + n.len()] == n {
+                return i as i64;
+            }
+            i += 1;
+        }
+        -1
+    }
+
+    /// `Purvasm.String.byteLastIndexOf hay needle from` — the last view-relative byte offset
+    /// `<= from` at which `needle` occurs, or `-1` (mirrors the ulib `Utf8.byteLastIndexOf`).
+    pub fn str_byte_last_index_of(&self, hay: TaggedWord, needle: TaggedWord, from: i64) -> i64 {
+        let hv = self.str_view(Self::str_ptr(hay));
+        let nv = self.str_view(Self::str_ptr(needle));
+        let (h, n) = (self.view_bytes(&hv), self.view_bytes(&nv));
+        if n.len() > h.len() {
+            return -1;
+        }
+        let mut i = (from.max(0) as usize).min(h.len() - n.len()) as i64;
+        while i >= 0 {
+            let u = i as usize;
+            if &h[u..u + n.len()] == n {
+                return i;
+            }
+            i -= 1;
+        }
+        -1
+    }
+
+    /// `Purvasm.String.compareBytes a b` — byte-lexicographic order over the two views (`-1`/`0`/
+    /// `1`; equals code-point-lexicographic under UTF-8), borrowed in place — no copy-out
+    /// (ADR-0103 §4).
+    pub fn str_compare(&self, a: TaggedWord, b: TaggedWord) -> i32 {
+        let (va, vb) = (
+            self.str_view(Self::str_ptr(a)),
+            self.str_view(Self::str_ptr(b)),
+        );
+        match self.view_bytes(&va).cmp(self.view_bytes(&vb)) {
+            core::cmp::Ordering::Less => -1,
+            core::cmp::Ordering::Equal => 0,
+            core::cmp::Ordering::Greater => 1,
+        }
+    }
+
+    /// Borrowed-byte string equality (the `EqString` primop's core, ADR-0103 §4).
+    pub fn str_eq(&self, a: TaggedWord, b: TaggedWord) -> bool {
+        let (va, vb) = (
+            self.str_view(Self::str_ptr(a)),
+            self.str_view(Self::str_ptr(b)),
+        );
+        self.view_bytes(&va) == self.view_bytes(&vb)
+    }
+
+    /// `Purvasm.String.appendBulk a b` (and the `Append` primop's string arm): concatenate into a
+    /// fresh packed `Str`, ADR-0103 §4's island discipline — snapshot the lengths, **root both
+    /// operands, allocate, re-derive, then copy**; never a borrow held across the allocation.
+    pub fn str_append2(&mut self, a: TaggedWord, b: TaggedWord) -> TaggedWord {
+        let va = self.str_view(Self::str_ptr(a));
+        let vb = self.str_view(Self::str_ptr(b));
+        let (la, lb) = (va.len, vb.len);
+        let frame = self.frame();
+        let base = frame.len;
+        self.root(a);
+        self.root(b);
+        let p = self.new_str_uninit(la + lb);
+        let a1 = self.root_slot(base);
+        let b1 = self.root_slot(base + 1);
+        // Re-derive both views from the reloaded roots (the pre-allocation views are stale).
+        let va1 = self.str_view(Self::str_ptr(a1));
+        let vb1 = self.str_view(Self::str_ptr(b1));
+        // SAFETY: source ranges were validated by `str_view` on the current objects; `p` was just
+        // allocated with `la + lb` bytes' capacity; distinct objects, non-overlapping.
+        unsafe {
+            let dst = (p.as_ptr() as *mut u8).add(2 * WORD);
+            core::ptr::copy_nonoverlapping(self.view_ptr(&va1), dst, la);
+            core::ptr::copy_nonoverlapping(self.view_ptr(&vb1), dst.add(la), lb);
+        }
+        self.pop_frame(frame);
+        p.as_word()
+    }
+
+    /// `Purvasm.String.materialize s` — sever ownership below the §1 threshold: identity on a
+    /// packed `Str`, a compacting copy of a `StrSlice`.
+    pub fn str_materialize(&mut self, s: TaggedWord) -> TaggedWord {
+        let p = Self::str_ptr(s);
+        if self.header(p).kind() == Kind::Str {
+            return s;
+        }
+        let v = self.str_view(p);
+        let len = v.len;
+        let frame = self.frame();
+        let bslot = frame.len;
+        self.root(v.base.as_word());
+        let out = self.new_str_uninit(len);
+        let b = self.root_slot(bslot);
+        // SAFETY: as `build_str_view`'s materialise arm — current backing, validated range, fresh
+        // destination.
+        unsafe {
+            let src = (HeapPtr::from_word(b).as_ptr() as *const u8).add(2 * WORD + v.off);
+            core::ptr::copy_nonoverlapping(src, (out.as_ptr() as *mut u8).add(2 * WORD), len);
+        }
+        self.pop_frame(frame);
+        out.as_word()
     }
 
     // --- records (ADR-0069) -------------------------------------------------
@@ -1445,6 +1804,60 @@ fn evacuate(
     TaggedWord::from_addr(new_addr)
 }
 
+/// The byte length of the UTF-8 sequence starting with `b` (valid input by the `Str` invariant).
+#[inline]
+fn utf8_seq_len(b: u8) -> usize {
+    match b {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        _ => 4,
+    }
+}
+
+/// Is byte offset `i` a code-point boundary of valid UTF-8 (`i == len` counts as one)?
+#[inline]
+fn utf8_is_boundary(bytes: &[u8], i: usize) -> bool {
+    i == bytes.len() || (bytes[i] & 0xC0) != 0x80
+}
+
+/// Decode the code point starting at boundary `off` (valid UTF-8 by the `Str` invariant).
+fn utf8_decode(bytes: &[u8], off: usize) -> u32 {
+    let b0 = bytes[off];
+    match utf8_seq_len(b0) {
+        1 => b0 as u32,
+        2 => ((b0 as u32 & 0x1F) << 6) | (bytes[off + 1] as u32 & 0x3F),
+        3 => {
+            ((b0 as u32 & 0x0F) << 12)
+                | ((bytes[off + 1] as u32 & 0x3F) << 6)
+                | (bytes[off + 2] as u32 & 0x3F)
+        }
+        _ => {
+            ((b0 as u32 & 0x07) << 18)
+                | ((bytes[off + 1] as u32 & 0x3F) << 12)
+                | ((bytes[off + 2] as u32 & 0x3F) << 6)
+                | (bytes[off + 3] as u32 & 0x3F)
+        }
+    }
+}
+
+/// The result of a bounded code-point walk: what was actually consumed, and where it stopped.
+struct CpWalk {
+    consumed: usize,
+    off: usize,
+}
+
+/// Walk `bytes` from the front over at most `k` code points (UTF-8-valid by the `Str` invariant).
+fn cp_walk(bytes: &[u8], k: usize) -> CpWalk {
+    let mut consumed = 0usize;
+    let mut off = 0usize;
+    while consumed < k && off < bytes.len() {
+        off += utf8_seq_len(bytes[off]);
+        consumed += 1;
+    }
+    CpWalk { consumed, off }
+}
+
 /// The payload-index ranges that are **value slots** for a given kind and size (ADR-0064 §2). Up to
 /// two `[start, end)` ranges; everything outside them is a raw word the collector never interprets.
 fn value_slot_ranges(kind: Kind, size: u64) -> [(u64, u64); 2] {
@@ -1472,6 +1885,9 @@ fn value_slot_ranges(kind: Kind, size: u64) -> [(u64, u64); 2] {
         Kind::Array => [(0, size), (0, 0)],
         // [count: raw] [id: raw; count] — a Record's sorted label ids (ADR-0069); all raw.
         Kind::RawIds => [(0, 0), (0, 0)],
+        // [base: value → Str] [byte_off: raw] [byte_len: raw] [cp_len: raw] — the view keeps its
+        // packed backing alive through the one traced slot (ADR-0103 §1).
+        Kind::StrSlice => [(0, 1), (0, 0)],
     }
 }
 
@@ -1897,7 +2313,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "non-Str")]
+    #[should_panic(expected = "non-string")]
     fn str_read_rejects_non_str_object() {
         // Release-on: `str_read` on a non-`Str` (here a `NumberBox`) must reject the kind, not trust
         // payload word 0 as a length and build an out-of-bounds slice.
@@ -1961,5 +2377,235 @@ mod tests {
         let mut h = Heap::new(16);
         let s = h.new_str_uninit(2);
         h.str_byte_set(s, 2, b'x'); // index == len → out of bounds
+    }
+
+    // --- StrSlice (ADR-0103) --------------------------------------------------------------------
+
+    #[test]
+    fn byte_slice_builds_a_view_and_reads_through_it() {
+        let mut h = Heap::new(64);
+        let s = h.new_str(b"hello, world").as_word();
+        // B = 12, L = 5: 12 <= 4*5 → a StrSlice view.
+        let w = h.str_slice_bytes(s, 7, 12);
+        let p = unsafe { HeapPtr::from_word(w) };
+        assert_eq!(h.header(p).kind(), Kind::StrSlice);
+        assert_eq!(h.str_read(p), "world");
+        assert_eq!(h.str_len(p), 5);
+        assert_eq!(h.str_byte_get(p, 0), b'w');
+    }
+
+    #[test]
+    fn bounded_retention_materialises_a_tiny_extraction() {
+        let mut h = Heap::new(128);
+        let s = h.new_str("x".repeat(100).as_bytes()).as_word();
+        // B = 100 > 4·10 → a packed copy, not a view.
+        let w = h.str_slice_bytes(s, 0, 10);
+        let p = unsafe { HeapPtr::from_word(w) };
+        assert_eq!(h.header(p).kind(), Kind::Str);
+        assert_eq!(h.str_read(p), "x".repeat(10));
+    }
+
+    #[test]
+    fn empty_and_full_range_take_the_rule_exits() {
+        let mut h = Heap::new(64);
+        let s = h.new_str(b"abcdef").as_word();
+        let empty = h.str_slice_bytes(s, 3, 3);
+        assert_eq!(h.str_read(unsafe { HeapPtr::from_word(empty) }), "");
+        assert_eq!(
+            h.header(unsafe { HeapPtr::from_word(empty) }).kind(),
+            Kind::Str
+        );
+        // the full range is the backing itself — no wrapper.
+        let full = h.str_slice_bytes(s, 0, 6);
+        assert_eq!(full.to_bits(), s.to_bits());
+    }
+
+    #[test]
+    fn slicing_a_slice_rebases_onto_the_packed_backing() {
+        let mut h = Heap::new(64);
+        let s = h.new_str(b"hello, world").as_word();
+        let outer = h.str_slice_bytes(s, 7, 12); // "world" (a view)
+        let inner = h.str_slice_bytes(outer, 1, 4); // "orl" — B=12 <= 4*3 → still a view
+        let ip = unsafe { HeapPtr::from_word(inner) };
+        assert_eq!(h.header(ip).kind(), Kind::StrSlice);
+        // never nested: the inner view's base is the packed Str, not the outer slice.
+        let base = unsafe { HeapPtr::from_word(h.read_field(ip, 0)) };
+        assert_eq!(h.header(base).kind(), Kind::Str);
+        assert_eq!(h.str_read(ip), "orl");
+    }
+
+    #[test]
+    fn drop_take_clamp_and_derive_cp_len() {
+        let mut h = Heap::new(64);
+        let s = h.new_str("aβ🐱d".as_bytes()).as_word(); // 1+2+4+1 = 8 bytes, 4 code points
+        let dropped = h.str_drop_cp(s, 2); // "🐱d" — 5 bytes; parent count unknown, end not reached
+        let dp = unsafe { HeapPtr::from_word(dropped) };
+        assert_eq!(h.str_read(dp), "🐱d");
+        // unknown at build; the first demand counts the slice's own bytes and memoises.
+        assert_eq!(h.read_raw(dp, 3), CP_UNKNOWN);
+        assert_eq!(h.str_cp_length(dropped), 2);
+        assert_eq!(h.read_raw(dp, 3), 2);
+        // take records the retained count as its result cp_len.
+        let taken = h.str_take_cp(s, 2); // "aβ" — 3 bytes; B=8 <= 12 → view with cp_len = 2
+        let tp = unsafe { HeapPtr::from_word(taken) };
+        assert_eq!(h.str_read(tp), "aβ");
+        assert_eq!(h.read_raw(tp, 3), 2);
+        // clamping: dropping everything (or more) is the empty packed Str; a negative k is 0.
+        let all = h.str_drop_cp(s, 99);
+        assert_eq!(h.str_read(unsafe { HeapPtr::from_word(all) }), "");
+        let none = h.str_drop_cp(s, -1);
+        assert_eq!(none.to_bits(), s.to_bits()); // full range → the backing itself
+    }
+
+    #[test]
+    fn drop_on_a_known_slice_derives_parent_minus_consumed() {
+        let mut h = Heap::new(64);
+        let s = h.new_str("aβ🐱d".as_bytes()).as_word();
+        let taken = h.str_take_cp(s, 3); // cp_len = Some(3)
+        let dropped = h.str_drop_cp(taken, 1); // known parent: 3 − 1 = 2, no walk of the result
+        let dp = unsafe { HeapPtr::from_word(dropped) };
+        assert_eq!(h.read_raw(dp, 3), 2);
+        assert_eq!(h.str_read(dp), "β🐱");
+    }
+
+    #[test]
+    fn cp_at_decodes_and_signals_out_of_range() {
+        let mut h = Heap::new(64);
+        let s = h.new_str("aβ🐱d".as_bytes()).as_word();
+        assert_eq!(h.str_cp_at(s, 0), 'a' as i64);
+        assert_eq!(h.str_cp_at(s, 1), 'β' as i64);
+        assert_eq!(h.str_cp_at(s, 2), '🐱' as i64);
+        assert_eq!(h.str_cp_at(s, 3), 'd' as i64);
+        assert_eq!(h.str_cp_at(s, 4), -1);
+        assert_eq!(h.str_cp_at(s, -1), -1);
+    }
+
+    #[test]
+    #[should_panic(expected = "byteSlice: range")]
+    fn byte_slice_rejects_an_out_of_range_end() {
+        let mut h = Heap::new(64);
+        let s = h.new_str(b"abc").as_word();
+        let _ = h.str_slice_bytes(s, 0, 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "UTF-8 code-point boundary")]
+    fn byte_slice_rejects_a_mid_code_point_boundary() {
+        let mut h = Heap::new(64);
+        let s = h.new_str("aβc".as_bytes()).as_word();
+        let _ = h.str_slice_bytes(s, 0, 2); // splits β
+    }
+
+    #[test]
+    #[should_panic(expected = "str_len on a non-Str object")]
+    fn unsafe_set_byte_rejects_a_slice() {
+        let mut h = Heap::new(64);
+        let s = h.new_str(b"hello, world").as_word();
+        let w = h.str_slice_bytes(s, 7, 12);
+        h.str_byte_set(unsafe { HeapPtr::from_word(w) }, 0, b'!');
+    }
+
+    #[test]
+    fn borrowed_ops_accept_the_str_by_slice_matrix() {
+        let mut h = Heap::new(128);
+        let packed = h.new_str(b"world").as_word();
+        let big = h.new_str(b"hello, world").as_word();
+        let sliced = h.str_slice_bytes(big, 7, 12); // "world" as a view
+        assert!(h.str_eq(packed, sliced));
+        assert!(h.str_eq(sliced, packed));
+        assert_eq!(h.str_compare(sliced, packed), 0);
+        let smaller = h.new_str(b"worl").as_word();
+        assert_eq!(h.str_compare(smaller, sliced), -1);
+        assert_eq!(h.str_compare(sliced, smaller), 1);
+        // search over a view, with a view needle.
+        let hay = h.str_slice_bytes(big, 0, 12);
+        let needle = h.str_slice_bytes(big, 4, 8); // "o, w"
+        assert_eq!(h.str_byte_index_of(hay, needle, 0), 4);
+        assert_eq!(h.str_byte_index_of(hay, needle, 5), -1);
+        assert_eq!(h.str_byte_last_index_of(hay, packed, 11), 7);
+        // record hashing borrows both kinds identically.
+        assert_eq!(h.str_label_id(packed), h.str_label_id(sliced));
+    }
+
+    #[test]
+    fn append_concatenates_across_the_kind_matrix() {
+        // All four operand-kind combinations: Packed×Packed, Packed×Slice, Slice×Packed,
+        // Slice×Slice — the result is always a fresh packed Str.
+        let mut h = Heap::new(256);
+        let big = h.new_str(b"hello, world").as_word();
+        let hello_p = h.new_str(b"hello").as_word();
+        let world_p = h.new_str(b"world").as_word();
+        let hello_s = h.str_slice_bytes(big, 0, 5);
+        let world_s = h.str_slice_bytes(big, 7, 12);
+        for (a, b) in [
+            (hello_p, world_p),
+            (hello_p, world_s),
+            (hello_s, world_p),
+            (hello_s, world_s),
+        ] {
+            let joined = h.str_append2(a, b);
+            let jp = unsafe { HeapPtr::from_word(joined) };
+            assert_eq!(h.str_read(jp), "helloworld");
+            assert_eq!(h.header(jp).kind(), Kind::Str);
+        }
+    }
+
+    #[test]
+    fn materialize_severs_ownership_and_is_identity_on_packed() {
+        let mut h = Heap::new(64);
+        let s = h.new_str(b"hello, world").as_word();
+        assert_eq!(h.str_materialize(s).to_bits(), s.to_bits());
+        let view = h.str_slice_bytes(s, 7, 12);
+        let owned = h.str_materialize(view);
+        let op = unsafe { HeapPtr::from_word(owned) };
+        assert_eq!(h.header(op).kind(), Kind::Str);
+        assert_eq!(h.str_read(op), "world");
+    }
+
+    #[test]
+    fn a_live_slice_survives_the_backing_moving() {
+        // forced-GC fixture 1 (ADR-0103 §Verification): a collection moves the base under an
+        // already-live StrSlice; the view's traced base slot must follow it.
+        let mut h = Heap::new(64);
+        let s = h.new_str(b"hello, world").as_word();
+        let view = h.str_slice_bytes(s, 7, 12);
+        let mut roots = [view];
+        h.collect(&mut roots);
+        let vp = unsafe { HeapPtr::from_word(roots[0]) };
+        assert_eq!(h.str_read(vp), "world");
+        assert_eq!(h.str_cp_length(roots[0]), 5);
+    }
+
+    #[test]
+    fn slice_construction_survives_its_own_collection() {
+        // forced-GC fixture 2 (ADR-0103 §1's rooting obligation): the slice construction itself
+        // fires the collection that moves the input backing, between normalisation and the
+        // base-slot store. Fill the heap so the 5-word StrSlice allocation overflows: backing
+        // 4 words + junk 32 words = 36 occupied words (the junk is unrooted), and 36 + 5 > 40.
+        // The stats counter pins that the overflow collection actually ran (an earlier sizing
+        // left 36 <= 40 and never collected).
+        let mut h = Heap::new(40);
+        h.enable_stats_for_test();
+        let s = h.new_str(b"0123456789abcdef").as_word(); // 1 + 1 + 2 words
+        let junk = h.new_str("y".repeat(240).as_bytes()); // 1 + 1 + 30 words, unrooted garbage
+        let _ = junk;
+        // keep `s` reachable through the shadow stack while the builder allocates.
+        let sr = h.root(s);
+        let cur = h.get(sr);
+        let view = h.str_slice_bytes(cur, 6, 16);
+        assert_eq!(
+            h.stats().expect("stats were enabled").gc_collections,
+            1,
+            "the slice construction must have fired exactly one overflow collection"
+        );
+        assert_eq!(
+            h.str_read(unsafe { HeapPtr::from_word(view) }),
+            "6789abcdef"
+        );
+        // the backing moved under the builder; the re-rooted slot must still reach it.
+        assert_eq!(
+            h.str_read(unsafe { HeapPtr::from_word(h.get(sr)) }),
+            "0123456789abcdef"
+        );
     }
 }

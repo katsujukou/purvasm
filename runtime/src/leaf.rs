@@ -399,6 +399,132 @@ extern "C" fn leaf_unsafe_set_byte(
     })
 }
 
+// --- the ADR-0103 bulk string surface --------------------------------------------------------------
+//
+// One leaf call per *operation* (never per byte): the bounded-retention view builders, the cursor
+// ops, borrowed-byte search/compare, bulk append, and the ownership-severing materialize. Argument
+// order follows the pinned PureScript types (ADR-0103 §5).
+
+/// `Purvasm.String.byteSlice :: Int -> Int -> String -> String` — the `[from, to)` byte range,
+/// release-validated (range + UTF-8 boundaries); view-or-materialise per the §1 rule.
+#[export_name = "pvf_Purvasm_2eString_2ebyteSlice"]
+extern "C" fn leaf_byte_slice(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: usize) -> u64 {
+    // SAFETY: as [`leaf_show_int`]; `args` = `(Int, Int, String)`.
+    guard(|| unsafe {
+        let h = heap(ctx);
+        let a = args_slice(args, nargs);
+        h.str_slice_bytes(a[2], a[0].as_int() as i64, a[1].as_int() as i64)
+            .to_bits()
+    })
+}
+
+/// `Purvasm.String.dropCodePoints :: Int -> String -> String` (clamped; ADR-0103 §2's `cp_len` rule).
+#[export_name = "pvf_Purvasm_2eString_2edropCodePoints"]
+extern "C" fn leaf_drop_cp(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: usize) -> u64 {
+    // SAFETY: as [`leaf_show_int`]; `args` = `(Int, String)`.
+    guard(|| unsafe {
+        let h = heap(ctx);
+        let a = args_slice(args, nargs);
+        h.str_drop_cp(a[1], a[0].as_int() as i64).to_bits()
+    })
+}
+
+/// `Purvasm.String.takeCodePoints :: Int -> String -> String` (clamped; retained count = `cp_len`).
+#[export_name = "pvf_Purvasm_2eString_2etakeCodePoints"]
+extern "C" fn leaf_take_cp(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: usize) -> u64 {
+    // SAFETY: as [`leaf_show_int`]; `args` = `(Int, String)`.
+    guard(|| unsafe {
+        let h = heap(ctx);
+        let a = args_slice(args, nargs);
+        h.str_take_cp(a[1], a[0].as_int() as i64).to_bits()
+    })
+}
+
+/// `Purvasm.String.codePointLength :: String -> Int` (ADR-0103 §2's known/memoised contract).
+#[export_name = "pvf_Purvasm_2eString_2ecodePointLength"]
+extern "C" fn leaf_cp_length(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: usize) -> u64 {
+    // SAFETY: as [`leaf_show_int`]; `args` = `(String)`.
+    guard(|| unsafe {
+        let h = heap(ctx);
+        let a = args_slice(args, nargs);
+        TaggedWord::int(h.str_cp_length(a[0]) as i32).to_bits()
+    })
+}
+
+/// `Purvasm.String.codePointAt :: Int -> String -> Int` — the code point, `-1` when out of range.
+#[export_name = "pvf_Purvasm_2eString_2ecodePointAt"]
+extern "C" fn leaf_cp_at(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: usize) -> u64 {
+    // SAFETY: as [`leaf_show_int`]; `args` = `(Int, String)`.
+    guard(|| unsafe {
+        let h = heap(ctx);
+        let a = args_slice(args, nargs);
+        TaggedWord::int(h.str_cp_at(a[1], a[0].as_int() as i64) as i32).to_bits()
+    })
+}
+
+/// `Purvasm.String.byteIndexOf :: String -> String -> Int -> Int` — hay → needle → from-byte →
+/// matched byte offset or `-1`.
+#[export_name = "pvf_Purvasm_2eString_2ebyteIndexOf"]
+extern "C" fn leaf_byte_index_of(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: usize) -> u64 {
+    // SAFETY: as [`leaf_show_int`]; `args` = `(String, String, Int)`.
+    guard(|| unsafe {
+        let h = heap(ctx);
+        let a = args_slice(args, nargs);
+        TaggedWord::int(h.str_byte_index_of(a[0], a[1], a[2].as_int() as i64) as i32).to_bits()
+    })
+}
+
+/// `Purvasm.String.byteLastIndexOf :: String -> String -> Int -> Int` — as above, backwards.
+#[export_name = "pvf_Purvasm_2eString_2ebyteLastIndexOf"]
+extern "C" fn leaf_byte_last_index_of(
+    ctx: *mut Heap,
+    _clo: u64,
+    args: *const u64,
+    nargs: usize,
+) -> u64 {
+    // SAFETY: as [`leaf_show_int`]; `args` = `(String, String, Int)`.
+    guard(|| unsafe {
+        let h = heap(ctx);
+        let a = args_slice(args, nargs);
+        TaggedWord::int(h.str_byte_last_index_of(a[0], a[1], a[2].as_int() as i64) as i32).to_bits()
+    })
+}
+
+/// `Purvasm.String.compareBytes :: String -> String -> Int` — byte-lexicographic `-1`/`0`/`1`.
+#[export_name = "pvf_Purvasm_2eString_2ecompareBytes"]
+extern "C" fn leaf_compare_bytes(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: usize) -> u64 {
+    // SAFETY: as [`leaf_show_int`]; `args` = `(String, String)`.
+    guard(|| unsafe {
+        let h = heap(ctx);
+        let a = args_slice(args, nargs);
+        TaggedWord::int(h.str_compare(a[0], a[1])).to_bits()
+    })
+}
+
+/// `Purvasm.String.appendBulk :: String -> String -> String` — borrowed-bytes concat
+/// (root → alloc → re-derive, ADR-0103 §4).
+#[export_name = "pvf_Purvasm_2eString_2eappendBulk"]
+extern "C" fn leaf_append_bulk(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: usize) -> u64 {
+    // SAFETY: as [`leaf_show_int`]; `args` = `(String, String)`.
+    guard(|| unsafe {
+        let h = heap(ctx);
+        let a = args_slice(args, nargs);
+        h.str_append2(a[0], a[1]).to_bits()
+    })
+}
+
+/// `Purvasm.String.materialize :: String -> String` — sever ownership below the §1 threshold;
+/// identity on a packed `Str`.
+#[export_name = "pvf_Purvasm_2eString_2ematerialize"]
+extern "C" fn leaf_materialize(ctx: *mut Heap, _clo: u64, args: *const u64, nargs: usize) -> u64 {
+    // SAFETY: as [`leaf_show_int`]; `args` = `(String)`.
+    guard(|| unsafe {
+        let h = heap(ctx);
+        let a = args_slice(args, nargs);
+        h.str_materialize(a[0]).to_bits()
+    })
+}
+
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;

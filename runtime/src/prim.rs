@@ -43,15 +43,6 @@ unsafe fn num(h: &Heap, w: u64) -> f64 {
     f64::from_bits(h.read_raw(HeapPtr::from_word(TaggedWord::from_bits(w)), 0))
 }
 
-/// Read a `Str`'s bytes as an owned `String`.
-///
-/// # Safety
-/// `w` is a `Str` pointer word; `str_read` validates the object header / kind.
-#[inline]
-unsafe fn strv(h: &Heap, w: u64) -> String {
-    h.str_read(HeapPtr::from_word(TaggedWord::from_bits(w)))
-}
-
 // --- scalar semantic core (the tested invariants) ---------------------------------------------------
 
 /// Truncate to a signed 32-bit `Int` (`w32` / ECMAScript `ToInt32` last step, ADR-0041): the low 32
@@ -256,18 +247,19 @@ pub unsafe extern "C" fn pv_prim_number_to_int(ctx: *mut Heap, a: u64) -> u64 {
     })
 }
 
-// --- String primops (ctx: read Str bytes) -----------------------------------------------------------
+// --- String primops (ctx: borrowed Str/StrSlice bytes, ADR-0103 §4) ---------------------------------
 
 /// # Safety
-/// `ctx` live; `a`/`b` `Str` pointer words.
+/// `ctx` live; `a`/`b` string (`Str`/`StrSlice`) pointer words.
 #[no_mangle]
 pub unsafe extern "C" fn pv_prim_eq_string(ctx: *mut Heap, a: u64, b: u64) -> u64 {
     guard(|| {
         let h = heap(ctx);
-        mk_bool(strv(h, a) == strv(h, b))
+        mk_bool(h.str_eq(TaggedWord::from_bits(a), TaggedWord::from_bits(b)))
     })
 }
-/// Byte-lexicographic order (matches `codegen_ml` / OCaml `String` compare).
+/// Byte-lexicographic order (matches `codegen_ml` / OCaml `String` compare; borrowed in place —
+/// no copy-out, ADR-0103 §4).
 ///
 /// # Safety
 /// As [`pv_prim_eq_string`].
@@ -275,26 +267,30 @@ pub unsafe extern "C" fn pv_prim_eq_string(ctx: *mut Heap, a: u64, b: u64) -> u6
 pub unsafe extern "C" fn pv_prim_lt_string(ctx: *mut Heap, a: u64, b: u64) -> u64 {
     guard(|| {
         let h = heap(ctx);
-        mk_bool(strv(h, a) < strv(h, b))
+        mk_bool(h.str_compare(TaggedWord::from_bits(a), TaggedWord::from_bits(b)) < 0)
     })
 }
 
 // --- Append / Array primops (ctx) -------------------------------------------------------------------
 
-/// `Append`: `String ++ String` or `Array ++ Array` (ADR-0072 §5). Dispatches on `a`'s kind — a `Str`
-/// pointer → string concat; otherwise array concat (either operand may be the empty-array sentinel).
+/// `Append`: `String ++ String` or `Array ++ Array` (ADR-0072 §5). Dispatches on `a`'s kind — a
+/// string (`Str`/`StrSlice`) pointer → string concat (borrowed-bytes, root→alloc→re-derive,
+/// ADR-0103 §4); otherwise array concat (either operand may be the empty-array sentinel).
 ///
 /// # Safety
-/// `ctx` live; `a`/`b` `Str` pointers, or `Array` pointers / the empty-array sentinel.
+/// `ctx` live; `a`/`b` string pointers, or `Array` pointers / the empty-array sentinel.
 #[no_mangle]
 pub unsafe extern "C" fn pv_prim_append(ctx: *mut Heap, a: u64, b: u64) -> u64 {
     guard(|| {
         let h = heap(ctx);
         let av = TaggedWord::from_bits(a);
-        if av.is_pointer() && h.header(HeapPtr::from_word(av)).kind() == Kind::Str {
-            let mut s = strv(h, a);
-            s.push_str(&strv(h, b));
-            h.new_str(s.as_bytes()).as_word().to_bits()
+        if av.is_pointer()
+            && matches!(
+                h.header(HeapPtr::from_word(av)).kind(),
+                Kind::Str | Kind::StrSlice
+            )
+        {
+            h.str_append2(av, TaggedWord::from_bits(b)).to_bits()
         } else {
             array_append(h, a, b)
         }
@@ -541,5 +537,31 @@ mod tests {
         assert!(!bb(pv_prim_eq_int(mk_int(5), mk_int(6))));
         assert!(bb(pv_prim_lt_int(mk_int(-1), mk_int(0))));
         assert!(!bb(pv_prim_lt_int(mk_int(0), mk_int(0))));
+    }
+
+    #[test]
+    fn prim_append_dispatches_strings_across_the_kind_matrix() {
+        // `pv_prim_append` picks the string arm by inspecting its FIRST operand's kind
+        // (ADR-0103 §4: `Str | StrSlice`), so both first-operand kinds must be driven through the
+        // entry point itself, not just `str_append2` — with both second-operand kinds for coverage.
+        let mut h = Heap::new(256);
+        let big = h.new_str(b"hello, world").as_word();
+        let hello_p = h.new_str(b"hello").as_word();
+        let world_p = h.new_str(b"world").as_word();
+        let hello_s = h.str_slice_bytes(big, 0, 5);
+        let world_s = h.str_slice_bytes(big, 7, 12);
+        for (a, b) in [
+            (hello_p, world_p),
+            (hello_p, world_s),
+            (hello_s, world_p),
+            (hello_s, world_s),
+        ] {
+            // The raw ctx is taken fresh per call: reborrowing `h` (the reads below) would
+            // invalidate an earlier raw pointer's tag under Stacked Borrows (Miri).
+            let joined = unsafe { pv_prim_append(&mut h as *mut Heap, a.to_bits(), b.to_bits()) };
+            let jp = unsafe { HeapPtr::from_word(TaggedWord::from_bits(joined)) };
+            assert_eq!(h.str_read(jp), "helloworld");
+            assert_eq!(h.header(jp).kind(), Kind::Str);
+        }
     }
 }

@@ -52,6 +52,13 @@ pub enum Kind {
     ByNeed = 7,
     Array = 8,
     RawIds = 9,
+    /// A borrowed **view** into a packed [`Str`](Kind::Str)'s bytes (ADR-0103 §1):
+    /// `[base: value → Str] [byte_off: raw] [byte_len: raw] [cp_len: raw]` — always 4 payload
+    /// words. Built only by the bounded-retention slice builders (never nested — slicing a slice
+    /// re-bases onto the underlying `Str`); `cp_len` is the code-point count when known, the
+    /// `CP_UNKNOWN` sentinel otherwise (memoised on first demand, ADR-0103 §2). The discriminant
+    /// is ABI (ADR-0064 §2), fixed here, not to drift.
+    StrSlice = 10,
 }
 
 impl Kind {
@@ -69,6 +76,7 @@ impl Kind {
             7 => Some(Kind::ByNeed),
             8 => Some(Kind::Array),
             9 => Some(Kind::RawIds),
+            10 => Some(Kind::StrSlice),
             _ => None,
         }
     }
@@ -275,7 +283,8 @@ mod tests {
         assert_eq!(Kind::from_u8(7), Some(Kind::ByNeed));
         assert_eq!(Kind::from_u8(8), Some(Kind::Array));
         assert_eq!(Kind::from_u8(9), Some(Kind::RawIds));
-        assert_eq!(Kind::from_u8(10), None);
+        assert_eq!(Kind::from_u8(10), Some(Kind::StrSlice));
+        assert_eq!(Kind::from_u8(11), None);
         assert_eq!(Kind::from_u8(255), None);
     }
 }
