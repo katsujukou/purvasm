@@ -103,22 +103,15 @@ instance ordArray :: Ord a => Ord (Array a) where
         EQ -> go (PI.add i 1)
         o -> o
 
--- ulib shadow: byte-wise lexicographic `String` comparison over `Purvasm.String`/`Purvasm.Int`,
--- building `Ordering` directly (the registry routes this through the foreign `unsafeCompareImpl`).
+-- ulib shadow: byte-wise lexicographic `String` comparison via the ADR-0103 bulk leaf, building
+-- `Ordering` directly (the registry routes this through the foreign `unsafeCompareImpl`). One leaf
+-- call instead of a `byteAt` apply per byte (sidenote-0017).
 compareStringImpl :: String -> String -> Ordering
-compareStringImpl x y = go 0
-  where
-  nx = PS.byteLength x
-  ny = PS.byteLength y
-  go i =
-    if PI.eq i nx then (if PI.eq i ny then EQ else LT)
-    else if PI.eq i ny then GT
-    else
-      let
-        bx = PS.byteAt x i
-        by = PS.byteAt y i
-      in
-        if PI.lt bx by then LT else if PI.lt by bx then GT else go (PI.add i 1)
+compareStringImpl x y =
+  let
+    c = PS.compareBytes x y
+  in
+    if PI.lt c 0 then LT else if PI.eq c 0 then EQ else GT
 
 instance ordOrdering :: Ord Ordering where
   compare LT LT = EQ

@@ -1,8 +1,8 @@
 -- | ulib patch of `Data.Semigroup` (ADR-0038): interface-compatible with the registry
 -- | module — the class, instances, and `concatString` are verbatim — but the JS foreign
 -- | `concatArray` is reimplemented in PureScript over `Purvasm.Array`/`Purvasm.Int`, so it
--- | has a purvasm provider, and `concatString` likewise over `Purvasm.String`'s byte ops, so
--- | each has its element/byte handling on the optimiser's turf — no opaque foreign remains.
+-- | has a purvasm provider, and `concatString` is `Purvasm.String`'s bulk append leaf
+-- | (ADR-0103) — no opaque JS foreign remains.
 module Data.Semigroup
   ( class Semigroup
   , append
@@ -48,20 +48,11 @@ instance semigroupProxy :: Semigroup (Proxy a) where
 instance semigroupRecord :: (RL.RowToList row list, SemigroupRecord list row row) => Semigroup (Record row) where
   append = appendRecord (Proxy :: Proxy list)
 
--- ulib shadow: `concatString` reimplemented over `Purvasm.String`'s byte ops — allocate the
--- combined length, then blit `a` then `b` byte-for-byte — mirroring `concatArray`, so it carries
--- no opaque foreign (was the `Append` intrinsic).
+-- ulib shadow: `concatString` is the ADR-0103 bulk append leaf — one native copy instead of a
+-- per-byte `byteAt`/`unsafeSetByte` blit, whose apply-per-byte cost dominated string-building
+-- workloads (sidenote-0017).
 concatString :: String -> String -> String
-concatString a b = blitS b na (blitS a 0 (PS.unsafeNew (PI.add na nb)))
-  where
-  na = PS.byteLength a
-  nb = PS.byteLength b
-  blitS src off out = go 0 out
-    where
-    n = PS.byteLength src
-    go i acc =
-      if PI.lt i n then go (PI.add i 1) (PS.unsafeSetByte acc (PI.add off i) (PS.byteAt src i))
-      else acc
+concatString = PS.appendBulk
 
 -- | Allocate `length xs + length ys` and copy both in — a builder loop over the
 -- | `Purvasm.Array` primitives (cf. the registry's JS `concatArray`).

@@ -89,8 +89,10 @@ instance eqProxy :: Eq (Proxy a) where
   eq _ _ = true
 
 -- ulib shadow: scalar equality reimplemented over the `purvasm-base` primitives
--- (`Purvasm.Int`/`.Boolean`/`.Char`/`.Number`) and a byte-wise loop for `String`, so `Data.Eq`
--- carries no opaque scalar foreign — the registry `eq*Impl` wat providers are gone.
+-- (`Purvasm.Int`/`.Boolean`/`.Char`/`.Number`/`.String`), so `Data.Eq` carries no opaque scalar
+-- foreign — the registry `eq*Impl` wat providers are gone. `String` goes through the ADR-0103
+-- bulk comparison leaf: one leaf call instead of a `byteAt` apply per byte, which made `Eq String`
+-- the dominant cost of string-keyed lookups (sidenote-0017).
 eqBooleanImpl :: Boolean -> Boolean -> Boolean
 eqBooleanImpl x y = if x then y else PB.not y
 
@@ -105,14 +107,7 @@ eqCharImpl :: Char -> Char -> Boolean
 eqCharImpl x y = PI.eq (PC.toCodePoint x) (PC.toCodePoint y)
 
 eqStringImpl :: String -> String -> Boolean
-eqStringImpl x y =
-  if PI.eq nx (PS.byteLength y) then go 0 else false
-  where
-  nx = PS.byteLength x
-  go i =
-    if PI.eq i nx then true
-    else if PI.eq (PS.byteAt x i) (PS.byteAt y i) then go (PI.add i 1)
-    else false
+eqStringImpl x y = PI.eq (PS.compareBytes x y) 0
 
 -- ulib shadow: `eqArrayImpl` over the `Purvasm.Array` primitives, so the element comparator
 -- specializes on purvasm (vs prelude's opaque `foreign import eqArrayImpl`). Lengths must match,
