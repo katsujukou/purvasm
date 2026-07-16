@@ -10,7 +10,8 @@ import Data.List (List(..))
 import Data.Map as Map
 import Data.Set as Set
 import Data.Tuple (Tuple(..), fst, snd)
-import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, Ctx, beginFn, emit, emitGlobal, emitModule, fresh, freshFn, freshLabel, makeCx, renderBuffer, renderChunks, runCodegen, takeFn)
+import Data.Array as Array
+import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, Ctx, beginFn, emit, emitGlobal, emitModule, foldA, forA, forA_, forWithIndexA, fresh, freshFn, freshLabel, makeCx, renderBuffer, renderChunks, runCodegen, takeFn)
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
 
@@ -20,6 +21,7 @@ run = runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.
 
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.Backend.LLVM.Monad" do
+  spineSpec
   describe "fresh / freshLabel / freshFn" do
     it "pre-increments SSA temps starting at %t1" do
       let
@@ -89,3 +91,55 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Monad" do
           emitModule "define @b {\nentry:\n  ret\n}\n\n"
       renderChunks ctx.md
         `shouldEqual` "define @a {\nentry:\n  ret\n}\n\ndefine @b {\nentry:\n  ret\n}\n\n"
+
+-- --- the stack-safe spine combinators (2026-07-16 bugfix) -----------------------------------------
+--
+-- These four back every width-sized traversal in the LLVM backend, so their contract is pinned
+-- directly: left-to-right effect order (observed through the emission buffer), result order,
+-- index correctness, `foldl` direction, the empty spine, and — on one representative — stack
+-- safety at a width no `Data.Traversable`-based version survives on the default host stack.
+
+spineSpec :: Spec Unit
+spineSpec = describe "forA / forA_ / forWithIndexA / foldA (stack-safe spine combinators)" do
+  it "forA sequences effects left to right and returns results in element order" do
+    let
+      Tuple r ctx = run (forA [ "a", "b", "c" ] (\x -> emit x $> (x <> "!")))
+    r `shouldEqual` [ "a!", "b!", "c!" ]
+    renderBuffer ctx.fn `shouldEqual` "a\nb\nc\n"
+
+  it "forA_ sequences effects left to right" do
+    let
+      Tuple _ ctx = run (forA_ [ "x", "y" ] emit)
+    renderBuffer ctx.fn `shouldEqual` "x\ny\n"
+
+  it "forWithIndexA passes ascending indices alongside the elements" do
+    let
+      Tuple r ctx = run (forWithIndexA [ "a", "b" ] (\i x -> emit (show i <> x) $> Tuple i x))
+    r `shouldEqual` [ Tuple 0 "a", Tuple 1 "b" ]
+    renderBuffer ctx.fn `shouldEqual` "0a\n1b\n"
+
+  it "foldA folds left (foldl direction), sequencing effects in element order" do
+    let
+      Tuple r ctx = run (foldA (\acc x -> emit x $> (acc <> x)) "z" [ "a", "b", "c" ])
+    -- foldl: ((z <> a) <> b) <> c
+    r `shouldEqual` "zabc"
+    renderBuffer ctx.fn `shouldEqual` "a\nb\nc\n"
+
+  it "all four are identities on the empty spine" do
+    let
+      Tuple r1 ctx1 = run (forA ([] :: Array Int) (const fresh))
+      Tuple r2 _ = run (forWithIndexA ([] :: Array Int) (\_ _ -> fresh))
+      Tuple r3 _ = run (foldA (\acc _ -> pure (acc + 1)) 0 ([] :: Array Int))
+      Tuple _ ctx4 = run (forA_ ([] :: Array Int) (const (emit "never")))
+    r1 `shouldEqual` []
+    r2 `shouldEqual` []
+    r3 `shouldEqual` 0
+    renderBuffer ctx1.fn `shouldEqual` ""
+    renderBuffer ctx4.fn `shouldEqual` ""
+
+  it "survives a 200k-element spine on the default host stack (the reason these exist)" do
+    let
+      Tuple r _ = run (foldA (\acc _ -> pure (acc + 1)) 0 (Array.replicate 200000 unit))
+      Tuple rs _ = run (forA (Array.replicate 200000 unit) (const (pure unit)))
+    r `shouldEqual` 200000
+    Array.length rs `shouldEqual` 200000

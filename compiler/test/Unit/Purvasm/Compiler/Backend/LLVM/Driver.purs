@@ -36,7 +36,10 @@ import Effect.Class (liftEffect)
 import Effect.Ref as Ref
 import Node.Encoding (Encoding(..))
 import Node.FS.Sync (readTextFile)
+import Foreign.Object as Object
 import PureScript.CoreFn.Decode (decodeModule)
+import PureScript.CoreFn.Expr (Bind(..), Expr(..)) as CFE
+import PureScript.CoreFn.Literal (Literal(..)) as CFL
 import PureScript.CoreFn.Module (Module)
 import Purvasm.Compiler (ForeignSigMap, LoadResult(..), Options, build, defaultHooks)
 import Purvasm.Compiler.Backend.LLVM.Driver (llvmBackend)
@@ -79,6 +82,7 @@ countOccurrences needle hay = Array.length (String.split (Pattern needle) hay) -
 
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.Backend.LLVM.Driver" do
+  stackSafetySpec
   describe "llvmBackend via Purvasm.Compiler.build (B2 per-module, CoreFn → .ll)" do
     it "compiles Slice1 from CoreFn to byte-identical module + entry objects" do
       src <- liftEffect (readTextFile UTF8 "compiler/test/fixtures/slice1/corefn.json")
@@ -182,3 +186,35 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Driver" do
             (fail ("the nullary-Effect leaf closure must be arity 1; module IR:\n" <> ir))
           when (String.contains (Pattern ", i32 0, i64 1)") ir)
             (fail ("the nullary-Effect leaf closure must not be arity 0 (over-applies on run); module IR:\n" <> ir))
+
+-- --- stack safety on the emission spines (2026-07-16 bugfix) --------------------------------------
+
+-- | A `Regex.Core.Unicode`-class module, scaled up: one 20k-element array literal. `evalAtoms` and
+-- | `argBuffer` stacked one live `State`-bind frame per operand before the 2026-07-16 `tailRecM`
+-- | hardening; running under the test runner's default stack, a regression fails with a RangeError.
+stackSafetySpec :: Spec Unit
+stackSafetySpec = describe "stack safety (data-sized emission spines)" do
+  it "emits a 20k-element array-literal module on the default host stack (evalAtoms + argBuffer)" do
+    let
+      ann0 = { span: { start: { line: 0, column: 0 }, end: { line: 0, column: 0 } }, meta: Nothing }
+
+      bigMod :: Module
+      bigMod =
+        { name: [ "BigArr" ]
+        , path: ""
+        , builtWith: ""
+        , imports: []
+        , exports: [ "arr" ]
+        , reExports: Object.empty
+        , foreignNames: []
+        , decls:
+            [ CFE.NonRec ann0 "arr"
+                (CFE.Literal ann0 (CFL.LitArray (Array.replicate 20000 (CFE.Literal ann0 (CFL.LitInt 1)))))
+            ]
+        }
+    out <- buildIR { name: "BigArr", mod: bigMod, foreignSigs: Map.empty }
+      { entryModule: "BigArr", entryName: "arr", isEffect: false, opt: false }
+    let ir = fromMaybe "" (Array.head out.mods)
+    -- the operand buffer and the array build both made it out
+    (countOccurrences "[20000 x i64]" ir >= 1) `shouldEqual` true
+    (countOccurrences "pv_new_array" ir >= 1) `shouldEqual` true

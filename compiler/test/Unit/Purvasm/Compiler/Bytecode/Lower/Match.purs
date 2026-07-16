@@ -71,6 +71,7 @@ litHeads = fromMaybe [] <<< Array.findMap case _ of
 
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.Bytecode.Lower.Match" do
+  stackSafetySpec
   describe "compileTree — exact bytecode for new discriminants" do
     it "lowers a literal case to one SwitchLit with a wildcard default" do
       tree [ AtomVar "n" ]
@@ -216,3 +217,19 @@ spec = describe "Purvasm.Compiler.Bytecode.Lower.Match" do
             [ alt [ BCtor "Just" [ BVar "a" ] ] (bdy 1), alt [ BCtor "Nothing" [] ] (bdy 2) ]
         )
         `shouldEqual` 2
+
+-- --- stack safety (2026-07-16 bugfix) --------------------------------------------------------------
+
+-- | The measured overflow path: `emitChunk` sequenced one `State` bind — one live host frame —
+-- | per instruction of an already-lowered body, and a `PureScript.CST.Parser`-scale alternative
+-- | (tens of thousands of instructions) exhausted the default stack during the VM-target
+-- | self-compile. A stub `Lowerers` whose body is 50k instructions drives that exact seam under
+-- | the test runner's default stack; the assertion stays shallow on purpose.
+stackSafetySpec :: Spec Unit
+stackSafetySpec = describe "stack safety (data-sized assembler spines)" do
+  it "assembles a 50k-instruction leaf body on the default host stack (emitChunk)" do
+    let
+      hugeLw :: Lowerers
+      hugeLw = { atom: lowerAtom, body: \_ _ -> Array.replicate 50000 (PushInt 1) }
+      out = compileTree hugeLw false [ AtomLit (LInt 0) ] [ alt [ BVar "x" ] (bdy 1) ]
+    (Array.length out >= 50000) `shouldEqual` true

@@ -208,18 +208,18 @@ if [ "$OPT_EFFECT" = "1" ]; then
   done
   # The self-compile size leg (ADR-0089 self-compile extension): the compiler's own closure is
   # the regression gate for the inliner blow-up class the five bench closures cannot see
-  # (measured before the fix: whole-closure 1.666, CST.Parser x14.5). Stack posture is
-  # diagnostic for now — the bytecode lowering is not stack-safe (its own work item), so this
-  # leg runs with explicit headroom and asserts SIZE only; the default-stack completion assert
-  # arrives when that item closes.
+  # (measured before the fix: whole-closure 1.666, CST.Parser x14.5). Runs on the DEFAULT
+  # node stack: the middle-end stack-safety item closed 2026-07-16 (Normalize and the Match
+  # assembler loop over data-sized spines instead of stacking frames), so this leg now
+  # doubles as the default-stack completion assert the earlier diagnostic posture promised.
   if [ -z "$ONLY" ]; then
     sdir="$OUT/opt/self-compile"
     rm -rf "$sdir"
     mkdir -p "$sdir/opt" "$sdir/noopt"
     sc_ok=1
-    PURVASM_LIB="$ULIB" node --stack-size=16384 "$L2_ENTRY" run --corefn-dir output \
+    PURVASM_LIB="$ULIB" node "$L2_ENTRY" run --corefn-dir output \
       --outdir "$sdir/noopt" --entry Purvasm.CLI.Main --no-opt >"$sdir/noopt.log" 2>&1 || sc_ok=0
-    PURVASM_LIB="$ULIB" node --stack-size=16384 "$L2_ENTRY" run --corefn-dir output \
+    PURVASM_LIB="$ULIB" node "$L2_ENTRY" run --corefn-dir output \
       --outdir "$sdir/opt" --entry Purvasm.CLI.Main >"$sdir/opt.log" 2>&1 || sc_ok=0
     if [ "$sc_ok" = "0" ]; then
       printf '%-16s %-10s %14s\n' "self-compile" "-" "COMPILE-FAILED" | tee -a "$optsum"

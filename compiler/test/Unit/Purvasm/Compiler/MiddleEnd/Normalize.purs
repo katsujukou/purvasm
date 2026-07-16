@@ -8,6 +8,7 @@ module Test.Unit.Purvasm.Compiler.MiddleEnd.Normalize where
 
 import Prelude
 
+import Data.Array as Array
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.CESK.AST (Term(..))
 import Purvasm.Compiler.CESK.AST as Cesk
@@ -32,6 +33,7 @@ aInt = AtomLit <<< LInt
 
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.MiddleEnd.Normalize" do
+  stackSafetySpec
   describe "normalize" do
     it "leaves an already-atomic term as a tail atom" do
       normalize (num 42) `shouldEqual` Ret (CAtom (aInt 42))
@@ -107,3 +109,47 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Normalize" do
 
     it "collects no arguments from a non-application" do
       collectApp (TmVar "f") `shouldEqual` { head: TmVar "f", args: [] }
+
+-- --- stack-safety regression (2026-07-16 bugfix) --------------------------------------------------
+--
+-- The CPS walk nested a host-stack frame chain per array element / let-spine entry, which
+-- overflowed the default node stack on `Regex.Core.Unicode`-scale table literals (a 1,290-element
+-- array was ~the whole default stack inside the build driver). These run under the test runner's
+-- DEFAULT stack, so a stack-unsafe regression fails them with a `RangeError`, not a wrong value.
+-- Assertions stay shallow on purpose: comparing/sizing a 50k-deep result would itself recurse.
+
+stackSafetySpec :: Spec Unit
+stackSafetySpec = describe "stack safety (data-sized spines on the default host stack)" do
+  it "normalises a 100k-element atomic array literal" do
+    let
+      r = normalize (TmArray (Array.replicate 100000 (num 1)))
+      len = case r of
+        Ret (CArray es) -> Array.length es
+        _ -> -1
+    len `shouldEqual` 100000
+
+  it "normalises a 50k-element compound-element array (one let-named atom each)" do
+    let
+      r = normalize (TmArray (Array.replicate 50000 (add (num 1) (num 2))))
+      isLet = case r of
+        Let _ _ _ -> true
+        _ -> false
+    isLet `shouldEqual` true
+
+  it "normalises a 100k-deep let chain" do
+    let
+      deep = Array.foldl (\body i -> TmLet ("x" <> show i) (num i) body) (TmVar "x0") (Array.range 1 100000)
+      r = normalize deep
+      isLet = case r of
+        Let _ _ _ -> true
+        _ -> false
+    isLet `shouldEqual` true
+
+  it "normalises a 50k-argument application spine" do
+    let
+      app = Array.foldl TmApp (TmVar "f") (Array.replicate 50000 (num 1))
+      r = normalize app
+      len = case r of
+        Ret (CApp _ args) -> Array.length args
+        _ -> -1
+    len `shouldEqual` 50000

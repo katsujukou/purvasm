@@ -37,22 +37,19 @@ import Control.Monad.State.Class (gets, modify_)
 import Data.Array (range, zip)
 import Data.Array as Array
 import Data.Either (Either(..))
-import Data.Foldable (any, foldM, foldMap, foldl, traverse_)
-import Data.FoldableWithIndex (forWithIndex_)
-import Data.List (List(..))
+import Data.Foldable (foldMap, foldl)
+import Data.List (List(..), (:))
 import Data.List as List
 import Data.Map as Map
-import Data.Maybe (Maybe(..))
+import Data.Maybe (Maybe(..), fromMaybe)
 import Data.Set as Set
 import Data.String.Common (joinWith)
-import Data.Traversable (traverse)
-import Data.TraversableWithIndex (traverseWithIndex)
 import Data.Tuple (Tuple(..), fst, snd)
 import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.Compiler.Backend.LLVM.Abi (abiFrameOpen, abiGet, abiPopFrame, abiRoot, abiSettle)
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (fvExpr)
 import Purvasm.Compiler.Backend.LLVM.Mangle (ctorTag, escapeStringBytes, imm, immBool, immInt, immUnit, labelId, mangle, mangleForeign, sortRecordFields)
-import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, beginFn, emit, emitGlobal, emitModule, fresh, freshFn, freshLabel, freshStrName, getFrame, setFrame, takeFn)
+import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, beginFn, emit, emitGlobal, emitModule, foldA, forA, forA_, forWithIndexA, fresh, freshFn, freshLabel, freshStrName, getFrame, setFrame, takeFn)
 import Purvasm.Compiler.Backend.LLVM.Prim (inlinePrim, primSym)
 import Purvasm.Compiler.Backend.LLVM.Types (Env, EnvSrc(..), FnInfo, Lifted(..), LiftedBody(..), bindFnVar, bindVar, lookupEnv)
 import Purvasm.Compiler.Binder (Binder(..))
@@ -211,9 +208,14 @@ forceAtom env = case _ of
 -- | evaluation+root pass runs in list order, then the reload (`pv_get`) pass.
 evalAtoms :: Boolean -> Env -> Array Atom -> Codegen (Array String)
 evalAtoms force env atoms = do
-  slots <- go (List.fromFoldable atoms)
-  reloaded <- traverse reload slots
-  pure (Array.fromFoldable reloaded)
+  -- Stack-safety (2026-07-16 bugfix): both passes were per-element recursions/`traverse`s, and a
+  -- sequenced `State` step is a live host frame on the JS backend — a `Regex.Core.Unicode`-scale
+  -- array literal (1,290 operands) was ~0.5× the default stack. Both passes are `tailRecM` loops
+  -- now, in the same element order; the later-safepoint test is a precomputed suffix scan (the
+  -- per-element `any` over the remainder was also quadratic in the array length).
+  slots <- tailRecM evalStep { i: 0, acc: Nil }
+  reloaded <- tailRecM reloadStep { rem: slots, acc: Nil }
+  pure (Array.fromFoldable (List.reverse reloaded))
   where
   canSafepoint = case _ of
     AtomLit (LInt _) -> false
@@ -230,18 +232,29 @@ evalAtoms force env atoms = do
 
   one = if force then forceAtom env else atom env
 
+  -- `laterCan !! i` ⇔ the original `any canSafepoint rest` at element `i`.
+  laterCan :: Array Boolean
+  laterCan = Array.fromFoldable
+    (Array.foldr (\a st -> { flag: st.flag || canSafepoint a, out: st.flag : st.out }) { flag: false, out: Nil } atoms).out
+
   -- Evaluate+root in list order; `Left` = raw operand, `Right` = rooted handle (reloaded in a second
-  -- pass), mirroring boot's ``` `Raw / `Rooted ``` split.
-  go = case _ of
-    Nil -> pure Nil
-    Cons a rest -> do
+  -- pass), mirroring boot's ``` `Raw / `Rooted ``` split. `acc` is reversed; `evalStep` un-reverses
+  -- at `Done` so `reloadStep` runs in list order.
+  evalStep st = case Array.index atoms st.i of
+    Nothing -> pure (Done (List.reverse st.acc))
+    Just a -> do
       slot <-
         if isImmediate a then Left <$> one a
         else do
           v <- one a
-          if any canSafepoint rest then Right <$> root v else pure (Left v)
-      slots <- go rest
-      pure (Cons slot slots)
+          if fromMaybe false (Array.index laterCan st.i) then Right <$> root v else pure (Left v)
+      pure (Loop { i: st.i + 1, acc: Cons slot st.acc })
+
+  reloadStep st = case st.rem of
+    Nil -> pure (Done st.acc)
+    Cons s rest -> do
+      r <- reload s
+      pure (Loop { rem: rest, acc: Cons r st.acc })
 
   reload = case _ of
     Left v -> pure v
@@ -402,7 +415,7 @@ cexpr env tail = case _ of
               Nothing -> unsafeCrashWith "Backend.LLVM.Emit.cexpr: empty CApp operand list"
           SForceCell -> do
             fh <- atom env f >>= root
-            argHs <- traverse (\a -> atom env a >>= root) args
+            argHs <- forA args (\a -> atom env a >>= root)
             -- `forced` is numbered before `getCurrent fh`'s load chain (boot: `let forced = fresh in
             -- emit … forced (get_current fh)` — OCaml right-to-left arg eval emits the load chain first
             -- but numbers `forced` first).
@@ -411,7 +424,7 @@ cexpr env tail = case _ of
             emit ("  " <> forced <> " = call i64 @pv_force_if_byneed(ptr %ctx, i64 " <> fhc <> ")")
             e <- fresh
             emit ("  " <> e <> " = call i64 @pv_read_field(ptr %ctx, i64 " <> forced <> ", i64 2)")
-            ops <- traverse getCurrent argHs
+            ops <- forA argHs getCurrent
             pure (Tuple e ops)
         let arglist = foldMap (\o -> ", i64 " <> o) ops
         inDir <- gets _.inDirect
@@ -525,7 +538,7 @@ cexpr env tail = case _ of
     -- Functional update: fold `record_set` (each returns a new record). The base is forced (a by-need
     -- dict update); the accumulator is rooted across each value's evaluation and reloaded before the set.
     rh0 <- forceAtom env a >>= root
-    rhFinal <- foldM
+    rhFinal <- foldA
       ( \rh up -> do
           v <- atom env up.val
           r <- getCurrent rh
@@ -543,10 +556,10 @@ cexpr env tail = case _ of
     -- safepointed. Boxed literals are pre-rooted once at entry so the tree walk never allocates.
     let { scrutBinds, tree } = MatchCompile.compile scruts alts
     -- Root each scrutinee (forced — matching dereferences its structure).
-    occEnv0 <- traverse (\(Tuple occ a) -> Tuple occ <$> (forceAtom env a >>= root)) scrutBinds
+    occEnv0 <- forA scrutBinds (\(Tuple occ a) -> Tuple occ <$> (forceAtom env a >>= root))
     -- Hoist + root every boxed literal any arm compares against.
-    litEnv <- traverse (\l -> Tuple l <$> (atom env (AtomLit l) >>= root))
-      (sortUniqBoxed (Array.concatMap (\alt -> Array.concatMap binderBoxedLits alt.binders) alts))
+    litEnv <- forA (sortUniqBoxed (Array.concatMap (\alt -> Array.concatMap binderBoxedLits alt.binders) alts))
+      (\l -> Tuple l <$> (atom env (AtomLit l) >>= root))
     failLabel <- freshLabel "nomatch"
     merge <- if tail then pure "" else freshLabel "casejoin"
     let
@@ -625,7 +638,7 @@ cexpr env tail = case _ of
           ptrBlk <- freshLabel "ctptr"
           emit ("  br i1 " <> isImm <> ", label %" <> immBlk <> ", label %" <> ptrBlk)
           defaultLbl <- freshLabel "ctdef"
-          armLbls <- traverse (\(Tuple tag arm) -> { tag, arm, l: _ } <$> freshLabel "ctarm") arms
+          armLbls <- forA arms (\(Tuple tag arm) -> { tag, arm, l: _ } <$> freshLabel "ctarm")
           let
             casesFor keep = joinWith " "
               ( map (\a -> "i64 " <> show (ctorTag a.tag) <> ", label %" <> a.l)
@@ -641,10 +654,10 @@ cexpr env tail = case _ of
           ptag <- fresh
           emit ("  " <> ptag <> " = call i64 @pv_read_raw(ptr %ctx, i64 " <> scrut <> ", i64 0)")
           emit ("  switch i64 " <> ptag <> ", label %" <> defaultLbl <> " [ " <> casesFor (not <<< Array.null) <> " ]")
-          phis' <- foldM
+          phis' <- foldA
             ( \acc a -> do
                 emit (a.l <> ":")
-                oenv' <- foldM (\oe ex -> extract oe occ ex) oenv a.arm.extracts
+                oenv' <- foldA (\oe ex -> extract oe occ ex) oenv a.arm.extracts
                 lower oenv' a.arm.sub acc
             )
             phis
@@ -660,7 +673,7 @@ cexpr env tail = case _ of
               -- Immediate literals → a direct LLVM switch on the tagged word.
               scrut <- cur oenv occ
               defaultLbl <- freshLabel "swdef"
-              armLbls <- traverse (const (freshLabel "swarm")) arms
+              armLbls <- forA arms (const (freshLabel "swarm"))
               let
                 immOf = case _ of
                   LInt n -> immInt n
@@ -668,7 +681,7 @@ cexpr env tail = case _ of
                   _ -> unsafeCrashWith "Backend.LLVM.Emit.cexpr: non-immediate literal in immediate switch"
                 cases = Array.zipWith (\(Tuple l _) lbl -> "i64 " <> immOf l <> ", label %" <> lbl) arms armLbls
               emit ("  switch i64 " <> scrut <> ", label %" <> defaultLbl <> " [ " <> joinWith " " cases <> " ]")
-              phis' <- foldM
+              phis' <- foldA
                 ( \acc (Tuple (Tuple _ sub) lbl) -> do
                     emit (lbl <> ":")
                     lower oenv sub acc
@@ -682,13 +695,13 @@ cexpr env tail = case _ of
           occCur <- cur oenv occ
           emit ("  " <> len <> " = call i64 @pv_prim_length_array(ptr %ctx, i64 " <> occCur <> ")")
           defaultLbl <- freshLabel "swdef"
-          armLbls <- traverse (const (freshLabel "swarm")) arms
+          armLbls <- forA arms (const (freshLabel "swarm"))
           let cases = Array.zipWith (\(Tuple n _) lbl -> "i64 " <> immInt n <> ", label %" <> lbl) arms armLbls
           emit ("  switch i64 " <> len <> ", label %" <> defaultLbl <> " [ " <> joinWith " " cases <> " ]")
-          phis' <- foldM
+          phis' <- foldA
             ( \acc (Tuple (Tuple _ arm) lbl) -> do
                 emit (lbl <> ":")
-                oenv' <- foldM (\oe ex -> extract oe occ ex) oenv arm.extracts
+                oenv' <- foldA (\oe ex -> extract oe occ ex) oenv arm.extracts
                 lower oenv' arm.sub acc
             )
             phis
@@ -696,7 +709,7 @@ cexpr env tail = case _ of
           emit (defaultLbl <> ":")
           lower oenv default phis'
         MC.DexpandRecord occ extracts sub -> do
-          oenv' <- foldM (\oe ex -> extract oe occ ex) oenv extracts
+          oenv' <- foldA (\oe ex -> extract oe occ ex) oenv extracts
           lower oenv' sub phis
 
       -- Boxed literals cannot be `switch`ed — an equality chain against the hoisted rooted handles,
@@ -774,7 +787,7 @@ buildGrec named env binds = do
   -- Pre-lift each function member under a stable name; a shared name shadows an equally-named global,
   -- so it is captured (`globalsUnshadowed = gkeys \ sharedNames`).
   xfns <- gets _.xfns
-  memberFns0 <- map Array.catMaybes $ traverse
+  memberFns0 <- map Array.catMaybes $ flip forA
     ( \(Tuple m rhs) -> case rhs of
         Ret (CLam ps b) -> do
           Tuple name top <- case named m of
@@ -804,10 +817,10 @@ buildGrec named env binds = do
   let
     groupInfos = map (\r -> Tuple r.m r.info) memberFns0
     memberFns = map (\r -> case r.lifted of Lifted lm -> r { lifted = Lifted (lm { captureFns = groupInfos }) }) memberFns0
-  traverse_ (\r -> pushPending r.lifted) memberFns
+  forA_ memberFns (\r -> pushPending r.lifted)
   -- One suspension per member over the shared env: a function member's suspension builds its
   -- pre-lifted closure; any other member's suspension evaluates its RHS.
-  suspNames <- traverse
+  suspNames <- flip forA
     ( \(Tuple m rhs) -> do
         name <- freshFn "susp_"
         let
@@ -822,14 +835,14 @@ buildGrec named env binds = do
     )
     binds
   -- 1. shared env array = [unit × k] ++ [outside-capture values]; root it.
-  outsideVals <- traverse (readVar env) outside
+  outsideVals <- forA outside (readVar env)
   let elems = Array.replicate k immUnit <> outsideVals
   Tuple envP envN <- argBuffer elems
   envArr <- fresh
   emit ("  " <> envArr <> " = call i64 @pv_new_array(ptr %ctx, ptr " <> envP <> ", i64 " <> show envN <> ")")
   envH <- root envArr
   -- 2. placeholder cells; store each into env[i] (reloading env/cell after each allocation).
-  cellHs <- traverse
+  cellHs <- flip forA
     ( \i -> do
         cell <- fresh
         emit ("  " <> cell <> " = call i64 @pv_new_byneed_placeholder(ptr %ctx)")
@@ -841,7 +854,7 @@ buildGrec named env binds = do
     )
     (paramIndices k)
   -- 3. build each suspension closure over the shared env; backpatch it into its cell.
-  traverse_
+  flip forA_
     ( \(Tuple name ch) -> do
         envp <- getCurrent envH
         addr <- fresh
@@ -906,10 +919,19 @@ argBuffer operands =
     else do
       buf <- fresh
       emit ("  " <> buf <> " = alloca [" <> show n <> " x i64]")
-      forWithIndex_ operands \i v -> do
-        p <- fresh
-        emit ("  " <> p <> " = getelementptr [" <> show n <> " x i64], ptr " <> buf <> ", i64 0, i64 " <> show i)
-        emit ("  store i64 " <> v <> ", ptr " <> p)
+      -- Stack-safety (2026-07-16 bugfix): per-operand `forWithIndex_` over `State` is a live host
+      -- frame per element — a `Regex.Core.Unicode`-scale array literal's store sequence was the
+      -- remaining ~0.3×-stack overflow after `evalAtoms` was hardened. Same order, `tailRecM` loop.
+      tailRecM
+        ( \i -> case Array.index operands i of
+            Nothing -> pure (Done unit)
+            Just v -> do
+              p <- fresh
+              emit ("  " <> p <> " = getelementptr [" <> show n <> " x i64], ptr " <> buf <> ", i64 0, i64 " <> show i)
+              emit ("  store i64 " <> v <> ", ptr " <> p)
+              pure (Loop (i + 1))
+        )
+        0
       p0 <- fresh
       emit ("  " <> p0 <> " = getelementptr [" <> show n <> " x i64], ptr " <> buf <> ", i64 0, i64 0")
       pure (Tuple p0 n)
@@ -921,7 +943,7 @@ makeClosure env (Lifted l) = do
   envWord <- case l.captures of
     [] -> pure immUnit
     caps -> do
-      vals <- traverse (readVar env) caps
+      vals <- forA caps (readVar env)
       Tuple p n <- argBuffer vals
       arr <- fresh
       emit ("  " <> arr <> " = call i64 @pv_new_array(ptr %ctx, ptr " <> p <> ", i64 " <> show n <> ")")
@@ -965,7 +987,7 @@ emitFunction (Lifted l) = do
   beginFn
   frame <- abiFrameOpen
   setFrame frame
-  handles <- traverseWithIndex (\i _ -> root ("%p" <> show i)) l.params
+  handles <- forWithIndexA l.params (\i _ -> root ("%p" <> show i))
   let env1 = foldl (\env (Tuple p h) -> bindVar env p h) Nil (zip l.params handles)
   -- captures: positional reads from the env word `%env` (the shared/captured array); a capture that is
   -- a known recursive-group function member carries its direct-call info (`captureFns`). `selfHandle`
@@ -983,7 +1005,7 @@ emitFunction (Lifted l) = do
       pure (Tuple env' sh')
   Tuple env2 selfHandle <- case l.captures of
     [] -> pure (Tuple env1 Nothing)
-    _ -> foldM stepCap (Tuple env1 Nothing) (Array.mapWithIndex Tuple l.captures)
+    _ -> foldA stepCap (Tuple env1 Nothing) (Array.mapWithIndex Tuple l.captures)
   -- the self-call shortcut (ADR-0076 §2): while this body runs, a saturated call to `selfName`
   -- re-enters this very function with this very `%env`. Root the env word itself — a self-call
   -- re-supplies it, and the raw `%env` SSA value is stale after the first safepoint (the array moves).
@@ -1026,7 +1048,7 @@ emitFunction (Lifted l) = do
       e <- fresh
       emit ("  " <> e <> " = call i64 @pv_read_field(ptr %ctx, i64 %clo, i64 2)")
       pure e
-  args <- traverse
+  args <- flip forA
     ( \i -> do
         p <- fresh
         emit ("  " <> p <> " = getelementptr i64, ptr %args, i64 " <> show i)

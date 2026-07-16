@@ -25,8 +25,7 @@ import Prelude
 import Control.Monad.Rec.Class (Step(..), tailRec)
 import Control.Monad.State.Class (gets, modify_)
 import Data.Array as Array
-import Data.Foldable (foldl, traverse_)
-import Data.Traversable (traverse)
+import Data.Foldable (foldl)
 import Data.List (List(..), (:))
 import Data.Map (Map)
 import Data.Map as Map
@@ -40,7 +39,7 @@ import Purvasm.Compiler.Backend.LLVM.Abi (abiFrameOpen, abiPopFrame, abiRoot, ab
 import Purvasm.Compiler.Backend.LLVM.Emit (buildGrec, emitPending, expr, readVar)
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (fvExpr)
 import Purvasm.Compiler.Backend.LLVM.Mangle (immUnit, mangle, mangleForeign)
-import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, MakeCxOptions, beginFn, emit, emitModule, fresh, makeCx, renderChunks, runCodegen, takeFn)
+import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, MakeCxOptions, beginFn, emit, emitModule, forA, forA_, fresh, makeCx, renderChunks, runCodegen, takeFn)
 import Purvasm.Compiler.Backend.LLVM.Types (CallFact(..), EnvSrc(..), FnInfo, Gdef(..), Lifted(..), LiftedBody(..), SplitOutput)
 import Purvasm.Compiler.MiddleEnd.ANF (CExpr(..), Expr(..))
 import Purvasm.Compiler.MiddleEnd.Module (Decl)
@@ -183,18 +182,18 @@ emitGdef = case _ of
         -- stable member code symbols, so `gfns`'s pre-registered `$d` names line up.
         env' <- buildGrec (\m -> Just (mangle m)) Nil binds
         -- read each member's current cell value *before* popping the transient roots.
-        vals <- traverse (\(Tuple m _) -> Tuple m <$> readVar env' m) binds
+        vals <- forA binds (\(Tuple m _) -> Tuple m <$> readVar env' m)
         abiPopFrame frame
-        traverse_ (\(Tuple m v) -> storeRootGlobal m v) vals
+        forA_ vals (\(Tuple m v) -> storeRootGlobal m v)
 
 -- | Register the unit's own function bindings for direct calls, emit each gdef's root-handle global
 -- | definition(s) (init overwrites the 0 sentinel before any read), then its init function.
 emitGdefs :: Array Gdef -> Codegen Unit
 emitGdefs gdefs = do
   modify_ \c -> c { gfns = foldl registerGfn c.gfns gdefs }
-  traverse_ emitRootGlobals gdefs
+  forA_ gdefs emitRootGlobals
   when (not (Array.null gdefs)) (emitModule "\n")
-  traverse_ emitGdef gdefs
+  forA_ gdefs emitGdef
   where
   registerGfn m = case _ of
     Gfun k ps _ -> Map.insert k { dsym: mangle k <> "$d", arity: Array.length ps, src: SSentinel } m
@@ -208,7 +207,7 @@ emitGdefs gdefs = do
     Gcaf _ _ -> m
 
   emitRootGlobals g =
-    traverse_ (\k -> emitModule ("@" <> mangle k <> "$root = global i64 0\n")) (gdefKeys g)
+    forA_ (gdefKeys g) (\k -> emitModule ("@" <> mangle k <> "$root = global i64 0\n"))
 
 -- | Emit `pv_init_all`: call each binding's init in dependency (spine) order. Callers pass the reachable
 -- | subset.

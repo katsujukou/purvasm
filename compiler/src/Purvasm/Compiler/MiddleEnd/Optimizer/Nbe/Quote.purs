@@ -10,113 +10,246 @@
 -- | `let`-bound at its use site; an `SLet`'s computation is emitted **in place** (the ADR-0089 §5
 -- | pinning — this is the only point that linearises sequencing, and it never reorders).
 -- |
--- | Stack-safety note: like `Normalize` and `ANF.FreeVars`, the walk is ordinary structural
--- | recursion (depth = `let`-spine length); the iterative-spine hardening is deferred until real
--- | modules exercise it.
+-- | Stack-safety (2026-07-16 bugfix, the deferral in the earlier note cashed in): the CPS walk
+-- | stacked one host frame per `SLet`-spine entry / operand-array element and overflowed a reduced
+-- | stack on `Regex.Core.Unicode`-scale table literals (~0.5× the default was the measured
+-- | margin). Like `Normalize`, the walk now returns an explicit **binding prefix**
+-- | (innermost-first, so composition is a cons and `assemble`'s fold wraps stack-free), threads
+-- | the `$q` counter as a plain accumulator, and consumes every data-sized spine with
+-- | self-recursive **tail** loops (`goSpine` for `SLet`/`SLetRec` chains — kept out of `quoteC`,
+-- | whose non-tail self-calls would disable purs's self-TCO). Host recursion remains only on
+-- | genuine term *nesting*. The `$q` numbering and `Let` wrapping orders are exactly the CPS
+-- | walk's.
 module Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Quote
   ( quote
   ) where
 
 import Prelude
 
-import Control.Monad.State (State, evalState, get, modify_)
 import Data.Array as Array
+import Data.List (List(..), (:))
+import Data.List as List
 import Data.Map (Map)
 import Data.Map as Map
 import Data.Maybe (Maybe(..), fromMaybe)
-import Data.Traversable (for)
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (Comp(..), NRhs(..), Sem(..))
 
-type Q = State Int
+-- | One deferred wrapper of the eventual tail expression (the defunctionalised continuation).
+data QBind
+  = QLet String CExpr
+  | QLetRec (Array { var :: String, rhs :: Expr })
 
-freshQ :: Q String
-freshQ = do
-  modify_ (_ + 1)
-  n <- get
-  pure ("$q" <> show n)
+-- | The threaded state: the `$q` counter and the pending prefix, **innermost bind at the head**.
+type St = { n :: Int, pre :: List QBind }
+
+fresh :: Int -> { n :: Int, name :: String }
+fresh n = { n: n + 1, name: "$q" <> show (n + 1) }
+
+assemble :: List QBind -> CExpr -> Expr
+assemble pre ce = List.foldl (\e b -> wrap b e) (Ret ce) pre
+  where
+  wrap = case _ of
+    QLet x c -> Let x c
+    QLetRec binds -> LetRec binds
 
 -- | Reify a binding body's semantic value to ANF, with a per-binding deterministic supply.
 quote :: Sem -> Expr
-quote s = evalState (quoteExpr s) 0
+quote s = (tailQ 0 s).expr
 
-quoteExpr :: Sem -> Q Expr
-quoteExpr s = quoteC s (pure <<< Ret)
+-- | Reify to a full expression in its own binding scope (a lambda/branch/rhs body): only the
+-- | counter threads through; the prefix never escapes a scope.
+tailQ :: Int -> Sem -> { n :: Int, expr :: Expr }
+tailQ n0 s =
+  let
+    r = goSpine { n: n0, pre: Nil } s
+  in
+    { n: r.st.n, expr: assemble r.st.pre r.ce }
 
--- | Reify into a computation position, CPS-building the enclosing `let` spine (the `Normalize`
--- | pattern). `SLet`/`SLetRec` emit their binding here — in the order evaluation produced them.
-quoteC :: Sem -> (CExpr -> Q Expr) -> Q Expr
-quoteC s k = case s of
-  SLet _ rhs kont -> quoteC rhs \c -> do
-    x <- freshQ
-    rest <- quoteC (kont (SVar x)) k
-    pure (Let x c rest)
-  SLetRec bs kont -> do
-    names <- for bs (const freshQ)
-    let vars = map SVar names
-    rhss <- for bs \b -> quoteExpr (b.rhsF vars)
-    rest <- quoteC (kont vars) k
-    pure (LetRec (Array.zipWith (\v r -> { var: v, rhs: r }) names rhss) rest)
-  SLit l -> k (CAtom (AtomLit l))
-  SVar x -> k (CAtom (AtomVar x))
-  SForeign f -> k (CAtom (AtomForeign f))
-  SLam hints f -> do
-    ps <- for hints (const freshQ)
-    body <- quoteExpr (f (map SVar ps))
-    k (CLam ps body)
-  SCtor t n args -> quoteAtoms args \as -> k (CCtor t n as)
-  SArr args -> quoteAtoms args \as -> k (CArray as)
-  SRec fs -> quoteAtoms (map _.val fs) \as ->
-    k (CRecord (Array.zipWith (\f a -> { prop: f.prop, val: a }) fs as))
+-- | Consume an `SLet`/`SLetRec` spine iteratively (self-calls all tail ⇒ purs TCO ⇒ a chain of
+-- | any length costs no host stack), delegating everything else to `quoteC`. The `SLet` binding
+-- | order is the CPS walk's: the rhs's own reification first, then the fresh binder, then the
+-- | continuation.
+goSpine :: St -> Sem -> { st :: St, ce :: CExpr }
+goSpine st s = case s of
+  SLet _ rhs kont ->
+    let
+      r = quoteC st rhs
+      f = fresh r.st.n
+    in
+      goSpine { n: f.n, pre: QLet f.name r.ce : r.st.pre } (kont (SVar f.name))
+  SLetRec bs kont ->
+    let
+      names = go st.n Nil 0
+      go n acc i = case Array.index bs i of
+        Nothing -> { n, names: Array.fromFoldable (List.reverse acc) }
+        Just _ -> let f = fresh n in go f.n (f.name : acc) (i + 1)
+      vars = map SVar names.names
+      rhss = goRhss names.n Nil 0
+      goRhss n acc i = case Array.index bs i of
+        Nothing -> { n, rhss: Array.fromFoldable (List.reverse acc) }
+        Just b ->
+          let
+            r = tailQ n (b.rhsF vars)
+          in
+            goRhss r.n (r.expr : acc) (i + 1)
+      binds = Array.zipWith (\v r -> { var: v, rhs: r }) names.names rhss.rhss
+    in
+      goSpine { n: rhss.n, pre: QLetRec binds : st.pre } (kont vars)
+  other -> quoteC st other
+
+-- | Reify into a computation position, pushing operand `let`-bindings onto the prefix.
+quoteC :: St -> Sem -> { st :: St, ce :: CExpr }
+quoteC st s = case s of
+  SLet _ _ _ -> goSpine st s
+  SLetRec _ _ -> goSpine st s
+  SLit l -> { st, ce: CAtom (AtomLit l) }
+  SVar x -> { st, ce: CAtom (AtomVar x) }
+  SForeign f -> { st, ce: CAtom (AtomForeign f) }
+  SLam hints f ->
+    let
+      ps = go st.n Nil 0
+      go n acc i = case Array.index hints i of
+        Nothing -> { n, ps: Array.fromFoldable (List.reverse acc) }
+        Just _ -> let fr = fresh n in go fr.n (fr.name : acc) (i + 1)
+      body = tailQ ps.n (f (map SVar ps.ps))
+    in
+      { st: st { n = body.n }, ce: CLam ps.ps body.expr }
+  SCtor t n args ->
+    let
+      r = quoteAtoms st args
+    in
+      { st: r.st, ce: CCtor t n r.atoms }
+  SArr args ->
+    let
+      r = quoteAtoms st args
+    in
+      { st: r.st, ce: CArray r.atoms }
+  SRec fs ->
+    let
+      r = quoteAtoms st (map _.val fs)
+    in
+      { st: r.st, ce: CRecord (Array.zipWith (\f a -> { prop: f.prop, val: a }) fs r.atoms) }
   SRef r -> case r.spine of
-    [] -> k (CAtom r.atom)
-    sp -> quoteAtoms sp \as -> k (CApp r.atom as)
+    [] -> { st, ce: CAtom r.atom }
+    sp ->
+      let
+        ra = quoteAtoms st sp
+      in
+        { st: ra.st, ce: CApp r.atom ra.atoms }
   SComp c -> case c of
-    NApp h args -> quoteAtom h \ha -> quoteAtoms args \as -> k (CApp ha as)
-    NPrim op args -> quoteAtoms args \as -> k (CPrim op as)
-    NAcc v f -> quoteAtom v \a -> k (CAccessor a f)
-    NPerform v -> quoteAtom v \a -> k (CPerform a)
-    NUpd v ups -> quoteAtom v \a ->
-      quoteAtoms (map _.val ups) \as ->
-        k (CUpdate a (Array.zipWith (\u v' -> { prop: u.prop, val: v' }) ups as))
-    NIf cond t e -> quoteAtom cond \ca -> do
-      t' <- quoteExpr t
-      e' <- quoteExpr e
-      k (CIf ca t' e')
-    NCase scruts alts -> quoteAtoms scruts \sas -> do
-      alts' <- for alts \alt -> do
-        fresh <- for alt.vars (const freshQ)
+    NApp h args ->
+      let
+        rh = quoteAtom st h
+        ra = quoteAtoms rh.st args
+      in
+        { st: ra.st, ce: CApp rh.atom ra.atoms }
+    NPrim op args ->
+      let
+        ra = quoteAtoms st args
+      in
+        { st: ra.st, ce: CPrim op ra.atoms }
+    NAcc v f ->
+      let
+        r = quoteAtom st v
+      in
+        { st: r.st, ce: CAccessor r.atom f }
+    NPerform v ->
+      let
+        r = quoteAtom st v
+      in
+        { st: r.st, ce: CPerform r.atom }
+    NUpd v ups ->
+      let
+        rv = quoteAtom st v
+        ra = quoteAtoms rv.st (map _.val ups)
+      in
+        { st: ra.st
+        , ce: CUpdate rv.atom (Array.zipWith (\u v' -> { prop: u.prop, val: v' }) ups ra.atoms)
+        }
+    NIf cond t e ->
+      let
+        rc = quoteAtom st cond
+        rt = tailQ rc.st.n t
+        re = tailQ rt.n e
+      in
+        { st: rc.st { n = re.n }, ce: CIf rc.atom rt.expr re.expr }
+    NCase scruts alts ->
+      let
+        rs = quoteAtoms st scruts
+        ra = goAlts rs.st.n Nil 0
+        goAlts n acc i = case Array.index alts i of
+          Nothing -> { n, alts: Array.fromFoldable (List.reverse acc) }
+          Just alt ->
+            let
+              r = quoteAlt n alt
+            in
+              goAlts r.n (r.alt : acc) (i + 1)
+      in
+        { st: rs.st { n = ra.n }, ce: CCase rs.atoms ra.alts }
+
+quoteAlt
+  :: Int
+  -> { shape :: Array Binder, vars :: Array String, result :: NRhs }
+  -> { n :: Int, alt :: { binders :: Array Binder, result :: Rhs } }
+quoteAlt n0 alt =
+  let
+    freshes = go n0 Nil 0
+    go n acc i = case Array.index alt.vars i of
+      Nothing -> { n, names: Array.fromFoldable (List.reverse acc) }
+      Just _ -> let f = fresh n in go f.n (f.name : acc) (i + 1)
+    renames = Map.fromFoldable (Array.zip alt.vars freshes.names)
+    vars = map SVar freshes.names
+  in
+    case alt.result of
+      NUncond f ->
         let
-          renames = Map.fromFoldable (Array.zip alt.vars fresh)
-          vars = map SVar fresh
-        result <- case alt.result of
-          NUncond f -> Uncond <$> quoteExpr (f vars)
-          NGuarded gs -> Guarded <$> for gs \g -> do
-            guard <- quoteExpr (g.guard vars)
-            rhs <- quoteExpr (g.rhs vars)
-            pure { guard, rhs }
-        pure { binders: map (renameBinder renames) alt.shape, result }
-      k (CCase sas alts')
+          r = tailQ freshes.n (f vars)
+        in
+          { n: r.n, alt: { binders: map (renameBinder renames) alt.shape, result: Uncond r.expr } }
+      NGuarded gs ->
+        let
+          r = goGs freshes.n Nil 0
+          goGs n acc i = case Array.index gs i of
+            Nothing -> { n, gs: Array.fromFoldable (List.reverse acc) }
+            Just g ->
+              let
+                rg = tailQ n (g.guard vars)
+                rr = tailQ rg.n (g.rhs vars)
+              in
+                goGs rr.n ({ guard: rg.expr, rhs: rr.expr } : acc) (i + 1)
+        in
+          { n: r.n
+          , alt: { binders: map (renameBinder renames) alt.shape, result: Guarded r.gs }
+          }
 
--- | Reify into an atom position: compound values are `let`-bound at the use site.
-quoteAtom :: Sem -> (Atom -> Q Expr) -> Q Expr
-quoteAtom s k = case s of
-  SLit l -> k (AtomLit l)
-  SVar x -> k (AtomVar x)
-  SForeign f -> k (AtomForeign f)
-  SRef r | Array.null r.spine -> k r.atom
-  compound -> quoteC compound \c -> do
-    x <- freshQ
-    rest <- k (AtomVar x)
-    pure (Let x c rest)
+-- | Reify into an atom position: compound values are `let`-bound at the use site (the fresh name
+-- | is minted after the compound's own reification, before anything to its right — CPS order).
+quoteAtom :: St -> Sem -> { st :: St, atom :: Atom }
+quoteAtom st s = case s of
+  SLit l -> { st, atom: AtomLit l }
+  SVar x -> { st, atom: AtomVar x }
+  SForeign f -> { st, atom: AtomForeign f }
+  SRef r | Array.null r.spine -> { st, atom: r.atom }
+  compound ->
+    let
+      r = goSpine st compound
+      f = fresh r.st.n
+    in
+      { st: { n: f.n, pre: QLet f.name r.ce : r.st.pre }, atom: AtomVar f.name }
 
-quoteAtoms :: Array Sem -> (Array Atom -> Q Expr) -> Q Expr
-quoteAtoms ss k = go 0 []
+-- | Reify a spine of operands left to right — a tail loop, one iteration per element.
+quoteAtoms :: St -> Array Sem -> { st :: St, atoms :: Array Atom }
+quoteAtoms st0 ss = go st0 Nil 0
   where
-  go i acc = case Array.index ss i of
-    Nothing -> k acc
-    Just s -> quoteAtom s \a -> go (i + 1) (Array.snoc acc a)
+  go st acc i = case Array.index ss i of
+    Nothing -> { st, atoms: Array.fromFoldable (List.reverse acc) }
+    Just s ->
+      let
+        r = quoteAtom st s
+      in
+        go r.st (r.atom : acc) (i + 1)
 
 -- | Rename a binder shape's variables with the alternative's fresh-name map (total on
 -- | `binderVarsOrdered`, so the fallback branch is unreachable for well-formed alternatives).

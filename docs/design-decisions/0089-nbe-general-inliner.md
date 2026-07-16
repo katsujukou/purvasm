@@ -890,9 +890,54 @@ accepted cost of the revert: `monadStateStateT`-class builders whose dict parame
 passed through* (`projected == 0`) qualify for neither the strict 64-tier nor the known-arg tier,
 so the `get`/`put` machinery de-fuses while the S8 grouped `bind`/`pure` fusion survives.
 Recovering it cleanly is future work (candidates: a pass-through-aware tier with its own
-blow-up argument, or specialisation). The default-stack self-compile still crashes in the
+blow-up argument, or specialisation). ~~The default-stack self-compile still crashes in the
 bytecode lowering even at ×2.7 module growth — confirming the stack-safety item is real and
-independent; the leg's documented-headroom posture stands.
+independent; the leg's documented-headroom posture stands.~~
+> **Progress (2026-07-16):** the stack-safety item is **closed** (a maintainer-authorized
+> bugfix, no ADR): `Normalize` (a host-stack CPS — one frame chain per array element /
+> let-spine entry; the measured killer was `Regex.Core.Unicode`'s 1,290-element table under
+> the post-0087 driver's base stack) and the `Lower.Match` assembler (a `State` bind chain —
+> one live JS frame per emitted pseudo-instruction; died on `PureScript.CST.Parser`-scale
+> bodies) were both rewritten to explicit state threading with tail loops over every
+> data-sized spine. Output-preserving, verified: 294 unchanged-source modules byte-identical
+> on the LLVM path (`--no-opt` and `--opt`), 308/308 `.pmo`/`.pmi` byte-identical against the
+> pre-fix compiler on a bench closure, 388/388 unit (incl. new default-stack 100k-spine
+> regression fixtures) + 11/11 E2E. The self-compile leg now runs on the **default** node
+> stack — the completion assert this note promised — and `run-benchmarks.sh` dropped its
+> `--stack-size` headroom.
+>
+> **Progress (2026-07-16, the class-wide sweep):** a maintainer-directed margin hunt
+> (stage-isolated probes at shrinking `--stack-size`, attribution from the repeating frames of
+> an in-catch deep trace) found and killed the two remaining **data-sized** members of the
+> class: **`Nbe.Quote`** (the same CPS shape as the retired `Normalize` walk, its own comment's
+> deferred hardening cashed in — prefix-accumulator + `goSpine` tail loop, one `$q`-order-exact
+> rewrite; was the whole `--opt`/VM pipelines' thinnest point at ~0.5× the default stack) and
+> **`LLVM.Emit`'s `evalAtoms` + `argBuffer`** (per-operand `State` steps are live host frames
+> regardless of `tailRecM` elsewhere in the module — both now `tailRecM` loops, and
+> `evalAtoms`' per-element `any`-over-suffix, quadratic in array length, became a suffix scan
+> with identical semantics). The implementation review then extended the closure to **every
+> width-sized monadic spine in the LLVM backend**, not only the two that crashed: `Monad`
+> gained the shared stack-safe combinators (`forA`/`forA_`/`forWithIndexA`/`foldA` — `tailRecM`
+> loops; `StateT`'s `tailRecM` is flat, but any per-element `traverse`/`foldM`/`for_` outside
+> it is a live frame per element), and every `Emit`/`Program` traversal over operands, call
+> arities, captures, recursive-group members, case arms/extracts, parameters, and module
+> binding counts moved onto them (the `Data.Traversable`/`Data.Foldable` combinators remain
+> only on genuinely bounded spans). `Lower.Match` gained the direct regression its crash path
+> deserved: a stub `Lowerers` feeding a 50k-instruction leaf body through `compileTree` on the
+> default stack. Verified the same way: all unchanged-source modules byte-identical on both
+> LLVM modes; 308/308 bench-closure `.pmo` identical on the `--opt` VM path (a pure
+> Quote-identity check — no compiler source in that closure); **403/403 unit** (default-stack
+> fixtures: 100k/50k spines through Normalize, a 50k-operand array through the `--opt` seam, a
+> 20k-operand array through the emission path, a 50k-instruction body through the Match
+> assembler, and the shared combinators' own contract — left-to-right effect/result order,
+> indices, `foldl` direction, empty spine, and a 200k-element default-stack run) + 11/11 E2E. **Post-sweep margins** (full pipelines at reduced `--stack-size`,
+> default ≈ 984): `--no-opt` build, `--opt` build, and the VM self-compile all complete at
+> **300** (≥3× headroom; previously the builds died at 700 and `--opt` at 500 stage-isolated).
+> The remaining consumers are *nesting-bounded or measured*: the deepest is the CoreFn JSON
+> decoder (`PureScript.CoreFn.Decode`, recursion ∝ expression nesting; the corpus's deepest
+> module needs ~200–250 KB ≈ 4–5× headroom), NbE `Eval` is probed safe to 100k-element operands
+> at the default stack, and `MatchCompile`'s matrix recursion survives the bytecode-lower stage
+> probe at 150 (≥6×) — recorded here as measured margins, not rewritten.
 
 ## Engine status (2026-07-12): complete, reconciled divergences, and the future-work index
 

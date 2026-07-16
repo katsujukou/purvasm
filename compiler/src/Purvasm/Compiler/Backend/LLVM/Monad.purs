@@ -31,14 +31,20 @@ module Purvasm.Compiler.Backend.LLVM.Monad
   , setFrame
   , renderBuffer
   , renderChunks
+  , forA
+  , forA_
+  , forWithIndexA
+  , foldA
   ) where
 
 import Prelude
 
+import Control.Monad.Rec.Class (Step(..), tailRecM)
 import Control.Monad.State (State, execState, runState)
 import Control.Monad.State.Class (modify_, state)
 import Data.Array as Array
 import Data.List (List(..), (:))
+import Data.List as List
 import Data.Map (Map)
 import Data.Map as Map
 import Data.Maybe (Maybe(..))
@@ -78,7 +84,9 @@ type Ctx =
 
 -- | The emitter monad: a pure `State` over `Ctx`. `State` is `MonadRec`, so the deep linear spines
 -- | (`Let` chains, the `pending` drain, multi-operand folds) stay stack-safe when written with
--- | `tailRecM`/`foldM`.
+-- | `tailRecM` or the [`forA`]/[`foldA`] family below — and **only** then: a sequenced
+-- | `Data.Foldable.foldM`/`Data.Traversable.traverse` step is a live host frame per element
+-- | (2026-07-16 stack-safety bugfix; see the combinators' doc).
 type Codegen = State Ctx
 
 -- | The three knobs boot's `make_cx` takes; the rest of `Ctx` starts empty/zero.
@@ -172,6 +180,41 @@ getFrame = state \c -> Tuple c.frame c
 -- | Set the current function's frame handle operand.
 setFrame :: String -> Codegen Unit
 setFrame f = modify_ \c -> c { frame = f }
+
+-- | Stack-safe per-element sequencing for **data-sized** spines (2026-07-16 stack-safety bugfix):
+-- | a sequenced `State` step is a live host frame on the JS backend even inside a right-nested
+-- | `do`, so `Data.Traversable.traverse`/`Data.Foldable.foldM` over anything whose length grows
+-- | with the source — operand lists, arities, captures, recursive-group widths, case arms, module
+-- | binding counts — stacks one frame per element. These `tailRecM` loops do not (`StateT`'s
+-- | `tailRecM` delegates to the base monad's flat loop). Element order is left to right, exactly
+-- | `traverse`'s. Use the standard combinators only for genuinely bounded spans.
+forA :: forall a b. Array a -> (a -> Codegen b) -> Codegen (Array b)
+forA xs f = tailRecM go { i: 0, acc: Nil }
+  where
+  go st = case Array.index xs st.i of
+    Nothing -> pure (Done (Array.fromFoldable (List.reverse st.acc)))
+    Just x -> f x <#> \b -> Loop { i: st.i + 1, acc: b : st.acc }
+
+forA_ :: forall a b. Array a -> (a -> Codegen b) -> Codegen Unit
+forA_ xs f = tailRecM go 0
+  where
+  go i = case Array.index xs i of
+    Nothing -> pure (Done unit)
+    Just x -> f x $> Loop (i + 1)
+
+forWithIndexA :: forall a b. Array a -> (Int -> a -> Codegen b) -> Codegen (Array b)
+forWithIndexA xs f = tailRecM go { i: 0, acc: Nil }
+  where
+  go st = case Array.index xs st.i of
+    Nothing -> pure (Done (Array.fromFoldable (List.reverse st.acc)))
+    Just x -> f st.i x <#> \b -> Loop { i: st.i + 1, acc: b : st.acc }
+
+foldA :: forall a b. (b -> a -> Codegen b) -> b -> Array a -> Codegen b
+foldA f z xs = tailRecM go { i: 0, acc: z }
+  where
+  go st = case Array.index xs st.i of
+    Nothing -> pure (Done st.acc)
+    Just x -> f st.acc x <#> \acc -> Loop { i: st.i + 1, acc }
 
 -- | Render a reversed **line** buffer (the `fn` body): every line followed by `"\n"`, byte-for-byte
 -- | with boot's `Buffer.contents` (an empty buffer renders `""`). A single `joinWith` keeps it O(n).

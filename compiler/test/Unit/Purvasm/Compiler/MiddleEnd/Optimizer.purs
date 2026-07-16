@@ -78,6 +78,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
   backstopSpec
   quarantineSpec
   specializeRetrySpec
+  optStackSafetySpec
   describe "optimizeModule" do
     it "collapses a locally-known method call to its folded constant in one pass (DictElim then NbE)" do
       let
@@ -669,3 +670,23 @@ specializeRetrySpec = describe "quarantine × Specialize (real body-rewrite inva
     Set.isEmpty (specRefsOf bigBodyR1) `shouldEqual` false
     -- round 2: the pre-NbE input no longer matches the record (body inequality) — retry fires.
     firedKeys r2.events `shouldEqual` [ "TS.big" ]
+
+-- --- stack safety on the --opt seam (2026-07-16 bugfix; mirrors the Normalize fixtures) ----------
+
+optStackSafetySpec :: Spec Unit
+optStackSafetySpec = describe "stack safety (--opt seam over data-sized spines)" do
+  it "optimises a 50k-element array-literal CAF on the default host stack (Eval + Quote)" do
+    -- the Quote CPS stacked one frame per operand before the 2026-07-16 rewrite; this runs under
+    -- the test runner's default stack, so a stack-unsafe regression fails with a RangeError.
+    let
+      am :: AnfModule
+      am =
+        { name: "Test.Big"
+        , decls:
+            [ nonrec "Test.Big.arr" (Ret (CArray (Array.replicate 50000 (AtomLit (LInt 1))))) ]
+        }
+      r = optimizeModule emptyBuildEnv (localFactsOf emptyBuildEnv am) emptyQuarantine am
+      len = case map (\(_ /\ e) -> e) (Array.head (Array.concatMap _.members r.module.decls)) of
+        Just (Ret (CArray es)) -> Array.length es
+        _ -> -1
+    len `shouldEqual` 50000
