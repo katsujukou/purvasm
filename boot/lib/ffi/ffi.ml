@@ -631,6 +631,40 @@ let guest_argv : string array ref = ref Sys.argv
     evaluation starts. *)
 let set_guest_argv (argv : string array) : unit = guest_argv := argv
 
+(* UTF-8 code-point walking for the ADR-0103 bulk string leaves — the exact semantic mirrors of
+   the native runtime's helpers (`runtime/src/gc.rs`): same sequence-length table, same clamping,
+   same boundary rule. Valid UTF-8 is the `String` invariant on every backend (ADR-0006). *)
+let utf8_seq_len b =
+  if b <= 0x7f
+  then 1
+  else if b >= 0xc0 && b <= 0xdf
+  then 2
+  else if b >= 0xe0 && b <= 0xef
+  then 3
+  else 4
+
+let utf8_boundary s i = i = String.length s || Char.code s.[i] land 0xc0 <> 0x80
+
+(* Walk at most [k] code points from the front: [(byte_offset_reached, consumed)]. *)
+let utf8_cp_walk s k =
+  let n = String.length s in
+  let rec go i c =
+    if c >= k || i >= n then i, c else go (i + utf8_seq_len (Char.code s.[i])) (c + 1)
+  in
+  go 0 0
+
+let utf8_decode s i =
+  let b j = Char.code s.[i + j] in
+  match utf8_seq_len (b 0) with
+  | 1 -> b 0
+  | 2 -> ((b 0 land 0x1f) lsl 6) lor (b 1 land 0x3f)
+  | 3 -> ((b 0 land 0x0f) lsl 12) lor ((b 1 land 0x3f) lsl 6) lor (b 2 land 0x3f)
+  | _ ->
+    ((b 0 land 0x07) lsl 18)
+    lor ((b 1 land 0x3f) lsl 12)
+    lor ((b 2 land 0x3f) lsl 6)
+    lor (b 3 land 0x3f)
+
 let host : Cesk.Machine.host =
   let unary (f : V.t -> V.t) =
     ( 1
@@ -790,6 +824,119 @@ let host : Cesk.Machine.host =
               Bytes.unsafe_set (Bytes.unsafe_of_string s) i (Char.chr (b land 0xff));
               V.VString s
             | _ -> Cesk.Errors.stuck "unsafeSetByte: ill-typed arguments" )
+    (* The ADR-0103 bulk string surface — the CESK/VM parity mirrors of the native runtime's
+       bounded-retention / borrowed-byte leaves. Boot has no view representation (an OCaml
+       substring is already a cheap copy), so these are *semantic* mirrors: same clamping, same
+       `-1` signals, same UTF-8 code-point walks — observably identical by the differential. A
+       host-registry leaf addition under the post-0079 freeze's Level-2+-blocking exception
+       (ADR-0103 Context; ADR-0104 §1's scoped-freeze carve-out). *)
+    | "Purvasm.String.byteSlice" ->
+      Some
+        ( 3
+        , fun args ->
+            match args with
+            | [ V.VInt from; V.VInt to_; V.VString s ] ->
+              let len = String.length s in
+              if not (0 <= from && from <= to_ && to_ <= len)
+              then Cesk.Errors.stuck "byteSlice: range out of bounds"
+              else if not (utf8_boundary s from && utf8_boundary s to_)
+              then
+                Cesk.Errors.stuck "byteSlice: endpoint not on a UTF-8 code-point boundary"
+              else V.VString (String.sub s from (to_ - from))
+            | _ -> Cesk.Errors.stuck "byteSlice: ill-typed arguments" )
+    | "Purvasm.String.dropCodePoints" ->
+      Some
+        ( 2
+        , fun args ->
+            match args with
+            | [ V.VInt k; V.VString s ] ->
+              let o, _ = utf8_cp_walk s (max k 0) in
+              V.VString (String.sub s o (String.length s - o))
+            | _ -> Cesk.Errors.stuck "dropCodePoints: ill-typed arguments" )
+    | "Purvasm.String.takeCodePoints" ->
+      Some
+        ( 2
+        , fun args ->
+            match args with
+            | [ V.VInt k; V.VString s ] ->
+              let o, _ = utf8_cp_walk s (max k 0) in
+              V.VString (String.sub s 0 o)
+            | _ -> Cesk.Errors.stuck "takeCodePoints: ill-typed arguments" )
+    | "Purvasm.String.codePointLength" ->
+      Some
+        (unary (function
+           | V.VString s -> V.VInt (snd (utf8_cp_walk s max_int))
+           | _ -> Cesk.Errors.stuck "codePointLength: not a String"))
+    | "Purvasm.String.codePointAt" ->
+      Some
+        ( 2
+        , fun args ->
+            match args with
+            | [ V.VInt i; V.VString s ] ->
+              if i < 0
+              then V.VInt (-1)
+              else (
+                let o, c = utf8_cp_walk s i in
+                if c < i || o >= String.length s
+                then V.VInt (-1)
+                else V.VInt (utf8_decode s o))
+            | _ -> Cesk.Errors.stuck "codePointAt: ill-typed arguments" )
+    | "Purvasm.String.byteIndexOf" ->
+      Some
+        ( 3
+        , fun args ->
+            match args with
+            | [ V.VString hay; V.VString needle; V.VInt from ] ->
+              let hn = String.length hay
+              and nn = String.length needle in
+              let rec go i =
+                if i + nn > hn
+                then -1
+                else if String.sub hay i nn = needle
+                then i
+                else go (i + 1)
+              in
+              V.VInt (go (max from 0))
+            | _ -> Cesk.Errors.stuck "byteIndexOf: ill-typed arguments" )
+    | "Purvasm.String.byteLastIndexOf" ->
+      Some
+        ( 3
+        , fun args ->
+            match args with
+            | [ V.VString hay; V.VString needle; V.VInt from ] ->
+              let hn = String.length hay
+              and nn = String.length needle in
+              if nn > hn
+              then V.VInt (-1)
+              else (
+                let rec go i =
+                  if i < 0
+                  then -1
+                  else if String.sub hay i nn = needle
+                  then i
+                  else go (i - 1)
+                in
+                V.VInt (go (min (max from 0) (hn - nn))))
+            | _ -> Cesk.Errors.stuck "byteLastIndexOf: ill-typed arguments" )
+    | "Purvasm.String.compareBytes" ->
+      Some
+        ( 2
+        , fun args ->
+            match args with
+            | [ V.VString a; V.VString b ] -> V.VInt (compare (String.compare a b) 0)
+            | _ -> Cesk.Errors.stuck "compareBytes: ill-typed arguments" )
+    | "Purvasm.String.appendBulk" ->
+      Some
+        ( 2
+        , fun args ->
+            match args with
+            | [ V.VString a; V.VString b ] -> V.VString (a ^ b)
+            | _ -> Cesk.Errors.stuck "appendBulk: ill-typed arguments" )
+    | "Purvasm.String.materialize" ->
+      Some
+        (unary (function
+           | V.VString s -> V.VString s
+           | _ -> Cesk.Errors.stuck "materialize: not a String"))
     (* Host-system leaves (ADR-0022/0056): file IO (`purvasm-fs`, `Purvasm.FS.*`) and
        process/environment (`purvasm-system`, `Purvasm.System.*`). Each returns an `Effect`
        thunk that performs the IO when forced (the `Console.log` shape). *)

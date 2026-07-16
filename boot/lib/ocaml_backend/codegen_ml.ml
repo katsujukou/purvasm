@@ -169,6 +169,33 @@ let rec mkdir_p d =
   if d = "" || d = "." || d = "/" || Sys.file_exists d then ()
   else (mkdir_p (Filename.dirname d); (try Sys.mkdir d 0o755 with _ -> ()))
 
+(* UTF-8 walking for the ADR-0103 bulk string leaves — faithful copies of `Ffi`'s helpers
+   (the differential enforces parity), which in turn mirror `runtime/src/gc.rs`. *)
+let utf8_seq_len b =
+  if b <= 0x7f then 1
+  else if b >= 0xc0 && b <= 0xdf then 2
+  else if b >= 0xe0 && b <= 0xef then 3
+  else 4
+let utf8_boundary s i = i = String.length s || Char.code s.[i] land 0xc0 <> 0x80
+(* Walk at most [k] code points from the front: [(byte_offset_reached, consumed)]. *)
+let utf8_cp_walk s k =
+  let n = String.length s in
+  let rec go i c =
+    if c >= k || i >= n then i, c else go (i + utf8_seq_len (Char.code s.[i])) (c + 1)
+  in
+  go 0 0
+let utf8_decode s i =
+  let b j = Char.code s.[i + j] in
+  match utf8_seq_len (b 0) with
+  | 1 -> b 0
+  | 2 -> ((b 0 land 0x1f) lsl 6) lor (b 1 land 0x3f)
+  | 3 -> ((b 0 land 0x0f) lsl 12) lor ((b 1 land 0x3f) lsl 6) lor (b 2 land 0x3f)
+  | _ ->
+    ((b 0 land 0x07) lsl 18)
+    lor ((b 1 land 0x3f) lsl 12)
+    lor ((b 2 land 0x3f) lsl 6)
+    lor (b 3 land 0x3f)
+
 let foreign = function
   | "Data.Show.showIntImpl" -> VClos (fun v -> VString (string_of_int (as_int v)))
   | "Data.Show.showStringImpl" -> VClos (fun v -> VString (show_string_impl (as_str v)))
@@ -193,6 +220,59 @@ let foreign = function
       let str = as_str s in
       Bytes.unsafe_set (Bytes.unsafe_of_string str) (as_int i) (Char.chr (as_int b land 0xff));
       VString str)))
+  (* The ADR-0103 bulk string leaves; mirror `Ffi.host` (and the native runtime) exactly —
+     same clamps, same `-1` signals, same faults — the differential enforces parity. *)
+  | "Purvasm.String.byteSlice" ->
+    VClos (fun from -> VClos (fun to_ -> VClos (fun s ->
+      let s = as_str s and from = as_int from and to_ = as_int to_ in
+      let len = String.length s in
+      if not (0 <= from && from <= to_ && to_ <= len)
+      then stuck "byteSlice: range out of bounds"
+      else if not (utf8_boundary s from && utf8_boundary s to_)
+      then stuck "byteSlice: endpoint not on a UTF-8 code-point boundary"
+      else VString (String.sub s from (to_ - from)))))
+  | "Purvasm.String.dropCodePoints" ->
+    VClos (fun k -> VClos (fun s ->
+      let s = as_str s in
+      let o, _ = utf8_cp_walk s (max (as_int k) 0) in
+      VString (String.sub s o (String.length s - o))))
+  | "Purvasm.String.takeCodePoints" ->
+    VClos (fun k -> VClos (fun s ->
+      let s = as_str s in
+      let o, _ = utf8_cp_walk s (max (as_int k) 0) in
+      VString (String.sub s 0 o)))
+  | "Purvasm.String.codePointLength" ->
+    VClos (fun s -> VInt (snd (utf8_cp_walk (as_str s) max_int)))
+  | "Purvasm.String.codePointAt" ->
+    VClos (fun i -> VClos (fun s ->
+      let s = as_str s and i = as_int i in
+      if i < 0 then VInt (-1)
+      else (
+        let o, c = utf8_cp_walk s i in
+        if c < i || o >= String.length s then VInt (-1) else VInt (utf8_decode s o))))
+  | "Purvasm.String.byteIndexOf" ->
+    VClos (fun hay -> VClos (fun needle -> VClos (fun from ->
+      let hay = as_str hay and needle = as_str needle in
+      let hn = String.length hay and nn = String.length needle in
+      let rec go i =
+        if i + nn > hn then -1 else if String.sub hay i nn = needle then i else go (i + 1)
+      in
+      VInt (go (max (as_int from) 0)))))
+  | "Purvasm.String.byteLastIndexOf" ->
+    VClos (fun hay -> VClos (fun needle -> VClos (fun from ->
+      let hay = as_str hay and needle = as_str needle in
+      let hn = String.length hay and nn = String.length needle in
+      if nn > hn then VInt (-1)
+      else (
+        let rec go i =
+          if i < 0 then -1 else if String.sub hay i nn = needle then i else go (i - 1)
+        in
+        VInt (go (min (max (as_int from) 0) (hn - nn)))))))
+  | "Purvasm.String.compareBytes" ->
+    VClos (fun a -> VClos (fun b -> VInt (compare (String.compare (as_str a) (as_str b)) 0)))
+  | "Purvasm.String.appendBulk" ->
+    VClos (fun a -> VClos (fun b -> VString (as_str a ^ as_str b)))
+  | "Purvasm.String.materialize" -> VClos (fun s -> VString (as_str s))
   (* `Data.Number` math family as native leaves (ADR-0042); mirror `Ffi.host`. *)
   | "Data.Number.abs" -> VClos (fun v -> VNumber (Float.abs (as_num v)))
   | "Data.Number.floor" -> VClos (fun v -> VNumber (Float.floor (as_num v)))
