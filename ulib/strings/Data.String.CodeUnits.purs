@@ -40,7 +40,7 @@ module Data.String.CodeUnits
 import Prelude
 
 import Data.Maybe (Maybe(..), isJust)
-import Data.String.Internal.Utf8 (byteIndexOf, byteLastIndexOf, byteOffsetOfCp, cpIndexOfByteOffset, decodeAt, nextOffset, putCp, sliceBytes, utf8Len)
+import Data.String.Internal.Utf8 (byteIndexOf, byteLastIndexOf, byteOffsetOfCp, cpIndexOfByteOffset, decodeAt, putCp, sliceBytes, utf8Len)
 import Data.String.Pattern (Pattern(..))
 import Purvasm.Array as PA
 import Purvasm.Char as PC
@@ -129,16 +129,10 @@ charAt = _charAt Just Nothing
 
 _charAt :: (forall a. a -> Maybe a) -> (forall a. Maybe a) -> Int -> String -> Maybe Char
 _charAt just nothing i s =
-  if i < 0 then nothing else go 0 0
-  where
-  n = PS.byteLength s
-  go o k =
-    if o >= n then nothing
-    else
-      let
-        d = decodeAt s o
-      in
-        if k == i then just (PC.fromCodePoint d.cp) else go d.next (k + 1)
+  let
+    cp = PS.codePointAt i s
+  in
+    if cp < 0 then nothing else just (PC.fromCodePoint cp)
 
 -- | Converts the string to a character, if the length of the string is
 -- | exactly `1`.
@@ -163,10 +157,7 @@ uncons s = case charAt 0 s of
 
 -- | Returns the number of characters the string is composed of.
 length :: String -> Int
-length s = go 0 0
-  where
-  n = PS.byteLength s
-  go o k = if o >= n then k else go (nextOffset s o) (k + 1)
+length = PS.codePointLength
 
 -- | Returns the number of contiguous characters at the beginning
 -- | of the string for which the predicate holds.
@@ -236,7 +227,7 @@ _lastIndexOfStartingAt just nothing (Pattern x) startAt s =
 
 -- | Returns the first `n` characters of the string.
 take :: Int -> String -> String
-take n s = sliceBytes s 0 (byteOffsetOfCp s n)
+take = PS.takeCodePoints
 
 -- | Returns the last `n` characters of the string.
 takeRight :: Int -> String -> String
@@ -249,7 +240,7 @@ takeWhile p s = take (countPrefix p s) s
 
 -- | Returns the string without the first `n` characters.
 drop :: Int -> String -> String
-drop n s = sliceBytes s (byteOffsetOfCp s n) (PS.byteLength s)
+drop = PS.dropCodePoints
 
 -- | Returns the string without the last `n` characters.
 dropRight :: Int -> String -> String

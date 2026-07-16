@@ -8,6 +8,12 @@
 -- | Euclidean intrinsics, so on the non-negative byte / code-point values here they are plain
 -- | remainder / quotient. Everything operates on raw `Int` code points and byte offsets over the
 -- | byte-level `Purvasm.String` primitives — no `Char`, so the dependency surface is just `Purvasm.String`.
+-- |
+-- | The whole-string walks (slice / search / index↔offset conversion) delegate to the ADR-0103 bulk
+-- | leaves — one leaf call instead of one `byteAt` apply per byte, which is what made the guest-loop
+-- | versions the dominant compile-time cost (sidenote-0017). Only the per-code-point codec
+-- | (`decodeAt` / `putCp` / `utf8Len`) and the offset stepping stay guest loops: they are used by
+-- | callers that interleave decoding with per-character predicates, where no bulk leaf applies.
 module Data.String.Internal.Utf8
   ( byteLenOfLead
   , nextOffset
@@ -77,41 +83,25 @@ putCp s o cp =
 
 -- | The byte offset of the `i`-th code point, clamped: `i <= 0` → `0`, `i >= length` → `byteLength`.
 byteOffsetOfCp :: String -> Int -> Int
-byteOffsetOfCp s i = go 0 0
-  where
-  n = PS.byteLength s
-  go o k = if k >= i || o >= n then o else go (nextOffset s o) (k + 1)
+byteOffsetOfCp s i = PS.byteLength (PS.takeCodePoints i s)
 
--- | The code-point index of the byte offset `b` (assumed a code-point boundary, which a UTF-8
+-- | The code-point index of the byte offset `b` (which must be a code-point boundary, which a UTF-8
 -- | substring match always is) — the number of code points before it.
 cpIndexOfByteOffset :: String -> Int -> Int
-cpIndexOfByteOffset s b = go 0 0
-  where
-  go o k = if o >= b then k else go (nextOffset s o) (k + 1)
+cpIndexOfByteOffset s b = PS.codePointLength (PS.byteSlice 0 b s)
 
--- | Copy the bytes `[from, to)` of `s` into a fresh string (empty if `to <= from`).
+-- | Copy the bytes `[from, to)` of `s` (empty if `to <= from`). Both offsets must be code-point
+-- | boundaries within the string — `Purvasm.String.byteSlice` faults otherwise (every in-tree
+-- | caller passes offsets produced by a boundary walk or a substring match, which satisfy this).
 sliceBytes :: String -> Int -> Int -> String
-sliceBytes s from to =
-  if to <= from then PS.unsafeNew 0
-  else go from 0 (PS.unsafeNew (to - from))
-  where
-  go i j out = if i >= to then out else go (i + 1) (j + 1) (PS.unsafeSetByte out j (PS.byteAt s i))
+sliceBytes s from to = if to <= from then "" else PS.byteSlice from to s
 
 -- | The first byte offset `>= from` at which `needle`'s bytes occur in `hay`, or `-1`. UTF-8 is
 -- | self-synchronizing, so a byte match of a valid needle always begins on a code-point boundary.
 byteIndexOf :: String -> String -> Int -> Int
-byteIndexOf hay needle from = go from
-  where
-  hn = PS.byteLength hay
-  nn = PS.byteLength needle
-  matchAt i j = if j >= nn then true else if PS.byteAt hay (i + j) == PS.byteAt needle j then matchAt i (j + 1) else false
-  go i = if i + nn > hn then -1 else if matchAt i 0 then i else go (i + 1)
+byteIndexOf = PS.byteIndexOf
 
--- | The last byte offset `<= fromByte` at which `needle` occurs in `hay`, or `-1`.
+-- | The last byte offset `<= fromByte` at which `needle` occurs in `hay`, or `-1`. A negative
+-- | `fromByte` is clamped to `0` (so an empty needle still matches at offset `0`).
 byteLastIndexOf :: String -> String -> Int -> Int
-byteLastIndexOf hay needle fromByte = go (min fromByte (hn - nn))
-  where
-  hn = PS.byteLength hay
-  nn = PS.byteLength needle
-  matchAt i j = if j >= nn then true else if PS.byteAt hay (i + j) == PS.byteAt needle j then matchAt i (j + 1) else false
-  go i = if i < 0 then -1 else if matchAt i 0 then i else go (i - 1)
+byteLastIndexOf = PS.byteLastIndexOf
