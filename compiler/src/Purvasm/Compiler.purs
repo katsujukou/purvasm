@@ -37,7 +37,7 @@ import Prelude
 
 import Data.Array as Array
 import Data.Either (Either(..))
-import Data.Foldable (foldM, foldl)
+import Data.Foldable (foldM, foldl, traverse_)
 import Data.List (List(..), (:))
 import Data.List as List
 import Data.Map (Map)
@@ -56,6 +56,7 @@ import Purvasm.Compiler.MiddleEnd.Module (AnfModule, declsOfModule)
 import Purvasm.Compiler.MiddleEnd.Normalize (normalize)
 import Purvasm.Compiler.MiddleEnd.Optimizer (BuildEnv, emptyBuildEnv, extendSummary, localFactsOf, publishedForeignSigs, withForeignSigs)
 import Purvasm.Compiler.MiddleEnd.Optimizer as Optimizer
+import Purvasm.Compiler.MiddleEnd.Optimizer.Quarantine (RejectionEvent(..), emptyQuarantine)
 
 -- | A module's dotted name (the `loadModule` key).
 type ModuleName = String
@@ -201,6 +202,11 @@ type CompilerActionHooks m =
   , onEnterOptimizeIter :: AnfModule -> m Unit
   , onContinueOptimizeIter :: Int -> AnfModule -> m Unit
   , onLeaveOptimizeIter :: AnfModule -> m Unit
+  -- | A round-growth backstop rejection (ADR-0089 Addendum 2026-07-16): one `BackstopFired` per
+  -- | newly recorded rejection as the rounds run, and one `BackstopSummary` (attempts vs distinct
+  -- | bindings) before `onLeaveOptimizeIter` when anything fired. The host's warning sink lives
+  -- | here — the optimiser seam is pure and never logs.
+  , onOptimizerBackstop :: RejectionEvent -> m Unit
   , onBeforeCodegen :: AnfModule -> m Unit
   , onCodegenFailed :: String -> m Unit
   , onCleanUp :: ModuleName -> m Unit
@@ -216,6 +222,7 @@ defaultHooks =
   , onEnterOptimizeIter: noop
   , onContinueOptimizeIter: noop2
   , onLeaveOptimizeIter: noop
+  , onOptimizerBackstop: noop
   , onBeforeCodegen: noop
   , onCodegenFailed: noop
   , onCleanUp: noop
@@ -401,20 +408,44 @@ build backend action opts =
           )
 
   -- Iterate `optimizeModule` to a fixpoint (ADR-0087 owns the iteration; the seam is a pure step returning
-  -- `{ module, summary }`). Plain recursion — so `m` needs only `Monad` (ADR-0087's boundary), no
-  -- `MonadRec`: the depth is a small config cap, not the module count. It stops **on convergence** (a round
-  -- leaves the module unchanged — `AnfModule` has structural `Eq`) or, as a non-termination backstop, at
-  -- `maxOptimizeIter`. Today's only pass (`DictElim`) is idempotent, so a module with no static dispatch
-  -- converges in one round. Returns the last pass's `{ module, summary }`.
+  -- `{ module, summary, quarantine, events }`). Plain recursion — so `m` needs only `Monad` (ADR-0087's
+  -- boundary), no `MonadRec`: the depth is a small config cap, not the module count. It stops **on
+  -- convergence** (a round leaves the module unchanged — `AnfModule` has structural `Eq`) or, as a
+  -- non-termination backstop, at `maxOptimizeIter`. Returns the last pass's `{ module, summary }`.
   -- `lf` is supplied by the caller (with the module's own foreign shapes injected, ADR-0090 §3), and
   -- `env` carries the dependency dict machinery + foreign shapes.
+  --
+  -- Sticky backstop quarantine (ADR-0089 Addendum 2026-07-16): the driver owns the quarantine's
+  -- *lifetime* only — created empty here (before `onEnterOptimizeIter`), threaded opaquely through
+  -- the rounds, gone when this module's fixpoint returns (never cross-module, never persisted).
+  -- Each round's `RejectionEvent`s are dispatched to `onOptimizerBackstop` as they arrive; the
+  -- final counts go through the same hook as a `BackstopSummary` (the Addendum's named option),
+  -- only when something fired. `rejectionAttempts` counts NbE runs that tripped (a quarantined
+  -- skip produces no event, so it is not an attempt); `distinctBindings` counts unique keys.
   runOptimizer env lf am = do
     action.hooks.onEnterOptimizeIter am
     let
-      go n prev = do
-        let next = Optimizer.optimizeModule env lf prev
-        if next.module == prev || n + 1 >= action.maxOptimizeIter then
-          action.hooks.onLeaveOptimizeIter next.module $> next
+      firedKey = case _ of
+        BackstopFired r -> Just r.key
+        BackstopSummary _ -> Nothing
+      go n st prev = do
+        let next = Optimizer.optimizeModule env lf st.quarantine prev
+        traverse_ action.hooks.onOptimizerBackstop next.events
+        let
+          -- count `BackstopFired` only: the seam currently emits nothing else, but the counter's
+          -- contract is "NbE runs that tripped", so a future summary-shaped event must not inflate it.
+          fired = Array.mapMaybe firedKey next.events
+          st' =
+            { quarantine: next.quarantine
+            , attempts: st.attempts + Array.length fired
+            , keys: Set.union st.keys (Set.fromFoldable fired)
+            }
+        if next.module == prev || n + 1 >= action.maxOptimizeIter then do
+          when (st'.attempts > 0) do
+            action.hooks.onOptimizerBackstop
+              (BackstopSummary { rejectionAttempts: st'.attempts, distinctBindings: Set.size st'.keys })
+          action.hooks.onLeaveOptimizeIter next.module
+            $> { module: next.module, summary: next.summary }
         else
-          action.hooks.onContinueOptimizeIter (n + 1) next.module *> go (n + 1) next.module
-    go 0 am
+          action.hooks.onContinueOptimizeIter (n + 1) next.module *> go (n + 1) st' next.module
+    go 0 { quarantine: emptyQuarantine, attempts: 0, keys: Set.empty } am

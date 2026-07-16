@@ -1,6 +1,6 @@
 # 0089. The NbE general inliner on the optimiser seam
 
-- Status: Accepted — extended by the **Accepted** [Addendum (2026-07-11)](#addendum-2026-07-11-slice-3--fold-guaranteed-case-of-case-distribution) (slice 3: fold-guaranteed case-of-case)
+- Status: Accepted — extended by the **Accepted** [Addendum (2026-07-11)](#addendum-2026-07-11-slice-3--fold-guaranteed-case-of-case-distribution) (slice 3: fold-guaranteed case-of-case) and the **Accepted** [Addendum (2026-07-16)](#addendum-proposed-accepted-2026-07-16-sticky-backstop-quarantine-within-the-module-fixpoint) (sticky backstop quarantine)
 - Date: 2026-07-10
 
 ## Abstract
@@ -930,3 +930,226 @@ is threshold-gated future work: the evidence that reopens it is a trace where a 
 - higher-order specialization — its own future ADR, opening with the owed purs-wasm
   `Specialize.purs` close reading (ADR-0093 §Prior art);
 - `Dbe` — the seam pipeline's named remaining slot (`Optimizer.purs` preamble).
+
+## Addendum (~~Proposed~~ Accepted, 2026-07-16): sticky backstop quarantine within the module fixpoint
+
+- Status: ~~Proposed~~ **Accepted** _(2026-07-16: accepted by the maintainer after two review rounds — the P1s resolved in round 2, the two P3s folded in round 3)_
+- Date: 2026-07-16
+
+### Context — the backstop has no memory, so it repeats the same failure
+
+The self-compile extension's round-growth backstop (Decision 3 above) is doing its correctness job:
+the inflated term is discarded, the summary and next-round input derive from the post-backstop
+module, so an inflated term neither reaches codegen nor leaks to dependents — the maintainer's
+2026-07-16 review confirmed the observed giant `.ll` modules are *not* caused by it (they are the
+`--no-opt` conservative-rooting/code-size track's problem).
+
+What the observation *did* expose is a performance defect plus a reporting ambiguity:
+
+- **The backstop is memoryless.** A binding whose NbE round output trips the cap (e.g.
+  `PureScript.CST.Parser.parseFixityOp`, input 78 → output 323 nodes against the ×4-over-256 line)
+  is retried **every driver round** of the module's fixpoint: the inflated term is fully built —
+  paying the NbE CPU and the guest allocation — and then discarded, again, on identical input. The
+  cost is `--opt`-only but real on parser-scale modules.
+- **The warning fires per attempt, not per distinct failure**, so one binding warns once per round.
+  In hindsight the Progress note's "the backstop fired **27 times** across the closure" almost
+  certainly counted *attempts*, not distinct bindings; the two must be reported separately.
+- A borderline trip like 78 → 323 (11 nodes over the line) is a *calibration* observation, but the
+  fix chosen here is deliberately **not** a threshold loosening: raising the cap trades away the
+  blow-up guarantee to silence a cost that memory removes outright.
+
+### Decision
+
+Give the backstop a memory that is scoped to the **current module's fixpoint** (never persisted,
+never cross-module):
+
+1. **The backstop becomes a pure verdict, carried as data.** `backstop` stops warning via
+   `unsafePerformEffect` inside the seam and instead yields a pure **rejection record** with
+   everything the driver-side warning and the quarantine need:
+
+   ```purescript
+   type Rejection =
+     { input :: Expr            -- the round input the backstop preserved
+     , facts :: RelevantFacts   -- what NbE could have consulted (3.)
+     , inputSize :: Int         -- for the unchanged warning format
+     , outputSize :: Int
+     }
+   ```
+
+   The seam step stays pure (ADR-0086); no logging happens inside the optimiser.
+
+2. **API boundary: the optimiser owns the quarantine's meaning; the driver owns its lifetime.**
+   > **Review pin (2026-07-16, round 2):** the generic driver must not re-implement fact
+   > projection or comparison — it cannot (it has no access to the pass-internal `early`
+   > phase, and must not grow optimiser knowledge).
+
+   The optimiser subsystem owns the types and the comparison rule: `RelevantFacts`, the opaque
+   `Quarantine`, and the skip/retry decision all live in `Optimizer.*`. `optimizeModule` takes
+   the module's current `Quarantine` and returns it updated, alongside the events:
+
+   ```purescript
+   optimizeModule :: … -> Quarantine -> AnfModule
+     -> { module :: AnfModule, summary :: BuildSummary
+        , quarantine :: Quarantine, events :: Array RejectionEvent }
+   ```
+
+   The driver threads the `Quarantine` **opaquely**, exactly for the duration of one module's
+   fixpoint — and the **driver owns that lifetime; the hooks only bracket it** (a reporting hook
+   never creates, returns, or owns optimiser state). The order, pinned: the driver creates the
+   empty `Quarantine` immediately **before** `onEnterOptimizeIter`; threads it through each
+   round; dispatches each `RejectionEvent` to the new hook (5.); reports the final counts;
+   calls `onLeaveOptimizeIter`; and lets the `Quarantine` fall out of scope — never
+   cross-module, never persisted. The seam remains a pure single step; the driver remains
+   optimiser-ignorant.
+
+3. **`RelevantFacts` — the pre-NbE phase, pinned, and structurally compared.**
+   > **Review correction (2026-07-16, round 1):** keying on the input term alone is
+   > insufficient — `nbeBinding` is a function of the body *and* the round's facts.
+   > **Review pin (round 2):** those facts are the **pre-NbE** projections built from `early`
+   > (the post-`DictElim`/post-early-`Impurify` decls), **not** the published `BuildSummary` —
+   > the summary's `inlines`/`effects` are recomputed from the post-`Specialize` `guarded`
+   > module (a later phase) and are not observationally equivalent to what NbE saw.
+
+   What is recorded, exactly:
+
+   - **candidates**: entries of `candidatesOf intrinsicPrim env.inlines early` — the same
+     projection `nbeEnvOf` consumes this round;
+   - **effects**: what the pre-NbE `effectOracle` answers — the `early`-derived own-module
+     summaries (`ownEffects`) unioned with the dependency facts (`depEffects`);
+   - restricted to the **reachable key set**: the rejected body's free variables closed
+     transitively through candidate bodies (a worklist over `fvExpr`/`cfExpr` of each reachable
+     candidate's body, with a visited set — terminating on cyclic candidate graphs). This
+     over-approximates everything an NbE unfold of this body can consult.
+
+   `BuildSummary.inlines`/`BuildSummary.effects` are **never** used for this comparison.
+
+   The record is **plain structural data** — deliberately named `RelevantFacts`, not
+   "fingerprint": skipping NbE is *licensed* by this equality, so a lossy hash collision would
+   silently suppress a valid retry. `InlineCandidate` bodies are `Expr` and `EffectFact` is
+   plain data, so structural `Eq` is available and is the comparison:
+
+   ```purescript
+   type RelevantFacts =
+     Map String { candidate :: Maybe InlineCandidate, effect :: Maybe EffectFact }
+   ```
+
+   (If a profile ever motivates hashing, a hash may only *pre-filter*: equality still requires
+   the structural comparison on a hash match.) `RelevantFacts` is computed only at rejection
+   time (the rare path), never on the healthy path.
+
+4. **Skip iff nothing NbE could see has changed; retry otherwise.** On subsequent rounds, after
+   `DictElim` + early `Impurify` have produced the binding's body, the NbE attempt is **skipped
+   iff the body is term-identical to the record's `input` *and* the round's `RelevantFacts`
+   (projected over the recorded key set) are structurally equal**; the body is then kept as-is.
+   Only the NbE attempt is quarantined — `DictElim`, `Impurify` (GER canonicalisation), and
+   `Specialize` keep running for the binding. A `Specialize`-rewritten body, a candidate that
+   appeared/changed/**disappeared** inside the reachable set, or a moved effect fact all
+   invalidate the record; the attempt runs again and the entry is refreshed (re-recorded on a
+   new trip, dropped on success). The bias is deliberate: a false *retry* only re-spends the
+   CPU the memoryless backstop spent every round, while a false *skip* silently loses an
+   optimisation — ties break toward retrying.
+
+   **Why this comparison is complete** — what varies, what is stored, what is excluded, and why
+   that closes: `RelevantFacts` stores the **exact oracle/projection answers** over the
+   reachable key set, so entries for *dependency* keys (a `depEffects` answer, an `env.inlines`
+   candidate) **may be present in the stored data** — they are simply **constant throughout the
+   module fixpoint** (`extendSummary` runs *between* modules), so they compare equal every
+   round and never trigger a retry. What is deliberately **excluded** from the record is the
+   environment that is constant for a stronger reason: the `intrinsicPrim` table and the
+   structural resolver are compiler-build constants, foreign shapes (`lf.foreignSigs` /
+   `env.foreignSigs`) are fixed per build, and a structural body cannot reference the current
+   module's sibling facts. The only **per-round-variable** inputs to `nbeBinding` are therefore
+   the module-local candidates and the own-module effect summaries — the parts of the stored
+   answer whose change can (correctly) invalidate a record.
+
+5. **A typed rejection hook; attempts and bindings counted separately.** The existing
+   `CompilerActionHooks` has no rejection event, so the surface gains one:
+
+   ```purescript
+   onOptimizerBackstop :: RejectionEvent -> m Unit
+   ```
+
+   The driver emits the (unchanged-format) warning from this hook only when a **new record is
+   written** (first trip, or a retry that trips again under changed body/facts) — never from
+   inside the optimiser. Reporting semantics, pinned: **`rejectionAttempts`** counts NbE
+   executions that actually ran and tripped the backstop (a quarantined skip is *not* an
+   attempt); **`distinctBindings`** counts unique binding keys that tripped at least once. The
+   summary line reports both; its delivery channel is fixed at implementation as one of the two
+   named options — a `Summary` variant of the same `RejectionEvent` type, or a separate
+   `onOptimizerBackstopSummary` hook — never an optimiser-side write.
+
+The blow-up guarantee is unchanged: everything derived from a round (module output, summary,
+candidates) already derives from post-backstop terms; this addendum removes only the
+rebuild-and-discard work and the duplicate warnings.
+
+### Owed with implementation (fixtures)
+
+- A tripping binding co-resident with a binding that legitimately needs 3 rounds **whose facts are
+  outside the tripping body's reachable set**: the inflation is **built once** and warned **once**,
+  while the other binding still converges (the quarantine must not force early fixpoint exit).
+- The rejected binding's final term is **term-identical** to the pre-quarantine behaviour's.
+- A `Specialize`-changed body **re-attempts** NbE (and may succeed).
+- A **changed reachable fact with an unchanged body** re-attempts — one fixture per axis:
+  a sibling **candidate body** changes; a candidate goes **`Just → Nothing`** (withdrawn from
+  publication); the candidate is unchanged but the **effect fact alone** moves. The success
+  case — the retry now passes the cap — is the assertion.
+- A changed **unreachable** fact with an unchanged body does **not** re-attempt (`RelevantFacts`
+  is restricted, not the whole env).
+- A **cyclic candidate graph** (mutually-referencing candidate bodies) — the reachable-set
+  worklist terminates.
+- Warnings are emitted **only through `onOptimizerBackstop`** — the optimiser itself never
+  writes to any sink (the `unsafePerformEffect` is gone).
+- At **`maxOptimizeIter` exhaustion** (no convergence), the final module and summary still derive
+  from the post-backstop decls.
+- Summary/candidates always derive from post-backstop terms (existing fixture, re-asserted).
+- The `PureScript.CST.Parser` real-trace expectation: warning count drops from once-per-round to
+  ≈ once-per-binding (≈ 24 → 8 on the observed trace, modulo genuine fact-changed retries), with
+  `rejectionAttempts`/`distinctBindings` reported separately.
+
+### Alternative considered (review round 1)
+
+A **final-round recheck** instead of the fingerprint: skip on body identity alone during
+intermediate rounds, then re-attempt every quarantined binding once after the rest of the module
+converges. Simpler (no fingerprint), but it still rebuilds every blow-up once more at convergence,
+a late success can re-open iteration after "convergence" (muddying the fixpoint contract), and an
+intermediate-round improvement that would have cascaded into siblings is found one round too late.
+The restricted fingerprint keeps the skip sound per round at rejection-path-only cost.
+
+#### Progress (2026-07-16): implemented and measured — artifacts byte-identical, 24 → 14 warnings
+
+Implemented as pinned: `Optimizer.Quarantine` owns `RelevantFacts`/`Quarantine`/`RejectionEvent`
+and the structural comparison (`stillRejected` re-projects over the recorded key set; the
+`FactLookups` are `Lazy`, so the healthy path never pays the projection); `optimizeModule` gained
+the `Quarantine` in/out + `events` (the in-seam `unsafePerformEffect` warning is gone); the driver
+threads the quarantine per module fixpoint and dispatches `onOptimizerBackstop` (new hook,
+`defaultHooks` no-op), synthesising the `BackstopSummary` variant at fixpoint end (the named
+same-hook option); the CLI's `irHooks` prints both on stderr, per-rejection format unchanged.
+
+Fixtures: all owed cases landed — the fire → genuine-fact-retry → skip round pattern; final-term
+identity against a memoryless-loop oracle; unreachable-fact change skips; reachable candidate
+change / candidate `Just → Nothing` (with the passing retry dropping the record) / effect-fact-only
+change all retry; the cyclic candidate graph worklist terminates. Review round 3 (implementation
+review) added the **driver-contract fixtures** over the ADR-0087 mock harness — hook dispatch
+order (`Fired`s, one `Summary` with exact attempts/distinct counts, before `onLeaveOptimizeIter`),
+Fired-only counting (a summary-shaped event can never inflate `rejectionAttempts`), per-module
+quarantine/counter lifetime, a **no-`Fired` round that still continues the fold** (the quarantine
+skips while an out-of-reachable-set 3-round chain keeps converging), and the
+**`maxOptimizeIter`-exhaustion contract**: the post-backstop module reaches codegen and the
+post-backstop summary reaches dependents through `extendSummary` (candidate and effect channels
+both observed; the inflated term itself is unobservable through a summary by construction — the
+backstop floor, 256, sits above the publish bound, 64) — plus the **real-Specialize invalidation
+fixture** (the rejected binding's kept body is rewritten to a `$spec$` call site post-NbE, and the
+body-inequality check re-attempts next round). **394/394** unit + **11/11** E2E green.
+
+Measured on the real trace (`--opt` self-compile of the 297-module compiler closure, node leg,
+same corpus both legs): **memoryless baseline 24 warnings → quarantined 14 fired across 8 distinct
+bindings** (+ one summary line `14 rejection attempt(s) across 8 distinct binding(s)`, all in
+`PureScript.CST.Parser`) — the 6 extra attempts are the anticipated genuine fact-changed retries
+(round-1 normalisation α-renames sibling candidates, so a round-2 retry is *correct*, not noise);
+skip kicks in from the stable round on. **The emitted artifacts (298 `.ll` + `.pmi`) are
+byte-identical between the two legs** — the term-preservation invariant confirmed at whole-closure
+scale, so no `--opt` gate re-baselines. Wall-clock on this JS leg is unchanged within noise
+(≈27 s both, interleaved 2×2 — the saved work is ten NbE rebuilds in one module; the saving that
+matters is guest-allocation pressure on the native leg, which sidenote 0015's conditions expose).
+The historical "fired 27 times" is hereby re-read as attempts; attempts vs distinct bindings are
+now reported separately by construction.

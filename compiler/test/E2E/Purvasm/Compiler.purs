@@ -21,6 +21,7 @@ import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..)) a
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (cfExpr, fvExpr)
 import Purvasm.Compiler.MiddleEnd.Module (declsOfModule)
 import Purvasm.Compiler.MiddleEnd.Optimizer (emptyBuildEnv, extendSummary, localFactsOf, optimizeModule)
+import Purvasm.Compiler.MiddleEnd.Optimizer.Quarantine (emptyQuarantine)
 import Purvasm.Compiler.Primitive (PrimOp(..)) as Po
 import PureScript.CoreFn.Module (Module) as CFM
 import Data.Either (Either(..))
@@ -149,13 +150,13 @@ optimizeProbe mods probes =
           let
             am = declsOfModule m
           in
-            extendSummary e (optimizeModule e (localFactsOf e am) am).summary
+            extendSummary e (optimizeModule e (localFactsOf e am) emptyQuarantine am).summary
       )
       emptyBuildEnv
       mods
     probeAm = { name: "Parity.T", decls: map (\(Tuple k e) -> { recursive: false, members: [ Tuple k e ] }) probes }
   in
-    Array.concatMap _.members (optimizeModule env (localFactsOf env probeAm) probeAm).module.decls
+    Array.concatMap _.members (optimizeModule env (localFactsOf env probeAm) emptyQuarantine probeAm).module.decls
 
 -- | Does the expression anywhere use the given primop / reference the given name?
 usesPrim :: Po.PrimOp -> A.Expr -> Boolean

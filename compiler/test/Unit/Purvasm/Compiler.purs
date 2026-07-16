@@ -36,6 +36,7 @@ import Test.Unit.Purvasm.Compiler.MiddleEnd.Optimizer.DictElim as MiddleEnd.Opti
 import Test.Unit.Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis as MiddleEnd.Optimizer.EffectAnalysis
 import Test.Unit.Purvasm.Compiler.MiddleEnd.Optimizer.Impurify as MiddleEnd.Optimizer.Impurify
 import Test.Unit.Purvasm.Compiler.MiddleEnd.Optimizer.Nbe as MiddleEnd.Optimizer.Nbe
+import Test.Unit.Purvasm.Compiler.MiddleEnd.Optimizer.Quarantine as MiddleEnd.Optimizer.Quarantine
 import Test.Unit.Purvasm.Compiler.MiddleEnd.Optimizer.Specialize as MiddleEnd.Optimizer.Specialize
 import Test.Unit.Purvasm.Compiler.Util.Fnv1a64 as Util.Fnv1a64
 import Test.Unit.Purvasm.Compiler.Util.Int64Decimal as Util.Int64Decimal
@@ -49,6 +50,7 @@ main = runSpecAndExitProcess [ consoleReporter ] do
   MiddleEnd.Optimizer.EffectAnalysis.spec
   MiddleEnd.Optimizer.Impurify.spec
   MiddleEnd.Optimizer.Nbe.spec
+  MiddleEnd.Optimizer.Quarantine.spec
   MiddleEnd.Optimizer.Specialize.spec
   MiddleEnd.Optimizer.spec
   MiddleEnd.ANF.Pretty.spec

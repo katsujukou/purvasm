@@ -18,11 +18,18 @@ import Data.Maybe (Maybe(..), fromMaybe, isJust)
 import Data.String (Pattern(..), stripPrefix)
 import Data.Tuple (Tuple(..))
 import Foreign.Object as Object
+import PureScript.CoreFn.Ann (Ann)
 import PureScript.CoreFn.Expr (Bind(..), Expr(..)) as CFE
+import PureScript.CoreFn.Literal (Literal(..)) as CFL
 import PureScript.CoreFn.Module (Module) as CF
 import PureScript.CoreFn.Names (Qualified(..)) as CFN
 import Purvasm.Compiler (Backend, BuildError(..), BuildProducts, CompilerAction, CompilerActionHooks, LoadResult(..), Options, build, defaultHooks)
 import Purvasm.Compiler.Bytecode.Artifact (interfaceFromExports)
+import Purvasm.Compiler.MiddleEnd.ANF as ANF
+import Purvasm.Compiler.MiddleEnd.Module (AnfModule, declsOfModule)
+import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (fvExpr)
+import Purvasm.Compiler.MiddleEnd.Optimizer.Quarantine (RejectionEvent(..))
+import Data.Set as Set
 import Purvasm.Compiler.CESK.Translate (nameKey)
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
@@ -111,6 +118,7 @@ diamond = Map.fromFoldable
 
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.build" do
+  backstopSpec
   describe "loadClosure contracts" do
     it "fails the build when the root entry is Missing (EntryMissing)" do
       let Tuple result _ = run Map.empty baseOptions 1
@@ -209,3 +217,233 @@ spec = describe "Purvasm.Compiler.build" do
       withPrefix "fsr:" log `shouldEqual` [ "fsr:Dep" ]
       -- …and the consumer's codegen sees the private foreign's shape.
       withPrefix "emitFile:SIGS:Main" log `shouldEqual` [ "emitFile:SIGS:Main:Dep.privImpl" ]
+
+-- --- optimizer backstop driver contract (ADR-0089 Addendum 2026-07-16) ----------------------------
+--
+-- The seam-level quarantine specs (Test.Unit….MiddleEnd.Optimizer) drive `optimizeModule` by hand;
+-- these fixtures cover the half the *driver* owns: hook dispatch order (`BackstopFired` per recorded
+-- rejection, one `BackstopSummary` with exact counts, before `onLeaveOptimizeIter`), the
+-- Fired-only counter semantics, per-module quarantine/counter lifetime, and the `maxOptimizeIter`
+-- exhaustion path still emitting the post-backstop module.
+
+bsAnn :: Ann
+bsAnn = { span: { start: { line: 0, column: 0 }, end: { line: 0, column: 0 } }, meta: Nothing }
+
+bsInt :: Int -> CFE.Expr
+bsInt = CFE.Literal bsAnn <<< CFL.LitInt
+
+bsObj :: Array (Tuple String CFE.Expr) -> CFE.Expr
+bsObj = CFE.Literal bsAnn <<< CFL.LitObject
+
+bsLVar :: String -> CFE.Expr
+bsLVar x = CFE.Var bsAnn (CFN.Qualified Nothing x)
+
+bsQVar :: String -> String -> CFE.Expr
+bsQVar m x = CFE.Var bsAnn (CFN.Qualified (Just [ m ]) x)
+
+-- | The ADR-0089 backstop blow-up shape, as CoreFn (the seam fixtures' ANF shape, one level up):
+-- | `dict = {f:1}`; `b = \d -> let w1..w12 = {k:i} in {p: d.f, w1..w12}` (a <64-node live builder,
+-- | publishable, param projected); `big` = ten saturated `b dict` calls kept live by a record tail —
+-- | each unfold re-materialises ~50 nodes, so the round output trips the ×4-over-256 cap.
+bsTripModule :: String -> CF.Module
+bsTripModule mn = (modl mn [])
+  { exports = [ "dict", "b", "big" ]
+  , decls =
+      [ CFE.NonRec bsAnn "dict" (bsObj [ Tuple "f" (bsInt 1) ])
+      , CFE.NonRec bsAnn "b" builder
+      , CFE.NonRec bsAnn "big" bigBody
+      ]
+  }
+  where
+  builder = CFE.Abs bsAnn "d"
+    ( CFE.Let bsAnn (map wBind (Array.range 1 12))
+        ( bsObj
+            ( [ Tuple "p" (CFE.Accessor bsAnn "f" (bsLVar "d")) ]
+                <> map (\i -> Tuple ("w" <> show i) (bsLVar ("w" <> show i))) (Array.range 1 12)
+            )
+        )
+    )
+
+  wBind i = CFE.NonRec bsAnn ("w" <> show i) (bsObj [ Tuple "k" (bsInt i) ])
+
+  bigBody = CFE.Let bsAnn (map rBind (Array.range 1 10))
+    (bsObj (map (\i -> Tuple ("r" <> show i) (bsLVar ("r" <> show i))) (Array.range 1 10)))
+
+  rBind i = CFE.NonRec bsAnn ("r" <> show i) (CFE.App bsAnn (bsQVar mn "b") (bsQVar mn "dict"))
+
+-- | `recHooks` plus the backstop hook, recording each event as a tagged log line.
+bsHooks :: CompilerActionHooks M
+bsHooks = recHooks
+  { onOptimizerBackstop = case _ of
+      BackstopFired r -> tell [ "bsFired:" <> r.key ]
+      BackstopSummary s ->
+        tell [ "bsSummary:" <> show s.rejectionAttempts <> ":" <> show s.distinctBindings ]
+  }
+
+runBs
+  :: Backend Unit String
+  -> Map String LoadResult
+  -> Options
+  -> Int
+  -> Tuple (Either BuildError (BuildProducts String)) (Array String)
+runBs backend table opts maxIter =
+  runWriter (build backend ((mkAction table maxIter) { hooks = bsHooks }) opts)
+
+-- | Keep only the log lines carrying one of the given tags, in order.
+taggedBy :: Array String -> Array String -> Array String
+taggedBy pfxs = Array.filter (\s -> Array.any (\p -> isJust (stripPrefix (Pattern p) s)) pfxs)
+
+-- | The `big` member of a module's ANF (the backstop-kept term the assertions compare).
+bsBigOf :: String -> AnfModule -> Maybe ANF.Expr
+bsBigOf mn m =
+  map (\(Tuple _ e) -> e)
+    (Array.find (\(Tuple k _) -> k == (mn <> ".big")) (Array.concatMap _.members m.decls))
+
+backstopSpec :: Spec Unit
+backstopSpec = describe "optimizer backstop driver contract (ADR-0089 Addendum)" do
+  bsSkipConvergeSpec
+  bsSummaryFlowsSpec
+  it "dispatches Fired per recorded rejection, one Summary with exact counts, before leaveOpt" do
+    let
+      table = Map.singleton "TQ" (loaded (bsTripModule "TQ"))
+      Tuple result log = runBs testBackend table (baseOptions { opt = true, entryModule = "TQ" }) 10
+    outcome result `shouldEqual` "Right"
+    taggedBy [ "enterOpt", "contOpt", "leaveOpt", "bs" ] log `shouldEqual`
+      [ "enterOpt:TQ"
+      , "bsFired:TQ.big" -- round 1 trips and records
+      , "contOpt:1:TQ" -- round 1 changed the module (sibling normalisation)
+      , "bsFired:TQ.big" -- round 2: the sibling candidates α-renamed ⇒ genuine-fact retry trips again
+      , "bsSummary:2:1" -- rejectionAttempts=2, distinctBindings=1, before leaveOpt
+      , "leaveOpt:TQ"
+      ]
+
+  it "resets counters and quarantine per module fixpoint (nothing persists across the fold)" do
+    let
+      table = Map.fromFoldable
+        [ Tuple "Main" (loaded (modl "Main" [ "TQ1", "TQ2" ]))
+        , Tuple "TQ1" (loaded (bsTripModule "TQ1"))
+        , Tuple "TQ2" (loaded (bsTripModule "TQ2"))
+        ]
+      Tuple result log = runBs testBackend table (baseOptions { opt = true }) 10
+    outcome result `shouldEqual` "Right"
+    -- each tripping module gets its own fresh counters — two independent 2:1 summaries…
+    withPrefix "bsSummary" log `shouldEqual` [ "bsSummary:2:1", "bsSummary:2:1" ]
+    withPrefix "bsFired" log `shouldEqual`
+      [ "bsFired:TQ1.big", "bsFired:TQ1.big", "bsFired:TQ2.big", "bsFired:TQ2.big" ]
+    -- …and the entry module's own fixpoint sees no backstop event at all.
+    let mainSeg = Array.takeWhile (_ /= "leaveOpt:Main") (Array.dropWhile (_ /= "enterOpt:Main") log)
+    withPrefix "bs" mainSeg `shouldEqual` []
+
+  it "still emits the post-backstop module when maxOptimizeIter exhausts mid-blow-up" do
+    let
+      expectedBig = bsBigOf "TQ" (declsOfModule (bsTripModule "TQ"))
+      keptBackend = testBackend
+        { lowerModule = \_ lm ->
+            "IR:" <> lm.module.name <>
+              (if bsBigOf "TQ" lm.module == expectedBig then ":bigKept" else ":bigCHANGED")
+        }
+      table = Map.singleton "TQ" (loaded (bsTripModule "TQ"))
+      Tuple result log = runBs keptBackend table (baseOptions { opt = true, entryModule = "TQ" }) 1
+    outcome result `shouldEqual` "Right"
+    -- one round only: one rejection, summary 1:1, and the kept (round-input) term reaches codegen.
+    withPrefix "bsFired" log `shouldEqual` [ "bsFired:TQ.big" ]
+    withPrefix "bsSummary" log `shouldEqual` [ "bsSummary:1:1" ]
+    Array.elem "emitFile:IR:TQ:bigKept" log `shouldEqual` true
+
+-- | The 3-changing-rounds chain (all outside `big`'s reachable set): `slowX` is a >64-node lambda
+-- | whose dead padding (24 pads, keeping it over the 64-node publish bound in round 1) drops in round 1 (published from round 2); `slowY` calls `slowX` with a
+-- | large live literal argument, so it stays >64 until the round-2 unfold collapses it (published
+-- | from round 3, its extern reference blocking the 16–63 tier before then); `slowZ` calls `slowY`
+-- | and can only unfold it in round 3. Net: the module still *changes* in round 3, after the
+-- | quarantined `big` has gone quiet — the skip-while-others-converge path.
+bsSlowChain :: String -> Array CFE.Bind
+bsSlowChain mn =
+  [ CFE.NonRec bsAnn "slowX"
+      (CFE.Abs bsAnn "a" (CFE.Let bsAnn (map deadBind (Array.range 1 24)) (bsInt 5)))
+  , CFE.NonRec bsAnn "slowY"
+      (CFE.Abs bsAnn "b" (CFE.App bsAnn (bsQVar mn "slowX") bigLiveArg))
+  , CFE.NonRec bsAnn "slowZ"
+      (CFE.Abs bsAnn "c" (CFE.App bsAnn (bsQVar mn "slowY") (bsLVar "c")))
+  ]
+  where
+  deadBind i = CFE.NonRec bsAnn ("dx" <> show i) (bsObj [ Tuple "k" (bsInt i) ])
+  bigLiveArg = bsObj (map (\i -> Tuple ("g" <> show i) (bsInt i)) (Array.range 1 24))
+
+bsSkipConvergeSpec :: Spec Unit
+bsSkipConvergeSpec =
+  it "keeps iterating while the quarantine skips: a no-Fired round still continues and converges" do
+    let
+      mod' = (bsTripModule "TW") { decls = (bsTripModule "TW").decls <> bsSlowChain "TW" }
+      table = Map.singleton "TW" (loaded mod')
+      Tuple result log = runBs testBackend table (baseOptions { opt = true, entryModule = "TW" }) 10
+    outcome result `shouldEqual` "Right"
+    taggedBy [ "enterOpt", "contOpt", "leaveOpt", "bs" ] log `shouldEqual`
+      [ "enterOpt:TW"
+      , "bsFired:TW.big" -- round 1 trips and records
+      , "contOpt:1:TW"
+      , "bsFired:TW.big" -- round 2: genuine-fact retry (siblings α-renamed); slowY also unfolds slowX
+      , "contOpt:2:TW"
+      , "contOpt:3:TW" -- round 3: big SKIPS (no Fired) while slowZ unfolds slowY — the fold continues
+      , "bsSummary:2:1" -- round 4 converges; the skipped round contributed no attempt
+      , "leaveOpt:TW"
+      ]
+
+bsSummaryFlowsSpec :: Spec Unit
+bsSummaryFlowsSpec =
+  it "the exhausted module's post-backstop summary reaches dependents (candidates and effects)" do
+    -- maxOptimizeIter = 1: TQ's fixpoint exhausts mid-blow-up, so the summary handed to
+    -- `extendSummary` is the round-1, post-backstop one. The dependent TD then proves both of its
+    -- channels: TQ.b (a candidate published by that summary) unfolds into TD.use, and TQ.pureBig
+    -- (>64, never a candidate — its *effect fact* is the only channel) lets TD.w drop a dead call.
+    -- (The inflated term itself can never be observed through the summary: the backstop floor,
+    -- 256, sits above the publish bound, 64 — so the observable contract is that the kept-term
+    -- summary flows onward, which these two channels pin.)
+    let
+      tq = (bsTripModule "TQ")
+        { decls = (bsTripModule "TQ").decls <>
+            [ CFE.NonRec bsAnn "pureBig"
+                ( CFE.Abs bsAnn "y"
+                    ( CFE.Let bsAnn (map liveBind (Array.range 1 16))
+                        ( bsObj
+                            ( [ Tuple "y" (bsLVar "y") ]
+                                <> map (\i -> Tuple ("lv" <> show i) (bsLVar ("lv" <> show i))) (Array.range 1 16)
+                            )
+                        )
+                    )
+                )
+            ]
+        }
+      liveBind i = CFE.NonRec bsAnn ("lv" <> show i) (bsObj [ Tuple "k" (bsInt i) ])
+      td = (modl "TD" [ "TQ" ])
+        { exports = [ "use", "w" ]
+        , decls =
+            [ CFE.NonRec bsAnn "use" (CFE.App bsAnn (bsQVar "TQ" "b") (bsQVar "TQ" "dict"))
+            , CFE.NonRec bsAnn "w"
+                ( CFE.Abs bsAnn "x"
+                    ( CFE.Let bsAnn
+                        [ CFE.NonRec bsAnn "dead" (CFE.App bsAnn (bsQVar "TQ" "pureBig") (bsLVar "x")) ]
+                        (bsLVar "x")
+                    )
+                )
+            ]
+        }
+      table = Map.fromFoldable [ Tuple "TQ" (loaded tq), Tuple "TD" (loaded td) ]
+      memberOf key m = map (\(Tuple _ e) -> e)
+        (Array.find (\(Tuple k _) -> k == key) (Array.concatMap _.members m.decls))
+      identityLam = ANF.Ret (ANF.CLam [ "$q1" ] (ANF.Ret (ANF.CAtom (ANF.AtomVar "$q1"))))
+      tdBackend = testBackend
+        { lowerModule = \_ lm ->
+            if lm.module.name /= "TD" then "IR:" <> lm.module.name
+            else
+              "IR:TD:use-unfolded="
+                <> show (map (\e -> Set.member "TQ.b" (fvExpr Set.empty e)) (memberOf "TD.use" lm.module) == Just false)
+                <> ":w-dropped="
+                <> show (memberOf "TD.w" lm.module == Just identityLam)
+        }
+      Tuple result log = runBs tdBackend table (baseOptions { opt = true, entryModule = "TD" }) 1
+    outcome result `shouldEqual` "Right"
+    -- TQ exhausted its single round on a rejection…
+    withPrefix "bsFired" log `shouldEqual` [ "bsFired:TQ.big" ]
+    withPrefix "bsSummary" log `shouldEqual` [ "bsSummary:1:1" ]
+    -- …and its post-backstop summary still fed both dependent channels.
+    Array.elem "emitFile:IR:TD:use-unfolded=true:w-dropped=true" log `shouldEqual` true

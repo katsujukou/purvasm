@@ -148,5 +148,7 @@ language and are kept out of version control.)
 | [0099](0099-generalized-effect-reflection-cperform.md) | Generalized effect reflection and impurification: an explicit `CPerform` run-marker and canonical `Effect`/`ST` lowering | Accepted |
 | [0101](0101-ulib-tools-unicode-gen-command.md) | `ulib-tools unicode-gen`: fetch, pin, and generate the Unicode simple-case-mapping table, replacing `gen/gen_casemap.py` | Accepted |
 | [0102](0102-runtime-v1-1-performance-baseline-for-dynamic-apply.md) | Runtime v1.1 performance baseline for dynamic apply | Accepted |
+| [0103](0103-native-string-substrate-zero-copy-slices.md) | Native String substrate: zero-copy slice views, O(1) cursor operations, and bulk borrowed-byte string primitives | Proposed |
+| [0104](0104-retire-boot-byte-identity-gate.md) | Retire the boot byte-identity gate: correctness anchors move to the behavioural oracle and the self-host fixpoint | Proposed |
 
 ## Scope

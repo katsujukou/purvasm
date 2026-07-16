@@ -12,7 +12,10 @@
 -- |     candidates for dependents. `EffectAnalysis` (ADR-0095) supplies the pass's effect-fact
 -- |     oracle; its dead-drop consumer lives inside the NbE gate (no separate `Dbe` pass).
 -- |     **Iterating this pass to a fixpoint is the build driver's job** (ADR-0087) — the seam stays a
--- |     pure single step the driver can bracket with inspection hooks.
+-- |     pure single step the driver can bracket with inspection hooks. The pass also threads the
+-- |     round-growth backstop's sticky `Quarantine` (ADR-0089 Addendum 2026-07-16): the driver hands
+-- |     it in per round and receives it updated together with the round's `RejectionEvent`s — the
+-- |     seam never logs; rejections reach the host through the driver's `onOptimizerBackstop` hook.
 -- |
 -- | This is the `--opt` path only. Under `--no-opt` the driver is the identity (ADR-0086 Addendum): it runs
 -- | **no** `DictElim` here. `DictElim` is now purely an optimiser pass; the native backend's `--no-opt`
@@ -44,9 +47,8 @@ import Data.Map as Map
 import Data.Maybe (Maybe(..))
 import Data.Set (Set)
 import Data.Set as Set
-import Data.Tuple (Tuple(..))
-import Effect.Console (warn)
-import Effect.Unsafe (unsafePerformEffect)
+import Data.Traversable (mapAccumL)
+import Data.Tuple (Tuple(..), fst, snd)
 import Purvasm.Compiler.Bytecode.Artifact (Summary)
 import Purvasm.Compiler.ForeignSig (ForeignShape)
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..))
@@ -54,8 +56,9 @@ import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (cfExpr, fvExpr)
 import Purvasm.Compiler.Ffi (intrinsicPrim)
 import Purvasm.Compiler.MiddleEnd.Module (AnfModule, Decl, declKeys, mapDeclBodies)
 import Purvasm.Compiler.MiddleEnd.Optimizer.DictElim (DictMachinery, dictElimExpr, emptyMachinery, intrinsicLift, machineryOf, mergeMachinery)
-import Data.Lazy (force)
+import Data.Lazy (defer, force)
 import Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis (EffectFact, liftShape, moduleEffects, moduleEffectsLazy)
+import Purvasm.Compiler.MiddleEnd.Optimizer.Quarantine (Quarantine, RejectionEvent(..), clearRejection, recordRejection, relevantFactsOf, stillRejected)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Impurify (effectFamilyOf, impurifyExpr)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe (candidatesOf, nbeBinding, nbeEnvOf)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Analysis (sizeExpr)
@@ -186,8 +189,17 @@ localFactsOf (BuildEnv env) am =
 -- | the DictElim'd decls each driver iteration, never stored (ADR-0086 §3 / ADR-0095 §2).
 -- |
 -- | `intrinsicLift`: safe on this path only because the NbE intrinsic saturation runs next.
-optimizeModule :: BuildEnv -> LocalFacts -> AnfModule -> { module :: AnfModule, summary :: BuildSummary }
-optimizeModule (BuildEnv env) lf am =
+optimizeModule
+  :: BuildEnv
+  -> LocalFacts
+  -> Quarantine
+  -> AnfModule
+  -> { module :: AnfModule
+     , summary :: BuildSummary
+     , quarantine :: Quarantine
+     , events :: Array RejectionEvent
+     }
+optimizeModule (BuildEnv env) lf quarantine0 am =
   let
     full = mergeMachinery lf.dict env.dict
     gkeys = Set.union lf.gkeys env.gkeys
@@ -221,8 +233,45 @@ optimizeModule (BuildEnv env) lf am =
     -- to dependents. The growth floor keeps legitimate small-binding unfolds (a 5-node CAF
     -- normalising to a 20-node lambda) out of the backstop's reach; the blow-up class it exists
     -- for sits orders of magnitude above it.
-    optimised = early <#> \d ->
-      d { members = d.members <#> \(Tuple k e) -> Tuple k (backstop k e (nbeBinding nbe effectOracle k e)) }
+    --
+    -- Sticky quarantine (ADR-0089 Addendum, 2026-07-16): a binding whose previous rejection is
+    -- still current — term-identical body AND unchanged `RelevantFacts` — skips its NbE attempt
+    -- outright instead of rebuilding and discarding the same inflation every round. `factLookups`
+    -- is the exact **pre-NbE** observation the quarantine records/compares: the same
+    -- `candidatesOf … early` projection `nbeEnvOf` consumes this round (∪ the fixpoint-constant
+    -- dependency candidates) and the pre-NbE `effectOracle` — never the published summary, which
+    -- derives from the later post-`Specialize` module. `Lazy`: the healthy path (empty
+    -- quarantine, no rejection) never pays the projection.
+    factLookups = defer \_ ->
+      let
+        cands = Map.union (candidatesOf intrinsicPrim env.inlines early) env.inlines
+      in
+        { candidate: \k -> Map.lookup k cands, effect: effectOracle }
+
+    nbeStep acc@(Tuple q evs) (Tuple k e)
+      | stillRejected factLookups k e q = { accum: acc, value: Tuple k e }
+      | otherwise =
+          let
+            out = nbeBinding nbe effectOracle k e
+            inSize = sizeExpr e
+            outSize = sizeExpr out
+          in
+            if outSize > growthFloor && outSize > roundGrowthMax * inSize then
+              { accum: Tuple
+                  (recordRejection k { input: e, facts: relevantFactsOf (force factLookups) e } q)
+                  (Array.snoc evs (BackstopFired { key: k, inputSize: inSize, outputSize: outSize }))
+              , value: Tuple k e
+              }
+            else
+              { accum: Tuple (clearRejection k q) evs, value: Tuple k out }
+
+    nbeRound = mapAccumL
+      (\acc d -> let r = mapAccumL nbeStep acc d.members in { accum: r.accum, value: d { members = r.value } })
+      (Tuple quarantine0 [])
+      early
+    optimised = nbeRound.value
+    quarantine' = fst nbeRound.accum
+    events = snd nbeRound.accum
     -- Dictionary specialization (ADR-0093): `Specialize ∘ Nbe ∘ DictElim` per round. Discovery on
     -- the (post-backstop) NbE output; emitted clones and rewritten sites become part of the
     -- module the next round (and the summary below) derive from.
@@ -259,6 +308,8 @@ optimizeModule (BuildEnv env) lf am =
             -- reused from the pre-NbE `ownEffects` this pass consumed.
             , effects: moduleEffects depEffects guarded
             }
+    , quarantine: quarantine'
+    , events
     }
 
 -- | The per-round growth cap (ADR-0089 self-compile extension): raising it needs a measured
@@ -271,29 +322,6 @@ roundGrowthMax = 4
 -- | (which pinned only the ×4), recorded in the extension's Progress note.
 growthFloor :: Int
 growthFloor = 256
-
--- | Keep the round input when a binding's round output grew past `roundGrowthMax`× (above the
--- | floor). The warning goes through `unsafePerformEffect`: the seam step is pinned pure
--- | (ADR-0086), and a fired backstop is a diagnosis-worthy event that must not vanish into a
--- | silently smaller term.
-backstop :: String -> Expr -> Expr -> Expr
-backstop key input output =
-  let
-    inSize = sizeExpr input
-    outSize = sizeExpr output
-  in
-    if outSize > growthFloor && outSize > roundGrowthMax * inSize then
-      unsafePerformEffect do
-        warn
-          ( "purvasm: optimizer round-growth backstop fired at " <> key
-              <> " (input "
-              <> show inSize
-              <> " -> output "
-              <> show outSize
-              <> " nodes); keeping the round input"
-          )
-        pure input
-    else output
 
 -- | Fold a just-compiled module's summary into the build env, so its dependents' phases see it.
 extendSummary :: BuildEnv -> BuildSummary -> BuildEnv
