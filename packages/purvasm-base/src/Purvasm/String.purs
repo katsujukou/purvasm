@@ -15,6 +15,16 @@ module Purvasm.String
   , byteAt
   , unsafeNew
   , unsafeSetByte
+  , byteSlice
+  , dropCodePoints
+  , takeCodePoints
+  , codePointLength
+  , codePointAt
+  , byteIndexOf
+  , byteLastIndexOf
+  , compareBytes
+  , appendBulk
+  , materialize
   ) where
 
 -- | The UTF-8 byte length. On the purvasm backend: a byte-array length primitive.
@@ -48,3 +58,43 @@ foreign import unsafeNew :: Int -> String
 -- | `ulib` builders honour it (`Data.String.Common.blit`, `Data.String.Internal.Utf8` `putCp`/copy,
 -- | `Data.Semigroup` `append`, `Data.Int.byteString`, `Data.Show` `put1`..`put4`).
 foreign import unsafeSetByte :: String -> Int -> Int -> String
+
+-- | The `[from, to)` byte range as a String value (ADR-0103 §5). On the purvasm backend this is
+-- | the bounded-retention slice builder — a zero-copy view when the backing is at most 4× the
+-- | result, a compact copy otherwise — release-validated (in range, both endpoints on UTF-8
+-- | code-point boundaries). On JS a "byte" is a UTF-16 code unit and this is a plain `slice`.
+foreign import byteSlice :: Int -> Int -> String -> String
+
+-- | Drop the first `k` Unicode code points (`k` clamped to `[0, length]`) — the lexer-cursor
+-- | primitive: O(consumed), never O(remaining) (ADR-0103 §1/§3).
+foreign import dropCodePoints :: Int -> String -> String
+
+-- | Keep the first `k` Unicode code points (`k` clamped).
+foreign import takeCodePoints :: Int -> String -> String
+
+-- | The Unicode code-point count. O(1) when the value carries a known count or after the first
+-- | memoised demand; a first demand walks only the value's own bytes (ADR-0103 §2).
+foreign import codePointLength :: String -> Int
+
+-- | The `i`-th Unicode code point, or `-1` when `i` is out of range.
+foreign import codePointAt :: Int -> String -> Int
+
+-- | The first byte offset `>= from` at which the needle's bytes occur in the hay, or `-1`
+-- | (hay → needle → from; an empty needle matches at any in-range `from`). UTF-8 is
+-- | self-synchronising, so a valid needle's match always lands on a code-point boundary.
+foreign import byteIndexOf :: String -> String -> Int -> Int
+
+-- | The last byte offset `<= from` at which the needle occurs, or `-1`.
+foreign import byteLastIndexOf :: String -> String -> Int -> Int
+
+-- | Byte-lexicographic order: `-1`/`0`/`1` (equals code-point order under UTF-8). Borrowed in
+-- | place on the purvasm backend — no copy-out (ADR-0103 §4).
+foreign import compareBytes :: String -> String -> Int
+
+-- | Concatenation as one bulk operation (the `Semigroup String` implementation's primitive).
+foreign import appendBulk :: String -> String -> String
+
+-- | Sever ownership below the bounded-retention threshold: compact a view to its own packed
+-- | bytes (identity on an already-packed String). Use at boundaries that must not retain a
+-- | larger backing (ADR-0103 §1).
+foreign import materialize :: String -> String
