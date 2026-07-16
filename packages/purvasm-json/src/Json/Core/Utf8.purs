@@ -17,14 +17,11 @@ import Data.Array (length, unsafeIndex) as Array
 import Partial.Unsafe (unsafePartial)
 import Purvasm.String as PS
 
--- | Copy bytes `[from, to)` of `s` into a fresh string (empty if `to <= from`). The fresh `unsafeNew`
--- | buffer is threaded linearly through `unsafeSetByte` (the in-place build protocol, ADR-0052).
+-- | Copy bytes `[from, to)` of `s` (empty if `to <= from`) — the ADR-0103 bulk slice leaf: one
+-- | leaf call instead of a `byteAt` apply per byte. Both offsets must be code-point boundaries;
+-- | the parser only slices at ASCII delimiters (quotes, number edges), which always are.
 sliceBytes :: String -> Int -> Int -> String
-sliceBytes s from to =
-  if to <= from then PS.unsafeNew 0
-  else go from 0 (PS.unsafeNew (to - from))
-  where
-  go i j out = if i >= to then out else go (i + 1) (j + 1) (PS.unsafeSetByte out j (PS.byteAt s i))
+sliceBytes s from to = if to <= from then "" else PS.byteSlice from to s
 
 -- | The canonical UTF-8 bytes of code point `cp` (1–4 bytes, in order). Byte-identical to the ulib
 -- | `Data.String.Internal.Utf8.putCp` encoding.

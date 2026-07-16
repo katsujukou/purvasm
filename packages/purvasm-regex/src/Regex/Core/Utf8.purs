@@ -19,7 +19,7 @@ import Prelude
 import Data.Array (fromFoldable)
 import Data.Foldable (foldl)
 import Data.List (List(..), reverse)
-import Purvasm.String (byteAt, byteLength, unsafeNew, unsafeSetByte)
+import Purvasm.String (byteAt, byteLength, byteSlice, unsafeNew, unsafeSetByte)
 
 -- The backend probe: "Å" (U+00C5) is two UTF-8 bytes but one UTF-16 unit.
 isUtf8 :: Boolean
@@ -53,14 +53,11 @@ cpAt s i =
       { cp: (u - 0xD800) * 0x400 + (byteAt s (i + 1) - 0xDC00) + 0x10000, width: 2 }
     else { cp: u, width: 1 }
 
--- | Copy bytes/units `[lo, hi)` out into a fresh string (the ADR-0052 linear build) —
--- | representation-agnostic: units in, units out, both modes verbatim.
+-- | Copy bytes/units `[lo, hi)` out (empty if `hi <= lo`) — the ADR-0103 bulk slice leaf,
+-- | representation-agnostic: units in, units out, both modes verbatim. Both offsets must be
+-- | code-point boundaries; the matcher only produces offsets advanced by decoded widths.
 sliceBytes :: String -> Int -> Int -> String
-sliceBytes s lo hi = go (unsafeNew (hi - lo)) lo
-  where
-  go buf i =
-    if i >= hi then buf
-    else go (unsafeSetByte buf (i - lo) (byteAt s i)) (i + 1)
+sliceBytes s lo hi = if hi <= lo then "" else byteSlice lo hi s
 
 -- | Decode a string into its code points (input valid by the runtime contract, ADR-0067 §5).
 toCodePoints :: String -> Array Int
