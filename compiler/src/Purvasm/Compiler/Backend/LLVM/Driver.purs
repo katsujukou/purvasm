@@ -5,7 +5,8 @@
 -- |
 -- | It also carries the **backend-private boot-parity `DictElim` bridge** (ADR-0086 Addendum): the shared
 -- | build driver runs no `DictElim`, so the LLVM backend applies it in its own lowering (`lowerModule`/
--- | `lowerEntry`), resolving against the whole-program dictionary machinery derived once in `context`. This
+-- | `lowerEntry`), resolving against the dictionary machinery accumulated dependency-directed by the
+-- | driver's fold (ADR-0104 §5-1 — per-module contributions merged under import-closure projection). This
 -- | is a *transitional compatibility lowering* (boot's `--no-opt` `.ll` has dispatch collapsed, and Level-2
 -- | must match byte-for-byte), **not** an optimiser pass — the real `DictElim` lives in the optimiser
 -- | fixpoint, and this bridge is scheduled for removal when the LLVM codegen port off boot completes. The
@@ -80,9 +81,10 @@ type LlvmBackendOptions =
   , debug :: Boolean
   }
 
--- | The whole-program context the LLVM backend derives once (ADR-0087 §2): the codegen options
--- | (`gkeys`/`xfns`/inline-ABI), the whole-program dictionary `machinery` the private bridge resolves
--- | against, plus the entry knobs `lowerEntry` needs.
+-- | The LLVM backend's cross-module context (ADR-0087 §2 / ADR-0104 §5-1) — a merge-able bag of
+-- | module-keyed facts: the codegen options (`gkeys`/`xfns`/inline-ABI), the dictionary `machinery`
+-- | the private bridge resolves against, plus the entry knobs `lowerEntry` needs. `lowerModule`
+-- | receives the import-closure projection; `lowerEntry` the whole-program accumulation.
 type LlvmContext =
   { cxOpts :: MakeCxOptions
   , machinery :: DictMachinery
@@ -91,10 +93,12 @@ type LlvmContext =
   }
 
 -- | The backend-private boot-parity `DictElim` bridge (ADR-0086 Addendum): collapse statically-known
--- | dispatch to direct impl calls, resolving against the whole-program `machinery` and `gkeys` derived in
--- | `context`. Whole-program machinery is a no-collision superset of any module's dependency-visible
--- | machinery (keys are module-qualified), so it resolves byte-identically to the per-module threading of
--- | ADR-0086 §3 for well-typed programs. A **transitional compatibility lowering**, not an optimiser pass.
+-- | dispatch to direct impl calls, resolving against the context's `machinery` and `gkeys` — for a
+-- | module, its import-closure projection (ADR-0104 §5-1); for the entry, the whole program. The two
+-- | resolve byte-identically for well-typed programs: dispatch sites only reference dictionaries in the
+-- | module's import closure, and machinery keys are module-qualified (no collisions), so any superset up
+-- | to the whole program answers the same lookups. A **transitional compatibility lowering**, not an
+-- | optimiser pass.
 -- | Resolve the **compiler-builtin literal** free references — the resolver intrinsics whose definition
 -- | is a plain literal (`Prim.undefined` and `Data.Unit.unit`, both the immediate `0`, ADR-0038) — to
 -- | their literal atom, so `Prim.undefined` no longer reaches codegen as an unbound `AtomVar`. These are
@@ -130,8 +134,8 @@ resolveLitBuiltins = mapAtoms case _ of
 -- | `--opt` the optimiser inlines/impurifies a saturated call, so the gdef is dead-stripped; under
 -- | `--no-opt` the call stays and resolves to this gdef — the byte-identity reference (boot synthesises
 -- | the same gdef). Reads only the CoreFn `source`, so it is row-polymorphic over its input — the
--- | whole-program `context` (a `ContextModule`) and the per-module lowering (a `LoweredModule`) both feed
--- | it (ADR-0090).
+-- | per-module context contribution (`moduleContext`, a `ContextModule`) and the per-module lowering
+-- | (a `LoweredModule`) both feed it (ADR-0090).
 synthForeignGdefs :: forall r. { source :: CF.Module | r } -> Array Gdef
 synthForeignGdefs lm = Array.sortWith gdefInitKey (Array.mapMaybe synth lm.source.foreignNames)
   where
@@ -195,26 +199,48 @@ bridgeModule ctx leaves m = m { decls = map (mapDeclBodies (nativeByteIdentityBr
 
 -- | The LLVM backend as an ADR-0087 `Backend` (the neutral `build` driver's pure codegen capability):
 -- | per-module `.ll` (`lowerModule`), the whole-program init/entry `.ll` (`lowerEntry`), the module `.pmi`
--- | (`interfaceOf`), and the cross-module `context` (surface / `gkeys` / dictionary machinery) derived from
--- | the pre-optimisation modules. `lowerModule`/`lowerEntry` apply the private `DictElim` bridge before
--- | classifying, so native `--no-opt` stays byte-identical to boot even though the driver runs no `DictElim`.
+-- | (`interfaceOf`), and the cross-module context facts (surface / `gkeys` / dictionary machinery)
+-- | contributed per module (`moduleContext`, ADR-0104 §5-1) from its pre-optimisation lowering.
+-- | `lowerModule`/`lowerEntry` apply the private `DictElim` bridge before classifying, so native
+-- | `--no-opt` stays byte-identical to boot even though the driver runs no `DictElim`.
 llvmBackend :: LlvmBackendOptions -> Backend LlvmContext String
 llvmBackend opts =
-  { context: \modules ->
+  { emptyContext:
+      { cxOpts: { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: not opts.debug }
+      , machinery: emptyMachinery
+      , isEffect: opts.isEffect
+      , heapWords: opts.heapWords
+      }
+  -- The `Set.union`/`Map.union` shape satisfies the seam's idempotent-commutative-monoid contract:
+  -- the driver merges OVERLAPPING projections (diamond deps share their closure's facts), and two
+  -- valid contexts agree wherever they overlap — every key carries its defining module's one true
+  -- fact — so union is idempotent and the `Map.union` bias is unobservable. The scalar knobs are
+  -- constants closed from `opts`.
+  , mergeContext: \newer older ->
+      { cxOpts:
+          { gkeys: Set.union newer.cxOpts.gkeys older.cxOpts.gkeys
+          , xfns: Map.union newer.cxOpts.xfns older.cxOpts.xfns
+          , foreignArity: Map.empty
+          , inlineAbi: not opts.debug
+          }
+      , machinery: mergeMachinery newer.machinery older.machinery
+      , isEffect: opts.isEffect
+      , heapWords: opts.heapWords
+      }
+  -- One module's own contribution (ADR-0104 §5-1), derived under `deps` — the import-closure
+  -- projection: `machineryOf` reads the deps' machinery so instance recognition sees through their
+  -- `$Dict` wrappers (dependency order guaranteed by the driver's fold). The projection resolves
+  -- identically to the old whole-program derivation: a module's bodies only ever reference its import
+  -- closure, and machinery/`gkeys`/`xfns` are consulted by key lookup, never enumerated.
+  , moduleContext: \deps cm ->
       let
-        gdefs0Of lm = map classifyDecl lm.module.decls
-        allGdefs0 = Array.concatMap gdefs0Of modules
+        gdefs0 = map classifyDecl cm.module.decls
         -- synthesised intrinsic-foreign keys are top-level globals too (referenced cross-module by `$root`).
-        synthKeys = Array.concatMap (Array.concatMap gdefKeys <<< synthForeignGdefs) modules
-        gkeys = Set.fromFoldable (Array.concatMap gdefKeys allGdefs0 <> synthKeys)
-        surface = foldl (\acc lm -> Map.union (deriveSurface lm.source (gdefs0Of lm)) acc) Map.empty modules
-        xfns = foldl (surfaceFn surface) Map.empty allGdefs0
-        -- Modules arrive in dependency order, so folding the accumulated machinery in as `imported`
-        -- lets each module's instance recognition see through its dependencies' `$Dict` wrappers.
-        machinery = foldl
-          (\acc lm -> mergeMachinery (machineryOf acc (Array.concatMap _.members lm.module.decls)) acc)
-          emptyMachinery
-          modules
+        synthKeys = Array.concatMap gdefKeys (synthForeignGdefs cm)
+        gkeys = Set.fromFoldable (Array.concatMap gdefKeys gdefs0 <> synthKeys)
+        surface = deriveSurface cm.source gdefs0
+        xfns = foldl (surfaceFn surface) Map.empty gdefs0
+        machinery = machineryOf deps.machinery (Array.concatMap _.members cm.module.decls)
       in
         -- `foreignArity` is a per-module base — `lowerModule`/`lowerEntry` override it with the module's
         -- own native-leaf arities (`nativeLeafArities lm.foreignSigs`), threaded from FSR (ADR-0090).

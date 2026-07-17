@@ -59,7 +59,9 @@ loaded m = Loaded { path: "path/" <> nameKey m.name, mod: m }
 -- A stub backend: fake per-module IR `"IR:" <> name`, a stub interface, a single entry IR.
 testBackend :: Backend Unit String
 testBackend =
-  { context: const unit
+  { emptyContext: unit
+  , mergeContext: \_ _ -> unit
+  , moduleContext: \_ _ -> unit
   , interfaceOf: \_ lm -> interfaceFromExports { name: lm.module.name, imports: [], exports: [] }
   , lowerModule: \_ lm -> "IR:" <> lm.module.name
   , lowerEntry: \_ _ -> "IR:entry"
@@ -116,6 +118,27 @@ diamond = Map.fromFoldable
   , Tuple "C" (loaded (modl "C" []))
   ]
 
+-- A context-aware backend (ADR-0104 §5-1): `c = Map moduleName (set of dep modules its
+-- `moduleContext` call could see)` — each contribution records the deps projection it was computed
+-- under, so one run pins BOTH the own-contribution rule (the driver never folds `deps` back into a
+-- contribution) and the import-closure projection each lowering receives. `mergeContext` is
+-- `unionWith union` — the idempotent commutative monoid the seam requires (a plain concatenating
+-- merge would duplicate `C` through the diamond and the expected strings below would catch it).
+ctxBackend :: Backend (Map String (Set.Set String)) String
+ctxBackend =
+  { emptyContext: Map.empty
+  , mergeContext: Map.unionWith Set.union
+  , moduleContext: \deps cm -> Map.singleton (nameKey cm.source.name) (Set.fromFoldable (Map.keys deps))
+  , interfaceOf: \_ lm -> interfaceFromExports { name: lm.module.name, imports: [], exports: [] }
+  , lowerModule: \ctx lm -> renderCtx ("IR:" <> lm.module.name) ctx
+  , lowerEntry: \ctx _ -> renderCtx "IR:entry" ctx
+  }
+  where
+  -- deterministic rendering: `Map`/`Set` iterate in key order.
+  renderCtx tag ctx = tag <> "|" <> Array.intercalate "," (map entry (Map.toUnfoldable ctx))
+    where
+    entry (Tuple m deps) = m <> "<" <> Array.intercalate " " (Set.toUnfoldable deps) <> ">"
+
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.build" do
   backstopSpec
@@ -159,6 +182,26 @@ spec = describe "Purvasm.Compiler.build" do
           Array.length products.modules `shouldEqual` 4
           products.entry.path `shouldEqual` "out/entry.ll"
         Left _ -> "expected Right" `shouldEqual` "got Left"
+
+  describe "dependency-directed backend context (ADR-0104 §5-1)" do
+    it "hands each lowering its import-closure projection, each moduleContext its deps only, and the entry the whole program" do
+      -- On the diamond, the load-bearing rows are `B` (its projection carries `C` but NOT the
+      -- already-processed sibling `A` — a whole-closure or processed-prefix context would leak it,
+      -- and the byte-identity gates cannot see that leak because well-typed bodies never reference
+      -- sibling keys) and `Main` (its `moduleContext` saw the transitively-merged `{A, B, C}`).
+      -- `C<>` appearing exactly once in every projection also pins the idempotent diamond merge.
+      let
+        Tuple result _ = runWriter (build ctxBackend (mkAction diamond 1) baseOptions)
+        irs = case result of
+          Right p -> Array.snoc (map _.artifact.backendIR p.modules) p.entry.ir
+          Left _ -> []
+      irs `shouldEqual`
+        [ "IR:C|C<>"
+        , "IR:A|A<C>,C<>"
+        , "IR:B|B<C>,C<>"
+        , "IR:Main|A<C>,B<C>,C<>,Main<A B C>"
+        , "IR:entry|A<C>,B<C>,C<>,Main<A B C>"
+        ]
 
   describe "optimiser fixpoint iteration (driver-owned, ADR-0087)" do
     it "converges immediately on an idempotent pass: enter + leave, no changing round (--opt)" do

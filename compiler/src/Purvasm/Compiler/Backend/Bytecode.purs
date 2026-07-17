@@ -29,11 +29,13 @@ import Purvasm.Compiler.CESK.Translate (nameKey, qualifiedKey)
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (cfExpr, fvExpr)
 import Purvasm.Compiler.MiddleEnd.Module (Decl)
 
--- | The bytecode backend. `o = ModuleArtifact` (a `.pmo`); the whole-program context is `Unit` — bytecode
+-- | The bytecode backend. `o = ModuleArtifact` (a `.pmo`); the cross-module context is `Unit` — bytecode
 -- | is per-module independent, and cross-module reachability is `Link.link`'s at finalisation (ADR-0088 §0).
 bytecodeBackend :: Backend Unit ModuleArtifact
 bytecodeBackend =
-  { context: const unit
+  { emptyContext: unit
+  , mergeContext: \_ _ -> unit
+  , moduleContext: \_ _ -> unit
   , interfaceOf: \_ lm -> interfaceOf (moduleArtifactOf lm)
   , lowerModule: \_ lm -> moduleArtifactOf lm
   -- The VM entry is the link-time `mainTerm` (ADR-0087 §4); there is no per-module entry object, so this

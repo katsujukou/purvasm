@@ -353,3 +353,33 @@ lifetime separations):
 - **Retire the gate without a replacement identity.** Rejected: the stage fixpoint is nearly free
   mechanically (it is the existing 488/488 procedure re-anchored) and is the classic self-hosting
   correctness anchor; behavioural tests alone would drop the cheap whole-closure textual net.
+
+#### Progress (2026-07-17): §5-1 per-module restoration implemented; identity verified
+
+The step-1 restoration landed on the pinned seam: `Backend` moved from
+`context :: Array ContextModule -> c` to `emptyContext` / `mergeContext` / `moduleContext` — an
+**idempotent commutative monoid on valid fact sets** (the load-bearing law, pinned in the seam
+docs after review: the driver merges *overlapping* projections on diamonds, so a merely-disjoint
+merge contract would be wrong) — with the driver accumulating module-keyed contributions through
+the fold, memoising each module's import-closure projection
+(`visible(M) = merge(direct deps' visibles) ∪ contrib(M)`), and handing `lowerEntry` the final
+accumulation. `declsOfModule` runs once per module (the duplicated lowering is gone). A
+context-aware mock fixture pins the projection directly on the diamond (`B` sees `C` but never
+the already-processed sibling `A`; the entry sees the world) — coverage the byte-identity gates
+cannot provide, since well-typed bodies never reference sibling keys.
+
+Two results, recorded separately:
+
+- **§5-1 correctness** — same-input artifact identity, Node-hosted before/after compilers over
+  the identical CoreFn corpus + staged ulib: `--no-opt` 298/298 `.ll` + 297/297 `.pmi`
+  byte-identical, `--opt` likewise 298/298 + 297/297; unit 404 / e2e 11 green. Method note for
+  the future fixpoint script: the corpus IS the compiler, so a naive before/after run compiles
+  *different* corefn (the changed modules) and self-invalidates — hold the input fixed and vary
+  only the compiler build (the before-leg here: sources restored via `git show HEAD:` into a
+  scratch tree, built with shared package caches).
+- **Build performance (pre-existing debt, not a §5-1 regression)** — the *before*-leg native L3
+  `--opt` self-build was aborted after > 48 min at 100 % CPU inside one tail module (mod_282,
+  ~`LLVM.Emit`); completion time unknown. The comparison was moved to Node-hosted legs. This is a
+  measured data point for the §2 fixpoint profiles (smoke = `--no-opt`; the `--opt` milestone
+  leg's native flavour is currently impractical) and for the build-performance track this record
+  unblocks.

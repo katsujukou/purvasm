@@ -42,7 +42,8 @@ import Data.List (List(..), (:))
 import Data.List as List
 import Data.Map (Map)
 import Data.Map as Map
-import Data.Maybe (Maybe(..))
+import Data.Maybe (Maybe(..), maybe)
+import Data.Set (Set)
 import Data.Set as Set
 import Data.Tuple (fst, snd)
 import Data.Tuple.Nested (type (/\), (/\))
@@ -115,11 +116,12 @@ type BuildProducts o =
   , entry :: { ir :: o, path :: String }
   }
 
--- | The **pre-optimisation, pre-FSR** view a backend's `context` reads: a module's CoreFn source and its
--- | freshly-lowered `AnfModule`. It carries **no** `foreignSigs` — FSR has not run when `context` is
--- | derived (it runs per module inside the fold), so a shape map here could only ever be empty. Kept
--- | distinct from `LoweredModule` precisely so the whole-program surface derivation never reads an
--- | empty-shape lie (ADR-0090): foreign shapes belong to the per-module lowering inputs, not the context.
+-- | The **pre-optimisation, pre-FSR** view `moduleContext` reads to derive ONE module's context
+-- | contribution (ADR-0104 §5-1): the module's CoreFn source and its freshly-lowered `AnfModule`. It
+-- | carries **no** `foreignSigs` — the contribution is derived before the module's own FSR runs, so a
+-- | shape map here could only ever be empty. Kept distinct from `LoweredModule` precisely so the
+-- | contribution derivation never reads an empty-shape lie (ADR-0090): foreign shapes belong to the
+-- | per-module lowering inputs, not the context.
 type ContextModule =
   { source :: CF.Module
   , module :: AnfModule
@@ -127,7 +129,7 @@ type ContextModule =
 
 -- | An optimised module paired with its CoreFn source (the backend reads `imports`/`exports` for the
 -- | interface and reachability) and its **visible** foreign shapes. The unit `lowerModule`/`lowerEntry`
--- | codegen consumes (distinct from `ContextModule`, the pre-FSR whole-program `context` input).
+-- | codegen consumes (distinct from `ContextModule`, the pre-FSR `moduleContext` contribution input).
 type LoweredModule =
   { source :: CF.Module
   , module :: AnfModule
@@ -142,23 +144,49 @@ type LoweredModule =
 type EntryInput = { modules :: Array LoweredModule, entry :: Expr }
 
 -- | The **pure** backend codegen capability (ADR-0087 §2), parameterised over its output IR `o` (VM/LLVM)
--- | and an internal whole-program context `c` it derives once. Deliberately effect-free: link — the one
--- | effectful, non-shareable step — is left to CLI finalization (§4), so this record is trivially testable.
+-- | and an internal cross-module context `c`. Deliberately effect-free: link — the one effectful,
+-- | non-shareable step — is left to CLI finalization (§4), so this record is trivially testable.
 -- |
--- |   * `context` — derive the whole-program facts (the native `gkeys`/cross-module surface) from the
--- |     **pre-optimisation** modules (as `ContextModule`s — CoreFn source + lowered ANF, so the surface can
--- |     read each module's `exports`, but **no** foreign shapes: FSR has not run yet), once, before the fold.
--- |     These `gkeys` are the stable *base* set of existing source declarations, **not** the complete final
--- |     set: the optimiser's Specialize pass (ADR-0089) adds post-opt top-level keys (`$spec$` clones), so
--- |     `lowerModule`/`lowerEntry` complete `gkeys` with each object's final gdef keys before codegen.
+-- | The context is **dependency-directed** (ADR-0104 §5-1): it starts empty and the driver extends it
+-- | per module through the fold, so no eager whole-closure pass runs before compilation. `c` is a
+-- | merge-able bag of **module-keyed facts**, and `(c, mergeContext, emptyContext)` must form an
+-- | **idempotent commutative monoid on valid fact sets**: associative, `emptyContext` the identity,
+-- | and — load-bearing — `merge x x = x` with order immaterial. The driver merges **overlapping**
+-- | projections routinely (on a diamond `Main → A, B → C`, `visible(A)` and `visible(B)` both contain
+-- | `C`'s facts), and relies on idempotence for `visible(M) = merge of direct deps' visibles ∪ own` to
+-- | equal the import-closure union. Facts keyed by module-qualified names merged with `Set`/`Map`
+-- | unions satisfy this by construction (two contexts agree wherever they overlap — both carry module
+-- | `C`'s one true contribution); an accumulating representation (arrays, counters) does NOT and would
+-- | duplicate diamond facts:
+-- |
+-- |   * `emptyContext` — the facts of no modules at all; the merge identity.
+-- |   * `mergeContext a b` — the fact-set union. With the laws above the argument order is
+-- |     unobservable on the driver's inputs; implementations should still be deterministic for a
+-- |     fixed argument order.
+-- |   * `moduleContext deps cm` — ONE module's **own contribution** (the native `gkeys`/cross-module
+-- |     surface facts), computed from its **pre-optimisation** lowering (a `ContextModule` — CoreFn
+-- |     source + lowered ANF, so the surface can read `exports`, but **no** foreign shapes: FSR runs in
+-- |     the fold) *under* `deps` — the projection of its import closure's facts (dictionary-machinery
+-- |     recognition sees through dependencies' `$Dict` wrappers). The returned `c` is the module's
+-- |     contribution ONLY, never `deps` folded back in — the driver owns accumulation.
+-- |     The contributed `gkeys` are the stable *base* set of existing source declarations, **not** the
+-- |     complete final set: the optimiser's Specialize pass (ADR-0089) adds post-opt top-level keys
+-- |     (`$spec$` clones), so `lowerModule`/`lowerEntry` complete `gkeys` with each object's final gdef
+-- |     keys before codegen.
 -- |   * `interfaceOf` — the module's `.pmi` from its optimised ANF + CoreFn surface (backend-neutral in
 -- |     result — byte-identical to the bytecode deriver — but the `ExportKind` classification is the
 -- |     backend's).
--- |   * `lowerModule` — one optimised module → its backend IR.
--- |   * `lowerEntry` — the **whole-program** entry/init object (reachability over the module set); pure
--- |     codegen, run by the driver after the fold, *not* CLI link.
+-- |   * `lowerModule` — one optimised module → its backend IR. Receives the **import-closure
+-- |     projection** (deps ∪ own), never a whole-closure view: facts are consulted only by membership /
+-- |     key lookup on the module's own references, so the projection is emission-identical to the old
+-- |     whole-program context by construction (references never leave the import closure).
+-- |   * `lowerEntry` — the **whole-program** entry/init object (reachability over the module set);
+-- |     receives the **final accumulated** context (the entry imports the world). Pure codegen, run by
+-- |     the driver after the fold, *not* CLI link.
 type Backend c o =
-  { context :: Array ContextModule -> c
+  { emptyContext :: c
+  , mergeContext :: c -> c -> c
+  , moduleContext :: c -> ContextModule -> c
   , interfaceOf :: c -> LoweredModule -> Interface
   , lowerModule :: c -> LoweredModule -> o
   , lowerEntry :: c -> EntryInput -> o
@@ -302,13 +330,22 @@ topoOrder mods = Array.fromFoldable (List.reverse (snd (foldl visit (Set.empty /
 entryExprOf :: Options -> Expr
 entryExprOf opts = normalize (TmVar (opts.entryModule <> "." <> opts.entryName))
 
--- | The per-module fold state: the threaded optimiser env, and the emitted artifacts / optimised modules
--- | accumulated in dependency order.
-type FoldState o =
+-- | The per-module fold state: the threaded optimiser env, the emitted artifacts / optimised modules
+-- | accumulated in dependency order, and the dependency-directed backend context (ADR-0104 §5-1).
+type FoldState c o =
   { env :: BuildEnv
   -- | ADR-0090's `ForeignFacts`: the accumulated **dependencies' exported** foreign shapes, threaded in
   -- | every mode. Feeds `LoweredModule.foreignSigs` (codegen) and, under `--opt`, the optimiser env.
   , foreignEnv :: ForeignSigMap
+  -- | Each processed module's **import-closure projection** of the backend context (deps ∪ own),
+  -- | memoised by module name: `visible(M) = merge(visible over M's direct local deps) ∪ contrib(M)`.
+  -- | Merging direct deps' *projections* equals merging the closure's *contributions* because the
+  -- | merge is idempotent on module-keyed facts — this is `projection(context, importClosure(M))`
+  -- | without a per-module closure walk.
+  , visibles :: Map String c
+  -- | The running whole-program context: every processed module's contribution merged in dependency
+  -- | order. `lowerEntry` consumes the final value (the entry imports the world).
+  , total :: c
   , emitted :: Array (EmittedModule o)
   , lowered :: Array LoweredModule
   , progress :: Progress
@@ -316,11 +353,15 @@ type FoldState o =
 
 -- | Build a whole program to per-module artifacts + the entry object (ADR-0087 §1), stopping at pure
 -- | codegen. The driver is **neutral** (ADR-0086 Addendum): load the closure, and per module in dependency
--- | order `CoreFn → normalise → AnfModule`, then `if --opt` **iterate `optimizeModule` to a fixpoint** (up
+-- | order `CoreFn → normalise → AnfModule` (once — the same value feeds the backend context facts and the
+-- | optimiser, ADR-0104 §5-1), then `if --opt` **iterate `optimizeModule` to a fixpoint** (up
 -- | to `action.maxOptimizeIter` rounds) + `extendSummary`, `else` the identity — it runs **no `DictElim`
--- | of its own** (a backend's `--no-opt` boot-parity need is its own private lowering). Emit each module via
--- | `emitFile`, then run the backend's whole-program `lowerEntry` over the (raw) entry + reachable set and
--- | emit it via `emitEntry`. Returns `BuildProducts` for CLI finalization (link). Never links.
+-- | of its own** (a backend's `--no-opt` boot-parity need is its own private lowering). The backend context
+-- | is accumulated dependency-directed through the fold (no eager whole-closure pass): each module's
+-- | contribution is derived under its import-closure projection and merged in. Emit each module via
+-- | `emitFile`, then run the backend's whole-program `lowerEntry` (with the final accumulated context) over
+-- | the (raw) entry + reachable set and emit it via `emitEntry`. Returns `BuildProducts` for CLI
+-- | finalization (link). Never links.
 build
   :: forall c o m
    . Monad m
@@ -333,30 +374,31 @@ build backend action opts =
     Left err -> pure (Left err)
     Right loaded -> do
       let
-        -- `ContextModule`: pre-FSR source + lowered ANF only. FSR runs per module inside the fold, so a
-        -- `foreignSigs` here would be uniformly empty — the type omits it rather than lie (ADR-0090).
-        ctx = backend.context (map (\l -> { source: l.mod, module: declsOfModule l.mod }) loaded)
+        localNames = Set.fromFoldable (map _.name loaded)
         initialState =
           { env: emptyBuildEnv
           , foreignEnv: Map.empty
+          , visibles: Map.empty
+          , total: backend.emptyContext
           , emitted: []
           , lowered: []
           , progress: { total: Array.length loaded, current: 1 }
           }
         -- An FSR failure short-circuits the fold with `Left` (ADR-0090 §2), like `loadClosure`.
         step (Left e) _ = pure (Left e)
-        step (Right st) item = stepModule ctx st item
+        step (Right st) item = stepModule localNames st item
       foldM step (Right initialState) loaded >>= case _ of
         Left err -> pure (Left err)
         Right final -> do
           -- The entry is handed to the backend **raw** (no seam `DictElim`); the native backend bridges it
-          -- privately in `lowerEntry`, the VM does not (ADR-0086 Addendum).
-          let entryIr = backend.lowerEntry ctx { modules: final.lowered, entry: entryExprOf opts }
+          -- privately in `lowerEntry`, the VM does not (ADR-0086 Addendum). The context is the final
+          -- accumulated one — the entry imports the world (ADR-0104 §5-1).
+          let entryIr = backend.lowerEntry final.total { modules: final.lowered, entry: entryExprOf opts }
           entryPath <- action.emitEntry entryIr
           pure (Right { modules: final.emitted, entry: { ir: entryIr, path: entryPath } })
   where
-  stepModule :: c -> FoldState o -> { mod ∷ CF.Module, name ∷ String } -> m (Either BuildError (FoldState o))
-  stepModule ctx st item = do
+  stepModule :: Set String -> FoldState c o -> { mod ∷ CF.Module, name ∷ String } -> m (Either BuildError (FoldState c o))
+  stepModule localNames st item = do
     action.hooks.onStartCompile st.progress item.mod
     -- FSR (ADR-0090): the module's **own** shapes, only when it declares foreigns (`moduleForeignSigs` is
     -- also self-guarding, so the check is a fast-path). A failure halts the build with `ForeignSigFailed`.
@@ -368,6 +410,16 @@ build backend action opts =
       Right ownSigs -> do
         let
           am = declsOfModule item.mod
+          -- The backend-context thread (ADR-0104 §5-1): project the import closure (merge the direct
+          -- local deps' memoised projections — idempotent merge makes that the closure's union), derive
+          -- this module's own contribution under it, and extend. `am` is the same value the optimiser
+          -- receives below — `declsOfModule` runs once per module.
+          depsCtx = foldl
+            (\acc d -> maybe acc (\v -> backend.mergeContext v acc) (Map.lookup d st.visibles))
+            backend.emptyContext
+            (Array.filter (\n -> Set.member n localNames) (importNames item.mod))
+          contrib = backend.moduleContext depsCtx { source: item.mod, module: am }
+          moduleCtx = backend.mergeContext contrib depsCtx
           visible = Map.union ownSigs st.foreignEnv -- own ∪ deps (keys module-qualified, disjoint)
         action.hooks.onBeforeOptimize am
         optimised <-
@@ -388,7 +440,7 @@ build backend action opts =
         action.hooks.onBeforeCodegen optimised.module
         let
           lm = { source: item.mod, module: optimised.module, foreignSigs: visible }
-          artifact = { interface: backend.interfaceOf ctx lm, backendIR: backend.lowerModule ctx lm }
+          artifact = { interface: backend.interfaceOf moduleCtx lm, backendIR: backend.lowerModule moduleCtx lm }
         path <- action.emitFile artifact
         action.hooks.onCleanUp item.name
         let
@@ -401,6 +453,8 @@ build backend action opts =
           ( Right
               { env: optimised.env
               , foreignEnv: Map.union exportedOwn (Map.union optimised.published st.foreignEnv)
+              , visibles: Map.insert item.name moduleCtx st.visibles
+              , total: backend.mergeContext contrib st.total
               , emitted: Array.snoc st.emitted { artifact, path }
               , lowered: Array.snoc st.lowered lm
               , progress: st.progress { current = st.progress.current + 1 }
