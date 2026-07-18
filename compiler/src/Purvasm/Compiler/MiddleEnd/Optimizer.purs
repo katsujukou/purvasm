@@ -18,9 +18,9 @@
 -- |     seam never logs; rejections reach the host through the driver's `onOptimizerBackstop` hook.
 -- |
 -- | This is the `--opt` path only. Under `--no-opt` the driver is the identity (ADR-0086 Addendum): it runs
--- | **no** `DictElim` here. `DictElim` is now purely an optimiser pass; the native backend's `--no-opt`
--- | boot-parity requirement is a *backend-private* bridge in `llvmBackend`, not a seam phase — so the VM's
--- | `--no-opt` keeps dictionaries applied (the optimiser's effect stays observable).
+-- | **no** `DictElim` here. `DictElim` is purely an optimiser pass — under `--no-opt` no backend collapses
+-- | dispatch (dictionaries stay applied on VM and native alike, ADR-0104 §3), so the optimiser's effect
+-- | stays observable.
 -- |
 -- | The driver grows the env for dependents with `extendSummary`; `persistedSummary` projects the in-memory
 -- | `BuildSummary` onto the `.pmi`'s optional `Summary` (ADR-0084 §5) — `Nothing` today, so the `.pmi` core
@@ -158,7 +158,7 @@ emptyBuildEnv = BuildEnv { dict: emptyMachinery, gkeys: Set.empty, inlines: Map.
 -- | A module's **stable** facts — its own dictionary machinery and top-level keys — computed once from its
 -- | `AnfModule` and handed to the `optimizeModule` fixpoint (they do not change across iterations). The
 -- | driver computes this under `--opt` only (ADR-0086 Addendum); it is the half formerly folded into the
--- | removed `preOptimizeModule` (minus that phase's `DictElim` rewrite, now the optimiser pass / LLVM bridge).
+-- | removed `preOptimizeModule` (minus that phase's `DictElim` rewrite, now solely the optimiser pass).
 -- | Takes the dependency env because instance recognition must see through *imported* `$Dict` identity
 -- | wrappers (an instance is routinely declared outside its class's module); the env still holds only
 -- | dependency facts, so the self-pollution invariant is untouched.

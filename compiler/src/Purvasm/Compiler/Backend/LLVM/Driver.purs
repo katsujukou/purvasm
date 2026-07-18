@@ -3,14 +3,12 @@
 -- | each optimised `AnfModule` is classified to its own `Gdef`s and emitted as its own `.ll` object; the
 -- | init/entry object carries `pv_init_all` (reachable inits over the binding graph) + `@main`.
 -- |
--- | It also carries the **backend-private boot-parity `DictElim` bridge** (ADR-0086 Addendum): the shared
--- | build driver runs no `DictElim`, so the LLVM backend applies it in its own lowering (`lowerModule`/
--- | `lowerEntry`), resolving against the dictionary machinery accumulated dependency-directed by the
--- | driver's fold (ADR-0104 §5-1 — per-module contributions merged under import-closure projection). This
--- | is a *transitional compatibility lowering* (boot's `--no-opt` `.ll` has dispatch collapsed, and Level-2
--- | must match byte-for-byte), **not** an optimiser pass — the real `DictElim` lives in the optimiser
--- | fixpoint, and this bridge is scheduled for removal when the LLVM codegen port off boot completes. The
--- | VM backend has no such bridge.
+-- | It also carries the **backend-required lowering** (`nativeRequiredLowering`, ADR-0104 §3): native
+-- | leaf resolution (`AtomVar → AtomForeign`) and compiler-builtin literalisation, applied in BOTH modes
+-- | before `Gdef` classification — required native lowering, not an optimisation. Under `--no-opt`,
+-- | dictionaries stay dynamically dispatched, matching the VM's `--no-opt` semantics: the former
+-- | boot-parity `DictElim` bridge (ADR-0086 Addendum) was removed by ADR-0104 §3/§5 step 3 — the real
+-- | `DictElim` lives only in the optimiser fixpoint.
 module Purvasm.Compiler.Backend.LLVM.Driver
   ( LlvmBackendOptions
   , LlvmContext
@@ -40,7 +38,6 @@ import Purvasm.Compiler.ForeignSig (ForeignShape)
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), mapAtoms)
 import Purvasm.Compiler.MiddleEnd.Module (AnfModule, declsOfModule, mapDeclBodies)
 import Purvasm.Compiler.MiddleEnd.Normalize (normalize)
-import Purvasm.Compiler.MiddleEnd.Optimizer.DictElim (DictMachinery, dictElimExpr, emptyMachinery, machineryOf, mergeMachinery, noForeignLift)
 
 -- | One CoreFn module → its native `Gdef`s: lower to the neutral `AnfModule` (`declsOfModule`, shared
 -- | middle-end) then classify each `Decl` (`classifyDecl`, ADR-0086 §4 — a backend concern that runs after
@@ -82,33 +79,23 @@ type LlvmBackendOptions =
   }
 
 -- | The LLVM backend's cross-module context (ADR-0087 §2 / ADR-0104 §5-1) — a merge-able bag of
--- | module-keyed facts: the codegen options (`gkeys`/`xfns`/inline-ABI), the dictionary `machinery`
--- | the private bridge resolves against, plus the entry knobs `lowerEntry` needs. `lowerModule`
--- | receives the import-closure projection; `lowerEntry` the whole-program accumulation.
+-- | module-keyed facts: the codegen options (`gkeys`/`xfns`/inline-ABI) plus the entry knobs
+-- | `lowerEntry` needs. `lowerModule` receives the import-closure projection; `lowerEntry` the
+-- | whole-program accumulation.
 type LlvmContext =
   { cxOpts :: MakeCxOptions
-  , machinery :: DictMachinery
   , isEffect :: Boolean
   , heapWords :: Int
   }
 
--- | The backend-private boot-parity `DictElim` bridge (ADR-0086 Addendum): collapse statically-known
--- | dispatch to direct impl calls, resolving against the context's `machinery` and `gkeys` — for a
--- | module, its import-closure projection (ADR-0104 §5-1); for the entry, the whole program. The two
--- | resolve byte-identically for well-typed programs: dispatch sites only reference dictionaries in the
--- | module's import closure, and machinery keys are module-qualified (no collisions), so any superset up
--- | to the whole program answers the same lookups. A **transitional compatibility lowering**, not an
--- | optimiser pass.
 -- | Resolve the **compiler-builtin literal** free references — the resolver intrinsics whose definition
 -- | is a plain literal (`Prim.undefined` and `Data.Unit.unit`, both the immediate `0`, ADR-0038) — to
 -- | their literal atom, so `Prim.undefined` no longer reaches codegen as an unbound `AtomVar`. These are
 -- | representation choices (a `Unit`/absurd placeholder), *not* FFI: unlike a primop (category B, the
 -- | optimiser's `intrinsicPrim`) or a structural higher-order foreign (category C, a guest term
--- | `synthForeignGdefs` materialises as a gdef, ADR-0071 §6), they carry no code. boot resolves them at
--- | link (before its `dict_elim`), so rewriting
--- | to a literal atom here — not at codegen `readVar` (which would leave it an `AtomVar` that `evalAtoms`
--- | may root, unlike boot's immediate) — keeps the rooting boot-identical. Runs before the `DictElim`
--- | bridge to match boot's phase order (resolve → dict-elim).
+-- | `synthForeignGdefs` materialises as a gdef, ADR-0071 §6), they carry no code. Rewriting to a literal
+-- | atom here — not at codegen `readVar` (which would leave it an `AtomVar` that `evalAtoms` may root,
+-- | unlike an immediate) — keeps the reference rooting-free, the representation the immediate deserves.
 resolveLitBuiltins :: Expr -> Expr
 resolveLitBuiltins = mapAtoms case _ of
   a@(AtomVar k) -> case resolver k of
@@ -132,8 +119,8 @@ resolveLitBuiltins = mapAtoms case _ of
 -- | The gdefs are emitted in **key order** and (at the call sites) **before** the module's own decls,
 -- | mirroring boot's `foreign_groups` (sorted by key, ADR link.ml) prepended to `module_reached`. Under
 -- | `--opt` the optimiser inlines/impurifies a saturated call, so the gdef is dead-stripped; under
--- | `--no-opt` the call stays and resolves to this gdef — the byte-identity reference (boot synthesises
--- | the same gdef). Reads only the CoreFn `source`, so it is row-polymorphic over its input — the
+-- | `--no-opt` the call stays and resolves to this gdef — the optimiser-free reference lowering
+-- | (ADR-0104 §3). Reads only the CoreFn `source`, so it is row-polymorphic over its input — the
 -- | per-module context contribution (`moduleContext`, a `ContextModule`) and the per-module lowering
 -- | (a `LoweredModule`) both feed it (ADR-0090).
 synthForeignGdefs :: forall r. { source :: CF.Module | r } -> Array Gdef
@@ -175,39 +162,36 @@ leafClosureArity :: ForeignShape -> Int
 leafClosureArity s = if s.retVsat then max s.arity 1 else s.arity
 
 -- | Resolve a **native leaf** free reference from `AtomVar` to `AtomForeign`, so codegen emits its
--- | `@pvf_<key>` symbol + a no-capture closure of its arity. Runs before the `DictElim` bridge (boot
--- | resolves native leaves before `dict_elim`), so a class method whose impl *is* a native leaf (e.g.
--- | `Show Number`'s `showNumberImpl`) is carried into the instance dictionary as the foreign closure.
+-- | `@pvf_<key>` symbol + a no-capture closure of its arity. Runs on whole decl bodies before
+-- | classification, so a class method whose impl *is* a native leaf (e.g. `Show Number`'s
+-- | `showNumberImpl`) is carried into the instance dictionary as the foreign closure — under dynamic
+-- | dispatch the dictionary itself must hold a callable value, not an unbound `AtomVar`.
 resolveNativeForeigns :: Map String Int -> Expr -> Expr
 resolveNativeForeigns leaves = mapAtoms case _ of
   AtomVar k | Map.member k leaves -> AtomForeign k
   a -> a
 
--- | The native-private required lowerings applied before `Gdef` classification (ADR-0086 Addendum), in
--- | boot's phase order: resolve native leaves (`leaves`) and compiler-builtin literals, then the
--- | boot-parity `DictElim` bridge.
-nativeByteIdentityBridgeDictElim :: LlvmContext -> Map String Int -> Expr -> Expr
-nativeByteIdentityBridgeDictElim ctx leaves =
-  -- `noForeignLift`: nothing runs between this bridge and codegen, so a lifted intrinsic
-  -- `AtomVar "Purvasm.Int.add"` would reach `readVar` unbound (no saturation pass follows here).
-  dictElimExpr noForeignLift ctx.cxOpts.gkeys ctx.machinery
-    <<< resolveLitBuiltins
+-- | The native-required lowering applied before `Gdef` classification in BOTH modes (ADR-0104 §3):
+-- | resolve native leaves (`leaves`) and compiler-builtin literals. Required lowering, not an
+-- | optimisation — without it, leaf and builtin references reach codegen as unbound `AtomVar`s.
+nativeRequiredLowering :: Map String Int -> Expr -> Expr
+nativeRequiredLowering leaves =
+  resolveLitBuiltins
     <<< resolveNativeForeigns leaves
 
-bridgeModule :: LlvmContext -> Map String Int -> AnfModule -> AnfModule
-bridgeModule ctx leaves m = m { decls = map (mapDeclBodies (nativeByteIdentityBridgeDictElim ctx leaves)) m.decls }
+lowerModuleDecls :: Map String Int -> AnfModule -> AnfModule
+lowerModuleDecls leaves m = m { decls = map (mapDeclBodies (nativeRequiredLowering leaves)) m.decls }
 
 -- | The LLVM backend as an ADR-0087 `Backend` (the neutral `build` driver's pure codegen capability):
 -- | per-module `.ll` (`lowerModule`), the whole-program init/entry `.ll` (`lowerEntry`), the module `.pmi`
--- | (`interfaceOf`), and the cross-module context facts (surface / `gkeys` / dictionary machinery)
--- | contributed per module (`moduleContext`, ADR-0104 §5-1) from its pre-optimisation lowering.
--- | `lowerModule`/`lowerEntry` apply the private `DictElim` bridge before classifying, so native
--- | `--no-opt` stays byte-identical to boot even though the driver runs no `DictElim`.
+-- | (`interfaceOf`), and the cross-module context facts (surface / `gkeys`) contributed per module
+-- | (`moduleContext`, ADR-0104 §5-1) from its pre-optimisation lowering. `lowerModule`/`lowerEntry`
+-- | apply the required lowering (`nativeRequiredLowering`) before classifying; dictionaries stay
+-- | dynamically dispatched under `--no-opt` (ADR-0104 §3 — the boot-parity `DictElim` bridge is gone).
 llvmBackend :: LlvmBackendOptions -> Backend LlvmContext String
 llvmBackend opts =
   { emptyContext:
       { cxOpts: { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: not opts.debug }
-      , machinery: emptyMachinery
       , isEffect: opts.isEffect
       , heapWords: opts.heapWords
       }
@@ -223,16 +207,13 @@ llvmBackend opts =
           , foreignArity: Map.empty
           , inlineAbi: not opts.debug
           }
-      , machinery: mergeMachinery newer.machinery older.machinery
       , isEffect: opts.isEffect
       , heapWords: opts.heapWords
       }
-  -- One module's own contribution (ADR-0104 §5-1), derived under `deps` — the import-closure
-  -- projection: `machineryOf` reads the deps' machinery so instance recognition sees through their
-  -- `$Dict` wrappers (dependency order guaranteed by the driver's fold). The projection resolves
-  -- identically to the old whole-program derivation: a module's bodies only ever reference its import
-  -- closure, and machinery/`gkeys`/`xfns` are consulted by key lookup, never enumerated.
-  , moduleContext: \deps cm ->
+  -- One module's own contribution (ADR-0104 §5-1). The `deps` projection is unused since the
+  -- `DictElim` bridge's removal (ADR-0104 §3) took the machinery derivation with it — the seam still
+  -- passes it (the contract allows a backend to derive its contribution under its import closure).
+  , moduleContext: \_deps cm ->
       let
         gdefs0 = map classifyDecl cm.module.decls
         -- synthesised intrinsic-foreign keys are top-level globals too (referenced cross-module by `$root`).
@@ -240,24 +221,22 @@ llvmBackend opts =
         gkeys = Set.fromFoldable (Array.concatMap gdefKeys gdefs0 <> synthKeys)
         surface = deriveSurface cm.source gdefs0
         xfns = foldl (surfaceFn surface) Map.empty gdefs0
-        machinery = machineryOf deps.machinery (Array.concatMap _.members cm.module.decls)
       in
         -- `foreignArity` is a per-module base — `lowerModule`/`lowerEntry` override it with the module's
         -- own native-leaf arities (`nativeLeafArities lm.foreignSigs`), threaded from FSR (ADR-0090).
         { cxOpts: { gkeys, xfns, foreignArity: Map.empty, inlineAbi: not opts.debug }
-        , machinery
         , isEffect: opts.isEffect
         , heapWords: opts.heapWords
         }
-  -- The `.pmi` surface (export kinds/arities) is unchanged by `DictElim` (it rewrites bodies, not
-  -- top-level keys/arities), so the interface is byte-identical whether taken over the raw or bridged module.
+  -- The `.pmi` surface (export kinds/arities) is unchanged by the required lowering (it rewrites
+  -- bodies, not top-level keys/arities), so the interface is taken over the raw module.
   , interfaceOf: \_ lm -> interfaceOfAnf lm.source (map classifyDecl lm.module.decls)
   , lowerModule: \ctx lm ->
       let
         leaves = nativeLeafArities lm.foreignSigs
         -- Foreign gdefs first (boot's `foreign_groups`, key-sorted by `synthForeignGdefs`), then the
         -- module's own decls — the per-module view of boot's `foreign_groups @ module_reached`.
-        gdefs = synthForeignGdefs lm <> map classifyDecl (bridgeModule ctx leaves lm.module).decls
+        gdefs = synthForeignGdefs lm <> map classifyDecl (lowerModuleDecls leaves lm.module).decls
         defined = Set.fromFoldable (Array.concatMap gdefKeys gdefs)
       in
         moduleLl (ctx.cxOpts { foreignArity = leaves }) defined gdefs
@@ -269,9 +248,9 @@ llvmBackend opts =
         -- program, sorted by key, precede **all** module decls (in dependency-spine order). `reachableGdefs`
         -- then prunes to the entry's closure, preserving this order for `pv_init_all`.
         allForeigns = Array.sortWith gdefInitKey (Array.concatMap synthForeignGdefs input.modules)
-        allDecls = Array.concatMap (\lm -> map classifyDecl (bridgeModule ctx (nativeLeafArities lm.foreignSigs) lm.module).decls) input.modules
+        allDecls = Array.concatMap (\lm -> map classifyDecl (lowerModuleDecls (nativeLeafArities lm.foreignSigs) lm.module).decls) input.modules
       in
         entryLl (ctx.cxOpts { foreignArity = allLeaves }) ctx.isEffect ctx.heapWords
           (allForeigns <> allDecls)
-          (nativeByteIdentityBridgeDictElim ctx allLeaves input.entry)
+          (nativeRequiredLowering allLeaves input.entry)
   }

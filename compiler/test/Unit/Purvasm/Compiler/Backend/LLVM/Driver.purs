@@ -2,13 +2,18 @@
 -- | through the neutral `Purvasm.Compiler.build` driver + the LLVM `Backend` (`llvmBackend`), and assert
 -- | the emitted module/entry objects.
 -- |
--- | Three checks, each locking a distinct backend contract:
+-- | The checks, each locking a distinct backend contract:
 -- |
 -- |  * **`slice1` byte-identity** — the pure-value baseline: `Slice1`'s single, fully-reachable binding
--- |    (`identInt`) emits module + init/entry objects byte-identical to boot's `--no-opt` `.ll`
--- |    (fixtures under `test/fixtures/slice1/`). B2's "emit every module binding" and boot B1's DCE'd
--- |    output coincide here, so byte-identity is a clean gate. Exercises the backend-private `DictElim`
--- |    bridge (ADR-0086 Addendum), since the driver runs no `DictElim` under `--no-opt`.
+-- |    (`identInt`) emits module + init/entry objects byte-identical to the **L2-owned golden**
+-- |    fixtures under `test/fixtures/slice1/` (originally baselined from boot's `--no-opt` `.ll`;
+-- |    per ADR-0104 §4 an intentional emission change re-baselines them in the same PR, with the
+-- |    behavioural gate green as the licence).
+-- |  * **bridge retirement** (`dict-retire` fixture, ADR-0104 §3) — `--no-opt` dictionary dispatch
+-- |    stays DYNAMIC (the use site consults the accessor + instance-dictionary roots and never the
+-- |    impl directly), with `--opt` as the contrast (the optimiser's `DictElim` — the one legitimate
+-- |    collapse site — eliminates the dispatch). Reintroducing a bridge-like `--no-opt` collapse
+-- |    fails the first leg; breaking the optimiser pass fails the second.
 -- |  * **structural-foreign materialisation** (`structural-ref` fixture) — a module declaring the
 -- |    structural foreign `Effect.Ref._new` must emit its **guest-term body** (the one-cell mutable array,
 -- |    ADR-0071 §6 / ADR-0072 §9) as a synthesised gdef, **before** the module's own decls (boot's
@@ -80,6 +85,16 @@ buildIR fixture opts = do
 countOccurrences :: String -> String -> Int
 countOccurrences needle hay = Array.length (String.split (Pattern needle) hay) - 1
 
+-- | The text of ONE emitted function — from its `@<name>(` reference in the `define` line to the
+-- | closing brace — so an assertion can pin a specific use site without tripping over the same
+-- | symbol's own definition elsewhere in the object.
+functionBody :: String -> String -> Maybe String
+functionBody name ir = do
+  start <- String.indexOf (Pattern ("@" <> name <> "(")) ir
+  let rest = String.drop start ir
+  end <- String.indexOf (Pattern "\n}") rest
+  pure (String.take end rest)
+
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.Backend.LLVM.Driver" do
   stackSafetySpec
@@ -92,12 +107,45 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Driver" do
         Left err -> fail ("CoreFn decode failed: " <> err)
         Right mod -> do
           -- `Slice1` imports `Prim`, reported `Missing` (skipped), so the closure is exactly `[Slice1]`.
-          -- The entry `Slice1.identInt` (a bare `--value` entry); `isEffect: false` / `opt: false` matches
-          -- boot's `--no-opt` reference.
+          -- The entry `Slice1.identInt` (a bare `--value` entry); `isEffect: false` / `opt: false` is
+          -- the optimiser-free reference lowering the goldens are baselined on.
           out <- buildIR { name: "Slice1", mod, foreignSigs: Map.empty }
             { entryModule: "Slice1", entryName: "identInt", isEffect: false, opt: false }
           out.mods `shouldEqual` [ expectedMod ]
           out.entry `shouldEqual` Just expectedEntry
+
+    -- ADR-0104 §3 retirement pin: under `--no-opt` dictionary dispatch stays DYNAMIC. The fixture's
+    -- instance member references a TOP-LEVEL impl (`speak = speakDogImpl` — exactly the liftable
+    -- shape the former boot-parity bridge collapsed to a direct call), so any bridge-like collapse
+    -- reintroduced into the `--no-opt` path turns the use site back into a `speakDogImpl` reference
+    -- and fails the first leg. The `--opt` leg is the contrast: the optimiser's `DictElim` — the one
+    -- legitimate collapse site — must eliminate the dispatch there.
+    it "keeps --no-opt dictionary dispatch dynamic; --opt collapses it (bridge retirement, ADR-0104 §3)" do
+      src <- liftEffect (readTextFile UTF8 "compiler/test/fixtures/dict-retire/corefn.json")
+      case parseModule src of
+        Left err -> fail ("CoreFn decode failed: " <> err)
+        Right mod -> do
+          let fixture = { name: "DictRetire", mod, foreignSigs: Map.empty }
+          noopt <- buildIR fixture { entryModule: "DictRetire", entryName: "use", isEffect: false, opt: false }
+          case functionBody "pv_g_DictRetire_2euse$init" (fromMaybe "" (Array.head noopt.mods)) of
+            Nothing -> fail "use$init not found in the --no-opt module IR"
+            Just useInit -> do
+              -- the use site consults the accessor and the instance dictionary at runtime …
+              unless (String.contains (Pattern "@pv_g_DictRetire_2espeak$root") useInit)
+                (fail ("--no-opt use site must load the accessor root (dynamic dispatch); use$init:\n" <> useInit))
+              unless (String.contains (Pattern "@pv_g_DictRetire_2espeakDog$root") useInit)
+                (fail ("--no-opt use site must load the instance-dictionary root; use$init:\n" <> useInit))
+              -- … and never the impl directly (the retired bridge's collapse):
+              when (String.contains (Pattern "speakDogImpl") useInit)
+                (fail ("--no-opt use site must not collapse to the impl (bridge reintroduced?); use$init:\n" <> useInit))
+          opt <- buildIR fixture { entryModule: "DictRetire", entryName: "use", isEffect: false, opt: true }
+          case functionBody "pv_g_DictRetire_2euse$init" (fromMaybe "" (Array.head opt.mods)) of
+            Nothing -> fail "use$init not found in the --opt module IR"
+            Just useInit -> do
+              when (String.contains (Pattern "@pv_g_DictRetire_2espeak$root") useInit)
+                (fail ("--opt must eliminate the accessor dispatch (optimiser DictElim); use$init:\n" <> useInit))
+              when (String.contains (Pattern "call i64 @pv_apply(") useInit)
+                (fail ("--opt use site must not generic-apply through the dictionary; use$init:\n" <> useInit))
 
     -- P2-1: the structural rung must be materialised as a guest-term gdef (reverting `synthForeignGdefs`
     -- to the intrinsic-only rung leaves `Effect.Ref._new` unsynthesised, so every assertion below fails).

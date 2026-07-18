@@ -11,7 +11,7 @@ import Data.Tuple (Tuple(..))
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
-import Purvasm.Compiler.MiddleEnd.Optimizer.DictElim (dictElimExpr, emptyMachinery, intrinsicLift, machineryOf, mergeMachinery, noForeignLift)
+import Purvasm.Compiler.MiddleEnd.Optimizer.DictElim (dictElimExpr, emptyMachinery, intrinsicLift, machineryOf, mergeMachinery)
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
 
@@ -106,27 +106,16 @@ spec = describe "Purvasm.Compiler.MiddleEnd.DictElim" do
       dictElimExpr intrinsicLift Set.empty m call
         `shouldEqual` Ret (CApp (AtomVar "Purvasm.Int.add") [ AtomVar "x", AtomVar "y" ])
 
-    it "the bridge policy (noForeignLift) declines the same intrinsic impl — no Simplify follows it" do
-      -- The LLVM byte-identity bridge feeds codegen directly: a lifted `AtomVar "Purvasm.Int.add"`
-      -- would reach `readVar` unbound, so under `noForeignLift` the dispatch must stay a call.
-      let
-        m = machineryOf emptyMachinery
-          [ Tuple "Sr.add" (accessor "add")
-          , Tuple "Sr.srInt" (instanceRec [ Tuple "add" (AtomVar "Purvasm.Int.add") ])
-          ]
-        call = Ret (CApp (AtomVar "Sr.add") [ AtomVar "Sr.srInt", AtomVar "x", AtomVar "y" ])
-      dictElimExpr noForeignLift Set.empty m call `shouldEqual` call
-
-    it "the bridge policy still lifts an AtomForeign impl (a resolved native leaf)" do
-      -- `resolveNativeForeigns` runs before the bridge and turns native-leaf impls into
-      -- `AtomForeign`, which codegen lowers via its `pvf_*` symbol — liftable under every policy.
+    it "lifts an AtomForeign impl (a resolved native leaf) — liftable under every policy" do
+      -- `resolveNativeForeigns` turns native-leaf impls into `AtomForeign`, which codegen lowers via
+      -- its `pvf_*` symbol — `liftable` accepts it unconditionally, before any `ForeignLift` policy.
       let
         m = machineryOf emptyMachinery
           [ Tuple "Sh.show" (accessor "show")
           , Tuple "Sh.showNumber" (instanceRec [ Tuple "show" (AtomForeign "Data.Show.showNumberImpl") ])
           ]
         call = Ret (CApp (AtomVar "Sh.show") [ AtomVar "Sh.showNumber", AtomVar "x" ])
-      dictElimExpr noForeignLift Set.empty m call
+      dictElimExpr intrinsicLift Set.empty m call
         `shouldEqual` Ret (CApp (AtomForeign "Data.Show.showNumberImpl") [ AtomVar "x" ])
 
     it "declines an impl that is neither a global key nor a known foreign (a local name)" do

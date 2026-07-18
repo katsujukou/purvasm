@@ -427,3 +427,42 @@ vacate the GC coverage), and the no-collection case FAILS — demonstrated live 
 fixture sizing under-allocated and the gate reported `NO-GC(0)` instead of passing. Result:
 8/8 legs behaviour-identical to the oracle with 2–8 collections each. **The §5 step-3 (bridge
 removal) blocker is released once this lands with review.**
+
+#### Progress (2026-07-18): §5 step 3 — the boot-parity `DictElim` bridge removed
+
+The §3 decomposition executed exactly: `dictElimExpr` over the whole-program machinery is gone
+from `Backend/LLVM/Driver`, together with `LlvmContext.machinery`, its `moduleContext`
+derivation (`machineryOf` over deps) and `mergeContext` merge; `noForeignLift` — the bridge's
+lift policy, with no other production consumer — went with it (its DictElim unit test retired;
+the `AtomForeign`-always-liftable property test was re-anchored on `intrinsicLift`, being a
+property of `liftable`, not of the bridge policy). The survivors are exactly the §3 pins:
+`nativeRequiredLowering leaves = resolveLitBuiltins <<< resolveNativeForeigns leaves`, applied
+in BOTH modes, and `synthForeignGdefs` untouched. The `ForeignLift` parameter stays parametric
+(a call-site property); the seam's `moduleContext deps` projection stays in the contract (the
+LLVM backend simply no longer uses it). Prose de-anchored in the same change: seam docs
+(`Compiler`/`Optimizer`), CLI `--no-opt`/`--emit-llvm` help, and the slice1 golden test's
+header (now explicitly the §4 L2-owned-golden contract).
+
+**The first intentional emission divergence, measured** (same-corefn, pre/post compilers per
+the §5-1 method note): `--no-opt` 47/104 objects diverge on the dict-dispatch fixture closure —
+the diff shape is exactly dispatch un-collapsing (direct `concatString`/`showIntImpl`/
+`Purvasm.Int.add` references replaced by `semigroupString`/`semiringInt` dictionary roots and
+`append$d`/`add$d`/`foldl$d` accessor calls); `--opt` is **0/104** — the bridge was already a
+no-op behind the real optimiser pass, so the daily (`--opt`) path's emission is byte-unchanged:
+no *generated-code* performance regression is possible on the measured closure (compile-time
+behaviour — e.g. the dropped machinery derivation — is a separate axis this diff does not
+speak to). Gates: behavioural gate green post-removal (8/8 legs ≡ oracle,
+gc 2–8 — dynamic `--no-opt` dispatch now production and covered by the very fixture class the
+gate was built for), unit green (slice1 goldens needed **no** re-baseline: the fixture has no
+dispatch), e2e 11/11 (VM-side goldens unaffected — the VM never had a bridge), examples sweep
+10/10.
+
+Review round (P1): the removal itself is now pinned by an automated fixture — the behavioural
+gate is bridge-invariant (same values either way) and slice1 has no dispatch, so nothing above
+would catch a bridge *reintroduction*. `test/fixtures/dict-retire` (a self-contained local
+class whose instance member references a top-level impl — exactly the liftable shape the bridge
+collapsed) + a `Test.Unit….LLVM.Driver` case asserting the `--no-opt` use site loads the
+accessor + instance-dictionary roots and never references the impl directly, with `--opt` as
+the contrast leg (the optimiser's `DictElim` must eliminate the dispatch). Discrimination
+verified live: the same test run against the pre-removal compiler fails on exactly the
+`--no-opt` leg (direct `speakDogImpl$d` call, no dictionary roots). Unit total: 404/404.

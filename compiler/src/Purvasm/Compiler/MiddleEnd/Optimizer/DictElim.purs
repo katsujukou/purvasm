@@ -2,15 +2,13 @@
 -- | backend-neutral optimiser (ADR-0086 §3), not a codegen concern. A method call `accessor dict args`
 -- | rewrites to `impl args` when both the accessor and the instance dictionary are statically known.
 -- |
--- | It runs in **two** places (ADR-0086 Addendum — the shared driver runs no `DictElim` of its own, and
--- | the VM none under `--no-opt`): inside `optimizeModule`'s fixpoint as an ordinary correctness-first
--- | optimisation pass (`--opt`, both backends), and as the LLVM backend's **private byte-identity
--- | bridge** (`Backend.LLVM.Driver`, a transitional compatibility lowering — boot's `--no-opt` `.ll` has
--- | dispatch collapsed, so Level-2's must match byte-for-byte; retired when the LLVM port off boot
--- | completes). The two call sites share this transcription of boot's `dict_elim.ml`, diverging only
--- | on the `ForeignLift` policy parameter (the split ADR-0086 §3 sanctions): the optimiser lifts
--- | intrinsic foreign keys (`intrinsicLift` — safe because the NbE inliner's intrinsic saturation
--- | runs next), the bridge lifts none (`noForeignLift` — nothing runs between it and codegen).
+-- | It runs in **one** place: inside `optimizeModule`'s fixpoint as an ordinary correctness-first
+-- | optimisation pass (`--opt`, both backends). Under `--no-opt` no backend collapses dispatch —
+-- | dictionaries stay dynamically dispatched on native and VM alike (ADR-0104 §3 retired the LLVM
+-- | backend's former boot-parity bridge, this pass's other historical call site). The transcription of
+-- | boot's `dict_elim.ml` keeps its `ForeignLift` policy parameter (the split ADR-0086 §3 sanctions):
+-- | the optimiser lifts intrinsic foreign keys (`intrinsicLift` — safe because the NbE inliner's
+-- | intrinsic saturation runs next).
 -- |
 -- | A method call is `accessor dict args`, where the `accessor` is `\d -> case d of v -> v.φ` (the
 -- | newtype dict binder erased, ADR-0018) and an instance `dict` is the newtype-identity-wrapped record
@@ -29,7 +27,6 @@ module Purvasm.Compiler.MiddleEnd.Optimizer.DictElim
   , mergeMachinery
   , machineryOf
   , intrinsicLift
-  , noForeignLift
   , dictElimExpr
   ) where
 
@@ -185,9 +182,11 @@ machineryOf imported pairs =
     -- dependencies' at `mergeMachinery`.
     { accessors, instances, identities, effectFamily: Set.empty }
 
--- | The policy axis on which the two `DictElim` call sites diverge (the split ADR-0086 §3 explicitly
--- | sanctions, realised as a parameter rather than two definitions): may a *foreign-key* `AtomVar`
--- | impl (not in gkeys) be lifted to a call site?
+-- | The lift-policy axis (the split ADR-0086 §3 explicitly sanctions, realised as a parameter rather
+-- | than a baked-in choice): may a *foreign-key* `AtomVar` impl (not in gkeys) be lifted to a call
+-- | site? Kept parametric even though only `intrinsicLift` remains in production (the LLVM bridge's
+-- | `noForeignLift` went with the bridge, ADR-0104 §3) — the policy is a call-site property, not a
+-- | pass property.
 type ForeignLift = String -> Boolean
 
 -- | The **optimiser** policy: lift **intrinsic** foreign keys. Safe there — and only there — because
@@ -206,19 +205,10 @@ type ForeignLift = String -> Boolean
 intrinsicLift :: ForeignLift
 intrinsicLift = isJust <<< intrinsicPrim
 
--- | The **LLVM byte-identity bridge** policy: lift **no** foreign-key `AtomVar` — nothing runs between
--- | the bridge and codegen, so a lifted intrinsic `AtomVar "Purvasm.Int.add"` would reach `readVar`
--- | unbound (there is no `Simplify` behind the bridge to collapse it, and the bridge's
--- | `resolveNativeForeigns`/`resolveLitBuiltins` handle only native-leaf and literal builtins).
--- | Native-leaf impls are still lifted — they arrive as `AtomForeign` (already resolved by
--- | `resolveNativeForeigns` before the bridge), which `liftable` accepts unconditionally.
-noForeignLift :: ForeignLift
-noForeignLift = const false
-
 -- | An impl is safe to lift to a call site iff it is in scope everywhere **and lowerable by the
 -- | consumer of this pass's output**: a literal or (resolved) foreign, a reference to a top-level
 -- | binding (a program-wide global key), or a foreign-key reference the caller's `ForeignLift` policy
--- | accepts (see `intrinsicLift`/`noForeignLift`).
+-- | accepts (see `intrinsicLift`).
 liftable :: ForeignLift -> Set String -> Atom -> Boolean
 liftable foreignLift gkeys = case _ of
   AtomLit _ -> true

@@ -116,15 +116,15 @@ options = fromRecord
   , noOpt:
       ArgParser.flag [ "--no-opt" ]
         "Disable the optimiser (the DictElim + NbE-inliner fixpoint, ADR-0086/0089); the shared\n\
-        \driver is then the identity (normalise-only), and the LLVM backend privately applies its\n\
-        \transitional boot byte-identity bridge (ADR-0086 Addendum). The un-optimised native path\n\
-        \is the `.ll` byte-identity reference for the boot port (ADR-0082 §2), and a bisection aid\n\
-        \separating a codegen bug from an optimiser bug."
+        \driver is then the identity (normalise-only) and dictionaries stay dynamically\n\
+        \dispatched (ADR-0104 §3). The un-optimised native path is the optimiser-free reference\n\
+        \lowering — a bisection aid separating a codegen bug from an optimiser bug."
         # ArgParser.boolean
   , emitLlvm:
       ArgParser.flag [ "--emit-llvm" ]
-        "Stop after emitting the `.ll` objects (no clang/link). Useful for the byte-identity\n\
-        \differential against boot; a full build otherwise links a native executable."
+        "Stop after emitting the `.ll` objects (no clang/link). Useful for `.ll`-level\n\
+        \differentials (e.g. the stage fixpoint, ADR-0104 §2); a full build otherwise links\n\
+        \a native executable."
         # ArgParser.boolean
   , emitIr:
       ArgParser.argument [ "--emit-ir" ]

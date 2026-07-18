@@ -98,7 +98,7 @@ type Options =
   -- | `true` ⇒ the entry is an `Effect` run for effects (applied to unit); `false` ⇒ a bare value printed.
   , isEffect :: Boolean
   -- | `true` ⇒ `--opt` (iterate `optimizeModule` to a fixpoint, up to `maxOptimizeIter`); `false` ⇒
-  -- | `--no-opt` (the byte-identity bridge only).
+  -- | `--no-opt` (the optimiser-free reference lowering, ADR-0104 §3).
   , opt :: Boolean
   }
 
@@ -166,9 +166,9 @@ type EntryInput = { modules :: Array LoweredModule, entry :: Expr }
 -- |   * `moduleContext deps cm` — ONE module's **own contribution** (the native `gkeys`/cross-module
 -- |     surface facts), computed from its **pre-optimisation** lowering (a `ContextModule` — CoreFn
 -- |     source + lowered ANF, so the surface can read `exports`, but **no** foreign shapes: FSR runs in
--- |     the fold) *under* `deps` — the projection of its import closure's facts (dictionary-machinery
--- |     recognition sees through dependencies' `$Dict` wrappers). The returned `c` is the module's
--- |     contribution ONLY, never `deps` folded back in — the driver owns accumulation.
+-- |     the fold) *under* `deps` — the projection of its import closure's facts, for a backend whose
+-- |     contribution derivation must see through dependency-owned facts. The returned `c` is the
+-- |     module's contribution ONLY, never `deps` folded back in — the driver owns accumulation.
 -- |     The contributed `gkeys` are the stable *base* set of existing source declarations, **not** the
 -- |     complete final set: the optimiser's Specialize pass (ADR-0089) adds post-opt top-level keys
 -- |     (`$spec$` clones), so `lowerModule`/`lowerEntry` complete `gkeys` with each object's final gdef
@@ -356,7 +356,8 @@ type FoldState c o =
 -- | order `CoreFn → normalise → AnfModule` (once — the same value feeds the backend context facts and the
 -- | optimiser, ADR-0104 §5-1), then `if --opt` **iterate `optimizeModule` to a fixpoint** (up
 -- | to `action.maxOptimizeIter` rounds) + `extendSummary`, `else` the identity — it runs **no `DictElim`
--- | of its own** (a backend's `--no-opt` boot-parity need is its own private lowering). The backend context
+-- | of its own** (a backend's *required* lowering — e.g. native leaf/builtin resolution — is the backend's
+-- | own concern inside `lowerModule`/`lowerEntry`, applied in both modes; ADR-0104 §3). The backend context
 -- | is accumulated dependency-directed through the fold (no eager whole-closure pass): each module's
 -- | contribution is derived under its import-closure projection and merged in. Emit each module via
 -- | `emitFile`, then run the backend's whole-program `lowerEntry` (with the final accumulated context) over
@@ -390,9 +391,9 @@ build backend action opts =
       foldM step (Right initialState) loaded >>= case _ of
         Left err -> pure (Left err)
         Right final -> do
-          -- The entry is handed to the backend **raw** (no seam `DictElim`); the native backend bridges it
-          -- privately in `lowerEntry`, the VM does not (ADR-0086 Addendum). The context is the final
-          -- accumulated one — the entry imports the world (ADR-0104 §5-1).
+          -- The entry is handed to the backend **raw** (no seam `DictElim`); the native backend applies
+          -- its required lowering privately in `lowerEntry`, the VM none (ADR-0104 §3). The context is
+          -- the final accumulated one — the entry imports the world (ADR-0104 §5-1).
           let entryIr = backend.lowerEntry final.total { modules: final.lowered, entry: entryExprOf opts }
           entryPath <- action.emitEntry entryIr
           pure (Right { modules: final.emitted, entry: { ir: entryIr, path: entryPath } })

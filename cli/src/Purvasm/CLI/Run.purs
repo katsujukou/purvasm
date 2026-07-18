@@ -79,9 +79,8 @@ options = fromRecord
   , noOpt:
       ArgParser.flag [ "--no-opt" ]
         "Disable the optimiser (the DictElim + NbE-inliner fixpoint, ADR-0086/0089); keep only\n\
-        \normalisation (the VM has no bridge — dictionaries stay applied). `--opt` runs the real\n\
-        \optimiser over the ANF — the VM is the optimiser's effect-measurement field (ADR-0088);\n\
-        \the emitted bytecode is no longer byte-identical to boot."
+        \normalisation (dictionaries stay applied). `--opt` runs the real optimiser over the\n\
+        \ANF — the VM is the optimiser's effect-measurement field (ADR-0088)."
         # ArgParser.boolean
   , emitIr:
       ArgParser.argument [ "--emit-ir" ]
