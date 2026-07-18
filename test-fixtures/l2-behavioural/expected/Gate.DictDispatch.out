@@ -1,0 +1,8 @@
+1/2/false/LT
+"a"/"a"/true/EQ
+[1,2]/[1,3]/false/LT
+(Just 5)/Nothing/false/GT
+woofwoof/meowmeow
+123
+xyz
+bulk=10626

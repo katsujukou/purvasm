@@ -1,0 +1,16 @@
+start
+acc:1:1
+acc:2:3
+acc:3:6
+acc:4:10
+acc:5:15
+total=15
+churn:100:2884
+churn:200:6469
+churn:300:10469
+churn:400:14469
+fold:1
+fold:2
+fold:3
+s=123
+end

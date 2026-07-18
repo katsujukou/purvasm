@@ -1,13 +1,14 @@
 # `tools/` — regression harnesses
 
-Manual, run-from-the-repo-root harnesses (inside `nix develop`). They are **not yet
-wired into CI** — run them before landing changes to the native backend / link step /
-FFI. Wiring them into a CI job (one that has the Level-2 CLI built, the runtime
-staticlib, staged ulib, `clang`/`llvm`, and `cargo`) is an open follow-up; see the note
-at the bottom.
+Run-from-the-repo-root harnesses (inside `nix develop`). Except where noted they are
+**not yet wired into CI** — run them before landing changes to the native backend /
+link step / FFI. Wiring the rest into a CI job (one that has the Level-2 CLI built, the
+runtime staticlib, staged ulib, `clang`/`llvm`, and `cargo`) is an open follow-up; see
+the note at the bottom.
 
 | Harness | Guards | Needs |
 |---|---|---|
+| `l2-native-behavioural.sh` | The ADR-0104 §2 **Level-2 native behavioural gate** (standing net; **CI-wired**: `l2-behavioural-ci.yaml`): behavioural fixtures (`test-fixtures/l2-behavioural`) compiled by Level-2 to native binaries, run under a small `PURVASM_HEAP_WORDS` in both `--opt`/`--no-opt`; stdout ≡ oracle (frozen boot VM + fixture-owned expected traces), stats schema-checked with `gc_collections >= 1` (forced-GC coverage cannot go vacuous). | boot, runtime `.a` (release), staged ulib (`dist/ulib`), `clang`, `node`, workspace `spago build` |
 | `native-run-diff.sh` | ADR-0082 native **execution** differential: `Prim`-only fixtures built to a native binary by **both** boot and Level-2, run, and asserted equal. Codegen → `clang` → link → run. | boot, runtime `.a`, `clang`, `purs`, `node` |
 | `llvm-diff.sh` | Byte-identical `.ll` between boot `--no-opt` and the Level-2 build. | boot, `purs`, `node` |
 | `foreign-sigs-diff.sh` | FSR (ADR-0080) foreign-signature reconstruction vs boot's registry. | boot, `purs`, `node` |

@@ -42,8 +42,10 @@ retired gate.
 
 Maintainer decision (2026-07-16), which this record captures: *boot byte-identity is considered
 achieved; boot is fully frozen; Level-2+ backends are driven by functional improvement, with
-correctness anchored on behavioural invariance against the CESK oracle and on level-to-level byte
-identity.*
+correctness anchored on behavioural invariance against the execution oracle and on level-to-level
+byte identity.* (Originally phrased as "the CESK oracle"; the 2026-07-18 §2 amendment pins the
+oracle as the frozen boot VM + fixture-owned expected traces and retires the CESK-leg
+requirement.)
 
 ## Decision
 
@@ -80,16 +82,34 @@ terms* is not.**
 
 ### 2. Level-2+ correctness anchors
 
-- **Behavioural invariance against the CESK oracle** — values + `Effect` order, the discipline of
-  [0023](0023-effect-runtime-oracle.md)/[0064](0064-v1-single-capability-native-abi-codegen-contract.md) §7.
+- **Behavioural invariance against the execution oracle** — values + `Effect` order, the
+  discipline of [0023](0023-effect-runtime-oracle.md)/[0064](0064-v1-single-capability-native-abi-codegen-contract.md) §7.
   The VM and the boot-built binaries stay in the differential as long as boot remains in the build
   path — behavioural agreement never required byte agreement.
+
+  **The oracle, pinned (amendment 2026-07-18, maintainer decision):** for the current
+  *deterministic, sequential* language, the Level-2 behavioural gate's oracle is the **frozen boot
+  VM plus fixture-owned expected stdout** (the expected traces reduce the risk of Level-2 and the
+  VM sharing one error). A **direct CESK leg is NOT required**: the frozen CESK runner is an
+  *implementation* of the current sequential semantics, not a permanent normative semantics —
+  Level-2 has no CESK runtime of its own, so requiring that leg would quietly re-anchor
+  correctness to frozen boot, the very ratchet this record retires. The scenario that would
+  genuinely need a reference semantics — **concurrent primitives** — cannot reuse the current
+  runner anyway: with concurrency a program's meaning is a *set* of admissible observable traces,
+  not one output, so single-run stdout equality stops being meaningful. Any future concurrency
+  work therefore starts with its own ADR defining the verification contract — what is observable,
+  whether the scheduler is part of the semantics, trace refinement
+  (`Traces(impl) ⊆ Traces(spec)`) vs deterministic-scheduler differentials vs happens-before
+  normalisation vs linearizability, and the safety/liveness split — **before** selecting or
+  extending a reference machine. Deciding for the existing CESK first would let an implementation
+  dictate the semantics backwards.
 
   **The owed Level-2 native behavioural gate (review round 2 — the existing nets do NOT yet cover
   a Level-2 emitter bug):** today's forced-GC fixtures live in boot's e2e (they verify *boot's*
   emitter) and in the runtime's unit tests; `tools/native-run-diff.sh` runs a handful of
   Prim-only pure-value fixtures, `--no-opt` only, comparing boot-native vs Level-2-native vs a
-  fixed expected value — it never executes the CESK oracle, forces no collection, and the
+  fixed expected value — it covers no `Effect` order or dictionary dispatch, forces no
+  collection, and the
   Level-2 native harness is not CI-wired (`examples-ci` excludes Level-2). So "rooting-emission
   bugs are caught behaviourally" is **not yet true of Level-2-generated binaries**. Pinned:
   **before the FIRST intentional emission divergence — which is bridge removal, not liveness
@@ -99,11 +119,13 @@ terms* is not.**
   sequence, after the identity-preserving restoration and before bridge removal**: it compiles
   fixtures with Level-2, runs the resulting native binaries under a deliberately small heap
   (`PURVASM_HEAP_WORDS` — the existing knob, so the mechanism is unambiguous), and compares
-  values + `Effect` order against the CESK/VM legs — in BOTH `--opt` and `--no-opt`, with
-  `PURVASM_STATS` asserting that collections actually fired (a run where no collection happened
-  is not GC coverage), and with dictionary-dispatch-heavy fixtures included (the very path
-  bridge removal turns on). **Bridge removal and everything after it is blocked on this gate**,
-  not merely on this record's acceptance.
+  values + `Effect` order against the oracle above (the boot-VM leg AND the fixture's own
+  expected stdout) — in BOTH `--opt` and `--no-opt`, with `PURVASM_STATS` asserting that
+  collections actually fired (a run where no collection happened is not GC coverage), and with
+  dictionary-dispatch-heavy fixtures included (the very path bridge removal turns on). The gate
+  is a **standing** net, so it must be **CI-wired** (its absence from CI is one of the defects
+  this paragraph lists) no later than the change that removes the bridge. **Bridge removal and
+  everything after it is blocked on this gate**, not merely on this record's acceptance.
 - **Level-to-level byte identity (the self-host fixpoint)** — pinned procedure (review round 2:
   "stage N vs stage N+1" was ambiguous; comparing the boot-built compiler's *own* `.ll` against
   that compiler's *output* is the wrong reading — those legitimately diverge at the first
@@ -314,8 +336,9 @@ lifetime separations):
    (This slice may alternatively be re-homed to its own ADR; the five pins carry over verbatim.)
 2. **The Level-2 native behavioural gate** (§2) — lands here, between the identity-preserving
    restoration and the first divergence: small-heap (`PURVASM_HEAP_WORDS`) forced-GC runs of
-   Level-2-built binaries vs the CESK/VM legs, both modes, dictionary-dispatch fixtures
-   included, `PURVASM_STATS`-verified collections.
+   Level-2-built binaries vs the execution oracle (the frozen boot VM + fixture-owned expected
+   traces, per the §2 amendment), both modes, dictionary-dispatch fixtures included,
+   `PURVASM_STATS`-verified collections.
 3. **Bridge removal** (§3) — **the first intentional emission divergence** (review round 3: the
    `--no-opt` ANF/LLVM changes and dynamic dictionary dispatch goes production on native), so it
    is blocked on the step-2 gate; the §3 `--opt`-default caveat is already satisfied.
@@ -329,8 +352,9 @@ lifetime separations):
   lever), future emission-order and direct-call improvements — all previously frozen by proxy.
 - The native build driver can drop its whole-program pre-pass, restoring per-module,
   leaves-first compilation with only interface/summary facts flowing forward.
-- `--no-opt` loses its boot-anchored meaning; bisection now leans on the VM/CESK behavioural
-  differential, `PURVASM_TRACE`, and the stage fixpoint. The bridge's deletion also deletes the
+- `--no-opt` loses its boot-anchored meaning; bisection now leans on the behavioural
+  differential against the execution oracle (the VM leg + fixture-owned traces),
+  `PURVASM_TRACE`, and the stage fixpoint. The bridge's deletion also deletes the
   last whole-program byte-identity machinery from the seam.
 - The stage-fixpoint gate is only as good as the L3 build's viability — acceptable circularity:
   the gate runs at milestones until the build-performance track (which this record unblocks) makes
@@ -383,3 +407,23 @@ Two results, recorded separately:
   measured data point for the §2 fixpoint profiles (smoke = `--no-opt`; the `--opt` milestone
   leg's native flavour is currently impractical) and for the build-performance track this record
   unblocks.
+
+#### Progress (2026-07-18): §5 step 2 — the Level-2 native behavioural gate landed, CI-wired
+
+`tools/l2-native-behavioural.sh` + `test-fixtures/l2-behavioural/` (a workspace member, so the
+stress fixtures stay out of `examples/` per the repo's examples policy) + the
+`l2-behavioural-ci.yaml` workflow (trigger set includes `compiler/`/`cli/` — a Level-2 emitter
+change is what the gate exists to catch; required status: `l2-behavioural-ci-gate`).
+
+The gate implements the §2 pin as amended (2026-07-18): oracle = **frozen boot VM + fixture-owned
+expected stdout** (the expected traces were generated from the **JS backend** — a third,
+purvasm-independent source — and are committed as fixture-owned truth); a direct CESK leg is not
+required. Four fixtures (GC churn / `Effect` order / dictionary-dispatch-heavy incl. a local
+class + 500-call bulk / mixed records-closures-effects), each run in `--opt` AND `--no-opt`
+under `PURVASM_HEAP_WORDS=65536` with a schema-checked `purvasm-stats:v1` line and
+`gc_collections >= 1` asserted per run. Review hardening: the churn's allocations are
+data-dependent on the loop variables and land in printed checksums (constant-hoisting cannot
+vacate the GC coverage), and the no-collection case FAILS — demonstrated live when the first
+fixture sizing under-allocated and the gate reported `NO-GC(0)` instead of passing. Result:
+8/8 legs behaviour-identical to the oracle with 2–8 collections each. **The §5 step-3 (bridge
+removal) blocker is released once this lands with review.**

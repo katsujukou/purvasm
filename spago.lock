@@ -369,6 +369,24 @@
           "dependencies": []
         }
       },
+      "l2-behavioural-fixtures": {
+        "path": "test-fixtures/l2-behavioural",
+        "core": {
+          "dependencies": [
+            "arrays",
+            "console",
+            "effect",
+            "foldable-traversable",
+            "maybe",
+            "prelude",
+            "refs",
+            "strings"
+          ]
+        },
+        "test": {
+          "dependencies": []
+        }
+      },
       "purvasm-base": {
         "path": "packages/purvasm-base",
         "core": {

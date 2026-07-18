@@ -1,0 +1,11 @@
+package:
+  name: l2-behavioural-fixtures
+  dependencies:
+    - arrays
+    - console
+    - effect
+    - foldable-traversable
+    - maybe
+    - prelude
+    - refs
+    - strings

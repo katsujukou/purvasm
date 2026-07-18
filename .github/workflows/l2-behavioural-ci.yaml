@@ -1,0 +1,105 @@
+name: L2-Behavioural-CI
+
+# The ADR-0104 §2 Level-2 native behavioural gate as a standing CI net: build the behavioural
+# fixtures with the LEVEL-2 compiler (Node-hosted) to native binaries and run them under a
+# deliberately small heap, asserting stdout ≡ the oracle (frozen boot VM + fixture-owned expected
+# traces) and that collections actually fired (tools/l2-native-behavioural.sh). This is the
+# replacement net the retired boot byte-identity gate hands over to, and the blocker released
+# before the first intentional emission divergence (bridge removal, ADR-0104 §5) — so unlike
+# examples-ci, `compiler/`/`cli/` ARE in the trigger set: a Level-2 emitter change is exactly what
+# this gate exists to catch.
+#
+# Same gate topology as the sibling workflows (ADR-0057): the workflow always triggers so the
+# required `l2-behavioural-ci-gate` status is always produced; the heavy build is gated on whether
+# any crossed surface changed.
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'boot/**'
+              - 'runtime/**'
+              - 'compiler/**'
+              - 'cli/**'
+              - 'cli-lib/**'
+              - 'ulib/**'
+              - 'ulib-tools/**'
+              - 'packages/**'
+              - 'test-fixtures/**'
+              - 'tools/l2-native-behavioural.sh'
+              - 'spago.yaml'
+              - 'spago.lock'
+              - 'flake.nix'
+              - 'flake.lock'
+              - '.github/workflows/l2-behavioural-ci.yaml'
+
+  ci:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      # Setup Nix environment — identical to the sibling workflows so every toolchain (dune,
+      # cargo, clang/llvm, purs, spago, node) comes from flake.nix + flake.lock as the single
+      # source of truth.
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
+      - uses: cachix/cachix-action@v17
+        with:
+          name: katsujukou-github
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+      - uses: nicknovitski/nix-develop@v1
+
+      # The harness prerequisites, cheapest-signal first (it locates these, never builds them).
+      - name: Build boot (purvm)
+        run: dune build
+        working-directory: boot
+
+      # RELEASE: the default native pipeline emits the ADR-0079 inline ctx-header fast paths,
+      # which pair only with the release staticlib.
+      - name: Build runtime staticlib
+        run: cargo build --release
+        working-directory: runtime
+
+      # One workspace build yields the fixtures' CoreFn and the Level-2 compiler's JS output.
+      - name: Build spago workspace
+        run: spago build
+
+      - name: Stage ulib
+        run: node ulib-tools/index.js build --prepare-release
+
+      - name: Run the Level-2 native behavioural gate
+        run: ./tools/l2-native-behavioural.sh
+
+  # The single required status check; point branch protection at `l2-behavioural-ci-gate`.
+  l2-behavioural-ci-gate:
+    needs: [ci]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate on the ci result
+        run: |
+          result='${{ needs.ci.result }}'
+          if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+            echo "::error::L2 behavioural CI did not pass (result: $result)"
+            exit 1
+          fi
+          echo "L2 behavioural CI gate green (ci result: $result)"
