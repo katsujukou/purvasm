@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
-# The ADR-0082 native-backend byte-identity differential: for a given module + entry, boot's LLVM
-# backend (`--no-opt`) and the Level-2 native backend (`purvasm build`) must emit byte-identical `.ll`
-# — the standing forcing function for the codegen transcription while boot remains the golden reference.
+# RETIRED from standing use (ADR-0104 §4, 2026-07-19). This was the ADR-0082 native-backend
+# byte-identity differential: boot's LLVM backend (`--no-opt`) vs the Level-2 native backend,
+# byte-identical `.ll` — the forcing function for the codegen transcription while boot remained
+# the golden reference. That premise ended with ADR-0104: boot is frozen as bootstrap seed only,
+# and Level-2's `--no-opt` intentionally diverges from boot's (first at the §3 bridge removal —
+# dictionaries stay dynamically dispatched — then at liveness rooting), so this diff FAILS by
+# design on current heads. Kept in-tree as a bisection aid against pinned history (both sides
+# checked out before the first intentional divergence, commit db0a644's parent). The standing
+# identity gates are `tools/selfhost-fixpoint-diff.sh` (stage-3 ≡ stage-4) and the behavioural
+# gate `tools/l2-native-behavioural.sh`. Reviving this against pinned history also means staging
+# that revision's ulib into `dist/ulib` (the historical `purvasm_lib/` snapshot this script once
+# defaulted to no longer exists).
 #
 # Level 2 is B2 (separate per-module compilation), so each module's object contains all its bindings;
 # for a clean file-level diff use an entry whose reachable set is the whole corpus (no dead code), or
@@ -28,7 +37,7 @@ boot_value=""; [ "$VALUE_FLAG" = "--value" ] && boot_value="--value"
 
 # Level-2 side (B2: per-module `.ll`). `--emit-llvm` stops at the IR (no clang/link — the diff needs
 # only the `.ll`). PURVASM_LIB satisfies the ulib overlay resolution.
-: "${PURVASM_LIB:=$ROOT/purvasm_lib}"
+: "${PURVASM_LIB:=$ROOT/dist/ulib}"
 l2_value=""; [ "$VALUE_FLAG" = "--value" ] && l2_value="--value"
 PURVASM_LIB="$PURVASM_LIB" node "$ROOT/cli/index.node.js" build --no-opt --emit-llvm $l2_value \
   --entry "$ENTRY_MODULE" --entry-name "$ENTRY_NAME" \

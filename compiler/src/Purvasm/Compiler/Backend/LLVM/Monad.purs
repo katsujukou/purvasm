@@ -2,8 +2,9 @@
 -- | a single `ctx` of mutable ref cells + `Buffer.t`s; here that is a `State Ctx` over an immutable
 -- | record (maintainer decision), which keeps codegen pure (like `compileModule`) and testable.
 -- |
--- | Byte-identity (ADR-0082 §2) depends entirely on emission order and the counter discipline, so those
--- | invariants are pinned here, exactly as boot:
+-- | Deterministic emission — the L2-owned goldens and the ADR-0104 §2 stage fixpoint compare emitted
+-- | text — depends entirely on emission order and the counter discipline, so those invariants are
+-- | pinned here, exactly as boot's `ctx` had them:
 -- |
 -- | * `ssa` resets to 0 **per function** (`beginFn`); `lbl`/`fns`/`strs` are **module-global monotonic**
 -- |   (never reset) — so a label/lifted-fn number depends on the whole module's emission order.

@@ -1,6 +1,10 @@
--- | The decisive byte-identity check: a hand-built `ModuleArtifact` must serialise to the
--- | exact `.pvmo`/`.pvmi` bytes boot emits for `DiaA` (`purvm compile`). This pins both the
--- | JSON shape/key-order and the Yojson-faithful serialiser + MD5 hash.
+-- | The decisive serialisation check: a hand-built `ModuleArtifact` must serialise to the
+-- | exact expected `.pmo`/`.pmi` bytes (fixtures whose provenance is boot's `DiaA`,
+-- | `purvm compile`). This pins the JSON shape/key-order, the Yojson-faithful serialiser,
+-- | `version`, and the MD5 interface hash — a **format-class golden** (ADR-0104 §4): these
+-- | bytes are a persistent on-disk ABI, so they are NOT freely re-baselineable — a behavioural
+-- | green is not a licence here; changing them is a deliberate format migration (schema
+-- | version bump + migration/rejection story for existing artifacts).
 module Test.Unit.Purvasm.Compiler.Bytecode.Artifact where
 
 import Prelude
@@ -48,16 +52,16 @@ refPmiWithSummary = """{"version":3,"name":"DiaA","exports":[["DiaA.Two","caf"],
 
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.Bytecode.Artifact" do
-  it "serialises a module to byte-identical .pmo (== boot's .pvmo)" do
+  it "serialises a module to the exact golden .pmo (format-class, ADR-0104 §4)" do
     moduleToString diaA `shouldEqual` refPmo
 
-  it "serialises an interface to byte-identical .pmi (== boot's .pvmi, MD5 hash incl.)" do
+  it "serialises an interface to the exact golden .pmi (format-class incl. MD5 hash)" do
     interfaceToString (interfaceOf diaA) `shouldEqual` refPmi
 
   -- ADR-0084 §5: the `--opt`-only summary field must be *entirely absent* when `Nothing` (the
-  -- `--no-opt`/boot byte-identity invariant), and appended *after* `hash` when `Just`, leaving the
-  -- five-key core byte-for-byte unchanged.
-  it "omits the summary field when Nothing (five-key core == boot's .pvmi)" do
+  -- five-key core is the format-class ABI existing readers parse), and appended *after* `hash`
+  -- when `Just`, leaving the core byte-for-byte unchanged.
+  it "omits the summary field when Nothing (the five-key format-class core)" do
     interfaceToString ((interfaceOf diaA) { summary = Nothing }) `shouldEqual` refPmi
 
   it "appends the --opt summary after hash, core bytes unchanged" do

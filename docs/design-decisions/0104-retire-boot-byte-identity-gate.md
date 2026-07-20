@@ -158,6 +158,19 @@ terms* is not.**
   record unblocks), it runs as a milestone gate (release/ADR-landing checkpoints), with the
   per-PR net carried by the unit goldens and the behavioural e2e.
 
+  **Amendment (2026-07-19, waiver form per review — accepted by maintainer 2026-07-19):**
+  `--opt` remains the required milestone profile, but is temporarily **blocked and non-blocking
+  under an explicit maintainer waiver** by the recorded ADR-0102 performance debt (the native
+  `--opt` stage-3 leg stalls at the corpus tail — mod_282, ~`LLVM.Emit`: ≈ 100 % CPU for
+  54+ min on that one module on an unbounded 2026-07-19 attempt, a prior observation exceeding
+  48 min the same way; first recorded by the §5-1 Progress note). Until the blocker is
+  resolved, each release/ADR-landing checkpoint must record a **bounded re-attempt** and an
+  **explicit maintainer waiver**; merely omitting the run is not satisfaction of the gate. The
+  **smoke profile is the operative fixpoint gate during this waiver**. The waiver expires when
+  the native milestone profile first completes successfully or when the tracked performance
+  blocker is declared resolved — the milestone pin then applies as written. A Node-hosted run
+  is not a substitute (it exercises neither `C2` nor `C3`).
+
   **Acceptance ordering (review round 1):** this record is sequenced **after
   [ADR-0103](0103-native-string-substrate-zero-copy-slices.md)** — the fixpoint gate's practical
   routine (a whole-closure L3 run) is only affordable once the string-substrate quadratic falls,
@@ -466,3 +479,60 @@ accessor + instance-dictionary roots and never references the impl directly, wit
 the contrast leg (the optimiser's `DictElim` must eliminate the dispatch). Discrimination
 verified live: the same test run against the pre-removal compiler fails on exactly the
 `--no-opt` leg (direct `speakDogImpl$d` call, no dictionary roots). Unit total: 404/404.
+
+#### Progress (2026-07-19): the fixpoint gate script landed; §4 guard sweep executed
+
+`tools/selfhost-fixpoint-diff.sh` implements the §2 pinned procedure. **The smoke fixpoint
+holds: stage-3 ≡ stage-4, 595/595 artifacts byte-identical (298 `.ll` incl. `entry.ll` +
+297 `.pmi`).** Two facts the pinned procedure met in practice, both now documented in the
+script header:
+
+- the pinned closure's entry is **`Purvasm.CLI.Native`** — `Purvasm.CLI.Main` is the
+  Node-hosted entry whose closure pulls `node-*` foreigns with no native leaves (boot's C2
+  build fails on `Node.FS.Constants.f_OK`);
+- the purvasm-native CLI **cannot exec `clang`** (`Process` has no native exec leaf,
+  ADR-0045), so C2 cannot link C3 in-process. The script's link vehicle is the Node-hosted
+  CLI (the same compiler) running the full build, with its emitted `_build` **asserted
+  byte-identical to stage-3 before its binary is adopted as C3** — C3 is thereby linked from
+  stage-3's bytes, and the assert doubles as a native≡Node compiler cross-check (it held,
+  595/595). Replicating the CLI's provider-map/link pipeline in shell was rejected — it would
+  be a second linker to keep correct.
+
+Profile measurement (the §2 "default decided by measurement" clause): **smoke (`--no-opt`) is
+the default** — end-to-end 8–20 min across the day's runs (C2 via boot ≈ 3–10 min, clang over
+boot's ~4200 partitions dominating and strongly cache-dependent; stage-3 emit ≈ 1.5–3 min; C3
+link ≈ 1–7 min; stage-4 emit ≈ 2–3 min), fine as a milestone-cadence gate, not per-PR. The **milestone (`--opt`) native leg does not complete** — an
+unbounded attempt cleared 281/298 modules in ≈ 4 min and then sat on the same tail module the
+§5-1 note recorded (mod_282, ~`LLVM.Emit`) at ≈ 100 % CPU for 54+ minutes before being
+abandoned (a prior observation exceeded 48 min the same way) — the ADR-0102 apply-count class
+on the native runtime, since the Node-hosted `--opt` build of the same corpus takes minutes.
+The milestone profile stays in the script; its obligation status is the §2 amendment
+(blocked + non-blocking under an explicit maintainer waiver, smoke operative meanwhile).
+
+Review round (2026-07-19) hardening, verified by clean scripted runs: **inputs are
+snapshotted** — the `output/` tree (which carries BOTH the pinned CoreFn closure and the
+Node-hosted compiler's own compiled JS), the `cli/index.node.js` wrapper (copied into the
+snapshot at the same relative layout, so the link leg runs the snapshot's wrapper and a
+concurrent `spago build` can swap neither its input nor its compiler code), the staged ulib,
+and the runtime `.a` — ≈ 2 s for ≈ 108 MB, and every leg reads only the snapshots, so
+"identical input" is a property of the run, not of repo quiescence. The **comparison set is
+validated before any byte comparison**: per build, exactly one `entry.ll`, ≥ 1 module `.ll`,
+≥ 1 `.pmi`, module-`.ll` count = `.pmi` count, and **both build kinds enforce an exact
+filename allowlist** (emit-only: the comparison classes alone, numeric `mod_[0-9]+` names
+only; link: additionally the known `.o` byproducts `mod_N.o`/`entry.o`/`foreign_N.o`,
+empirically derived) — a class missing from both sides, or an unknown class, now fails the
+gate instead of shrinking it. Hardened smoke result: all three builds report
+`297 module .ll + entry.ll + 297 .pmi`, C3-link ≡ stage-3 595/595, stage-3 ≡ stage-4 595/595;
+end-to-end wall time ranged 8–20 min across the day's runs (clang-dominated, strongly
+cache-dependent), superseding the earlier ≈ 17 min single-run figure.
+
+The §4 sweep executed in the same change: `llvm-diff.sh` carries the retirement header
+(revivable only against pinned history — both sides at `db0a644`'s parent — and its historical
+`purvasm_lib/` overlay no longer exists; revival means restaging that era's ulib);
+`tools/README.md` rows updated; the composite/format-class classification is now written into
+the guards themselves (`Test…Compiler.Compile` / `Link` preambles + titles: composite;
+`Test…Bytecode.Artifact`: format-class, explicitly not re-baselineable on a behavioural green;
+`Test…LLVM.Mangle`: link-time ABI + value representation, likewise pinned); `CLI.Compile`'s
+prose and the e2e describe are de-anchored; the five LLVM emitter preambles
+(`Emit`/`Abi`/`Mangle`/`Program`/`Prim`) now state ADR-0082 transcription *provenance* without
+asserting the retired gate as a standing obligation.

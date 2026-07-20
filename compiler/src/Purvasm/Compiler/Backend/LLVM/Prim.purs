@@ -1,7 +1,7 @@
 -- | Primitive-operation lowering for the LLVM backend (ADR-0071 §6): the runtime-helper symbol table
 -- | (`primSym`) and the inline IR for the scalar `Int`/`Boolean` ops (`inlinePrim`). A faithful
--- | transcription of boot's `codegen_llvm.ml` (`prim_sym`, `inline_prim`), byte-identical to boot's
--- | `.ll` (ADR-0082 §2).
+-- | transcription of boot's `codegen_llvm.ml` (`prim_sym`, `inline_prim`) — the ADR-0082 port; its
+-- | boot byte-identity gate is retired (ADR-0104 §4) and emission is now L2-owned.
 -- |
 -- | Scalar `Int`/`Boolean` ops are **pure** (no ctx, no safepoint) and are emitted inline against the
 -- | `(payload << 1) | 1` immediate representation; `Number`/`String`/`Array`/`Record` ops read or

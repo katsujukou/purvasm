@@ -1,7 +1,8 @@
--- | The `Codegen` monad's counter/buffer discipline is what byte-identity (ADR-0082 §2) rests on:
--- | `ssa` resets per function while `lbl`/`fns` stay module-global monotonic, buffers preserve emission
--- | order, and a buffer renders as every line followed by `"\n"` (empty → `""`). These are exactly the
--- | invariants boot's `ctx` mutation guarantees, so they get a direct test.
+-- | The `Codegen` monad's counter/buffer discipline is what deterministic emission (the L2-owned
+-- | goldens and the ADR-0104 §2 stage fixpoint compare emitted text) rests on: `ssa` resets per
+-- | function while `lbl`/`fns` stay module-global monotonic, buffers preserve emission order, and a
+-- | buffer renders as every line followed by `"\n"` (empty → `""`). These are exactly the invariants
+-- | boot's `ctx` mutation guaranteed, so they get a direct test.
 module Test.Unit.Purvasm.Compiler.Backend.LLVM.Monad where
 
 import Prelude

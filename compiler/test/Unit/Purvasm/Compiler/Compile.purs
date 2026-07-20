@@ -1,7 +1,11 @@
--- | `compileModule` end-to-end: a hand-built CoreFn `Module` (boot's `diamond/DiaA`)
--- | through CoreFn → CESK → ANF → `Gdef` → groups must serialise to the exact `.pvmo`/
--- | `.pvmi` bytes boot's `purvm compile` emits — the whole separate-compilation pipeline
--- | bar `Decode`, byte-identical.
+-- | `compileModule` end-to-end: a hand-built CoreFn `Module` (the `diamond/DiaA` fixture)
+-- | through CoreFn → CESK → ANF → `Gdef` → groups must serialise to the exact expected
+-- | `.pmo`/`.pmi` bytes — the whole separate-compilation pipeline bar `Decode`. The
+-- | expectations are **L2-owned composite goldens** (ADR-0104 §4; provenance: boot's
+-- | `purvm compile`): the instruction/lowering *content* is emission-class (re-baselineable
+-- | on an intentional VM-lowering change, behavioural gate green as the licence), while the
+-- | *serialisation* — JSON schema, key order, `version`, hash — is format-class (a persistent
+-- | ABI; changing those bytes is a format migration, never a routine re-baseline).
 module Test.Unit.Purvasm.Compiler.Compile where
 
 import Prelude
@@ -80,14 +84,14 @@ refRecPmi = """{"version":3,"name":"RecMod","exports":[["RecMod.loop",["recfn",1
 
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.Compile" do
-  it "compiles a CoreFn module to byte-identical .pmo (== boot's .pvmo)" do
+  it "compiles a CoreFn module to the exact golden .pmo (composite golden, ADR-0104 §4)" do
     moduleToString (compileModule diaA) `shouldEqual` refPmo
 
-  it "derives a byte-identical .pmi (== boot's .pvmi)" do
+  it "derives the exact golden .pmi (composite golden, ADR-0104 §4)" do
     interfaceToString (interfaceOf (compileModule diaA)) `shouldEqual` refPmi
 
-  it "marks a recursive lambda group recursive:true in the .pmo (== boot, ADR-0077)" do
+  it "marks a recursive lambda group recursive:true in the .pmo (ADR-0077)" do
     moduleToString (compileModule recMod) `shouldEqual` refRecPmo
 
-  it "publishes a recursive lambda as [\"recfn\", n] in the .pmi (== boot, ADR-0077)" do
+  it "publishes a recursive lambda as [\"recfn\", n] in the .pmi (ADR-0077)" do
     interfaceToString (interfaceOf (compileModule recMod)) `shouldEqual` refRecPmi

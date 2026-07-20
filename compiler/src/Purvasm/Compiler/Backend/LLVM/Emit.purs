@@ -1,7 +1,8 @@
 -- | The recursive ANF → `.ll` lowering: atoms, computations, expressions, and the two-entry lifted
 -- | function emission (ADR-0072 §4, ADR-0076 §1). A faithful transcription of boot's `codegen_llvm.ml`
 -- | (`atom`/`read_var`/`expr`/`cexpr`/`emit_ret`/`make_closure`/`arg_buffer`/`lift`/`emit_function`/
--- | `emit_pending`), byte-identical to boot's `.ll` (ADR-0082 §2).
+-- | `emit_pending`) — the ADR-0082 port; its boot byte-identity gate is retired (ADR-0104 §4) and
+-- | emission is now L2-owned.
 -- |
 -- | Stack-safety (maintainer-flagged): the deep-linear ANF `Let`/`LetRec` spine is walked with
 -- | `tailRecM` (`State` is `MonadRec`), and `emitPending` drains its LIFO queue with `tailRecM` too, so
@@ -96,7 +97,8 @@ compareBoxed a b = case a, b of
   _, _ -> EQ
 
 -- | Sort-and-dedup the boxed literals (boot's `sort_uniq compare`): the emission order of their rooted
--- | constants at case entry is byte-identity-relevant.
+-- | constants at case entry must be deterministic — the L2-owned goldens and the ADR-0104 §2 stage
+-- | fixpoint compare emitted text.
 sortUniqBoxed :: Array Literal -> Array Literal
 sortUniqBoxed = Array.nubByEq (\a b -> compareBoxed a b == EQ) <<< Array.sortBy compareBoxed
 

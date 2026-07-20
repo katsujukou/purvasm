@@ -1,7 +1,8 @@
--- | The LLVM backend's immediate/symbol encodings must be byte-identical to boot's `codegen_llvm.ml`,
--- | since the `.ll` byte-identity gate (ADR-0082 §2) compares the emitted text directly. Expected
--- | values are anchored on boot's actual `--no-opt` output (e.g. `@pv_g_Slice1_2eidentInt$root`,
--- | `@pv_g_go$root`, `@pv_g_Example_2eFib_2eLib_2efib$root`).
+-- | The LLVM backend's immediate/symbol encodings, pinned by L2-owned goldens (provenance: boot's
+-- | `codegen_llvm.ml` `--no-opt` output, e.g. `@pv_g_Slice1_2eidentInt$root`, `@pv_g_go$root`,
+-- | `@pv_g_Example_2eFib_2eLib_2efib$root`). Mangling is link-time ABI (`@pvf_` leaf symbols must
+-- | match the runtime/ulib `.c` exports) and immediates are the value representation, so these are
+-- | NOT freely re-baselineable emission cosmetics (ADR-0104 §4).
 module Test.Unit.Purvasm.Compiler.Backend.LLVM.Mangle where
 
 import Prelude

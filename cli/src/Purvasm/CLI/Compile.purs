@@ -51,9 +51,11 @@ options = ArgParser.fromRecord
         # ArgParser.boolean
   }
 
--- | Compile a single module to its `.pmo`/`.pmi` objects (boot's `purvm compile`):
--- | read `<corefnDir>/<entryModule>/corefn.json`, decode it, run `compileModule`, and
--- | write the artifacts (byte-identical to boot) under `<outDir>/_build`.
+-- | Compile a single module to its `.pmo`/`.pmi` objects (the counterpart of boot's
+-- | `purvm compile`): read `<corefnDir>/<entryModule>/corefn.json`, decode it, run
+-- | `compileModule`, and write the artifacts under `<outDir>/_build`. Artifact correctness is
+-- | anchored by the ADR-0104 goldens (§4) and the behavioural/fixpoint gates (§2), not by boot
+-- | byte-identity.
 cmd :: forall r. Options -> Run (ENV + LOG + FS + EXCEPT String + EFFECT + r) Unit
 cmd opts = do
   info $ Fmt.fmt @"Compiling {modname}" { modname: opts.targetModule }

@@ -1,7 +1,8 @@
 -- | Pure textual encodings the LLVM backend emits (ADR-0072 §2): tagged-word immediate constants
 -- | and linker-symbol mangling. A faithful transcription of the corresponding helpers in boot's
--- | `codegen_llvm.ml` (`imm`/`imm_int`/`imm_bool`/`imm_unit`, `escape_ident`/`mangle`/`mangle_foreign`),
--- | byte-identical to boot's output — the `.ll` byte-identity gate depends on it (ADR-0082 §2).
+-- | `codegen_llvm.ml` (`imm`/`imm_int`/`imm_bool`/`imm_unit`, `escape_ident`/`mangle`/`mangle_foreign`)
+-- | — the ADR-0082 port. The encodings stay pinned by L2-owned goldens: mangling is link-time ABI
+-- | (`@pvf_` leaf symbols must match the runtime/ulib `.c` exports) and immediates are the value rep.
 -- |
 -- | The `fnv1a_64`-derived encodings (`labelId`, `ctorTag`, `sortRecordFields`) build on the pure 64-bit
 -- | hash in `Util.Fnv1a64`; `escapeStringBytes`/`utf8Bytes` back the `String`-literal constant.

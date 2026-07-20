@@ -1,7 +1,7 @@
--- | The ctx-header inline fast paths are the highest byte-identity risk in the port: every function
--- | roots its params through them, so a single wrong SSA number or reordered line diverges the whole
--- | `.ll`. Each emitter is run in isolation and asserted against boot's exact block shape (ADR-0079;
--- | cf. boot's `--no-opt` output, e.g. the `rchk`/`schk` blocks of `Slice1`/`Example.Fib.Lib`).
+-- | The ctx-header inline fast paths are the port's highest-risk emitters: every function roots its
+-- | params through them, so a single wrong SSA number or reordered line diverges the whole `.ll`.
+-- | Each emitter is run in isolation and asserted against L2-owned golden block shapes (ADR-0079;
+-- | provenance: boot's `--no-opt` output, e.g. the `rchk`/`schk` blocks of `Slice1`/`Example.Fib.Lib`).
 module Test.Unit.Purvasm.Compiler.Backend.LLVM.Abi where
 
 import Prelude

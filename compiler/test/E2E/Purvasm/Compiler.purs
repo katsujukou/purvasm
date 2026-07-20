@@ -84,7 +84,7 @@ spec = do
       compile (CF.Abs nullAnn "x" (local "x"))
         `shouldEqual` [ Closure [ "x" ] [ Load "x", Return ], Return ]
 
-  describe "separate compilation: corefn.json → .pmo/.pmi (byte-identical to boot)" do
+  describe "separate compilation: corefn.json → .pmo/.pmi (composite golden, ADR-0104 §4)" do
     it "compiles real purs corefn (diamond/DiaA) to the exact .pmo and .pmi bytes" do
       case jsonParser diaACorefn of
         Left e -> fail ("JSON parse failed: " <> e)

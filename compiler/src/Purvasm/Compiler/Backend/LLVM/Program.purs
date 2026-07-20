@@ -3,8 +3,8 @@
 -- | global + `$init` (plus lifted code via `emitPending`), and build a module object (`moduleLl`) or the
 -- | init/entry object (`entryLl`). A faithful transcription of boot's `codegen_llvm.ml`
 -- | (`gdef_keys`/`classify_nonrec`/`reachable_gdefs`/`store_root_global`/`emit_init_fn`/`emit_gdef`/
--- | `emit_gdefs`/`emit_init_all`/`emit_entry_stub`/`module_ll`/`entry_ll`), byte-identical to boot's
--- | `.ll` (ADR-0082 §2).
+-- | `emit_gdefs`/`emit_init_all`/`emit_entry_stub`/`module_ll`/`entry_ll`) — the ADR-0082 port; its
+-- | boot byte-identity gate is retired (ADR-0104 §4) and emission is now L2-owned.
 -- |
 -- | All three `Gdef` classes are emitted: `Gfun`/`Gcaf` (self-hoisted closure / strict CAF) and `Grec`
 -- | (a recursive group built by-need over a shared env via `Emit.buildGrec`, ADR-0070 §4).
@@ -280,7 +280,8 @@ moduleLl opts defined gdefs =
     -- (`defined`, which includes those clones) into `gkeys` so `readVar` resolves a clone reference to a
     -- local `$root` load instead of crashing as unbound. `externGlobalDecls defined` still subtracts
     -- `defined`, so a locally-defined clone is never wrongly declared `external`; under `--no-opt` there are
-    -- no clones and `defined ⊆ opts.gkeys`, so the union is a no-op (the byte-identity gate is unaffected).
+    -- no clones and `defined ⊆ opts.gkeys`, so the union is a no-op (the reference lowering's emission is
+    -- unchanged).
     Tuple parts ctx = runCodegen (makeCx (opts { gkeys = Set.union opts.gkeys defined })) do
       emitGdefs gdefs
       emitPending

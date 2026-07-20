@@ -2,7 +2,8 @@
 -- | (ADR-0079 §1/§2): rooting, frame open/pop, `pv_get`, settle, and by-need force. A faithful
 -- | transcription of boot's `codegen_llvm.ml` (`declarations`, `ctx_header_version`/offsets,
 -- | `abi_stamp`, `header_field`, `abi_frame_open`/`abi_pop_frame`/`abi_get`/`abi_root`/`abi_settle`,
--- | `force_value`), byte-identical to boot's `.ll` (ADR-0082 §2).
+-- | `force_value`) — the ADR-0082 port; its boot byte-identity gate is retired (ADR-0104 §4) and
+-- | emission is now L2-owned.
 -- |
 -- | In release mode (`inlineAbi = true`) these emit the fast paths as inline IR against the
 -- | `pv_ctx_header`; under `--debug` (`inlineAbi = false`) every operation is a single entry call (the

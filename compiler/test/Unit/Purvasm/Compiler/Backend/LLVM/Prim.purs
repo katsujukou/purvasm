@@ -1,4 +1,4 @@
--- | The inline `Int`/`Boolean` primop IR must be byte-identical to boot's `inline_prim` — verified here
+-- | The inline `Int`/`Boolean` primop IR is pinned by L2-owned goldens (provenance: boot's `inline_prim`) — verified here
 -- | against boot's exact emission shape (the `%t = trunc i64 %t' to i32` pattern where the trunc temp is
 -- | numbered *before* the `ashr` payload temp, boot's right-to-left arg eval; cf. the `add i32` block in
 -- | boot's `--no-opt` `.ll`). `primSym` maps each op to its runtime helper symbol.

@@ -1,7 +1,9 @@
 -- | Invariants of `link` (artifacts → runnable `Image`) the types cannot enforce:
 -- | modules come out in dependency order, only the entry-reachable definitions survive
--- | (reachability DCE), and the result is byte-identical to boot's `app.pvm`. Checked
--- | against boot's `diamond` image (`purvm build -m DiaA -e both --value`).
+-- | (reachability DCE), and the linked image matches its expected bytes. The expectation is
+-- | an **L2-owned composite golden** (ADR-0104 §4; provenance: boot's `diamond` image,
+-- | `purvm build -m DiaA -e both --value`): the gdef instruction content is emission-class,
+-- | the image schema/serialisation is format-class (see `Test…Bytecode.Artifact`).
 module Test.Unit.Purvasm.Compiler.Link where
 
 import Prelude
