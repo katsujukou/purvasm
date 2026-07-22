@@ -34,7 +34,7 @@ import Effect.Ref as Ref
 import Fmt as Fmt
 import PureScript.CoreFn.Module (Module)
 import Purvasm.CLI.Compile (parseModule)
-import Purvasm.CLI.Effect.Env (ENV)
+import Purvasm.CLI.Effect.Env (ENV, lookupEnv)
 import Purvasm.CLI.Effect.Filesystem (FS, FilePath)
 import Purvasm.CLI.Effect.Filesystem as FS
 import Purvasm.CLI.Effect.Log (LOG)
@@ -273,11 +273,20 @@ cmd opts = do
   -- The FSR static inputs (ulib `foreignSigs` + spago cache-db), read once and closed into the action's
   -- `foreignSigsOf` capability (ADR-0090 §2) and reused by the `--check-foreign-sigs` diagnostic.
   fsEnv <- ForeignSigs.loadEnv { ulibDir, corefnDir: opts.corefnDir }
+  -- Test-only ABI-profile knob (ADR-0105 §4, the slice-0 debug-leg vehicle): `PURVASM_EMIT_DEBUG_ABI=1`
+  -- emits the debug entry-call IR (ADR-0079 `inlineAbi = false`) so the behavioural gate's debug leg can
+  -- link it against the debug runtime staticlib. Deliberately an env knob, not a CLI flag: the debug
+  -- profile is a verification pairing, not a user-facing build mode. Fail-closed like the runtime's
+  -- `PURVASM_*` knobs: an ABI-profile selector must not let a typo silently mean "release".
+  debugAbi <- lookupEnv "PURVASM_EMIT_DEBUG_ABI" >>= case _ of
+    Nothing -> pure false
+    Just "1" -> pure true
+    Just other -> throw (Fmt.fmt @"PURVASM_EMIT_DEBUG_ABI: expected absent or \"1\", got {other}" { other: show other })
   let
     action = mkAction opts ulibDir buildDir fsEnv modIdx irBuf
 
     backend :: Backend LlvmContext String
-    backend = llvmBackend { isEffect: not opts.value, heapWords: defaultHeapWords, debug: false }
+    backend = llvmBackend { isEffect: not opts.value, heapWords: defaultHeapWords, debug: debugAbi }
     buildOpts =
       { entryModule: opts.entryModule
       , entryName: opts.entryName

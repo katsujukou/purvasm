@@ -150,5 +150,6 @@ language and are kept out of version control.)
 | [0102](0102-runtime-v1-1-performance-baseline-for-dynamic-apply.md) | Runtime v1.1 performance baseline for dynamic apply | Accepted |
 | [0103](0103-native-string-substrate-zero-copy-slices.md) | Native String substrate: bounded-retention slice views, linear cursor traversal, and bulk borrowed-byte string primitives | Accepted |
 | [0104](0104-retire-boot-byte-identity-gate.md) | Retire the boot byte-identity gate: correctness anchors move to the behavioural oracle and the self-host fixpoint | Accepted |
+| [0105](0105-liveness-based-rooting-emission.md) | Liveness-based rooting emission for the native LLVM backend | Accepted |
 
 ## Scope

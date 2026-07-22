@@ -165,6 +165,13 @@ pub struct Heap {
     /// `None` (the default) means every instrumentation point below is a single flag check and
     /// nothing else — no formatting, clock reads, or counter writes on the hot path.
     stats: Option<Stats>,
+    /// GC-stress mode (ADR-0105 §5, test-only instrumentation): when set, [`alloc`](Heap::alloc)
+    /// collects at **every** entry — the safepoint superset — so every missing-root window
+    /// deterministically contains a collection (what it guarantees is the window being *exercised*;
+    /// observability of a corruption is the fixtures' readback/checksum concern). Enabled by
+    /// `PURVASM_GC_STRESS=1` on a native (`new_native`) heap, or directly by a test; production
+    /// heap/ABI semantics are unchanged when off (a single flag check on the alloc path).
+    gc_stress: bool,
 }
 
 // ADR-0079 §1: the header IS offset 0 of the context pointer.
@@ -224,6 +231,7 @@ impl Heap {
             pending_tail: None,
             trace: false,
             stats: None,
+            gc_stress: false,
         }
     }
 
@@ -233,11 +241,11 @@ impl Heap {
     /// heaps this way; hand-written `CodeFn` tests / Miri use [`Heap::new`].
     ///
     /// # Panics
-    /// If `PURVASM_STATS` is present and not exactly `"1"` (ADR-0102 §3), or `PURVASM_HEAP_WORDS` is
-    /// present and not a non-empty positive decimal `usize` (ADR-0102 §4) — a present-but-malformed
-    /// value is a diagnosable configuration error, not silently ignored. Across the `pv_runtime_new`
-    /// ABI entry this becomes a process abort (`guard`'s panic containment); a direct Rust-level call
-    /// (tests) just unwinds.
+    /// If `PURVASM_STATS` (ADR-0102 §3) or `PURVASM_GC_STRESS` (ADR-0105 §5) is present and not
+    /// exactly `"1"`, or `PURVASM_HEAP_WORDS` is present and not a non-empty positive decimal
+    /// `usize` (ADR-0102 §4) — a present-but-malformed value is a diagnosable configuration error,
+    /// not silently ignored. Across the `pv_runtime_new` ABI entry this becomes a process abort
+    /// (`guard`'s panic containment); a direct Rust-level call (tests) just unwinds.
     pub fn new_native(words_per_space: usize) -> Heap {
         // Heap-size override (ADR-0102 §4): absent means "use the codegen-provided default"
         // (`words_per_space`, unchanged); a present value replaces it outright. This is scoped to
@@ -284,6 +292,18 @@ impl Heap {
             Ok(false) => None,
             Err(msg) => panic!("{msg}"),
         };
+        // Opt-in GC-stress mode (ADR-0105 §5); same accept-"1"-or-absent contract and native-only
+        // read as PURVASM_STATS above.
+        h.gc_stress = match std::env::var_os("PURVASM_GC_STRESS") {
+            None => false,
+            Some(v) => match v.to_str() {
+                Some("1") => true,
+                Some(s) => panic!("PURVASM_GC_STRESS: expected absent or \"1\", got {s:?}"),
+                None => {
+                    panic!("PURVASM_GC_STRESS: expected absent or \"1\", got non-UTF-8 value {v:?}")
+                }
+            },
+        };
         h
     }
 
@@ -305,6 +325,14 @@ impl Heap {
     #[cfg(test)]
     pub(crate) fn enable_stats_for_test(&mut self) {
         self.stats = Some(Stats::default());
+    }
+
+    /// Force GC-stress mode on for this heap without touching the environment — **test-only**
+    /// (ADR-0105 §5 slice 0): the in-process analogue of `PURVASM_GC_STRESS=1`, with the same
+    /// no-env-mutation rationale as [`enable_stats_for_test`](Heap::enable_stats_for_test).
+    #[cfg(test)]
+    pub(crate) fn enable_gc_stress_for_test(&mut self) {
+        self.gc_stress = true;
     }
 
     /// The current apply/GC counters (ADR-0102 §3), or `None` if stats are disabled for this
@@ -603,6 +631,12 @@ impl Heap {
             "object of {words} words exceeds the semi-space capacity ({} words)",
             self.cap
         );
+        // GC-stress (ADR-0105 §5): collect at EVERY alloc entry, so any missing-root window is
+        // exercised deterministically. Before the overflow check — the stressed collection usually
+        // makes the overflow branch moot, and a still-full heap falls through to the normal path.
+        if self.gc_stress {
+            self.gc();
+        }
         // GC-on-alloc (ADR-0066 §4): collect on overflow (roots = the shadow stack), then retry once.
         if self.top + words > self.cap {
             self.gc();
@@ -2607,5 +2641,50 @@ mod tests {
             h.str_read(unsafe { HeapPtr::from_word(h.get(sr)) }),
             "0123456789abcdef"
         );
+    }
+
+    #[test]
+    fn gc_stress_collects_at_every_alloc_and_rooted_values_survive() {
+        // ADR-0105 §5 slice 0: under stress, EVERY alloc entry collects — no overflow needed —
+        // so a missing-root window deterministically contains a collection. The safe constructors'
+        // self-rooting must keep their inputs correct through the per-alloc collections, and the
+        // copied-words counter must show live relocation actually happened (the stress leg's
+        // vacuity guard, `gc_copied_words > 0`).
+        let mut h = Heap::new(4096);
+        h.enable_stats_for_test();
+        h.enable_gc_stress_for_test();
+        let s = h.new_str(b"stress-survivor").as_word(); // allocs (collects) then roots internally
+        let sr = h.root(s);
+        // Each new_adt: roots its fields, then its alloc collects — the just-rooted `sr` string
+        // and every prior ADT must relocate correctly on every round.
+        let mut prev = h.get(sr);
+        for i in 0..8u32 {
+            let p = h.new_adt(i, &[prev, h.get(sr)]);
+            prev = p.as_word();
+            let pr = h.root(prev);
+            prev = h.get(pr);
+        }
+        let stats = h.stats().expect("stats were enabled");
+        assert!(
+            stats.gc_collections >= 9,
+            "stress mode must collect at every alloc (got {} collections)",
+            stats.gc_collections
+        );
+        assert!(
+            stats.gc_copied_words > 0,
+            "stressed collections with a live set must have copied words"
+        );
+        // the string survived every collection and reads back intact through its slot.
+        assert_eq!(
+            h.str_read(unsafe { HeapPtr::from_word(h.get(sr)) }),
+            "stress-survivor"
+        );
+        // the ADT chain survived: walk it back down checking tags.
+        let mut cur = prev;
+        for i in (0..8u32).rev() {
+            let p = unsafe { HeapPtr::from_word(cur) };
+            assert_eq!(h.read_raw(p, 0), i as u64, "tag at chain depth {i}");
+            cur = h.read_field(p, 1);
+        }
     }
 }

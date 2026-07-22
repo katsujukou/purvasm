@@ -1172,6 +1172,60 @@ mod tests {
         );
     }
 
+    // --- `PURVASM_GC_STRESS` process-level behavior (ADR-0105 §5; same subprocess isolation and
+    // absent-or-"1" contract as `PURVASM_STATS` above) ---------------------------------------------
+
+    #[test]
+    fn purvasm_gc_stress_one_collects_on_every_alloc() {
+        if std::env::var_os("__PURVASM_ABI_TEST_CHILD").is_some() {
+            unsafe { stats_smoke_child() };
+            return;
+        }
+        // Stress + stats together: the smoke child's `pv_make_closure` allocates, so under stress
+        // the stats line must report at least one collection with NO overflow ever occurring
+        // (a 4096-word space the smoke workload cannot fill).
+        let out = run_isolated(
+            "abi::tests::purvasm_gc_stress_one_collects_on_every_alloc",
+            &[
+                ("PURVASM_GC_STRESS", Some("1")),
+                ("PURVASM_STATS", Some("1")),
+            ],
+        );
+        assert!(out.status.success(), "child failed: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let gc = stderr
+            .lines()
+            .find(|l| l.starts_with("purvasm-stats:v1 "))
+            .and_then(|l| l.split(' ').find_map(|p| p.strip_prefix("gc_collections=")))
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("no parsable gc_collections in stderr: {stderr}"));
+        assert!(
+            gc >= 1,
+            "stress mode must collect without overflow (gc_collections={gc}): {stderr}"
+        );
+    }
+
+    #[test]
+    fn purvasm_gc_stress_other_value_aborts_runtime_creation() {
+        if std::env::var_os("__PURVASM_ABI_TEST_CHILD").is_some() {
+            let _ctx = pv_runtime_new(1 << 12); // must abort before returning
+            unreachable!("pv_runtime_new should have aborted on a malformed PURVASM_GC_STRESS");
+        }
+        let out = run_isolated(
+            "abi::tests::purvasm_gc_stress_other_value_aborts_runtime_creation",
+            &[("PURVASM_GC_STRESS", Some("yes"))],
+        );
+        assert!(
+            !out.status.success(),
+            "child should have aborted, got: {out:?}"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("PURVASM_GC_STRESS"),
+            "expected the PURVASM_GC_STRESS diagnostic on stderr, got: {stderr}"
+        );
+    }
+
     // --- `PURVASM_HEAP_WORDS` process-level behavior (subprocess-isolated, reusing `run_isolated`
     // above: env mutation must not race parallel `cargo test` threads) ------------------------------
 

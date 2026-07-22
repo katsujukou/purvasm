@@ -74,9 +74,11 @@ jobs:
         working-directory: boot
 
       # RELEASE: the default native pipeline emits the ADR-0079 inline ctx-header fast paths,
-      # which pair only with the release staticlib.
-      - name: Build runtime staticlib
-        run: cargo build --release
+      # which pair only with the release staticlib. DEBUG: the gate's debug-ABI-profile leg
+      # (ADR-0105 §4) links entry-call IR against the debug staticlib (generation-checked
+      # entries), so both profiles are built.
+      - name: Build runtime staticlib (release + debug)
+        run: cargo build --release && cargo build
         working-directory: runtime
 
       # One workspace build yields the fixtures' CoreFn and the Level-2 compiler's JS output.
