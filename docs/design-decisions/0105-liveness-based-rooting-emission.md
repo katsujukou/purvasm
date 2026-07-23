@@ -389,3 +389,71 @@ error, verified exit 1 — an ABI-profile selector must not let a typo mean "rel
 `PURVASM_GC_STRESS` documented in `new_native`'s Panics contract and pinned by
 STATS-mirrored subprocess tests (malformed value aborts creation; `"1"` collects with no
 overflow). Runtime tests 152/152.
+
+#### Progress (2026-07-23): slice 1 — the liveness analysis and `RootPlan` landed
+
+`Backend.LLVM.Liveness` implements §1+§2 as a pure, emission-independent module:
+
+- **§1 transfers**: `primOpSafepoint` (the table's prim rows, one total function),
+  `atomCanSafepoint` / `forcedAtomCanSafepoint` (materialisation + force accounting — a forced
+  non-immediate operand is a potential safepoint via `pv_force_if_byneed`'s slow path, and a
+  boxed literal / foreign reference allocates at `atom` time), and `cexprCanSafepoint` — the
+  per-node summary over each recipe's WHOLE lowering sequence, derived from `Emit`'s recipes.
+- **§2 `RootPlan`**: `activationPlan cfg body` — ONE backward pass over the ANF (a pure
+  `tailRec` spine collection folded tail-first; recursion depth = control nesting only, §2a)
+  returning `{ crossing, loweringMayRoot, anySafepoint }`; `needsFrame` = the two-tier union.
+  The §1 use-at-call boundary falls out of the pass shape (at each safepoint the names live
+  AFTER the node join `crossing`; the node's own operands are consumed by it). Closure opacity:
+  `CLam`/`LetRec` bodies are walked for free variables only. The self `%env` word rides a
+  pseudo-name (`envPseudo`) used at self-references. Case/dtree stays the conservative
+  lowering-tier fallback (`CCase`: everything live at an arm entry crosses; `mayRoot = true`).
+- **§4 by construction**: the plan takes no ABI-profile input — the release/debug equality
+  contract is the function signature; the unit test documents it (determinism pinned).
+- **Tests** (`Test…LLVM.Liveness` + a `Driver` recipe-consistency case; final unit total after
+  the review rounds 429/429, e2e 11/11): consumed-before-safepoint (the sidenote-0011 `fib`
+  case: the `sub` result does NOT cross), crossing, use-at-call vs live-after-call on the same
+  operand, branch-entry crossing under the condition force, capture escape ending the
+  obligation, closure opacity (a nested body's crossings do not leak), `%env` crossing iff a
+  safepoint precedes a self-call, case-arm binders (crossing inside the arm vs
+  consumed-at-call), sequential guard clauses (incl. the post-guard force), `LetRec`
+  construction, frame elision (a scalar leaf body: `needsFrame = false`) and the
+  `CUpdate`-accumulator contrast, the `evalAtoms` suffix-scan mirror (`operandsMayRoot`, incl.
+  the `CRecord` canonical-order counterexample and the 20k-var linearity regression), and the
+  §2a scale fixtures (a 50k-binding `Let` spine, 20k-operand array, 5k-arm case — all on the
+  default stack). The recipe-consistency test pins the load-bearing direction against the
+  CURRENT emitter: declared-false recipes (`CAtom`/`CAccessor`) emit exactly the prologue
+  root blocks, `CUpdate` roots beyond them, and the sorted-order `CRecord` roots its
+  var-before-allocating-operand (prologue + 1).
+
+An honest limitation recorded for slice 2 / future refinement: because `CPrim` FORCES its
+operands and a forced variable is conservatively a potential safepoint, a leaf like
+`\a b -> a + b` still gets `needsFrame = true` through `operandsMayRoot` (the second operand's
+force can safepoint, so `evalAtoms` may root the first). The frame-elision win at this slice's
+precision comes from single-crossing-free bodies and literal-operand shapes; a
+"provably-not-by-need" refinement (params/locals that cannot hold cells) is the follow-up
+lever, NOT taken here.
+
+Slice-1 review round (2026-07-23), all folded, 428/428 unit + 11/11 e2e: **[P1] `CRecord`
+analyses operands in the emitter's canonical order** — the emitter sorts fields by unsigned
+label id BEFORE `evalAtoms` (ADR-0069 §1), so a source order placing the allocating operand
+first inverted the suffix scan (analysis said no-root while the emitter roots — exactly the
+frame-elision ownership violation §2 forbids); `cexprMayRootLocally` now runs the scan over
+`sortRecordFields` order, pinned by a deterministic counterexample derived from
+`sortRecordFields` itself in BOTH the helper test and a real-IR recipe-consistency case (the
+var on the sorted-first label must be rooted: prologue + 1). **[P2] `operandsMayRoot` is one
+reverse fold** (the per-index `Array.drop`/`any` re-scan was O(n²), unexercised by
+all-immediate fixtures); a 20k-var regression pins linearity. **[P2] guard clauses are
+sequential** — a later clause's live-in now feeds an earlier guard's continuation (a false
+guard falls through), so a case-arm binder used only after a failing guard crosses that
+guard's safepoints; pinned by the two-clause regression (`b` used only in clause 2 crosses
+clause 1's call-guard).
+
+Slice-1 review round 2 (2026-07-24): **[P2] the post-guard force is an independent potential
+safepoint** — the emitter forces every guard's VALUE before testing it (the dtree
+guard-fallthrough), so a guard expression with no internal safepoint still puts a force
+between itself and both continuations; the fold now unions `contAfterGuard` at that force,
+exempt only when the guard's tail is an immediate literal (`guardResultForced`, a
+spine-iterative walk). Pinned by the variable-guard regression (`b` used only in clause 2
+crosses clause 1's `q`-guard force, where the clause-1 guard expression itself cannot
+safepoint); 429/429. The earlier progress text above is synced to the final counts/fixtures
+(P3).

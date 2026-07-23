@@ -35,7 +35,7 @@ import Data.Map as Map
 import Data.Maybe (Maybe(..), fromMaybe)
 import Data.String (Pattern(..))
 import Data.String as String
-import Data.Tuple (Tuple(..))
+import Data.Tuple (Tuple(..), fst)
 import Effect.Aff (Aff)
 import Effect.Class (liftEffect)
 import Effect.Ref as Ref
@@ -46,8 +46,10 @@ import PureScript.CoreFn.Decode (decodeModule)
 import PureScript.CoreFn.Expr (Bind(..), Expr(..)) as CFE
 import PureScript.CoreFn.Literal (Literal(..)) as CFL
 import PureScript.CoreFn.Module (Module)
+import PureScript.CoreFn.Names (Qualified(..)) as CFQ
 import Purvasm.Compiler (ForeignSigMap, LoadResult(..), Options, build, defaultHooks)
 import Purvasm.Compiler.Backend.LLVM.Driver (llvmBackend)
+import Purvasm.Compiler.Backend.LLVM.Mangle (sortRecordFields)
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (fail, shouldEqual)
 
@@ -98,6 +100,7 @@ functionBody name ir = do
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.Backend.LLVM.Driver" do
   stackSafetySpec
+  recipeConsistencySpec
   describe "llvmBackend via Purvasm.Compiler.build (B2 per-module, CoreFn → .ll)" do
     it "compiles Slice1 from CoreFn to byte-identical module + entry objects" do
       src <- liftEffect (readTextFile UTF8 "compiler/test/fixtures/slice1/corefn.json")
@@ -234,6 +237,74 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Driver" do
             (fail ("the nullary-Effect leaf closure must be arity 1; module IR:\n" <> ir))
           when (String.contains (Pattern ", i32 0, i64 1)") ir)
             (fail ("the nullary-Effect leaf closure must not be arity 0 (over-applies on run); module IR:\n" <> ir))
+
+-- --- ADR-0105 §2 recipe consistency (may-root declarations vs emitted roots) ----------------------
+
+-- | The load-bearing direction of the two-tier consistency: a recipe whose
+-- | `cexprMayRootLocally` declaration is FALSE must emit **no roots beyond the prologue** (an
+-- | under-declaration would let `needsFrame` elide a frame that lowering then roots into — the
+-- | shadow-stack ownership violation §2 pins). Verified against the CURRENT root-on-create
+-- | emitter: the prologue roots every param unconditionally, so "beyond the prologue" =
+-- | root-block count minus param count. `CUpdate` is the may-root=true contrast (its
+-- | accumulator rooting is real). Root blocks are counted by their `rchk` label lines.
+recipeConsistencySpec :: Spec Unit
+recipeConsistencySpec = describe "ADR-0105 recipe consistency (may-root vs emitted roots)" do
+  it "declared-false recipes (CAtom/CAccessor) emit only the prologue roots; CUpdate roots beyond" do
+    let
+      ann0 = { span: { start: { line: 0, column: 0 }, end: { line: 0, column: 0 } }, meta: Nothing }
+
+      lam1 x b = CFE.Abs ann0 x b
+
+      -- CRecord field order (review P1): the var on the sorted-FIRST label, the boxed string
+      -- on the sorted-SECOND, the record literal written in the OPPOSITE source order — the
+      -- emitter's canonical (sorted) order makes the var precede an allocating operand, so it
+      -- must be rooted even though a naive source-order scan would say otherwise.
+      recLabels = map fst (sortRecordFields [ Tuple "a" unit, Tuple "value" unit ])
+
+      testMod :: Module
+      testMod =
+        { name: [ "TestRoots" ]
+        , path: ""
+        , builtWith: ""
+        , imports: []
+        , exports: [ "ident", "acc", "upd", "rec" ]
+        , reExports: Object.empty
+        , foreignNames: []
+        , decls:
+            [ CFE.NonRec ann0 "ident" (lam1 "x" (CFE.Var ann0 (CFQ.Qualified Nothing "x")))
+            , CFE.NonRec ann0 "acc" (lam1 "r" (CFE.Accessor ann0 "field" (CFE.Var ann0 (CFQ.Qualified Nothing "r"))))
+            , CFE.NonRec ann0 "upd"
+                ( lam1 "r"
+                    ( CFE.ObjectUpdate ann0 (CFE.Var ann0 (CFQ.Qualified Nothing "r")) Nothing
+                        [ Tuple "a" (CFE.Literal ann0 (CFL.LitInt 1)) ]
+                    )
+                )
+            , CFE.NonRec ann0 "rec"
+                ( lam1 "x" case recLabels of
+                    [ l1, l2 ] -> CFE.Literal ann0
+                      ( CFL.LitObject
+                          [ Tuple l2 (CFE.Literal ann0 (CFL.LitString "s"))
+                          , Tuple l1 (CFE.Var ann0 (CFQ.Qualified Nothing "x"))
+                          ]
+                      )
+                    _ -> CFE.Var ann0 (CFQ.Qualified Nothing "x")
+                )
+            ]
+        }
+    out <- buildIR { name: "TestRoots", mod: testMod, foreignSigs: Map.empty }
+      { entryModule: "TestRoots", entryName: "ident", isEffect: false, opt: false }
+    let
+      ir = fromMaybe "" (Array.head out.mods)
+      rootBlocks name = countOccurrences "\nrchk" (fromMaybe "" (functionBody name ir))
+    -- one param each ⇒ exactly ONE prologue root block, nothing from the recipe:
+    rootBlocks "pv_g_TestRoots_2eident$d" `shouldEqual` 1
+    rootBlocks "pv_g_TestRoots_2eacc$d" `shouldEqual` 1
+    -- CUpdate (declared may-root): the accumulator rooting is real — beyond the prologue.
+    (rootBlocks "pv_g_TestRoots_2eupd$d" > 1) `shouldEqual` true
+    -- CRecord in the emitter's sorted order: the var operand precedes the allocating string,
+    -- so evalAtoms roots it — prologue + 1 (and the analysis' canonical-order declaration must
+    -- agree: see Test…LLVM.Liveness's ordering counterexample over the same labels).
+    rootBlocks "pv_g_TestRoots_2erec$d" `shouldEqual` 2
 
 -- --- stack safety on the emission spines (2026-07-16 bugfix) --------------------------------------
 
