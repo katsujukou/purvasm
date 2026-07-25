@@ -1,9 +1,11 @@
 -- | The runtime C-ABI surface the emitted module declares, and the ctx-header inline fast paths
--- | (ADR-0079 §1/§2): rooting, frame open/pop, `pv_get`, settle, and by-need force. A faithful
--- | transcription of boot's `codegen_llvm.ml` (`declarations`, `ctx_header_version`/offsets,
--- | `abi_stamp`, `header_field`, `abi_frame_open`/`abi_pop_frame`/`abi_get`/`abi_root`/`abi_settle`,
--- | `force_value`) — the ADR-0082 port; its boot byte-identity gate is retired (ADR-0104 §4) and
--- | emission is now L2-owned.
+-- | (ADR-0079 §1/§2): `pv_get`, settle, and by-need force. A faithful transcription of boot's
+-- | `codegen_llvm.ml` (`declarations`, `ctx_header_version`/offsets, `abi_stamp`, `header_field`,
+-- | `abi_get`/`abi_settle`, `force_value`) — the ADR-0082 port; its boot byte-identity gate is
+-- | retired (ADR-0104 §4) and emission is now L2-owned. The frame/rooting fast paths
+-- | (`abi_frame_open`/`abi_pop_frame`/`abi_root`) live in `Backend.LLVM.Root` behind the
+-- | ADR-0105 capability API; runtime entry calls route through the classified seam
+-- | (`Backend.LLVM.Safepoint`).
 -- |
 -- | In release mode (`inlineAbi = true`) these emit the fast paths as inline IR against the
 -- | `pv_ctx_header`; under `--debug` (`inlineAbi = false`) every operation is a single entry call (the
@@ -20,10 +22,7 @@ module Purvasm.Compiler.Backend.LLVM.Abi
   , declarations
   , abiStamp
   , headerField
-  , abiFrameOpen
-  , abiPopFrame
   , abiGet
-  , abiRoot
   , abiSettle
   , forceValue
   ) where
@@ -33,6 +32,7 @@ import Prelude
 import Control.Monad.State.Class (gets)
 import Data.String (joinWith)
 import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, emit, fresh, freshLabel)
+import Purvasm.Compiler.Backend.LLVM.Safepoint (RtArg(..), RtOp(..), rtCall)
 
 -- | The ctx-header ABI version stamped into each inline object (ADR-0079 §1).
 ctxHeaderVersion :: Int
@@ -150,36 +150,11 @@ headerField off = do
   emit ("  " <> a <> " = getelementptr i8, ptr %ctx, i64 " <> show off)
   pure a
 
--- | Open a shadow-stack frame, returning the mark operand: inline reads `roots_len`, `--debug` calls
--- | `pv_frame`.
-abiFrameOpen :: Codegen String
-abiFrameOpen = gets _.inlineAbi >>= case _ of
-  false -> do
-    m <- fresh
-    emit ("  " <> m <> " = call i64 @pv_frame(ptr %ctx)")
-    pure m
-  true -> do
-    m <- fresh
-    lenp <- headerField offRootsLen
-    emit ("  " <> m <> " = load i64, ptr " <> lenp)
-    pure m
-
--- | Pop the frame back to `mark`: inline stores `roots_len`, `--debug` calls `pv_pop_frame`.
-abiPopFrame :: String -> Codegen Unit
-abiPopFrame mark = gets _.inlineAbi >>= case _ of
-  false -> emit ("  call void @pv_pop_frame(ptr %ctx, i64 " <> mark <> ")")
-  true -> do
-    lenp <- headerField offRootsLen
-    emit ("  store i64 " <> mark <> ", ptr " <> lenp)
-
 -- | Read a root handle's current value: inline loads `roots_base` then the slot, `--debug` calls
 -- | `pv_get`.
 abiGet :: String -> Codegen String
 abiGet handle = gets _.inlineAbi >>= case _ of
-  false -> do
-    t <- fresh
-    emit ("  " <> t <> " = call i64 @pv_get(ptr %ctx, i64 " <> handle <> ")")
-    pure t
+  false -> rtCall RtGet [ I64 handle ]
   true -> do
     base <- fresh
     emit ("  " <> base <> " = load ptr, ptr %ctx")
@@ -189,59 +164,12 @@ abiGet handle = gets _.inlineAbi >>= case _ of
     emit ("  " <> t <> " = load i64, ptr " <> slot)
     pure t
 
--- | Root a freshly produced value and return its handle. Inline: the in-capacity store is the fast
--- | path (a 4-block `rchk`/`rfast`/`rslow`/`rdone` with a phi); `len == cap` falls to `pv_root`, which
--- | grows and returns the same bare-index handle. `--debug` is a single `pv_root`.
-abiRoot :: String -> Codegen String
-abiRoot v = gets _.inlineAbi >>= case _ of
-  false -> do
-    h <- fresh
-    emit ("  " <> h <> " = call i64 @pv_root(ptr %ctx, i64 " <> v <> ")")
-    pure h
-  true -> do
-    chk <- freshLabel "rchk"
-    fast <- freshLabel "rfast"
-    slow <- freshLabel "rslow"
-    done <- freshLabel "rdone"
-    emit ("  br label %" <> chk)
-    emit (chk <> ":")
-    lenp <- headerField offRootsLen
-    len <- fresh
-    emit ("  " <> len <> " = load i64, ptr " <> lenp)
-    cap <- fresh
-    capAddr <- headerField offRootsCap
-    emit ("  " <> cap <> " = load i64, ptr " <> capAddr)
-    full <- fresh
-    emit ("  " <> full <> " = icmp eq i64 " <> len <> ", " <> cap)
-    emit ("  br i1 " <> full <> ", label %" <> slow <> ", label %" <> fast)
-    emit (fast <> ":")
-    base <- fresh
-    emit ("  " <> base <> " = load ptr, ptr %ctx")
-    slot <- fresh
-    emit ("  " <> slot <> " = getelementptr i64, ptr " <> base <> ", i64 " <> len)
-    emit ("  store i64 " <> v <> ", ptr " <> slot)
-    len1 <- fresh
-    emit ("  " <> len1 <> " = add i64 " <> len <> ", 1")
-    emit ("  store i64 " <> len1 <> ", ptr " <> lenp)
-    emit ("  br label %" <> done)
-    emit (slow <> ":")
-    hs <- fresh
-    emit ("  " <> hs <> " = call i64 @pv_root(ptr %ctx, i64 " <> v <> ")")
-    emit ("  br label %" <> done)
-    emit (done <> ":")
-    h <- fresh
-    emit ("  " <> h <> " = phi i64 [ " <> len <> ", %" <> fast <> " ], [ " <> hs <> ", %" <> slow <> " ]")
-    pure h
-
 -- | Settle a returned value after a call (ADR-0079): if a tail is pending, `pv_settle` reifies it;
 -- | otherwise the value passes through. Inline is a 3-block `schk`/`sslow`/`sdone` with a phi;
 -- | `--debug` is a single `pv_settle`.
 abiSettle :: String -> Codegen String
 abiSettle r = gets _.inlineAbi >>= case _ of
-  false -> do
-    t <- fresh
-    emit ("  " <> t <> " = call i64 @pv_settle(ptr %ctx, i64 " <> r <> ")")
-    pure t
+  false -> rtCall RtSettle [ I64 r ]
   true -> do
     chk <- freshLabel "schk"
     slow <- freshLabel "sslow"
@@ -258,8 +186,7 @@ abiSettle r = gets _.inlineAbi >>= case _ of
     emit ("  " <> has <> " = icmp ne i64 " <> pf <> ", 0")
     emit ("  br i1 " <> has <> ", label %" <> slow <> ", label %" <> done)
     emit (slow <> ":")
-    rs <- fresh
-    emit ("  " <> rs <> " = call i64 @pv_settle(ptr %ctx, i64 " <> r <> ")")
+    rs <- rtCall RtSettle [ I64 r ]
     emit ("  br label %" <> done)
     emit (done <> ":")
     t <- fresh
@@ -282,8 +209,7 @@ forceValue v = do
   emit ("  " <> imm <> " = icmp ne i64 " <> bit <> ", 0")
   emit ("  br i1 " <> imm <> ", label %" <> done <> ", label %" <> slow)
   emit (slow <> ":")
-  forced <- fresh
-  emit ("  " <> forced <> " = call i64 @pv_force_if_byneed(ptr %ctx, i64 " <> v <> ")")
+  forced <- rtCall RtForceIfByneed [ I64 v ]
   emit ("  br label %" <> done)
   emit (done <> ":")
   r <- fresh

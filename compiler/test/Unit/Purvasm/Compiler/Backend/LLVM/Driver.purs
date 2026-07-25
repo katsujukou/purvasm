@@ -243,10 +243,12 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Driver" do
 -- | The load-bearing direction of the two-tier consistency: a recipe whose
 -- | `cexprMayRootLocally` declaration is FALSE must emit **no roots beyond the prologue** (an
 -- | under-declaration would let `needsFrame` elide a frame that lowering then roots into — the
--- | shadow-stack ownership violation §2 pins). Verified against the CURRENT root-on-create
--- | emitter: the prologue roots every param unconditionally, so "beyond the prologue" =
--- | root-block count minus param count. `CUpdate` is the may-root=true contrast (its
--- | accumulator rooting is real). Root blocks are counted by their `rchk` label lines.
+-- | shadow-stack ownership violation §2 pins). Under the plan-driven emitter the prologue roots
+-- | exactly the crossing names, so each fixture's expected `rchk` count is the exact sum of its
+-- | crossing roots + its recipe's internal roots — exact counts, not lower bounds, so a recipe
+-- | silently losing (or growing) an internal root fails the discrimination. `lowfr` is the
+-- | two-tier discriminator: an EMPTY crossing set whose frame exists solely because
+-- | `loweringMayRoot` is true. Root blocks are counted by their `rchk` label lines.
 recipeConsistencySpec :: Spec Unit
 recipeConsistencySpec = describe "ADR-0105 recipe consistency (may-root vs emitted roots)" do
   it "declared-false recipes (CAtom/CAccessor) emit only the prologue roots; CUpdate roots beyond" do
@@ -267,7 +269,7 @@ recipeConsistencySpec = describe "ADR-0105 recipe consistency (may-root vs emitt
         , path: ""
         , builtWith: ""
         , imports: []
-        , exports: [ "ident", "acc", "upd", "rec" ]
+        , exports: [ "ident", "acc", "upd", "rec", "lowfr" ]
         , reExports: Object.empty
         , foreignNames: []
         , decls:
@@ -289,6 +291,15 @@ recipeConsistencySpec = describe "ADR-0105 recipe consistency (may-root vs emitt
                       )
                     _ -> CFE.Var ann0 (CFQ.Qualified Nothing "x")
                 )
+            -- two-tier discriminator: the param is UNUSED (empty crossing set), but the
+            -- array literal's first string is rooted across the second's allocation — the
+            -- frame exists solely because the lowering tier declares may-root.
+            , CFE.NonRec ann0 "lowfr"
+                ( lam1 "x"
+                    ( CFE.Literal ann0
+                        (CFL.LitArray [ CFE.Literal ann0 (CFL.LitString "a"), CFE.Literal ann0 (CFL.LitString "b") ])
+                    )
+                )
             ]
         }
     out <- buildIR { name: "TestRoots", mod: testMod, foreignSigs: Map.empty }
@@ -296,15 +307,31 @@ recipeConsistencySpec = describe "ADR-0105 recipe consistency (may-root vs emitt
     let
       ir = fromMaybe "" (Array.head out.mods)
       rootBlocks name = countOccurrences "\nrchk" (fromMaybe "" (functionBody name ir))
-    -- one param each ⇒ exactly ONE prologue root block, nothing from the recipe:
-    rootBlocks "pv_g_TestRoots_2eident$d" `shouldEqual` 1
+    -- ADR-0105 slice 2a (plan-driven expectations): `ident` has no safepoint node at all, so
+    -- its frame is elided outright — the identity-class choreography win 2a keeps.
+    rootBlocks "pv_g_TestRoots_2eident$d" `shouldEqual` 0
+    -- `acc`'s param is read by the accessor's force — a safepoint node, so 2a roots it at the
+    -- prologue (the use-at-call exemption that elided this root was the slice-2 gate's
+    -- missing-root class); `CAccessor` still declares no lowering-local roots, so the single
+    -- block is exactly the prologue's.
     rootBlocks "pv_g_TestRoots_2eacc$d" `shouldEqual` 1
-    -- CUpdate (declared may-root): the accumulator rooting is real — beyond the prologue.
-    (rootBlocks "pv_g_TestRoots_2eupd$d" > 1) `shouldEqual` true
-    -- CRecord in the emitter's sorted order: the var operand precedes the allocating string,
-    -- so evalAtoms roots it — prologue + 1 (and the analysis' canonical-order declaration must
-    -- agree: see Test…LLVM.Liveness's ordering counterexample over the same labels).
+    -- CUpdate (declared may-root), EXACT: the 2a prologue root of the base-record param (1) +
+    -- the forced base rooted as the fold seed (1) + the accumulator re-rooted after the single
+    -- `record_set` (1). A recipe losing its accumulator rooting — which `>= 1` could not see
+    -- past the prologue root — drops this to 2 and fails.
+    rootBlocks "pv_g_TestRoots_2eupd$d" `shouldEqual` 3
+    -- CRecord in the emitter's sorted order: the param crosses (2a: read by an allocating
+    -- node) — one prologue block — and its reloaded operand precedes the allocating string,
+    -- so evalAtoms roots the temporary too (lowering tier; the canonical-order declaration
+    -- must agree: see Test…LLVM.Liveness's ordering counterexample over the same labels).
     rootBlocks "pv_g_TestRoots_2erec$d" `shouldEqual` 2
+    -- the two-tier frame decision, discriminated directly: `lowfr`'s crossing set is EMPTY
+    -- (nothing reads the param), so the prologue roots nothing — the single root block is the
+    -- lowering tier's (first string rooted across the second's allocation), and the frame it
+    -- requires is popped back to its mark (%t1) before the return.
+    rootBlocks "pv_g_TestRoots_2elowfr$d" `shouldEqual` 1
+    String.contains (Pattern "store i64 %t1, ptr")
+      (fromMaybe "" (functionBody "pv_g_TestRoots_2elowfr$d" ir)) `shouldEqual` true
 
 -- --- stack safety on the emission spines (2026-07-16 bugfix) --------------------------------------
 

@@ -22,14 +22,17 @@ module Purvasm.Compiler.Backend.LLVM.Monad
   , fresh
   , freshLabel
   , freshFn
-  , freshStrName
   , emit
+  , unsafeEmitRawCall
   , emitModule
-  , emitGlobal
+  , emitDefine
+  , unsafeEmitRawModule
+  , FnBody
+  , renderFnBody
+  , emitStringConstant
+  , containsCallText
   , beginFn
   , takeFn
-  , getFrame
-  , setFrame
   , renderBuffer
   , renderChunks
   , forA
@@ -52,6 +55,9 @@ import Data.Maybe (Maybe(..))
 import Data.Set (Set)
 import Data.Set as Set
 import Data.String (joinWith)
+import Data.String as String
+import Partial.Unsafe (unsafeCrashWith)
+import Purvasm.Compiler.Backend.LLVM.Mangle (escapeStringBytes)
 import Data.Tuple (Tuple(..))
 import Purvasm.Compiler.Backend.LLVM.Types (FnInfo, Lifted, SelfCtx)
 
@@ -70,7 +76,6 @@ type Ctx =
   , fns :: Int -- ^ lifted-function counter
   , strs :: Int -- ^ string-constant counter
   , pending :: List Lifted -- ^ lambdas to emit (LIFO)
-  , frame :: String -- ^ the current function's shadow-stack frame handle operand
   , gkeys :: Set String -- ^ top-level qualified keys (referenced as `@<mangle>$root`)
   , foreignArity :: Map String Int -- ^ native-leaf key → closure arity (ADR-0073/0080, from FSR)
   , externs :: Set String -- ^ referenced globals not defined here
@@ -81,6 +86,8 @@ type Ctx =
   , selfCtx :: Maybe SelfCtx -- ^ the binding whose lambda is being emitted
   , inDirect :: Boolean -- ^ emitting a `tailcc` direct entry (`%env` exists, `musttail` legal)
   , inlineAbi :: Boolean -- ^ release inline ABI fast paths (ADR-0079); `false` under `--debug`
+  , rootAll :: Boolean -- ^ ADR-0105: `true` = root-on-create fallback (init bodies, `LClosure` wrappers); `false` = the activation plan drives rooting
+  , crossing :: Set String -- ^ ADR-0105: the activation plan's crossing set (consulted only when `rootAll = false`)
   }
 
 -- | The emitter monad: a pure `State` over `Ctx`. `State` is `MonadRec`, so the deep linear spines
@@ -110,7 +117,6 @@ makeCx opts =
   , fns: 0
   , strs: 0
   , pending: Nil
-  , frame: "%frame"
   , gkeys: opts.gkeys
   , foreignArity: opts.foreignArity
   , externs: Set.empty
@@ -121,6 +127,8 @@ makeCx opts =
   , selfCtx: Nothing
   , inDirect: false
   , inlineAbi: opts.inlineAbi
+  , rootAll: true
+  , crossing: Set.empty
   }
 
 -- | Run an emission, returning the value and the final state.
@@ -149,38 +157,104 @@ freshFn prefix = state \c -> let n = c.fns + 1 in Tuple (prefix <> show n) c { f
 freshStrName :: Codegen String
 freshStrName = state \c -> let n = c.strs + 1 in Tuple ("@.str." <> show n) c { strs = n }
 
+-- | Does the text contain a call instruction? The line-start is normalised (a leading-space
+-- | prepend, plus newline/tab starts inside chunks) so a column-zero `call i64 …` cannot slip
+-- | past a naive ` call ` substring test. (String-literal bytes go through
+-- | [`emitStringConstant`], never here, so the guard cannot false-positive on guest data.)
+containsCallText :: String -> Boolean
+containsCallText s =
+  String.contains (String.Pattern " call ") (" " <> s)
+    || String.contains (String.Pattern "\ncall ") s
+    || String.contains (String.Pattern "\tcall ") s
+
 -- | Emit one line into the current function body (boot's `emit`, which appends the line + `'\n'`).
+-- | REJECTS call instructions (ADR-0105 §1): every classifiable call must be rendered by the
+-- | classified seam (`Backend.LLVM.Safepoint`), so a raw `call` line here is a structural error
+-- | caught at emission time, not a convention.
 emit :: String -> Codegen Unit
-emit line = modify_ \c -> c { fn = line : c.fn }
+emit line =
+  if containsCallText line then
+    unsafeCrashWith
+      ("Backend.LLVM.Monad.emit: raw call text bypasses the classified seam (ADR-0105 §1); route it through Safepoint: " <> line)
+  else unsafeEmitRawCall line
 
--- | Append a pre-formatted raw chunk (a whole `define` block, carrying its own newlines) to the module
--- | buffer (boot's `Buffer.add_string cx.md`).
+-- | The unchecked line emitter. The `unsafe` prefix marks the seam invariant it can break, not
+-- | a type hole: ONLY the classified seam (`Backend.LLVM.Safepoint`, which renders from its row
+-- | table) and the one documented ctx-birth line (`pv_runtime_new` in `Program`) may call this —
+-- | `tools/seam-audit.sh` (CI) pins that allowlist by file and expected count.
+unsafeEmitRawCall :: String -> Codegen Unit
+unsafeEmitRawCall line = modify_ \c -> c { fn = line : c.fn }
+
+-- | Append a pre-formatted raw chunk to the module buffer (boot's `Buffer.add_string cx.md`).
+-- | REJECTS call text like [`emit`] — an assembled chunk carrying its own `call` lines would
+-- | bypass the seam through the module buffer. Guest-code `define` blocks (whose bodies
+-- | legitimately carry calls, each already validated line-by-line) go through [`emitDefine`];
+-- | the one legitimately call-carrying skeleton chunk (`pv_init_all`'s body) goes through
+-- | [`unsafeEmitRawModule`].
 emitModule :: String -> Codegen Unit
-emitModule chunk = modify_ \c -> c { md = chunk : c.md }
+emitModule chunk =
+  if containsCallText chunk then
+    unsafeCrashWith
+      ("Backend.LLVM.Monad.emitModule: raw call text bypasses the classified seam (ADR-0105 §1); use emitDefine (validated body) or the audited unsafeEmitRawModule: " <> chunk)
+  else unsafeEmitRawModule chunk
 
--- | Append a pre-formatted raw chunk (a `@…` global line, carrying its own newline) to the module-level
--- | globals buffer (boot's `Buffer.add_string cx.globals`).
-emitGlobal :: String -> Codegen Unit
-emitGlobal chunk = modify_ \c -> c { globals = chunk : c.globals }
+-- | Assemble a `define` block around a validated function body: the wrapper text (header, and
+-- | the fixed `}` footer) is call-checked here, while the [`FnBody`] between them is
+-- | validated-by-construction (every line passed [`emit`]'s guard or an audited raw site).
+emitDefine :: String -> FnBody -> Codegen Unit
+emitDefine header (FnBody body) =
+  if containsCallText header then
+    unsafeCrashWith
+      ("Backend.LLVM.Monad.emitDefine: raw call text in a define header (ADR-0105 §1): " <> header)
+  else unsafeEmitRawModule (header <> body <> "}\n\n")
+
+-- | The unchecked module-chunk emitter (see [`unsafeEmitRawCall`] for the `unsafe` contract):
+-- | ONLY `Program.emitInitAll`'s assembled `pv_init_all` skeleton may pass call-carrying text —
+-- | `tools/seam-audit.sh` pins that allowlist.
+unsafeEmitRawModule :: String -> Codegen Unit
+unsafeEmitRawModule chunk = modify_ \c -> c { md = chunk : c.md }
+
+-- | Materialise a guest string as a module-level `@.str.N` byte constant — the ONLY
+-- | module-globals emitter (boot's `string_constant` global). Takes the RAW guest string only:
+-- | the name, byte length and escaped bytes are ALL derived internally (`freshStrName` /
+-- | `Mangle.escapeStringBytes`), so no caller-supplied fragment reaches the globals buffer and
+-- | the fixed `c"…"` constant shape cannot express instruction text (round-5 closure:
+-- | caller-supplied name/escaped parts could have smuggled raw IR past the fixed suffix). The
+-- | empty string emits nothing — `Nothing`, boot's early return; callers pass a null pointer.
+emitStringConstant :: String -> Codegen (Maybe { name :: String, len :: Int })
+emitStringConstant s =
+  let
+    { escaped, len } = escapeStringBytes s
+  in
+    if len == 0 then pure Nothing
+    else do
+      name <- freshStrName
+      modify_ \c -> c
+        { globals = (name <> " = private unnamed_addr constant [" <> show len <> " x i8] c\"" <> escaped <> "\"\n") : c.globals }
+      pure (Just { name, len })
 
 -- | Start a new function body: reset the SSA counter and clear the current-function line buffer.
--- | `lbl`/`fns`/`strs` are deliberately untouched (module-global).
+-- | `lbl`/`fns`/`strs` are deliberately untouched (module-global). The ADR-0105 per-activation
+-- | rooting policy resets to the conservative root-on-create fallback (`rootAll = true`) —
+-- | `emitFunction` overrides it when an activation plan exists. (Frame state is NOT here: the
+-- | open frame is the lexical `Root.FrameToken` the emitters thread.)
 beginFn :: Codegen Unit
-beginFn = modify_ \c -> c { ssa = 0, fn = Nil }
+beginFn = modify_ \c -> c { ssa = 0, fn = Nil, rootAll = true, crossing = Set.empty }
 
--- | Take the current function body as rendered text and clear the line buffer (boot reads
--- | `Buffer.contents cx.fn` into a `define` template). The counters are left alone; `beginFn` resets
--- | `ssa` at the next function.
-takeFn :: Codegen String
-takeFn = state \c -> Tuple (renderBuffer c.fn) c { fn = Nil }
+-- | A rendered function body whose every line went through the guarded emitters — the
+-- | constructor is private, so call-carrying body text can only re-enter the module buffer via
+-- | [`emitDefine`] (never re-injected through the validated [`emitModule`]).
+newtype FnBody = FnBody String
 
--- | The current function's shadow-stack frame handle operand (boot's `cx.frame`).
-getFrame :: Codegen String
-getFrame = state \c -> Tuple c.frame c
+-- | The body's text, for the pure final-assembly templates (`entryLl`'s `@main` block).
+renderFnBody :: FnBody -> String
+renderFnBody (FnBody s) = s
 
--- | Set the current function's frame handle operand.
-setFrame :: String -> Codegen Unit
-setFrame f = modify_ \c -> c { frame = f }
+-- | Take the current function body (validated-by-construction) and clear the line buffer (boot
+-- | reads `Buffer.contents cx.fn` into a `define` template). The counters are left alone;
+-- | `beginFn` resets `ssa` at the next function.
+takeFn :: Codegen FnBody
+takeFn = state \c -> Tuple (FnBody (renderBuffer c.fn)) c { fn = Nil }
 
 -- | Stack-safe per-element sequencing for **data-sized** spines (2026-07-16 stack-safety bugfix):
 -- | a sequenced `State` step is a live host frame on the JS backend even inside a right-nested

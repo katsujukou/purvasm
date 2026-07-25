@@ -35,11 +35,13 @@ import Data.Set as Set
 import Data.String (joinWith)
 import Data.Tuple (Tuple(..), fst, snd)
 import Partial.Unsafe (unsafeCrashWith)
-import Purvasm.Compiler.Backend.LLVM.Abi (abiFrameOpen, abiPopFrame, abiRoot, abiStamp, ctxHeaderVersion, declarations, forceValue)
+import Purvasm.Compiler.Backend.LLVM.Abi (abiStamp, ctxHeaderVersion, declarations, forceValue)
 import Purvasm.Compiler.Backend.LLVM.Emit (buildGrec, emitPending, expr, readVar)
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (fvExpr)
 import Purvasm.Compiler.Backend.LLVM.Mangle (immUnit, mangle, mangleForeign)
-import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, MakeCxOptions, beginFn, emit, emitModule, forA, forA_, fresh, makeCx, renderChunks, runCodegen, takeFn)
+import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, FnBody, MakeCxOptions, beginFn, emit, emitModule, forA, forA_, fresh, makeCx, renderChunks, renderFnBody, runCodegen, takeFn, unsafeEmitRawCall, unsafeEmitRawModule)
+import Purvasm.Compiler.Backend.LLVM.Root (emitGfunInit, emitInitFnFramed, entryTeardown, openFrame)
+import Purvasm.Compiler.Backend.LLVM.Safepoint (RtArg(..), RtOp(..), rtCall, rtCallVoid)
 import Purvasm.Compiler.Backend.LLVM.Types (CallFact(..), EnvSrc(..), FnInfo, Gdef(..), Lifted(..), LiftedBody(..), SplitOutput)
 import Purvasm.Compiler.MiddleEnd.ANF (CExpr(..), Expr(..))
 import Purvasm.Compiler.MiddleEnd.Module (Decl)
@@ -123,25 +125,12 @@ reachableGdefs gkeys entry gdefs =
 
 -- --- emission ----------------------------------------------------------------------------------------
 
--- | Root a value into `@<mangle key>$root` and store the handle (the caller has popped any transient
--- | frame, so the root lands in the never-popped init region).
-storeRootGlobal :: String -> String -> Codegen Unit
-storeRootGlobal key v = do
-  h <- abiRoot v
-  emit ("  store i64 " <> h <> ", ptr @" <> mangle key <> "$root")
-
--- | Wrap an init-body emitter in `define void @<mangle name>$init(ptr %ctx)`.
-emitInitFn :: String -> Codegen Unit -> Codegen Unit
-emitInitFn name body = do
-  beginFn
-  body
-  emit "  ret void"
-  text <- takeFn
-  emitModule ("define void @" <> mangle name <> "$init(ptr %ctx) {\nentry:\n" <> text <> "}\n\n")
-
 -- | Emit one gdef's `$init` function (and, for a `Gfun`, queue its code). `Gfun`: a closed top-level
 -- | closure; its `$d` is exported iff the key is in the cross-module surface (`xfns`). `Gcaf`: a strict
--- | value under a transient frame.
+-- | value under a transient frame. Each body RETURNS its `(globalKey, value)` pairs and the
+-- | `Root` init wrapper plants the permanent roots after the body (and, for the framed shapes,
+-- | after the transient frame is popped) — the ADR-0105 §2 phase order is wrapper-owned, so a
+-- | permanent handle inside the transient frame is not expressible here.
 emitGdef :: Gdef -> Codegen Unit
 emitGdef = case _ of
   Gfun key ps body -> do
@@ -157,34 +146,23 @@ emitGdef = case _ of
         , exported: Map.member key xfns
         }
     modify_ \c -> c { pending = lifted : c.pending }
-    emitInitFn key do
-      addr <- fresh
-      emit ("  " <> addr <> " = ptrtoint ptr @" <> mangle key <> " to i64")
-      clo <- fresh
-      emit ("  " <> clo <> " = call i64 @pv_make_closure(ptr %ctx, i64 " <> addr <> ", i32 " <> show (Array.length ps) <> ", i64 " <> immUnit <> ")")
-      storeRootGlobal key clo
+    -- the frameless init is a fixed shape owned by Root — no body callback exists to misuse.
+    emitGfunInit key (Array.length ps)
   Gcaf key e ->
-    emitInitFn key do
-      frame <- abiFrameOpen
-      modify_ \c -> c { frame = frame }
-      mv <- expr Nil false e
+    emitInitFnFramed key \tok -> do
+      mv <- expr (Just tok) Nil false e
       case mv of
-        Just v -> do
-          abiPopFrame frame
-          storeRootGlobal key v
+        Just v -> pure [ Tuple key v ]
         Nothing -> unsafeCrashWith "Program.emitGdef: Gcaf body produced no value"
   Grec binds -> case Array.head binds of
     Nothing -> unsafeCrashWith "Program.emitGdef: empty Grec"
     Just (Tuple firstKey _) ->
-      emitInitFn firstKey do
-        frame <- abiFrameOpen
-        modify_ \c -> c { frame = frame }
+      emitInitFnFramed firstKey \tok -> do
         -- stable member code symbols, so `gfns`'s pre-registered `$d` names line up.
-        env' <- buildGrec (\m -> Just (mangle m)) Nil binds
-        -- read each member's current cell value *before* popping the transient roots.
-        vals <- forA binds (\(Tuple m _) -> Tuple m <$> readVar env' m)
-        abiPopFrame frame
-        forA_ vals (\(Tuple m v) -> storeRootGlobal m v)
+        env' <- buildGrec (Just tok) (\m -> Just (mangle m)) Nil binds
+        -- read each member's current cell value while its transient root is still live; the
+        -- wrapper pops the frame and permanent-roots the returned raw values.
+        forA binds (\(Tuple m _) -> Tuple m <$> readVar env' m)
 
 -- | Register the unit's own function bindings for direct calls, emit each gdef's root-handle global
 -- | definition(s) (init overwrites the 0 sentinel before any read), then its init function.
@@ -210,38 +188,43 @@ emitGdefs gdefs = do
     forA_ (gdefKeys g) (\k -> emitModule ("@" <> mangle k <> "$root = global i64 0\n"))
 
 -- | Emit `pv_init_all`: call each binding's init in dependency (spine) order. Callers pass the reachable
--- | subset.
+-- | subset. The per-gdef `@…$init` call lines assembled here are module-SKELETON text (a chunk,
+-- | not recipe emission) — the one call-carrying chunk allowed through `unsafeEmitRawModule`,
+-- | pinned by file/shape/count in `tools/seam-audit.sh` ($init symbols are the program's own,
+-- | always-safepoint init tier; the entry's own `pv_init_all` call goes through `RtInitAll`).
 emitInitAll :: Array Gdef -> Codegen Unit
 emitInitAll gdefs =
   let
     calls = joinWith "\n" (map (\g -> "  call void @" <> mangle (gdefInitKey g) <> "$init(ptr %ctx)") gdefs)
   in
-    emitModule ("define void @pv_init_all(ptr %ctx) {\nentry:\n" <> calls <> "\n  ret void\n}\n\n")
+    unsafeEmitRawModule ("define void @pv_init_all(ptr %ctx) {\nentry:\n" <> calls <> "\n  ret void\n}\n\n")
 
 -- | Emit the `@main` entry stub body: `pv_runtime_new` → `pv_abi_check` → `pv_init_all` → evaluate the
 -- | entry → print (pure) or run+drain (effect) → free → return. Returns the body text.
-emitEntryStub :: Boolean -> Int -> Expr -> Codegen String
+emitEntryStub :: Boolean -> Int -> Expr -> Codegen FnBody
 emitEntryStub isEffect heapWords entry = do
   beginFn
-  emit ("  %ctx = call ptr @pv_runtime_new(i64 " <> show heapWords <> ")")
-  emit ("  call void @pv_abi_check(i32 " <> show ctxHeaderVersion <> ")")
-  emit "  call void @pv_init_all(ptr %ctx)"
-  frame0 <- abiFrameOpen
-  modify_ \c -> c { frame = frame0 }
-  mv <- expr Nil false entry
+  -- ctx birth: the one call the classified seam cannot render (it produces the `%ctx` every seam
+  -- call takes, and returns `ptr`); everything after it routes through the seam. The raw-call
+  -- emitter is allowlisted for exactly this line in `tools/seam-audit.sh`.
+  unsafeEmitRawCall ("  %ctx = call ptr @pv_runtime_new(i64 " <> show heapWords <> ")")
+  rtCallVoid RtAbiCheck [ I32 (show ctxHeaderVersion) ]
+  rtCallVoid RtInitAll []
+  -- the entry's roots are transient under its own frame; the permanent tier exists only
+  -- inside `Root`'s init wrappers (`emitGfunInit` / `emitInitFnFramed`), so the entry stub
+  -- has no expression for it (ADR-0105 §2: the entry stub has NO permanent-root capability).
+  tok <- openFrame
+  mv <- expr (Just tok) Nil false entry
   v <- case mv of
     Just v -> pure v
     Nothing -> unsafeCrashWith "Program.emitEntryStub: entry produced no value"
   if isEffect then do
-    r <- fresh
-    emit ("  " <> r <> " = call i64 @pv_run_effect(ptr %ctx, i64 " <> v <> ")")
-    emit "  call void @pv_drain_output(ptr %ctx)"
+    void (rtCall RtRunEffect [ I64 v ])
+    rtCallVoid RtDrainOutput []
   else do
     fv <- forceValue v
-    emit ("  call void @pv_print_int(i64 " <> fv <> ")")
-  abiPopFrame frame0
-  emit "  call void @pv_runtime_free(ptr %ctx)"
-  emit "  ret i32 0"
+    rtCallVoid RtPrintInt [ I64 fv ]
+  entryTeardown tok
   takeFn
 
 -- --- module / entry object decls -------------------------------------------------------------------
@@ -342,7 +325,7 @@ entryLl opts isEffect heapWords gdefs entry =
       <> "\n"
       <> renderChunks ctx.md
       <> "\ndefine i32 @main() {\nentry:\n"
-      <> parts.entryBody
+      <> renderFnBody parts.entryBody
       <> "}\n"
 
 -- | Build the cross-module export surface (`xfns`) from the published call facts (`surface`): an exported

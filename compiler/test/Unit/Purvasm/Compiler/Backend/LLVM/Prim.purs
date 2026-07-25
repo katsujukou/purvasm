@@ -7,7 +7,7 @@ module Test.Unit.Purvasm.Compiler.Backend.LLVM.Prim where
 import Prelude
 
 import Data.Maybe (Maybe(..))
-import Data.Tuple (Tuple(..), snd)
+import Data.Tuple (Tuple(..))
 import Data.Map as Map
 import Data.Set as Set
 import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, makeCx, renderBuffer, runCodegen)

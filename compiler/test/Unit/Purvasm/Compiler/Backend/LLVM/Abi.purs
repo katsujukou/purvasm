@@ -12,7 +12,7 @@ import Data.Map as Map
 import Data.Set as Set
 import Data.String (Pattern(..), split)
 import Data.Tuple (snd)
-import Purvasm.Compiler.Backend.LLVM.Abi (abiFrameOpen, abiGet, abiPopFrame, abiRoot, abiSettle, abiStamp, declarations, forceValue)
+import Purvasm.Compiler.Backend.LLVM.Abi (abiGet, abiSettle, abiStamp, declarations, forceValue)
 import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, makeCx, renderBuffer, runCodegen)
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
@@ -38,49 +38,12 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Abi" do
         )
       abiStamp false `shouldEqual` ""
 
-  describe "abiFrameOpen / abiGet / abiPopFrame" do
-    it "opens a frame by reading roots_len (getelementptr emitted before the load)" do
-      emitted abiFrameOpen `shouldEqual`
-        ( "  %t2 = getelementptr i8, ptr %ctx, i64 8\n"
-            <> "  %t1 = load i64, ptr %t2\n"
-        )
-
+  describe "abiGet" do
     it "reads a handle's value via roots_base + slot" do
       emitted (abiGet "%h") `shouldEqual`
         ( "  %t1 = load ptr, ptr %ctx\n"
             <> "  %t2 = getelementptr i64, ptr %t1, i64 %h\n"
             <> "  %t3 = load i64, ptr %t2\n"
-        )
-
-    it "pops a frame by storing the mark back into roots_len" do
-      emitted (abiPopFrame "%m") `shouldEqual`
-        ( "  %t1 = getelementptr i8, ptr %ctx, i64 8\n"
-            <> "  store i64 %m, ptr %t1\n"
-        )
-
-  describe "abiRoot" do
-    it "emits the 4-block in-capacity fast path with the len/pv_root phi" do
-      emitted (abiRoot "%v") `shouldEqual`
-        ( "  br label %rchk1\n"
-            <> "rchk1:\n"
-            <> "  %t1 = getelementptr i8, ptr %ctx, i64 8\n"
-            <> "  %t2 = load i64, ptr %t1\n"
-            <> "  %t4 = getelementptr i8, ptr %ctx, i64 16\n"
-            <> "  %t3 = load i64, ptr %t4\n"
-            <> "  %t5 = icmp eq i64 %t2, %t3\n"
-            <> "  br i1 %t5, label %rslow3, label %rfast2\n"
-            <> "rfast2:\n"
-            <> "  %t6 = load ptr, ptr %ctx\n"
-            <> "  %t7 = getelementptr i64, ptr %t6, i64 %t2\n"
-            <> "  store i64 %v, ptr %t7\n"
-            <> "  %t8 = add i64 %t2, 1\n"
-            <> "  store i64 %t8, ptr %t1\n"
-            <> "  br label %rdone4\n"
-            <> "rslow3:\n"
-            <> "  %t9 = call i64 @pv_root(ptr %ctx, i64 %v)\n"
-            <> "  br label %rdone4\n"
-            <> "rdone4:\n"
-            <> "  %t10 = phi i64 [ %t2, %rfast2 ], [ %t9, %rslow3 ]\n"
         )
 
   describe "abiSettle" do

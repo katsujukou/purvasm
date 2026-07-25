@@ -72,6 +72,11 @@ data Gdef
 -- | binding is a known lambda (a direct-call candidate, ADR-0076 §2).
 type EnvEntry =
   { handle :: String
+  -- | ADR-0105 slice 2: `true` = `handle` is the value's SSA operand DIRECTLY (a non-crossing
+  -- | definition: no root slot exists, no reload happens — valid because no safepoint can
+  -- | intervene inside its live range); `false` = `handle` is a shadow-stack root handle and
+  -- | every use reloads through it.
+  , direct :: Boolean
   , knownFn :: Maybe FnInfo
   }
 
@@ -83,11 +88,21 @@ type Env = List (Tuple String EnvEntry)
 -- | shadows `Prelude`'s `bind` in a consumer that opens this module — do-notation's implicit `bind`
 -- | would otherwise become ambiguous.
 bindVar :: Env -> String -> String -> Env
-bindVar env x handle = Tuple x { handle, knownFn: Nothing } : env
+bindVar env x handle = Tuple x { handle, direct: false, knownFn: Nothing } : env
+
+-- | Bind a NON-CROSSING definition to its SSA operand directly (ADR-0105 §3: no slot, no store,
+-- | no reload) — only sound when the activation plan proves no safepoint sits inside its live range.
+bindDirectVar :: Env -> String -> String -> Env
+bindDirectVar env x v = Tuple x { handle: v, direct: true, knownFn: Nothing } : env
 
 -- | Bind a variable that is statically a known lambda — its saturated calls may go direct.
 bindFnVar :: Env -> String -> String -> FnInfo -> Env
-bindFnVar env x handle fn = Tuple x { handle, knownFn: Just fn } : env
+bindFnVar env x handle fn = Tuple x { handle, direct: false, knownFn: Just fn } : env
+
+-- | `bindDirectVar` for a known-lambda binding (ADR-0105): the SSA operand directly plus the
+-- | direct-call info.
+bindDirectFnVar :: Env -> String -> String -> FnInfo -> Env
+bindDirectFnVar env x v fn = Tuple x { handle: v, direct: true, knownFn: Just fn } : env
 
 -- | Look a variable up in the local scope, most-recent binding first.
 lookupEnv :: String -> Env -> Maybe EnvEntry
@@ -101,6 +116,9 @@ type SelfCtx =
   { name :: String
   , captureHandle :: Maybe String
   , envHandle :: String
+  -- | ADR-0105: `true` = `%env` never crosses a safepoint before a self-call, so `envHandle`
+  -- | is the raw `%env` SSA operand itself (no slot); `false` = a rooted handle, reloaded at use.
+  , envDirect :: Boolean
   , fnInfo :: FnInfo
   }
 

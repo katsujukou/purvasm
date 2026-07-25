@@ -108,34 +108,7 @@ rdone4:
 
 define tailcc i64 @pv_g_Slice1_2eidentInt$d(ptr %ctx, i64 %env, i64 %p0) {
 entry:
-  %t2 = getelementptr i8, ptr %ctx, i64 8
-  %t1 = load i64, ptr %t2
-  br label %rchk5
-rchk5:
-  %t3 = getelementptr i8, ptr %ctx, i64 8
-  %t4 = load i64, ptr %t3
-  %t6 = getelementptr i8, ptr %ctx, i64 16
-  %t5 = load i64, ptr %t6
-  %t7 = icmp eq i64 %t4, %t5
-  br i1 %t7, label %rslow7, label %rfast6
-rfast6:
-  %t8 = load ptr, ptr %ctx
-  %t9 = getelementptr i64, ptr %t8, i64 %t4
-  store i64 %p0, ptr %t9
-  %t10 = add i64 %t4, 1
-  store i64 %t10, ptr %t3
-  br label %rdone8
-rslow7:
-  %t11 = call i64 @pv_root(ptr %ctx, i64 %p0)
-  br label %rdone8
-rdone8:
-  %t12 = phi i64 [ %t4, %rfast6 ], [ %t11, %rslow7 ]
-  %t13 = load ptr, ptr %ctx
-  %t14 = getelementptr i64, ptr %t13, i64 %t12
-  %t15 = load i64, ptr %t14
-  %t16 = getelementptr i8, ptr %ctx, i64 8
-  store i64 %t1, ptr %t16
-  ret i64 %t15
+  ret i64 %p0
 }
 
 define internal i64 @pv_g_Slice1_2eidentInt(ptr %ctx, i64 %clo, ptr %args, i64 %nargs) {

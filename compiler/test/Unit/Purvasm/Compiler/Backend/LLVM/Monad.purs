@@ -12,13 +12,27 @@ import Data.Map as Map
 import Data.Set as Set
 import Data.Tuple (Tuple(..), fst, snd)
 import Data.Array as Array
-import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, Ctx, beginFn, emit, emitGlobal, emitModule, foldA, forA, forA_, forWithIndexA, fresh, freshFn, freshLabel, makeCx, renderBuffer, renderChunks, runCodegen, takeFn)
+import Control.Monad.Error.Class (try)
+import Data.Either (isLeft)
+import Data.Maybe (Maybe(..))
+import Data.String as String
+import Effect.Aff (Aff)
+import Effect.Class (liftEffect)
+import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, Ctx, beginFn, emit, emitDefine, emitModule, emitStringConstant, foldA, forA, forA_, forWithIndexA, fresh, freshFn, freshLabel, makeCx, renderBuffer, renderChunks, renderFnBody, runCodegen, takeFn)
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
 
 -- The default fresh state used across these cases.
 run :: forall a. Codegen a -> Tuple a Ctx
 run = runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true })
+
+-- Force a pure emission inside the Effect runtime so its guard `unsafeCrashWith` surfaces as a
+-- caught exception: evaluation is deferred into the Effect closure — strict evaluation at
+-- construction would throw outside `try`'s reach and kill the runner instead.
+expectCrash :: forall a. (Unit -> a) -> Aff Unit
+expectCrash thunk = do
+  r <- try (liftEffect (void (map (\_ -> thunk unit) (pure unit))))
+  isLeft r `shouldEqual` true
 
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.Backend.LLVM.Monad" do
@@ -70,10 +84,27 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Monad" do
     it "renders an empty buffer as the empty string" do
       renderBuffer (Nil :: List String) `shouldEqual` ""
 
-    it "keeps the globals buffer independent of the function buffer" do
-      let ctx = snd $ run (emit "fn0" *> emitGlobal "glob0\n" *> emit "fn1")
+    it "keeps the globals buffer independent of the function buffer (derived string constants only)" do
+      let Tuple r ctx = run (emit "fn0" *> emitStringConstant "ab" <* emit "fn1")
+      r `shouldEqual` Just { name: "@.str.1", len: 2 }
       renderBuffer ctx.fn `shouldEqual` "fn0\nfn1\n"
-      renderChunks ctx.globals `shouldEqual` "glob0\n"
+      renderChunks ctx.globals `shouldEqual` "@.str.1 = private unnamed_addr constant [2 x i8] c\"ab\"\n"
+
+    it "emits nothing for the empty string (the null-pointer case)" do
+      let Tuple r ctx = run (emitStringConstant "")
+      r `shouldEqual` Nothing
+      renderChunks ctx.globals `shouldEqual` ""
+
+    it "a hostile guest string cannot break out of the c\"…\" constant (all parts derived)" do
+      -- newline and quote are guest DATA: the escaper renders them as byte escapes, so the
+      -- buffer holds exactly ONE well-formed constant line with the derived name and an
+      -- intact closing quote — call-looking TEXT may remain, but only as bytes inside the
+      -- constant, never as an instruction position.
+      let ctx = snd $ run (emitStringConstant "a\"\n call i64 @evil(ptr %ctx)")
+      let rendered = renderChunks ctx.globals
+      Array.length (String.split (String.Pattern "\n") rendered) `shouldEqual` 2
+      String.take 8 rendered `shouldEqual` "@.str.1 "
+      String.drop (String.length rendered - 2) rendered `shouldEqual` "\"\n"
 
   describe "takeFn / emitModule / renderChunks" do
     it "takes the rendered function body and clears the line buffer" do
@@ -82,7 +113,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Monad" do
           emit "f1 line1"
           emit "f1 line2"
           takeFn
-      body `shouldEqual` "f1 line1\nf1 line2\n"
+      renderFnBody body `shouldEqual` "f1 line1\nf1 line2\n"
       ctx.fn `shouldEqual` (Nil :: List String)
 
     it "concatenates module chunks verbatim, preserving their own newlines" do
@@ -92,6 +123,29 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Monad" do
           emitModule "define @b {\nentry:\n  ret\n}\n\n"
       renderChunks ctx.md
         `shouldEqual` "define @a {\nentry:\n  ret\n}\n\ndefine @b {\nentry:\n  ret\n}\n\n"
+
+    it "emitDefine wraps a validated body in the header and the fixed footer" do
+      let
+        ctx = snd $ run do
+          emit "  ret i64 %v"
+          body <- takeFn
+          emitDefine "define internal i64 @f(ptr %ctx) {\nentry:\n" body
+      renderChunks ctx.md
+        `shouldEqual` "define internal i64 @f(ptr %ctx) {\nentry:\n  ret i64 %v\n}\n\n"
+
+  describe "the raw-call guards (ADR-0105 §1 negative tests)" do
+    it "emit rejects a raw call line" do
+      expectCrash \_ -> run (emit "  %t1 = call i64 @evil(ptr %ctx)")
+    it "emit rejects a column-zero call (line-start-normalised detection)" do
+      expectCrash \_ -> run (emit "call i64 @evil(ptr %ctx)")
+    it "emitModule rejects a call-carrying chunk" do
+      expectCrash \_ -> run (emitModule "define @x {\n  %t1 = call i64 @evil(ptr %ctx)\n}\n")
+    it "emitModule rejects a column-zero call inside a chunk" do
+      expectCrash \_ -> run (emitModule "define @x {\ncall i64 @evil(ptr %ctx)\n}\n")
+    it "emitDefine rejects a call-carrying header" do
+      expectCrash \_ -> run (takeFn >>= emitDefine "define @x( call i64 ) {\n")
+    it "the guards pass call-free text through" do
+      renderBuffer (snd (run (emit "  ret i64 1"))).fn `shouldEqual` "  ret i64 1\n"
 
 -- --- the stack-safe spine combinators (2026-07-16 bugfix) -----------------------------------------
 --

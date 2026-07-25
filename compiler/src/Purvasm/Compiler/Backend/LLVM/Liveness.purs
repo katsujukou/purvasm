@@ -10,12 +10,20 @@
 -- | lowering *sequence* — including operand forcing (`pv_force_if_byneed`'s slow path runs a
 -- | thunk, so a forced non-immediate operand is a potential safepoint) and boxed-literal /
 -- | foreign-closure materialisation inside `atom` — not just the node's "main" call (§1).
+-- | Per-operation classification comes from the classified emission seam
+-- | (`Backend.LLVM.Safepoint`) — the SAME rows the emitter renders calls from — so the analysis
+-- | cannot silently drift from what a recipe actually emits.
 -- |
--- | The crossing criterion implements the §1 use-at-call boundary: a value consumed as an
--- | *operand* of a safepoint operation, with no use reachable after it, does NOT cross — the
--- | backward pass unions, at each safepoint, the names live *after* the whole node (its operands
--- | are consumed by it; protecting operand values across the node's internal safepoints is the
--- | lowering recipes' declared, lowering-local concern).
+-- | The crossing criterion (slice 2a): at each safepoint node the backward pass unions the names
+-- | live *after* the whole node AND the names the node itself reads. The §1 use-at-call
+-- | exemption (operand-only consumption ≠ crossing) is deliberately NOT applied: an operand is
+-- | read at its own position inside the node's lowering sequence, so a direct (unrooted) SSA
+-- | value is stale whenever ANY safepoint sits between its definition and that read — including
+-- | the node's own internal ones (a sibling operand's boxed-literal allocation, a sibling's
+-- | force slow path, the recipe's pre-read machinery). Only a per-recipe read-order model could
+-- | discharge those cases soundly; that refinement is slice 2b's, behind the emission seam. A
+-- | name therefore stays direct only when its ENTIRE live range touches no safepoint node at
+-- | all — which still elides the pure-leaf choreography (the `CAtom` identity class).
 -- |
 -- | Closures are opaque (§2): a `CLam`/`LetRec` body is walked only for its free variables (the
 -- | captures, consumed at construction) — its own crossings belong to the lifted function's
@@ -51,10 +59,11 @@ import Data.Set (Set)
 import Data.Set as Set
 import Data.Tuple (Tuple(..), snd)
 import Purvasm.Compiler.Backend.LLVM.Mangle (sortRecordFields)
+import Purvasm.Compiler.Backend.LLVM.Safepoint (RtOp(..), guestCallSafepoint, rtSafepoint)
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr(..), Expr(..), Rhs(..))
-import Purvasm.Compiler.Primitive (PrimOp(..))
+import Purvasm.Compiler.Primitive (PrimOp)
 
 -- | One activation's rootable-name context: its parameters and captures (rooted today at the
 -- | prologue), and — for a self-recursive function — the binding name whose calls read the
@@ -93,15 +102,16 @@ needsFrame p = not (Set.isEmpty p.crossing) || p.loweringMayRoot
 
 -- | `atom` (unforced) materialisation: a boxed literal allocates (`pv_new_number`/`pv_new_str`)
 -- | and a foreign reference builds its leaf closure (`pv_make_closure`); a var is a plain
--- | slot/global reload and scalar literals are immediates.
+-- | slot/global reload and scalar literals are immediates. Each allocating arm reads its seam
+-- | row — the row the `Emit.atom` recipe renders that exact call from.
 atomCanSafepoint :: Atom -> Boolean
 atomCanSafepoint = case _ of
   AtomVar _ -> false
-  AtomForeign _ -> true
+  AtomForeign _ -> rtSafepoint RtMakeClosure
   AtomLit (LInt _) -> false
   AtomLit (LBool _) -> false
-  AtomLit (LNumber _) -> true
-  AtomLit (LString _) -> true
+  AtomLit (LNumber _) -> rtSafepoint RtNewNumber
+  AtomLit (LString _) -> rtSafepoint RtNewStr
 
 -- | A *forced* operand (`forceValue`): the slow path (`pv_force_if_byneed`) may run a thunk, so
 -- | any non-immediate forced operand is a potential safepoint on top of its materialisation.
@@ -111,56 +121,13 @@ forcedAtomCanSafepoint = case _ of
   AtomLit (LBool _) -> false
   -- every non-immediate: the force slow path alone may run a thunk (a var may hold a by-need
   -- cell), and boxed literals / foreigns additionally allocate at materialisation.
-  _ -> true
+  a -> rtSafepoint RtForceIfByneed || atomCanSafepoint a
 
 -- | The §1 classification of the primop's OWN runtime operation (operand forcing is accounted
--- | separately by `cexprCanSafepoint` — `CPrim` forces its operands). Anything allocating (or
--- | boxing) is a safepoint; in-place/read-only/register-only ops are not.
+-- | separately by `cexprCanSafepoint` — `CPrim` forces its operands): the seam's `RtPrim` row,
+-- | which sits beside the `primSym` rendering it.
 primOpSafepoint :: PrimOp -> Boolean
-primOpSafepoint = case _ of
-  -- boxed-Number arithmetic / widening box the result
-  AddNumber -> true
-  SubNumber -> true
-  MulNumber -> true
-  DivNumber -> true
-  IntToNumber -> true
-  -- string append and array construction allocate
-  Append -> true
-  NewArray -> true
-  -- functional record updates allocate
-  RecordSet -> true
-  RecordDelete -> true
-  RecordUnion -> true
-  -- in-place store (ADR-0052 linear array-builder contract)
-  SetArray -> false
-  -- register-only scalar ops and comparisons; read-only accessors
-  AddInt -> false
-  SubInt -> false
-  MulInt -> false
-  DivInt -> false
-  ModInt -> false
-  AndInt -> false
-  OrInt -> false
-  XorInt -> false
-  ShlInt -> false
-  ShrInt -> false
-  ZshrInt -> false
-  ComplementInt -> false
-  NumberToInt -> false
-  EqInt -> false
-  EqString -> false
-  EqNumber -> false
-  EqBool -> false
-  LtInt -> false
-  LtString -> false
-  LtNumber -> false
-  AndBool -> false
-  OrBool -> false
-  NotBool -> false
-  IndexArray -> false
-  LengthArray -> false
-  RecordGet -> false
-  RecordHas -> false
+primOpSafepoint op = rtSafepoint (RtPrim op)
 
 -- | Whether a node's whole lowering sequence can emit ≥ 1 safepoint operation (the §1
 -- | `maySafepoint` transfer). Sub-`Expr`s (branches, guard bodies) are NOT included — the
@@ -169,23 +136,25 @@ cexprCanSafepoint :: CExpr -> Boolean
 cexprCanSafepoint = case _ of
   CAtom a -> atomCanSafepoint a
   -- calls run guest code (force + call + settle)
-  CApp _ _ -> true
-  CPerform _ -> true
+  CApp _ _ -> guestCallSafepoint
+  CPerform _ -> guestCallSafepoint
   -- closure construction allocates
-  CLam _ _ -> true
+  CLam _ _ -> rtSafepoint RtMakeClosure
   -- CPrim forces every operand, then runs the op
   CPrim op args -> Array.any forcedAtomCanSafepoint args || primOpSafepoint op
   -- saturated non-nullary ctor allocates; nullary is an immediate tag; unsaturated builds a
   -- builder closure (and `pv_apply`s it when partially applied)
   CCtor _ arity args
     | arity == 0 && Array.null args -> false
-    | otherwise -> true
-  CArray elems -> not (Array.null elems)
+    | otherwise -> rtSafepoint RtNewAdt || rtSafepoint RtMakeClosure
+  CArray elems ->
+    if Array.null elems then rtSafepoint RtEmptyArray else rtSafepoint RtNewArray
   -- even the empty record allocates
-  CRecord _ -> true
+  CRecord _ -> rtSafepoint RtNewRecord
   -- the projection forces a by-need record first; the read itself is read-only
-  CAccessor a _ -> forcedAtomCanSafepoint a
-  CUpdate _ _ -> true
+  CAccessor a _ -> forcedAtomCanSafepoint a || rtSafepoint RtRecordGet
+  -- the base force + each `record_set` allocation
+  CUpdate a _ -> forcedAtomCanSafepoint a || rtSafepoint RtRecordSet
   -- the condition force; branch bodies recursed separately
   CIf a _ _ -> forcedAtomCanSafepoint a
   -- scrutinee forces + dtree machinery (conservative: the dtree is lowering-tier fallback)
@@ -333,9 +302,11 @@ stepBackward cfg after = case _ of
         binders
     in
       -- buildGrec allocates the shared env + cells: a safepoint sequence with `kAfter` live
-      -- across it, and a may-root recipe (placeholder/env roots).
+      -- across it, and a may-root recipe (placeholder/env roots). The captures themselves
+      -- cross too — the recipe reads them interleaved with its allocations, so a direct
+      -- SSA operand would be stale (intra-node, like `CUpdate`'s values).
       { live: kAfter <> captures
-      , crossing: after.crossing <> kAfter
+      , crossing: after.crossing <> kAfter <> captures
       , mayRoot: true
       , anySafepoint: true
       }
@@ -352,9 +323,10 @@ atomUses cfg = case _ of
 usesOf :: ActivationConfig -> Array Atom -> Set String
 usesOf cfg = Array.foldl (\acc a -> acc <> atomUses cfg a) Set.empty
 
--- | One computation under continuation-live set `k`. At every node that can safepoint, `k` —
--- | the names live AFTER the node; its own operands are consumed by it (§1 use-at-call
--- | boundary) — joins the crossing set.
+-- | One computation under continuation-live set `k`. At every node that can safepoint, the
+-- | names live AFTER the node AND the node's own operand names join the crossing set (the §1
+-- | 2a crossing rule — an operand is read inside the node's own lowering sequence, so it is
+-- | exposed to the node's internal safepoints).
 goC :: ActivationConfig -> CExpr -> Set String -> Res
 goC cfg c k = case c of
   CIf a t e ->
@@ -366,8 +338,9 @@ goC cfg c k = case c of
     in
       { live: atomUses cfg a <> branchLive
       -- the condition force precedes both branches: everything live at a branch entry is live
-      -- across it.
-      , crossing: rt.crossing <> re.crossing <> (if condSp then branchLive else Set.empty)
+      -- across it, and (2a) the condition's own names count as read at a safepoint node.
+      , crossing: rt.crossing <> re.crossing
+          <> (if condSp then branchLive <> atomUses cfg a else Set.empty)
       , mayRoot: rt.mayRoot || re.mayRoot
       , anySafepoint: condSp || rt.anySafepoint || re.anySafepoint
       }
@@ -376,10 +349,11 @@ goC cfg c k = case c of
       rAlts = Array.foldl (\acc alt -> mergeRes acc (goAlt cfg alt k)) emptyRes alts
     in
       -- scrutinee forces + the dtree's own machinery precede/interleave the arm bodies:
-      -- conservative — everything live at any arm entry crosses (the dtree is the §3
-      -- conservative-fallback tier).
+      -- conservative — everything live at any arm entry crosses, and the scrutinees
+      -- themselves cross (the dtree's hoisted-literal allocations may precede their
+      -- loads; the whole construct is the §3 conservative-fallback tier).
       { live: usesOf cfg scruts <> rAlts.live
-      , crossing: rAlts.crossing <> rAlts.live
+      , crossing: rAlts.crossing <> rAlts.live <> usesOf cfg scruts
       , mayRoot: true
       , anySafepoint: true
       }
@@ -389,8 +363,10 @@ goC cfg c k = case c of
       -- `pv_make_closure`); its crossings belong to the lifted function's own plan.
       captures = Set.difference (goExpr cfg body Set.empty).live (Set.fromFoldable ps)
     in
+      -- closure construction is a safepoint node reading its captures (2a): a direct capture
+      -- read after a sibling capture's boxed-literal materialisation would be stale.
       { live: k <> captures
-      , crossing: k
+      , crossing: k <> captures
       , mayRoot: cexprMayRootLocally c
       , anySafepoint: true
       }
@@ -398,8 +374,13 @@ goC cfg c k = case c of
     let
       sp = cexprCanSafepoint c
     in
+      -- 2a: a safepoint node's own operand names cross (see the module preamble). This
+      -- subsumes the intra-node special cases (`SSelf`'s post-argument `%env` read via
+      -- `atomUses`' self pseudo, `CUpdate`'s post-`record_set` value reads) and every
+      -- sibling-operand ordering hazard, at the price of rooting operands whose read
+      -- provably precedes the node's first internal safepoint — slice 2b's refinement.
       { live: k <> cexprUses cfg c
-      , crossing: if sp then k else Set.empty
+      , crossing: if sp then k <> cexprUses cfg c else Set.empty
       , mayRoot: cexprMayRootLocally c
       , anySafepoint: sp
       }
