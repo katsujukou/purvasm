@@ -22,6 +22,9 @@ intervened. ADR-0079 made each of these operations cheap (inline ctx-header IR i
 extern call) but deliberately did not change *when* they happen — its §4 pins "root-on-create,
 reload-after-safepoint, pop-before-`musttail`" as unchanged, and sidenote 0011 already names
 the follow-up: *root only a value live across a safepoint* (lever 1, "biggest expected win").
+(In `fib`-class code almost no value stays live beyond a safepoint's *return*; eliding the
+root of an operand that dies at the handover itself is the slice-2b read-order refinement —
+see §1 — the slice-2a rule keeps such operands rooted.)
 
 What root-on-create costs, measured on the current corpus (2026-07-20, `--no-opt`
 `--emit-llvm` over the self-host closure, 298 objects, 29,102 functions):
@@ -39,8 +42,8 @@ objects dominates the ADR-0104 fixpoint smoke profile and the L3 build, and it w
 motivation for 0104 §5 naming liveness rooting the second intentional divergence. It is also a
 *run-time* cost: a root store is an observable side effect (the GC really reads the slot), so
 `-O2` cannot delete it — only the codegen, which knows where the safepoints are, can (sidenote
-0011). In `fib`-class code almost no value is live across a safepoint (a `sub` result consumed
-as the very next call's argument needs no root), yet today every one is rooted and reloaded.
+0011). In `fib`-class code few values are live across a safepoint, yet today every one is
+rooted and reloaded.
 
 Why this is safe to do *now*: ADR-0104 retired the boot byte-identity gate and §5-2/§5-4
 landed its replacement net — the CI-wired forced-GC behavioural gate and the stage-fixpoint
@@ -103,18 +106,44 @@ from (and tested against) the lowering recipes themselves — including each rec
 just its "main" call). The liveness question "does this definition cross a safepoint" is
 answered entirely in ANF terms via these summaries.
 
-**The use-at-call boundary (pinned):** a value consumed *as an argument to* a safepoint
-operation, with no use reachable after it, is **not** live across that safepoint — the callee
-protects its own view of the arguments (callee self-rooting, per its own analysis); crossing
-requires a use *after* the operation returns. A value that is BOTH an argument and used after
-the call crosses as usual.
+**The crossing rule (pinned; amended 2026-07-24, slice 2a):** at every node whose lowering
+may safepoint, the node's own operand *names* join the crossing set together with everything
+live after the node — a name stays direct (raw SSA, no slot) only when its **entire live
+range touches no safepoint node at all**. This still elides the pure-leaf identity class
+(`CAtom`-tail bodies, all-immediate prims) but deliberately roots operands whose read
+provably precedes the consuming node's first internal safepoint (e.g. the single-operand
+accessor force).
+
+> **Superseded original (the "use-at-call boundary", in the record as Accepted 2026-07-21;
+> kept because its failure is the design lesson):** *a value consumed as an argument to a
+> safepoint operation, with no use reachable after it, is not live across that safepoint —
+> the callee protects its own view of the arguments; crossing requires a use after the
+> operation returns.* This is UNSOUND as a crossing rule. The callee does protect its own
+> view, but the operand must first *reach* the callee: it is read at its own position inside
+> the consuming node's lowering **sequence**, and any internal safepoint of the SAME node
+> ordered before that read — a sibling operand's boxed-literal materialisation
+> (`pv_new_str`/`pv_new_number`), a sibling's `forceValue` slow path, a foreign-atom closure
+> build, the recipe's pre-read machinery — invalidates a direct SSA operand before the
+> handover. The slice-2 behavioural gate caught the class deterministically (stress legs;
+> for `Data.Show`'s literal-plus-value `append` argv, even the normal legs). The piecemeal
+> intra-node exceptions folded during slice-1 review (`SSelf`'s post-argument `%env` read,
+> `CUpdate`'s post-`record_set` value reads, `CCase` scrutinees, `LetRec` captures) were
+> instances of this one general hazard.
+
+**Slice 2b (owed refinement of this record, NOT a slice-2 completion condition):** recover
+the read-order precision soundly — a per-recipe **read-order model** (a prefix-scan sibling
+of `operandsMayRoot`'s suffix scan: which operand reads provably precede the recipe's first
+internal safepoint), declared beside each recipe on the emission seam and held to the
+emitter by the recipe-consistency tests — together with the §3 between-safepoints reload
+cache, which consumes the same per-recipe safepoint-position declarations. Both are
+refinements behind the same seam; neither opens a new soundness surface.
 
 ### 2. The liveness analysis (ANF, per activation) and the two-tier `RootPlan`
 
 A backward pass over the ANF body computes, for every ANF-level rootable definition —
 parameter, capture, `Let` binder, case-arm binder (a NAME the ANF tree binds), and the
 self-recursion `%env` word — whether its **live range crosses at least one safepoint** (per
-the §1 transfer functions and use-at-call boundary). The analysis is
+the §1 transfer functions and crossing rule). The analysis is
 syntactic on the ANF tree (`fvExpr`'s traversal is the substrate, not the implementation —
 see the §2a engineering pins); closures are opaque — a capture's crossing is judged in the
 *capturing* activation only up to the `pv_make_closure` that consumes it (the callee roots
@@ -149,26 +178,40 @@ be structurally impossible for a *transient* root to be emitted inside an activa
 opened no frame (otherwise the root lands in the caller's frame or the never-popped init
 region: a shadow-stack ownership violation, not a precision loss).
 
-**The rooting API is split by root lifetime (pinned)** — one blanket "no rooting without a
-frame" rule would outlaw `storeRootGlobal`, which *deliberately* roots after popping the
-transient frame to create a permanent init-region handle; and one blanket exception would
-give transient roots an escape hatch. Instead the emission monad exposes two capabilities and
-closes the raw op:
+**The rooting API is split by root lifetime (pinned; realization amended 2026-07-25)** — one
+blanket "no rooting without a frame" rule would outlaw `storeRootGlobal`, which *deliberately*
+roots after popping the transient frame to create a permanent init-region handle; and one
+blanket exception would give transient roots an escape hatch. The raw rooting emission is
+private to ONE module (`Backend.LLVM.Root`), reachable only through:
 
-- `rootLocal` — requires the open-frame token; the ONLY way any activation/lowering root is
-  emitted; unavailable when `needsFrame = false` (the token does not exist).
-- `rootPermanent` — requires the init capability, held only by the **`Gfun`/`Gcaf`/`Grec`
-  `$init`** emission paths (every init stores a permanent root-handle global — a `Gfun` init
-  builds its closure and roots it permanently too); used after the transient frame is popped
-  *if the init opened one* (a `Gfun` init has none). The entry stub does NOT hold it — it is
-  RootPlan-scoped like any activation but creates no permanent roots. This is the only way
-  `storeRootGlobal`'s permanent handles are created.
-- raw `abiRoot` is private to these two — direct emission of it anywhere else is a
-  structural error.
+- `rootLocal` — consumes a `FrameToken`, an opaque witness minted only by `openFrame`:
+  possession proves a frame was opened on this emission path, and an activation whose plan
+  elided the frame holds none. **Honesty pin:** the token is a possession witness, NOT an
+  affine ownership proof — PureScript has no affine types, and emission order is not execution
+  order (one activation legitimately emits several pop sites, one per control path), so
+  "no root after pop" is a per-path property the type system cannot even state. What IS
+  structural: **`popFrame` is private to `Root`** — every pop is fused with what may legally
+  follow it: a path terminator (`retWith`/`musttailWith`/`tailcallWith` — pop+`ret`,
+  pop+`musttail`+`ret`, `pv_tailcall`+pop+`ret`), the entry teardown (`entryTeardown` —
+  pop+`pv_runtime_free`+`ret i32 0`), or the framed-init epilogue below. Pop-then-anything-
+  else is not expressible outside the module; `tools/seam-audit.sh` (CI) pins `popFrame` to
+  `Root` at the source level too.
+- the permanent tier — there is **no capability value and no rooting function in body scope**:
+  the frameless `Gfun` init is a FIXED SHAPE with **no body callback at all**
+  (`emitGfunInit key arity` — round 4: an unrestricted frameless body could have opened a
+  frame the wrapper never pops); a framed init body (`emitInitFnFramed`, `Gcaf`/`Grec`)
+  RETURNS its `(globalKey, value)` candidates and the wrapper owns the whole phase order
+  `open → body → pop → permanent roots`, so a "permanent" handle inside a transient frame is
+  not expressible (it would be popped away — the hazard the phase order exists to kill). The
+  framed wrapper is additionally robust to a body that opens and leaks extra frames: its pop
+  restores `roots_len` to the WRAPPER's mark, subsuming anything the body opened (pinned by
+  the wrapper-mark golden), and `openFrame`'s minting sites are themselves audit-pinned. The
+  entry stub is RootPlan-scoped like any activation and has no path to the permanent tier.
 
 This guards both directions: a local root cannot leak into the caller's frame or the init
-region (no token → no `rootLocal`), and a lowering recipe cannot "borrow" `rootPermanent` to
-dodge the frame discipline (no init capability outside init emission).
+region (no token → no `rootLocal`; no pop-with-continuation outside `Root`), and a lowering
+recipe cannot borrow the permanent tier to dodge the frame discipline (permanent rooting
+exists only inside the wrappers, after the body has already returned).
 
 **Scope (pinned):** the plan applies to every activation-shaped emission unit, not only
 `emitFunction`: lifted functions, `Gfun`/`Gcaf`/`Grec` init bodies, the entry
@@ -201,7 +244,10 @@ spine and a wide-operand/wide-case body through the full analysis+emission path.
   and re-caches until the next safepoint. At a branch join (`CIf`/`CCase` arms rejoining, dtree
   merge points) the cache is conservatively invalidated iff any incoming path contains a
   safepoint. This subsumes the existing `evalAtoms` suffix-scan elision (ADR-0072 §6 slice 1),
-  which is retired into the general discipline.
+  which is retired into the general discipline. *(Re-sequenced 2026-07-25 into slice 2b: the
+  cache's invalidation points are per-recipe safepoint positions — the same declarations the
+  2b read-order model needs — so it lands with them, behind the seam. Until then every rooted
+  use reloads via `abiGet`; the conservative direction.)*
 - **`musttail`**: pop-before-tail unchanged (ADR-0064 §4) — now "pop iff a frame was opened"
   (`needsFrame`, never the emission-time question "did anything happen to root").
 - **Trampoline/settle**: unchanged; settle placement is not rooting and keeps its current
@@ -279,8 +325,9 @@ used for bridge removal:
 2. **Slice 1:** the liveness analysis + `RootPlan` as its own module (`Backend.LLVM.Liveness`
    or ANF-neutral if it has no LLVM specifics), including the §1 classification table +
    per-node transfer summaries and the §2a stack-safety shape. Unit tests over: the
-   crossing/branch/closure-escape edge classes (consumed-before-safepoint, use-at-call vs
-   live-after-call, crossing, branch-join invalidation, capture escape, self-recursive
+   crossing/branch/closure-escape edge classes (consumed-before-safepoint,
+   operand-read-at-safepoint (the 2a crossing rule), crossing, branch-join invalidation,
+   capture escape, self-recursive
    `%env`, dtree occurrence fallback); the **release/debug `RootPlan` equality** property
    (§4); lowering-recipe may-root declarations vs the recipes' actual emissions (the two-tier
    consistency, §2); and the §2a default-stack fixtures (50k `Let` spine, wide operands/arms).
@@ -306,7 +353,8 @@ used for bridge removal:
   profile and the L3 build — falls with it. This is the lever 0104 was run to unlock, and it
   shortens the very gate (fixpoint) that guards it.
 - Run-time: fewer root stores and reloads on every hot path (sidenote 0011's `fib`-class
-  argument: almost no crossing values), on top of 0079's per-op cheapening. Both modes'
+  argument — under the 2a rule the realised share is the identity class; the rest returns
+  with the 2b read-order refinement), on top of 0079's per-op cheapening. Both modes'
   binaries shrink; `--debug` loses entry-call count too.
 - The emitter takes on real analysis complexity (today's rooting is decision-free). The risk
   class — a missed root = relocation-time corruption — is what slice 0's net targets: the
@@ -392,6 +440,10 @@ overflow). Runtime tests 152/152.
 
 #### Progress (2026-07-23): slice 1 — the liveness analysis and `RootPlan` landed
 
+*(Historical note: this entry describes the slice-1 state under the ORIGINAL use-at-call
+boundary; slice 2a — §1's amended crossing rule and the slice-2 progress note below —
+replaced that rule and re-pinned the affected tests to the 2a expectations.)*
+
 `Backend.LLVM.Liveness` implements §1+§2 as a pure, emission-independent module:
 
 - **§1 transfers**: `primOpSafepoint` (the table's prim rows, one total function),
@@ -457,3 +509,174 @@ spine-iterative walk). Pinned by the variable-guard regression (`b` used only in
 crosses clause 1's `q`-guard force, where the clause-1 guard expression itself cannot
 safepoint); 429/429. The earlier progress text above is synced to the final counts/fixtures
 (P3).
+
+#### Progress (2026-07-24/25): slice 2 — plan-driven emission + the 2a crossing rule + the §1 seam and §2 capability APIs
+
+**Emission integration (2026-07-24).** `EnvEntry.direct`/`bindDirectVar` (a direct binding is
+its raw SSA operand — no slot, no store, no reload), plan-driven `emitFunction` (`LBody` →
+`activationPlan` drives param/capture/self-`%env` rooting and frame elision; `readVar`'s
+direct branch returns the operand as-is; frame pops at every return/`musttail`/trampoline
+site — first landed as a `popFrameIfOpen` helper, since fused into `Root`'s terminator forms,
+see round 3 below), `Let` sites root iff crossing. First gate run came back RED — normal legs
+included — which root-caused to the §1 use-at-call boundary itself (concrete counterexample:
+`mod_17` `showCharImpl$d` stores a `pv_apply` result into a second apply's argv AFTER a
+sibling literal's `pv_new_str`; a corpus scan found 557 sites of the class). The rule was
+replaced by the 2a crossing rule now normative in §1; `Liveness` implements it (the
+intra-node special cases deleted as subsumed), and the slice-1 tests were re-pinned to the 2a
+expectations. All gates green after the fix: behavioural gate 5 fixtures × both optimiser
+modes × stress legs + the debug-ABI leg; unit 429/429, e2e 11/11, examples 10/10; fixpoint
+smoke stage-3 ≡ stage-4 AND C3-link ≡ stage-3, 597/597 each; whole-corpus residual-hazard
+scan (raw-operand-store-after-safepoint pattern) 0 hits.
+
+**Slice-2 review (maintainer, 2026-07-24) and the closing work (2026-07-25).** The review
+confirmed the 2a design and named the unimplemented Accepted pins as slice-2 blockers; all
+landed:
+
+- **§1 classified emission seam = `Backend.LLVM.Safepoint`.** A closed `RtOp` descriptor sum
+  (one constructor per runtime entry + `RtPrim PrimOp` over `Prim.primSym`) whose row carries
+  symbol / ctx-taking / return kind / **safepoint class**; ALL runtime call text is rendered
+  by `rtCall` / `rtCallWith` (caller-supplied result temp, for the boot numbering-order
+  sites: `SForceCell`, dtree `extract`, `DswitchLen`, the boxed-literal chain) / `rtCallVoid`,
+  and guest calls by `guestDirect`/`guestMusttail`. `Liveness` consults the SAME rows
+  (`primOpSafepoint = rtSafepoint (RtPrim op)`; the atom/force/per-node arms reference their
+  rows), so analysis-vs-lowering drift now requires editing the shared table.
+  **Non-bypassability is layered (round-2 review):** `Monad.emit` REJECTS any line containing
+  call text at emission time (a raw `call` crashes deterministically — accidental drift
+  cannot survive a single test run); the unchecked emitter is the `unsafe`-prefixed
+  `unsafeEmitRawCall`, used only by the seam's renderers and the one ctx-birth line; and
+  `tools/seam-audit.sh` (a PureScript-CI step) rejects call-text construction in the backend
+  sources outside the exact allowlist. The allowlist, precisely: `Safepoint.purs` (the seam),
+  the `%ctx = call ptr @pv_runtime_new` ctx-birth line in `Program` (it produces the `%ctx`
+  every seam call renders, and returns `ptr`), and the per-gdef `@…$init(ptr %ctx)` call
+  lines `emitInitAll` assembles into `pv_init_all`'s body (module-SKELETON chunk text — the
+  entry's own call *to* `pv_init_all` goes through `RtInitAll`). Seam tests: a
+  declaration-membership sweep of EVERY row against `Abi.declarations`, with the enumeration
+  MECHANICAL off the `Generic` reps of `RtOp`/`PrimOp` (a new constructor is swept
+  automatically — no manual list to forget; the counts 29 non-prim + 38 prim are pinned as a
+  sanity check on the enumerator itself), the classification pins (`pv_tailcall`
+  NOT-a-safepoint; `SetArray` in-place), and render goldens (ctx/no-ctx, void, i32 operands,
+  `tailcc`/`musttail`).
+- **§2 root-lifetime API = `Backend.LLVM.Root`** (round-2 realization; see the amended §2
+  text for the honesty pin). Opaque `FrameToken` minted ONLY by `openFrame`; the raw rooting
+  emission is private to the module, and `Abi` no longer exports any rooting/frame operation.
+  `Ctx.frame`/`frameOpen` (the Boolean check round 1 flagged) are DELETED: the token is
+  threaded lexically through `expr`/`cexpr`/`evalAtoms`/`buildGrec` (`Maybe FrameToken`;
+  `Nothing` = the plan elided the frame, and `Emit.root` crashing on it remains the
+  under-declared-recipe detector). Round 2 closed the two API gaps: (a) **activation pops are
+  fused with their terminators** — `retWith`/`musttailWith`/`tailcallWith` are the only pop
+  forms the expression emitters can reach, so pop-then-root is not expressible there; bare
+  `popFrame` is confined to `Program`'s three init/entry epilogues (audit-held); (b) the
+  permanent tier has **no capability value** — `Root.emitInitFn` scopes the permanent-rooting
+  function to the `$init` body callback it wraps (`InitCap`/`initRegion` deleted), so the
+  entry stub and activation bodies have no expression for it. Affinity itself is documented
+  as out of the type system's reach (§2 honesty pin): emission order ≠ execution order, so
+  token consumption is not even the right spec — the structural fusion plus the
+  behavioural/stress net carry the per-path property.
+- **Refactor identity.** Same-corefn comparison over the self-host corpus, content-paired by
+  init symbol across module renumbering: round 1 (seam + tokens) **293/293** modules with
+  unchanged corefn byte-identical, round 2 (fused pops + callback-scoped permanent tier +
+  emit guard) **295/295** — each time the only differing artifacts are the compiler's own
+  edited modules and `entry.ll`'s init aggregation. Post-refactor gates: unit **450/450**
+  (new `Test…Safepoint` + `Test…Root` modules; the frame/root goldens moved out of
+  `Test…Abi`; the fused-terminator goldens; the `emitInitFn`-callback rooting ≡ `rootLocal`
+  single-rooting-emission pin), e2e 11/11, behavioural gate full green including stress and
+  the debug-ABI leg (which executes `Root`'s `--debug` entry-call paths).
+- **Recipe-consistency strengthening (review P2).** Exact counts, not lower bounds: `ident`
+  0, `acc` 1, `upd` **3** (prologue + forced-base fold seed + post-`record_set` accumulator —
+  losing the accumulator root now fails), sorted-order `CRecord` 2; plus `lowfr`, the
+  two-tier discriminator — an activation with an EMPTY crossing set whose frame exists solely
+  because `loweringMayRoot` is true (exactly one lowering root, frame pop asserted).
+- **§3 conservative-fallback scopes, as landed (the list §3 requires):** `LClosure` wrapper
+  bodies, `Gcaf`/`Grec` init bodies and the entry stub stay on the `rootAll` root-on-create
+  fallback (`Gfun` bodies and all lifted `LBody` functions are plan-driven); `CCase`/dtree
+  remains entirely lowering-tier (slice-1 state); `CPrim`'s forced-operand conservatism (the
+  slice-1 honest limitation) stands. These, with the §3 reload cache and the operand
+  read-order precision, are slice 2b's residual.
+
+**Round-3 review closure (2026-07-25).** Two P1s survived round 2; both are now structural
+(and the §2 realization text above is the round-3 state):
+
+- **Permanent-root phase order is wrapper-owned.** Round 2's callback-scoped rooting function
+  was callable before the transient frame's pop (the review's counterexample was in this
+  record's own test). Superseded: init bodies RETURN `(globalKey, value)` pairs; `emitInitFn`
+  (frameless) and `emitInitFnFramed` (framed — the wrapper owns `open → body → pop →
+  permanent roots`) plant them strictly post-body/post-pop. With `entryTeardown` fusing the
+  entry epilogue, bare `popFrame` disappeared from `Program` entirely and went
+  **private to `Root`**. The framed-init golden pins the phase order as one emission
+  (transient root inside the frame, pop, THEN the permanent block).
+- **The audit is exact and self-testing, and the module buffer is guarded.** `Monad.emitModule`
+  now rejects call-carrying chunks like `emit`; guest `define` blocks go through `emitDefine`
+  (an opaque validated `FnBody` between call-checked wrapper texts — call text cannot re-enter
+  the module buffer unvalidated), and the one call-carrying skeleton chunk (`pv_init_all`'s
+  body) is isolated behind `unsafeEmitRawModule`. `tools/seam-audit.sh` pins, per file ×
+  construction shape × exact count: the 4 seam renderers, `Program`'s two constructions (each
+  matched against its pinned source shape), every `unsafeEmitRawCall`/`unsafeEmitRawModule`
+  use site, and `popFrame`'s confinement to `Root` — and SELF-TESTS on every run (seven
+  violation classes injected into a scratch copy must each be rejected, and a clean copy must
+  pass, before the real tree is checked). Negative unit tests pin the runtime guards
+  themselves (`emit`/`emitModule`/`emitDefine` each crash on call text).
+
+Round-3 verification: unit **455/455** (the forbidden-ordering test replaced by the
+phase-order golden; guard negative tests added), audit + self-test green, same-corefn
+identity **296/296** unchanged-input modules byte-identical (differs only in the four
+re-edited compiler modules), behavioural gate full green again (both modes, stress, debug-ABI
+— `OK gc29612` on the debug leg), fixpoint smoke re-run green (C3-link ≡ stage-3 and
+stage-3 ≡ stage-4, 601/601 each).
+
+**Round-4 review closure (2026-07-25).** Two P1s on boundary closure (not new liveness
+counterexamples — the 2a rule and current output remained sound; the findings were that the
+boundary protecting them from future emitter changes was weaker than claimed):
+
+- **The frameless init body existed to be abused.** An unrestricted `Codegen` body given to
+  the frameless wrapper could `openFrame` (public) and the wrapper would plant permanent
+  roots without ever popping it. Closed by elimination: the `Gfun` init is fully determined
+  by `(key, arity)`, so `emitGfunInit` is now a FIXED SHAPE with no body callback (the
+  generic frameless `emitInitFn` is deleted). The framed wrapper is robust to body-opened
+  frames by pop-to-mark semantics — pinned by a golden asserting the pop stores the
+  WRAPPER's mark with a body-leaked frame in between — and `openFrame` minting sites are
+  audit-pinned per file × count (Root 4 / Emit 2 / Program 2 / others 0).
+- **Remaining seam bypasses closed.** (a) The unsafe emitters are audited across ALL of
+  `compiler/src` recursively (outside the backend directory the identifiers must not appear
+  at all — an import from a sibling directory no longer passes); (b) free-form `emitGlobal`
+  is deleted — the globals buffer is reachable only through the typed `emitStringConstant`
+  (name/len/escaped rendered into the fixed `c"…"` constant shape, which cannot express an
+  instruction); (c) call detection is line-start-normalised (`containsCallText`: a
+  leading-space prepend plus newline/tab starts), so a column-zero `call i64 …` cannot slip
+  past — with negative unit tests for exactly that, and new audit self-test classes
+  (column-zero call, unsafe-emitter-outside-backend, openFrame drift).
+
+Round-4 verification: unit **458/458**, e2e 11/11, audit + self-tests green (ten in-dir
+violation classes + the wide-scan class), same-corefn identity **296/296** unchanged-input
+modules byte-identical (differs only in the four re-edited compiler modules), behavioural
+gate full green (both modes, stress, debug-ABI `OK gc29612`), fixpoint smoke re-run green
+(C3-link ≡ stage-3 and stage-3 ≡ stage-4, 601/601 each).
+
+**Round-5 review closure (2026-07-25).** One P1 remained on the seam: the round-4
+`emitStringConstant` still took `name`/`escaped`/`len` as raw parts, so a hostile `name`
+(embedded newline + IR text) could have voided the fixed suffix and injected arbitrary IR
+through the globals buffer. Closed by derivation: the emitter now takes ONLY the raw guest
+`String` and derives everything itself (`freshStrName` for the name,
+`Mangle.escapeStringBytes` for length/bytes; the empty string returns `Nothing`, boot's
+null-pointer case) — `freshStrName` is un-exported, `Emit.stringConstant` consumes the
+returned `{name, len}`. Call-looking TEXT may legitimately survive inside the `c"…"` bytes
+(guest data, not an instruction position); what the shape forbids is structural breakout, and
+the hostile-string unit test pins exactly that (one well-formed line, derived name prefix,
+intact closing quote — a raw newline or quote cannot appear). [P2] `openFrame` joined the
+compiler-src-wide audit scan (outside the backend directory the identifier must not appear;
+smuggle self-test added). [P3] the entry-stub comment's stale `emitInitFn` reference synced
+to the wrapper-owned wording. Round-5 verification: unit **460/460**, e2e 11/11, audit +
+self-tests green, same-corefn identity **298/298** unchanged-input modules byte-identical
+(differs only in the two code-edited modules, `Monad`/`Emit`), behavioural gate full green
+(both modes, stress, debug-ABI `OK gc29612`), fixpoint smoke re-run green (C3-link ≡ stage-3
+and stage-3 ≡ stage-4, 601/601 each).
+
+**Measurements (2a, same-corefn vs pre-slice-2 HEAD).** IR 97.8 → 94.6 MB (−3.3 %), root
+blocks 88,555 → 83,666 (−5.5 %), ctx reload heads 212,569 → 206,881 (−2.7 %), frames elided
+on 2,014/10,961 `$d` functions (18.4 %) — the identity-class share; the choreography bulk is
+2b's. Bench llvm leg (fib/quicksort): no regression — every overlapping size faster than the
+7/11 baseline (exponents 0.96/1.05; the baseline predates ADR-0103, so the absolute speedup
+conflates tracks — the operative claim is strictly-no-regression). Post-seam fixpoint smoke:
+re-run green — C3-link ≡ stage-3 AND stage-3 ≡ stage-4, **601/601** artifacts byte-identical
+each (300 module `.ll` + `entry.ll` + 300 `.pmi`; the count grew by the two new modules) —
+and re-verified green after the round-2 refactor (fused pops + callback-scoped permanent
+tier + emit guard), alongside the full behavioural gate (both modes, stress, debug-ABI).
