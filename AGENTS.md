@@ -37,6 +37,12 @@
 
 ## Technical
 
+- The project's technology stack must remain confined to what is enumerated in
+  `flake.nix` — namely Node, PureScript, OCaml, and Rust. If you encounter a
+  task that cannot be implemented with these tools and find yourself considering
+  other means, consult the human maintainer first. Do not modify `flake.nix`
+  gratuitously.
+
 - Modules outside a subsystem should not depend on that subsystem's
   internal modules.
 
