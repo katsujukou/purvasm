@@ -98,6 +98,10 @@ jobs:
       - name: Install ulib
         run: node ulib-tools/index.js build --out purvasm_lib/ulib
 
+      # ADR-0105 §1: no raw call text outside the classified seam (source-level allowlist).
+      - name: Audit (LLVM classified-seam raw calls)
+        run: ./tools/seam-audit.sh
+
       - name: Test (compiler unit)
         run: spago test -p compiler -m Test.Unit.Purvasm.Compiler
 
