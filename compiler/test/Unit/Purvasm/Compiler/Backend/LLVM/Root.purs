@@ -15,6 +15,7 @@ import Data.Set as Set
 import Data.Tuple (Tuple(..), snd)
 import Purvasm.Compiler.Backend.LLVM.Mangle (mangle)
 import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, Ctx, makeCx, renderBuffer, renderChunks, runCodegen)
+import Purvasm.Compiler.Backend.LLVM.Value (unsafeTestVal, vImm)
 import Purvasm.Compiler.Backend.LLVM.Root (emitGfunInit, emitInitFnFramed, entryTeardown, musttailWith, openFrame, retWith, rootLocal, tailcallWith)
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
@@ -86,37 +87,37 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Root" do
 
   describe "rootLocal" do
     it "emits the 4-block in-capacity fast path with the len/pv_root phi (after its frame open)" do
-      emitted (openFrame >>= \tok -> rootLocal tok "%v") `shouldEqual`
+      emitted (openFrame >>= \tok -> rootLocal tok (unsafeTestVal "%v")) `shouldEqual`
         (openLines <> rootBlockAt 1 2 "%v")
 
     it "is a single pv_root entry call under --debug" do
-      emittedWith false (openFrame >>= \tok -> rootLocal tok "%v") `shouldEqual`
+      emittedWith false (openFrame >>= \tok -> rootLocal tok (unsafeTestVal "%v")) `shouldEqual`
         ( "  %t1 = call i64 @pv_frame(ptr %ctx)\n"
             <> "  %t2 = call i64 @pv_root(ptr %ctx, i64 %v)\n"
         )
 
   describe "retWith / musttailWith / tailcallWith / entryTeardown (the fused pop forms)" do
     it "retWith pops iff a frame is open, then rets" do
-      emitted (openFrame >>= \tok -> retWith (Just tok) "%v") `shouldEqual`
+      emitted (openFrame >>= \tok -> retWith (Just tok) (unsafeTestVal "%v")) `shouldEqual`
         (openLines <> popLines 3 <> "  ret i64 %v\n")
-      emitted (retWith Nothing "%v") `shouldEqual` "  ret i64 %v\n"
+      emitted (retWith Nothing (unsafeTestVal "%v")) `shouldEqual` "  ret i64 %v\n"
 
     it "pops via the pv_pop_frame entry call under --debug" do
-      emittedWith false (openFrame >>= \tok -> retWith (Just tok) "%v") `shouldEqual`
+      emittedWith false (openFrame >>= \tok -> retWith (Just tok) (unsafeTestVal "%v")) `shouldEqual`
         ( "  %t1 = call i64 @pv_frame(ptr %ctx)\n"
             <> "  call void @pv_pop_frame(ptr %ctx, i64 %t1)\n"
             <> "  ret i64 %v\n"
         )
 
     it "musttailWith pops BEFORE the musttail call, then rets its result" do
-      emitted (openFrame >>= \tok -> musttailWith (Just tok) { dsym: "foo$d", env: "%e", args: [ "%a" ] }) `shouldEqual`
+      emitted (openFrame >>= \tok -> musttailWith (Just tok) { dsym: "foo$d", env: unsafeTestVal "%e", args: [ unsafeTestVal "%a" ] }) `shouldEqual`
         ( openLines <> popLines 3
             <> "  %t4 = musttail call tailcc i64 @foo$d(ptr %ctx, i64 %e, i64 %a)\n"
             <> "  ret i64 %t4\n"
         )
 
     it "tailcallWith stashes the pending tail, pops, and returns unit to the trampoline" do
-      emitted (openFrame >>= \tok -> tailcallWith (Just tok) { fv: "%f", argp: "%p", nargs: 2 }) `shouldEqual`
+      emitted (openFrame >>= \tok -> tailcallWith (Just tok) { fv: unsafeTestVal "%f", argp: "%p", nargs: 2 }) `shouldEqual`
         ( openLines
             <> "  call void @pv_tailcall(ptr %ctx, i64 %f, ptr %p, i64 2)\n"
             <> popLines 3
@@ -146,8 +147,8 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Root" do
       let
         Tuple _ ctx = runWith true
           ( emitInitFnFramed "TestK" \tok -> do
-              _ <- rootLocal tok "%v"
-              pure [ Tuple "TestK" "%w" ]
+              _ <- rootLocal tok (unsafeTestVal "%v")
+              pure [ Tuple "TestK" (unsafeTestVal "%w") ]
           )
       renderChunks ctx.md `shouldEqual`
         initWrapper "TestK"
@@ -163,7 +164,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Root" do
         Tuple _ ctx = runWith true
           ( emitInitFnFramed "TestK" \_ -> do
               _ <- openFrame
-              pure [ Tuple "TestK" "%v" ]
+              pure [ Tuple "TestK" (unsafeTestVal "%v") ]
           )
       -- the pop stores %t1 — the WRAPPER's mark — so the body's leaked frame (mark %t3) is
       -- subsumed and the permanent root still lands in the init region.

@@ -45,8 +45,9 @@ import Data.Maybe (Maybe(..))
 import Data.Tuple (Tuple(..))
 import Purvasm.Compiler.Backend.LLVM.Abi (headerField, offRootsCap, offRootsLen)
 import Purvasm.Compiler.Backend.LLVM.Mangle (immUnit, mangle)
-import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, beginFn, emit, emitDefine, forA_, fresh, freshLabel, takeFn)
-import Purvasm.Compiler.Backend.LLVM.Safepoint (RtArg(..), RtOp(..), guestMusttail, rtCall, rtCallVoid)
+import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, beginFn, emit, emitDefine, emitGuestRet, emitGuestStore, forA_, fresh, freshLabel, takeFn)
+import Purvasm.Compiler.Backend.LLVM.Safepoint (RtArg(..), RtOp(..), guestMusttail, machineryHandleCall, rtCall, rtCallVoid)
+import Purvasm.Compiler.Backend.LLVM.Value (Val, vImm)
 
 -- | Witness of THIS activation's open shadow-stack frame, carrying the frame's mark operand.
 -- | Opaque: minted only by [`openFrame`] (see the module preamble for what the witness does and
@@ -57,7 +58,9 @@ newtype FrameToken = FrameToken String
 -- | `pv_frame`.
 openFrame :: Codegen FrameToken
 openFrame = gets _.inlineAbi >>= case _ of
-  false -> FrameToken <$> rtCall RtFrame []
+  -- the mark is a HOST index (roots_len) — the machinery row returns it raw (2b-0 round 2:
+  -- no token-unwrap escape exists; handle-returning rows bypass the guest-token surface).
+  false -> FrameToken <$> machineryHandleCall RtFrame []
   true -> do
     m <- fresh
     lenp <- headerField offRootsLen
@@ -74,7 +77,7 @@ popFrame (FrameToken mark) = gets _.inlineAbi >>= case _ of
     emit ("  store i64 " <> mark <> ", ptr " <> lenp)
 
 -- | Root a transient value into the open frame and return its handle (popped with the frame).
-rootLocal :: FrameToken -> String -> Codegen String
+rootLocal :: FrameToken -> Val -> Codegen String
 rootLocal (FrameToken _) = emitRoot
 
 popIfOpen :: Maybe FrameToken -> Codegen Unit
@@ -84,27 +87,27 @@ popIfOpen = case _ of
 
 -- | Terminate the current path with `ret`, popping the activation's frame iff it opened one —
 -- | the fused pop+terminator (a pop with a live continuation is not expressible through this).
-retWith :: Maybe FrameToken -> String -> Codegen Unit
+retWith :: Maybe FrameToken -> Val -> Codegen Unit
 retWith frame v = do
   popIfOpen frame
-  emit ("  ret i64 " <> v)
+  emitGuestRet v
 
 -- | Terminate the current path with a `musttail` direct call (ADR-0076 §3): pop this frame
 -- | first — the callee opens its own — with every operand computed before the pop; no safepoint
 -- | in between (the ADR-0064 §4 pop-before-`musttail` discipline), then the mandatory `ret`.
-musttailWith :: Maybe FrameToken -> { dsym :: String, env :: String, args :: Array String } -> Codegen Unit
+musttailWith :: Maybe FrameToken -> { dsym :: String, env :: Val, args :: Array Val } -> Codegen Unit
 musttailWith frame c = do
   popIfOpen frame
   r <- guestMusttail c
-  emit ("  ret i64 " <> r)
+  emitGuestRet r
 
 -- | Terminate the current path via the trampoline (ADR-0071 §4): stash the pending tail
 -- | (`pv_tailcall` — pinned NOT a safepoint), pop this frame, return unit to the trampoline.
-tailcallWith :: Maybe FrameToken -> { fv :: String, argp :: String, nargs :: Int } -> Codegen Unit
+tailcallWith :: Maybe FrameToken -> { fv :: Val, argp :: String, nargs :: Int } -> Codegen Unit
 tailcallWith frame c = do
-  rtCallVoid RtTailcall [ I64 c.fv, Ptr c.argp, I64 (show c.nargs) ]
+  rtCallVoid RtTailcall [ V c.fv, Ptr c.argp, I64 (show c.nargs) ]
   popIfOpen frame
-  emit ("  ret i64 " <> immUnit)
+  emitGuestRet (vImm immUnit)
 
 -- | The entry stub's fused epilogue: pop the entry frame, free the runtime, return from
 -- | `@main`. Nothing can be emitted between the pop and the process teardown.
@@ -124,7 +127,7 @@ emitGfunInit key arity = do
   beginFn
   addr <- fresh
   emit ("  " <> addr <> " = ptrtoint ptr @" <> mangle key <> " to i64")
-  clo <- rtCall RtMakeClosure [ I64 addr, I32 (show arity), I64 immUnit ]
+  clo <- rtCall RtMakeClosure [ I64 addr, I32 (show arity), V (vImm immUnit) ]
   storePermanentRoots [ Tuple key clo ]
   finishInitFn key
 
@@ -133,7 +136,7 @@ emitGfunInit key arity = do
 -- | transiently through the token and returns its permanent-root candidates as raw values read
 -- | back before this returns), pop the frame, and only then plant the permanent roots. A
 -- | "permanent" handle inside the transient frame is not expressible.
-emitInitFnFramed :: String -> (FrameToken -> Codegen (Array (Tuple String String))) -> Codegen Unit
+emitInitFnFramed :: String -> (FrameToken -> Codegen (Array (Tuple String Val))) -> Codegen Unit
 emitInitFnFramed name body = do
   beginFn
   tok <- openFrame
@@ -145,7 +148,7 @@ emitInitFnFramed name body = do
 -- | Plant each `(globalKey, value)` candidate as a permanent init-region handle stored into
 -- | its `@<mangle key>$root` global — the ADR-0105 §2 permanent tier, reachable only from the
 -- | two init wrappers above (after any transient frame is popped, so the handle survives).
-storePermanentRoots :: Array (Tuple String String) -> Codegen Unit
+storePermanentRoots :: Array (Tuple String Val) -> Codegen Unit
 storePermanentRoots pairs =
   forA_ pairs \(Tuple key v) -> do
     h <- emitRoot v
@@ -161,9 +164,9 @@ finishInitFn name = do
 -- | post-body permanent tier). Inline: the in-capacity store is the fast path (a 4-block
 -- | `rchk`/`rfast`/`rslow`/`rdone` with a phi); `len == cap` falls to `pv_root`, which grows
 -- | and returns the same bare-index handle. `--debug` is a single `pv_root`.
-emitRoot :: String -> Codegen String
+emitRoot :: Val -> Codegen String
 emitRoot v = gets _.inlineAbi >>= case _ of
-  false -> rtCall RtRoot [ I64 v ]
+  false -> machineryHandleCall RtRoot [ V v ]
   true -> do
     chk <- freshLabel "rchk"
     fast <- freshLabel "rfast"
@@ -185,13 +188,14 @@ emitRoot v = gets _.inlineAbi >>= case _ of
     emit ("  " <> base <> " = load ptr, ptr %ctx")
     slot <- fresh
     emit ("  " <> slot <> " = getelementptr i64, ptr " <> base <> ", i64 " <> len)
-    emit ("  store i64 " <> v <> ", ptr " <> slot)
+    emitGuestStore v slot
     len1 <- fresh
     emit ("  " <> len1 <> " = add i64 " <> len <> ", 1")
     emit ("  store i64 " <> len1 <> ", ptr " <> lenp)
     emit ("  br label %" <> done)
     emit (slow <> ":")
-    hs <- rtCall RtRoot [ I64 v ]
+    -- the handle is a raw index (both arms; `pv_root` returns the same bare index).
+    hs <- machineryHandleCall RtRoot [ V v ]
     emit ("  br label %" <> done)
     emit (done <> ":")
     h <- fresh

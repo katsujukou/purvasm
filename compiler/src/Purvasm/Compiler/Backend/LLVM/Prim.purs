@@ -12,14 +12,17 @@
 -- | `pv_prim_*` runtime helper); `inlinePrim` handles only the scalar `Int`/`Boolean` ops inline.
 module Purvasm.Compiler.Backend.LLVM.Prim
   ( primSym
+  , primArity
   , inlinePrim
   ) where
 
 import Prelude
 
 import Data.Maybe (Maybe(..))
+import Data.Traversable (traverse)
 import Data.Tuple (Tuple(..))
-import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, emit, fresh)
+import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, emit, fresh, unsafeMintFresh, unsafeUseVal)
+import Purvasm.Compiler.Backend.LLVM.Value (Val)
 import Purvasm.Compiler.Primitive (PrimOp(..))
 
 -- | A primop's runtime helper `(symbol, needs_ctx)`. `needs_ctx` is `true` for the boxed-value ops.
@@ -63,6 +66,21 @@ primSym = case _ of
   RecordHas -> Tuple "pv_prim_record_has" true
   RecordDelete -> Tuple "pv_prim_record_delete" true
   RecordUnion -> Tuple "pv_prim_record_union" true
+
+-- | Each primop's operand count — the seam's `Vals` schema arity (ADR-0105 §6.2 round 2:
+-- | kind AND count are the schema contract, so an under/over-application of a prim is a
+-- | structural error at the seam, not a downstream LLVM parse error).
+primArity :: PrimOp -> Int
+primArity = case _ of
+  ComplementInt -> 1
+  NotBool -> 1
+  IntToNumber -> 1
+  NumberToInt -> 1
+  LengthArray -> 1
+  NewArray -> 1
+  SetArray -> 3
+  RecordSet -> 3
+  _ -> 2
 
 -- The tagged-word payload `w >> 1` (arithmetic).
 payload :: String -> Codegen String
@@ -150,10 +168,19 @@ boolBin mnem a b = do
   emit ("  " <> r <> " = " <> mnem <> " i1 " <> ba <> ", " <> bb)
   ofI1 r
 
--- | Inline IR for a scalar `Int`/`Boolean` op (returns `Just` the result operand); `Nothing` for every
+-- | Inline IR for a scalar `Int`/`Boolean` op (returns `Just` the result token); `Nothing` for every
 -- | other op (div/mod and all boxed ops), where the caller falls back to the `primSym` runtime call.
-inlinePrim :: PrimOp -> Array String -> Codegen (Maybe String)
-inlinePrim op ops = case op, ops of
+-- | Operand tokens are verified up front (ADR-0105 §6.2): the inline sequences emit no
+-- | safepoint, so nothing can invalidate an operand between this check and its consuming
+-- | instruction, and the result is minted at the (unchanged) current epoch.
+inlinePrim :: PrimOp -> Array Val -> Codegen (Maybe Val)
+inlinePrim op vals = do
+  ops <- traverse unsafeUseVal vals
+  result <- inlinePrim' op ops
+  traverse unsafeMintFresh result
+
+inlinePrim' :: PrimOp -> Array String -> Codegen (Maybe String)
+inlinePrim' op ops = case op, ops of
   AddInt, [ a, b ] -> Just <$> bin32 "add" a b
   SubInt, [ a, b ] -> Just <$> bin32 "sub" a b
   MulInt, [ a, b ] -> Just <$> bin32 "mul" a b

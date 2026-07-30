@@ -308,6 +308,159 @@ the `purvasm-stats:v1` schema) — a stress run whose collections copied nothing
 object was ever relocated, i.e. the leg exercised nothing; it must fail as vacuous rather
 than pass.
 
+### 6. Slice 2b design — the read-order refinement and the reload cache (amendment, Accepted 2026-07-25 — awaiting maintainer)
+
+The §1 crossing rule (2a) roots every operand of every safepoint node; §3's reload discipline
+was re-sequenced here. This section is the owed design. It rests on a pinned runtime handover
+contract (whose per-entry verification is 2b-0's deliverable, not a settled fact), adds an
+emission-time total check, and then takes the two refinements behind the seam.
+
+**6.1 The handover policy (pinned; per-function ownership, NOT blanket self-rooting).** The
+runtime's real contract is ADR-0066 §3's **per-function ownership**: each entry protects its
+own view of its operands by ONE of the named policies, and the policy is per-entry (even
+per-operand), not universal —
+
+1. **consume/snapshot-before-safepoint** — the raw operand is read into host scalars (or
+   fully consumed) before anything can allocate (the Number primops snapshot to scalars
+   first; the contract is written at `prim.rs:7`);
+2. **self-root + reload** — root the raw operands, allocate, read back from the root slots
+   (`new_array`/`new_adt` at `gc.rs:701`/`663`, `new_record` composing them,
+   `new_closure_raw` for its env word, `new_pap`, `record_set`);
+3. **allocation-free handover to callee ownership** — the exact-saturated `apply` fast path
+   deliberately does NOT root the borrowed argv: nothing allocates before `call_code`, and
+   from then on the args are the CALLEE's per-its-own-plan responsibility (`apply.rs:11`).
+   `apply` as a whole is a COMPOSITE of the policies: the generic exact/over-apply paths hand
+   `call_args` to the `CodeFn` allocation-free the same way and root only the over-apply
+   LEFTOVERS; the by-need path roots args across the force; under-apply delegates to the
+   self-rooting `new_pap`;
+4. **discard-before-safepoint** — `pv_settle`'s pending-tail path never uses `r` after the
+   stashed tail runs (the placeholder-return convention).
+
+What 2b consumes is the derived guarantee: for every classified row, a raw operand handed
+over at the call boundary is safe PROVIDED no safepoint sits between its read and that
+boundary — the row's own policy covers everything from the boundary onward. **2b-1 is
+BLOCKED on the per-entry/per-operand policy INVENTORY** (every sp-relevant row assigned its
+policy against the runtime source — `pv_prim_append`, the remaining allocating `pv_prim_*`
+rows and `force_if_byneed`'s cell handling still owed) **and on provider-side evidence PER
+INVENTORY ROW**: each entry/operand row either has a dedicated forced-GC (`gc_stress`)
+runtime test exercising ITS handover window, or is shown to delegate allocation-free to an
+already-tested common primitive — a per-class representative alone cannot catch one entry
+silently changing its policy later.
+
+**6.2 Emission-time total check first (2b-0, the net).** The seam's sp-classified emitters
+bump a monotonic **safepoint epoch** in `Ctx` — and the check rides WITH each value to its
+point of USE, not its point of read: a read-time-only assert would have missed the slice-2a
+bug itself (read a direct value at epoch E, a sibling operand's materialisation bumps to
+E+1, then the stale raw SSA is stored into argv — the read-time check already passed).
+Value operands flow as an **opaque token carrying the epoch at which the SSA value LAST
+BECAME VALID — never the epoch at read, and never the epoch of an ANF binding event**:
+re-stamping at read time would launder a stale direct value into a fresh-looking token, and
+so would an ALIAS binding (`let x = y`, a `CAtom` environment binding that mints NO new SSA)
+stamped with the current epoch. The token is a small state machine, pinned:
+
+- **`Imm`/`Raw`** (scalar-literal words, counts, label ids, `alloca`/`ptrtoint` words):
+  epoch-free, passes verification always;
+- **`Direct`/`Fresh { ssa, validEpoch }`**: `validEpoch` is set ONLY by the events that
+  actually produce a new valid SSA value — a non-safepoint instruction's result (stamped
+  with the current epoch after its operands verified), a function-entry parameter/capture,
+  or a safepoint call's result (stamped POST-bump: verify operands → bump → mint). (A
+  reload is the `Rooted` arm's event — it refreshes THAT token's cached SSA, not a `Fresh`
+  mint.) An alias/environment binding INHERITS the whole token unchanged; `readVar` never
+  re-stamps. Stale at consumption = soundness violation → **crash**;
+- **`Rooted { handle }`** (with its cached `{ ssa, epoch }`): cache epoch current → reuse
+  the SSA; mismatch → the CONSUMPTION-SIDE checked renderer emits the `abiGet` reload just
+  before the consuming instruction and re-caches at the current epoch — the renderer is the
+  ONE owner of reloads (this arm IS the 6.4 reload cache: a rooted mismatch is a cache miss,
+  never a crash; only `Direct`/`Fresh` staleness is a violation). **Phasing:** the
+  reload-on-miss behaviour is 2b-2's; during 2b-0/2b-1 (byte-identical / pre-cache
+  emission) the reloads stay at their current choreographed sites, so a rooted token must
+  arrive FRESH at consumption — a stale one there indicates a choreography bug and crashes
+  exactly like `Direct` until 2b-2 retires those sites and hands the renderer ownership.
+
+`envPseudo`/`envDirect` ride the same token path as any direct binding — no separate
+raw-string extraction survives. Verification is at CONSUMPTION and must be TOTAL over
+guest-value instruction operands: not only the seam call renderers and the `argBuffer`
+stores, but `ret` (the fused terminator forms), the rooting stores (`rootLocal` / the
+permanent tier), the inline prims' arithmetic/comparison operands, the `CCase`
+`switch`/`icmp`/`phi` operands, and the force/settle helpers' fast-path IR — the norm is
+that NO guest-value operand position accepts a bare `String` (early lowering to `String`
+erases provenance and is what the token type exists to forbid). **The seam's operand ROLES
+are total too**: each `RtOp`/`RtPrim` row carries its argument schema (which positions are
+guest values vs raw metadata), checked by the renderer against the supplied kinds — a call
+site cannot bypass verification by passing a guest value in a raw-metadata position (per-op
+smart constructors or a schema match; the 6.1 inventory's operand roles and the renderer are
+tied to the same rows). Only the `sp = true` seam/guest-call emissions bump, after their
+operands verify (verify-then-bump) — `argBuffer` stores, `ret`s, prims and every other
+non-safepoint consumer verify WITHOUT bumping. Any `Direct`/`Fresh` value whose validity is
+separated from its use by ANY safepoint crashes deterministically at emission time,
+corpus-wide — the recipe-consistency tests then pin shapes, not carry the whole soundness
+argument. 2b-0 lands the epoch + tokens
++ use-point verification on the CURRENT 2a emission (where it must hold: direct = whole
+range safepoint-free, rooted values are reloaded fresh) with byte-identical output — net
+first, as slice 0 was — and the assertion stays ON in production emission (it never changes
+the IR; one Int compare per consumption).
+
+**6.3 The activation-tier read-order refinement (2b-1).** The normative contribution of a
+safepoint node N to the crossing set is
+
+> `crossingContribution(N) = liveAfter(N) ∪ preReadHazardOperands(N)`
+
+— the `liveAfter` term is UNCHANGED from 2a (a name used after N always crosses: an early
+read does not end the obligation of a later use; handover only covers the operand handed
+over). What 2b-1 refines is only the second term: 2a takes ALL of N's operand names,
+the refinement takes those whose read has a safepoint BEFORE it inside N — per recipe, a
+pinned `preRead` declaration, a FORWARD prefix scan (the sibling of `operandsMayRoot`'s
+suffix scan) over the recipe's operand order plus its pre-read machinery flag. The rows,
+derived from the emitters (each held by the 6.2 use-point check plus a recipe fixture):
+
+| recipe | read order / pre-read machinery | operands that stay direct-eligible |
+|---|---|---|
+| `CPrim` (forced, no machinery) | reads L→R, each followed by its force | operand i iff no forced-safepoint among 1..i−1 (`\a b -> a + b`: `a` yes, `b` crosses via `a`'s force) |
+| `CApp` generic / `SSentinel` / `SClosureEnv` | `evalAtoms` UNFORCED over (f : args) | operand i iff no boxed-literal/foreign materialisation among earlier operands — the all-vars `fib`-class call keeps everything direct |
+| `CApp` `SSelf` | args first, `%env` read after | `envPseudo` crosses iff any arg can materialise-safepoint |
+| `CApp` `SForceCell` | callee atom read first; args after earlier atoms | prefix rule with unforced atom safepoints (the roots themselves stay lowering-tier) |
+| `CCtor` saturated / `CArray` / `CRecord` (SORTED order) | `evalAtoms` unforced | prefix rule |
+| `CCtor` unsaturated | builder closure BUILT before args | no operand direct (pre-read machinery safepoint) |
+| `CAccessor` / `CIf` cond / guard force | single operand read FIRST | always direct-eligible — the acc-class elision returns |
+| `CUpdate` | base read first; vals after `record_set`s | base only (DELIBERATELY conservative: the FIRST update value is also read before the first `record_set` and is refinable later; the initial 2b-1 does not take it) |
+| `CLam` captures / `LetRec` captures | ALL capture reads precede the first alloc (`makeClosure` / `buildGrec` read loops) | every capture — the biggest recovered class, resting directly on 6.1's buffer handover |
+| `CCase` scrutinees | scrutinee i after 1..i−1's forces | prefix rule (arm-live conservatism and the dtree lowering tier unchanged) |
+
+**6.4 The reload cache (2b-2, the §3 discipline).** The cache IS the 6.2 token machine's
+`Rooted` arm: a rooted token whose cached epoch is current reuses its SSA (no `abiGet`); a
+mismatch is a cache MISS — the consumption-side checked renderer (the one reload owner)
+emits the reload just before the consuming instruction and re-caches at the current epoch.
+2b-2 is the step that RETIRES the current read-site reload choreography (`readVar`'s
+immediate `abiGet`, the `getCurrent` sites, `evalAtoms`' reload pass) in favour of this
+single owner — until then the Rooted arm runs in verification-only mode (6.2 phasing note).
+ANF-level control flow (the `CIf`/`CCase`/guard labels Emit itself emits) conservatively
+clears the cache (§3's branch-join rule, taken in its simple always-clear form first); the
+seam ops' own internal linear blocks (`fchk`/`rchk`/`schk` chains — single entry, single
+exit) do NOT clear, their slow-path safepoints already bump the epoch. This is where the
+210k-reload census mass lives.
+
+**Epoch/cache control-flow pins.** The epoch is an EMISSION-ORDER monotone, not a path-exact
+one: mutually exclusive branches and seam-internal slow paths bump it unconditionally, which
+over-approximates safepoint reachability — always the SAFE direction (a stale-looking token
+is re-verified/reloaded, never the reverse). Pinned: (a) operand tokens are verified BEFORE
+the consuming emission bumps (verify-then-bump); (b) every `sp = true` row and every guest
+call bumps EXACTLY once per emission; (c) an ANF-level label always clears the reload cache;
+(d) the cache key is the binding/root-handle IDENTITY, never the source name (shadowing must
+miss, not alias); (e) `beginFn` resets both epoch and cache; (f) epoch overflow is
+fail-closed (crash, not wrap). If the over-approximation ever produces a false-positive
+assert on legitimate emission, the remedy is a path-sensitive epoch join — NEVER weakening
+the assert.
+
+**6.5 Sequencing and gates.** 2b-0 (the epoch, the epoch-carrying operand tokens and the
+use-point verification, byte-identical on the 2a emission; PLUS the 6.1 per-entry/per-operand
+policy inventory and the provider-side forced-GC runtime tests — all gates green) → 2b-1
+(read-order crossing refinement, UNBLOCKED only by the completed inventory + provider tests;
+re-baselines, behavioural gate incl. stress + debug-ABI, fixpoint, census) → 2b-2 (reload
+cache; re-baselines, the full battery again, census + bench — the build-time claim is judged
+here). Each step is a separate review checkpoint. Not taken (unchanged residual): `CCase`
+arm-live conservatism and the dtree lowering tier, provably-not-by-need force refinement,
+lazy rooting, the `CUpdate` first-value refinement.
+
 ## Verification (the 0104 §2 net, plus the stress rung)
 
 Sequenced so the strengthened net exists BEFORE the divergence — the same discipline 0104 §5
@@ -669,6 +822,144 @@ self-tests green, same-corefn identity **298/298** unchanged-input modules byte-
 (differs only in the two code-edited modules, `Monad`/`Emit`), behavioural gate full green
 (both modes, stress, debug-ABI `OK gc29612`), fixpoint smoke re-run green (C3-link ≡ stage-3
 and stage-3 ≡ stage-4, 601/601 each).
+
+#### Progress (2026-07-26): slice 2b-0 — the token net landed (§6.2) + the §6.1 inventory
+
+**Compiler side (§6.2), byte-identical and corpus-verified.** `Types.Val` (`VRaw` |
+`VFresh { ssa, epoch }` — the `Rooted` operand arm is 2b-2's; a rooted BINDING is
+`BindingV`'s `RootedV handle`, its read reloads and the reload's result flows as `VFresh`),
+`Ctx.spEpoch` + `currentEpoch`/`bumpEpoch` (overflow fail-closed) / `useVal`/`useValAt` /
+`mintFresh` in `Monad`; the seam's `RtArg` gained the guest-value arm (`V Val`) and every row
+an **argument schema** (`Fixed` roles | `AllVals` for the prim family) checked by the
+renderer; `rtCall`/`rtCallWith` return the result TOKEN (verify-then-bump-then-mint);
+`Abi.abiSettle`/`forceValue` and the `CIf`/`CCase` phis verify each incoming against its
+**per-arm epoch snapshot** (the §6.4 path-sensitive join — needed from day one: the
+emission-order epoch is over-approximate across mutually exclusive arms, and a then-arm value
+would otherwise false-positive at the merge whenever the else-arm safepoints); `argBuffer`
+verifies at each store WITHOUT bumping; alias bindings inherit tokens by construction
+(`bindDirectVar` stores the given `Val`; `readVar` of a direct binding hands it back
+unre-stamped). Every guest-value operand position in `Emit`/`Program`/`Root`/`Abi`/`Prim` now
+consumes tokens; `bumpEpoch` joined the audit (per-file counts + wide scan + self-test
+class). Results: unit **470/470** (all emission goldens UNCHANGED; new negative tests — stale
+crash, alias-staleness survival, `useValAt` phi form, seam-level stale-after-bump,
+fresh-into-own-sp-row, three schema violations), e2e 11/11, **full-corpus emission with
+verification ACTIVE: zero false positives, 292/292 unchanged-input modules byte-identical**
+(the differing artifacts are exactly the compiler's own edited modules).
+
+**Runtime side (§6.1): the per-entry/per-operand handover inventory, verified against source
+and evidenced per row.** Policies: (1) consume/snapshot — the boxed-`Number` family and the
+heap primops per the `prim.rs` module contract (inputs to locals/vectors before any
+allocation); array `Append` (snapshot-then-delegate, `prim.rs:304`); `pv_tailcall` (owned
+`Vec` copy before returning; the stash-to-take no-alloc window is the §1 pin);
+`pv_prim_new_array` (immediate length, delegates). (2) self-root+reload — `new_array`
+(`gc.rs:701`), `new_adt` (`:663`), `new_closure_raw`'s env (`:737`), `new_pap` (`:753`),
+`new_record` (composition, `:1294`), `record_set`/`record_delete`/`record_union`
+(`record.rs:102/128/155`), `str_append2` (`gc.rs:1221`, the ADR-0103 root→alloc→re-derive),
+`force`'s cell (`byneed.rs:18`). (3) allocation-free handover to callee ownership — `apply`'s
+saturated fast path and the generic exact/over-apply `call_args` (leftovers rooted; by-need
+arm roots args across the force; under-apply delegates to `new_pap`) — `apply.rs`; guest
+direct/`musttail` calls (params rooted per the callee's own plan). (4) discard — `pv_settle`'s
+pending-tail placeholder. `pv_run_effect` delegates to `apply`. Provider-side evidence: seven
+NEW forced-GC (`gc_stress`) runtime tests — `new_closure` env, `new_record` composition,
+the record-op trio, `force`'s cell, the by-need-callee arg arm, over-apply leftovers, the
+Number-family snapshot, array-append snapshot-then-delegate — joining the existing
+`new_array` GC-firing fixture (ADR-0103) and the slice-0 survivor-integrity test (which
+covers `new_adt` + `new_str`); runtime suite **160/160**, the handover tests Miri-clean,
+`cargo fmt` clean.
+
+2b-0 gates, all green: behavioural gate full (both optimiser modes × stress legs + the
+debug-ABI leg, `OK gc29612`), fixpoint smoke C3-link ≡ stage-3 AND stage-3 ≡ stage-4
+(**601/601** each — the whole self-host cycle ran with the token verification ACTIVE in every
+emission).
+
+**2b-0 review round 2 (2026-07-26): the mechanically-non-bypassable boundary, closed.** The
+round-1 net verified correctly but its API could be walked around (re-wrap a stale SSA as an
+immune raw, extract with `valKey` — `Root` did — or hold `useVal`'s bare `String` across a
+bump; `useValAt` took caller-chosen epochs; `mintFresh` re-stamped freely); and the §6.1
+evidence had per-row gaps. Closed:
+
+- **`Value` kernel (new module):** `Val`'s constructors are PRIVATE; `vImm` REJECTS
+  `%`-prefixed text (an SSA register cannot be laundered as epoch-immune); the pure
+  `verifyAt`/`mintAt` primitives are audit-caged to `Monad`'s tracked-epoch wrappers, `keyOf`
+  to `Types` (which stamps `EnvEntry.key` at bind time — `directTarget` compares keys, never
+  extracts operands); `unsafeTestVal`/`unsafeValText` exist for test goldens with a pinned
+  zero-use count under `src`.
+- **Fused verify+emit renderers:** `emitGuestStore`/`emitGuestRet`/`emitPayloadAshr`/
+  `emitLowBitAnd`/`emitGuestSwitch` take the token and emit the consuming instruction in one
+  step; phis flow as the opaque **`PhiIncoming`** — `phiArm` verifies AT the arm's end (the
+  freeze IS the verification) and `emitPhi` renders+mints, so `useValAt` no longer exists.
+  The seam's own arg rendering and the inline prims use the audit-caged
+  `unsafeUseVal`/`unsafeMintFresh` bridges (their sequences cannot bump before interpolation).
+- **`machineryHandleCall`** (allowlist `RtFrame`/`RtRoot`) returns raw HOST-index handles —
+  the reviewer-named alternative that removes `Root`'s need for any token unwrap.
+- **Prim schema arity:** `Vals n` via `Prim.primArity` — kind AND count are checked (an
+  under/over-applied prim is a seam violation, with negative tests), closing the P2.
+- **§6.1 per-row evidence completed:** `sub`/`mul`/`div` Number (independent
+  implementations), `pv_prim_record_set`'s DYNAMIC `Str` key + absent-label INSERT branch
+  (`record_unsafe_set` → `record_insert`), under-apply's `new_pap` heap captures, and
+  `pv_settle`'s discard policy (a stashed tail run under stress, placeholder dropped) —
+  runtime **164/164**, the handover tests Miri-clean.
+- Audit v4: the kernel identifiers joined the per-file × count cage and the wide scan
+  (self-test classes now fifteen + the wide pair), rewritten as a one-pass-per-file counter.
+- Verification: unit **472/472** (all emission goldens unchanged; new negatives:
+  phi-freeze-after-bump, `vImm` laundering, prim arity), same-corefn identity **293/293**
+  unchanged-input modules byte-identical, e2e 11/11, behavioural gate full green (both modes,
+  stress, debug-ABI `OK gc29612`), fixpoint smoke green — C3-link ≡ stage-3 and stage-3 ≡
+  stage-4, **603/603** each (the count grew by the `Value` module; the whole self-host cycle
+  ran with the opaque-token verification active).
+
+**Pinned 2b-2 blocker (round-2 P2): the `musttail` prepared-call split.** Today
+`musttailWith` pops and THEN renders the guest call — sound while the choreography hands it
+fresh values, but 2b-2's renderer-owned reload would fire on a `Rooted` cache miss AFTER
+`popIfOpen`, when the root handle is already dead. 2b-2 MUST introduce the two-phase form
+first (an opaque `PreparedCall`: operands verified/reloaded BEFORE the pop; after the pop
+only the already-rendered call is emitted) — this joins §6.4's phasing note as an explicit
+precondition, not an implementation detail.
+
+#### Progress (2026-07-29): slice 2b-1 — the §6.3 read-order refinement landed
+
+`Liveness` now computes `crossingContribution(N) = liveAfter(N) ∪ preReadHazardOperands(N)`:
+`prefixHazards` (the forward fold) + the per-recipe `preReadHazards` table exactly as pinned
+in §6.3 — `CIf`'s condition and `CLam`/`LetRec` captures dropped from the crossing term,
+`CCase` scrutinees on the forced prefix, `CApp` hazards `envPseudo` iff the callee is the
+self name AND some argument materialises, `CUpdate` stays base-only conservative. The §6.2
+net did its job: the full corpus (302 objects) emitted under the refined plan with **zero
+token-verification failures** — every no-hazard claim held against the real emission — and
+the test shifts were exactly the predicted classes (the fib case, use-at-call, the
+condition, captures, `%env` with var-args, the `CUpdate` base, `acc` 1→0 / `upd` 3→2 /
+`rec` 2→1; the slice-1 goldens needed NO re-baseline). The review round added the §6.3
+per-recipe FIXTURE MATRIX — eight positive/negative `activationPlan` pairs covering every
+independent table branch (generic-`CApp` allocating-earlier vs reverse, saturated
+`CCtor`/`CArray` both directions, unsaturated `CCtor`'s machinery, `CRecord` in CANONICAL
+order both directions with a fail-closed label-shape guard, multi-scrutinee forced prefix,
+`CUpdate`'s variable value vs base, `LetRec` captures) — so a silently-emptied branch fails
+the units directly, not by corpus luck; final unit count **481/481**. Results: e2e 11/11,
+behavioural gate full green (both modes, stress, debug-ABI `OK gc29612`), fixpoint smoke
+**603/603** both compares. **Census (vs the 2a emission, same corpus): IR 100.0 → 78.2 MB
+(−21.8 %), root blocks 84,105 → 53,851 (−36.0 %), ctx reload heads 208,252 → 147,764
+(−29.0 %), frames elided 2,593/10,985 (23.6 %, was 18.1 %).** The remaining choreography
+mass is 2b-2's (the reload cache, behind the `PreparedCall` blocker).
+
+**2b-0 review round 3 (2026-07-29): the last three net holes.** [P1] `vImm` validated only
+the first character, so leading whitespace could smuggle an SSA register (`vImm " %t9"` →
+a valid `i64  %t9` operand) — the constructor now validates the WHOLE production grammar
+(optional `-`, one or more digits, nothing else; negatives for space/tab/suffix/empty/lone
+`-`). [P1] a public `phiArm` freeze did not prove the arm actually ENDED there (a same-arm
+bump after the freeze rode through) — `phiArm` is now private and the exported forms fuse the
+freeze with the arm boundary it proves: `closeHopArm` (verify + `br hop`/`hop:`/`br merge`,
+the CIf/CCase idiom), `armIncomingAt` (freeze fused with the NEXT arm's label — the Abi fast
+arm, whose own terminator is already emitted), and `armIncomingClosing` (the last arm's
+freeze fused with its closing branch and the merge label; an interloper before `emitPhi`
+would make the phi a non-first instruction — invalid LLVM, rejected deterministically).
+[P1] the audit globbed only the backend root while the wide scan excluded the whole backend
+subtree, so a NESTED `Backend/LLVM/Internal/Evil.purs` escaped both — the audit now walks the
+backend RECURSIVELY keyed on relative paths (a nested file named `Monad.purs` does not
+inherit the root allowlist), with nested-smuggle self-test classes. Verification: unit
+**473/473**, audit + 17 self-test classes green, same-corefn identity **297/297**
+unchanged-input modules byte-identical (differs only in the four edited modules —
+`Value`/`Monad`/`Abi`/`Emit`), e2e 11/11, behavioural gate full green (both modes, stress,
+debug-ABI `OK gc29612`), fixpoint smoke green (C3-link ≡ stage-3 and stage-3 ≡ stage-4,
+**603/603** each).
 
 **Measurements (2a, same-corefn vs pre-slice-2 HEAD).** IR 97.8 → 94.6 MB (−3.3 %), root
 blocks 88,555 → 83,666 (−5.5 %), ctx reload heads 212,569 → 206,881 (−2.7 %), frames elided

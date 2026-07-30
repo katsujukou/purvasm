@@ -200,4 +200,63 @@ mod tests {
         let n = h.new_number(1.0);
         let _ = h.force(n.as_word());
     }
+
+    /// ADR-0105 §6.1 handover inventory (provider-side evidence): `force` is the
+    /// self-root+reload policy for the CELL — the suspension's guest allocations collect under
+    /// stress, and the memoise write must land in the RELOCATED cell (a raw cell pointer held
+    /// across `apply` would write into a dead semi-space).
+    #[test]
+    fn handover_force_roots_the_cell_across_the_thunk_under_stress() {
+        fn make_str(h: &mut Heap, _clo: Value, _args: &[Value]) -> Value {
+            h.new_str(b"forced-payload").as_word()
+        }
+        let mut h = Heap::new(4096);
+        h.enable_gc_stress_for_test();
+        let susp = h.new_closure(make_str, 1, Value::unit()).as_word();
+        let suspr = h.root(susp);
+        let sv = h.get(suspr);
+        let cell = h.new_byneed(sv).as_word();
+        let cr = h.root(cell);
+        let cv = h.get(cr);
+        let v1 = h.force(cv);
+        assert_eq!(
+            h.str_read(unsafe { HeapPtr::from_word(v1) }),
+            "forced-payload"
+        );
+        // memoised: the second force reads the cell's stored value, no re-run.
+        let cv2 = h.get(cr);
+        let v2 = h.force(cv2);
+        assert_eq!(v1, v2);
+    }
+
+    /// §6.1: `apply` on a by-need CALLEE roots the in-flight args across the force (the
+    /// composite policy's by-need arm) — the suspension's allocations collect under stress and
+    /// the heap-pointer argument must arrive intact at the forced closure.
+    #[test]
+    fn handover_byneed_callee_roots_args_across_force_under_stress() {
+        fn ident(_h: &mut Heap, _clo: Value, args: &[Value]) -> Value {
+            args[0]
+        }
+        fn make_ident_closure(h: &mut Heap, _clo: Value, _args: &[Value]) -> Value {
+            h.new_closure(ident, 1, Value::unit()).as_word()
+        }
+        let mut h = Heap::new(4096);
+        h.enable_gc_stress_for_test();
+        let susp = h
+            .new_closure(make_ident_closure, 1, Value::unit())
+            .as_word();
+        let suspr = h.root(susp);
+        let sv = h.get(suspr);
+        let cell = h.new_byneed(sv).as_word();
+        let cr = h.root(cell);
+        let arg = h.new_str(b"through-the-force").as_word();
+        let ar = h.root(arg);
+        let cv = h.get(cr);
+        let av = h.get(ar);
+        let r = h.apply(cv, &[av]);
+        assert_eq!(
+            h.str_read(unsafe { HeapPtr::from_word(r) }),
+            "through-the-force"
+        );
+    }
 }

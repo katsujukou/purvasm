@@ -219,11 +219,11 @@ emitEntryStub isEffect heapWords entry = do
     Just v -> pure v
     Nothing -> unsafeCrashWith "Program.emitEntryStub: entry produced no value"
   if isEffect then do
-    void (rtCall RtRunEffect [ I64 v ])
+    void (rtCall RtRunEffect [ V v ])
     rtCallVoid RtDrainOutput []
   else do
     fv <- forceValue v
-    rtCallVoid RtPrintInt [ I64 fv ]
+    rtCallVoid RtPrintInt [ V fv ]
   entryTeardown tok
   takeFn
 

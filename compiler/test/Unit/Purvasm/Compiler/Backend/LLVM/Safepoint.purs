@@ -10,15 +10,20 @@ module Test.Unit.Purvasm.Compiler.Backend.LLVM.Safepoint where
 
 import Prelude
 
+import Control.Monad.Error.Class (try)
 import Data.Array as Array
+import Data.Either (isLeft)
 import Data.Foldable (for_)
 import Data.Generic.Rep (class Generic, Argument(..), Constructor(..), NoArguments(..), Sum(..), to)
 import Data.Map as Map
 import Data.Set as Set
 import Data.String (Pattern(..), contains)
 import Data.Tuple (snd)
+import Effect.Aff (Aff)
+import Effect.Class (liftEffect)
 import Purvasm.Compiler.Backend.LLVM.Abi (declarations)
 import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, makeCx, renderBuffer, runCodegen)
+import Purvasm.Compiler.Backend.LLVM.Value (unsafeTestVal, vImm)
 import Purvasm.Compiler.Backend.LLVM.Safepoint (RtArg(..), RtOp(..), guestCallSafepoint, guestDirect, guestMusttail, rtCall, rtCallVoid, rtCallWith, rtSafepoint, rtSym)
 import Purvasm.Compiler.Primitive (PrimOp(..))
 import Test.Spec (Spec, describe, it)
@@ -27,6 +32,13 @@ import Test.Spec.Assertions (shouldEqual)
 emitted :: forall a. Codegen a -> String
 emitted m = renderBuffer
   (snd (runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true }) m)).fn
+
+-- Force a pure emission inside the Effect runtime so its guard `unsafeCrashWith` surfaces as a
+-- caught exception (evaluation deferred into the Effect closure — the `Monad`-test pattern).
+expectCrash :: forall a. (Unit -> a) -> Aff Unit
+expectCrash thunk = do
+  r <- try (liftEffect (void (map (\_ -> thunk unit) (pure unit))))
+  isLeft r `shouldEqual` true
 
 -- Mechanical enumeration of a `Generic` sum whose constructors are nullary or carry ONE
 -- generically-enumerable payload. Tied to the closed type: a new constructor changes the rep
@@ -89,7 +101,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Safepoint" do
 
   describe "rtCall / rtCallWith / rtCallVoid" do
     it "renders a ctx-taking value call" do
-      emitted (rtCall RtApply [ I64 "%f", Ptr "%p", I64 "3" ]) `shouldEqual`
+      emitted (rtCall RtApply [ V (unsafeTestVal "%f"), Ptr "%p", I64 "3" ]) `shouldEqual`
         "  %t1 = call i64 @pv_apply(ptr %ctx, i64 %f, ptr %p, i64 3)\n"
 
     it "renders a ctx-free value call with no operands" do
@@ -97,28 +109,56 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Safepoint" do
         "  %t1 = call i64 @pv_empty_array()\n"
 
     it "renders into a caller-supplied temp (the boot numbering-order sites)" do
-      emitted (rtCallWith "%r" RtReadField [ I64 "%v", I64 "2" ]) `shouldEqual`
+      emitted (rtCallWith "%r" RtReadField [ V (unsafeTestVal "%v"), I64 "2" ]) `shouldEqual`
         "  %r = call i64 @pv_read_field(ptr %ctx, i64 %v, i64 2)\n"
 
     it "renders void calls, with and without ctx, including i32 operands" do
-      emitted (rtCallVoid RtTailcall [ I64 "%f", Ptr "%p", I64 "2" ]) `shouldEqual`
+      emitted (rtCallVoid RtTailcall [ V (unsafeTestVal "%f"), Ptr "%p", I64 "2" ]) `shouldEqual`
         "  call void @pv_tailcall(ptr %ctx, i64 %f, ptr %p, i64 2)\n"
       emitted (rtCallVoid RtAbiCheck [ I32 "1" ]) `shouldEqual`
         "  call void @pv_abi_check(i32 1)\n"
 
     it "routes the pv_prim family through primSym's symbol/ctx" do
-      emitted (rtCall (RtPrim AddNumber) [ I64 "%a", I64 "%b" ]) `shouldEqual`
+      emitted (rtCall (RtPrim AddNumber) [ V (unsafeTestVal "%a"), V (unsafeTestVal "%b") ]) `shouldEqual`
         "  %t1 = call i64 @pv_prim_add_number(ptr %ctx, i64 %a, i64 %b)\n"
-      emitted (rtCall (RtPrim AddInt) [ I64 "%a", I64 "%b" ]) `shouldEqual`
+      emitted (rtCall (RtPrim AddInt) [ V (unsafeTestVal "%a"), V (unsafeTestVal "%b") ]) `shouldEqual`
         "  %t1 = call i64 @pv_prim_add_int(i64 %a, i64 %b)\n"
+
+  describe "the checked renderers (ADR-0105 §6.2 negative tests)" do
+    it "a token staled by an sp row's bump crashes at the NEXT consumption (verify-then-bump)" do
+      -- `v` mints at epoch 0 (RtEmptyArray is not a safepoint); the RtNewStr emission bumps;
+      -- consuming `v` afterwards must fail — the read/use-across-safepoint class.
+      expectCrash \_ -> emitted do
+        v <- rtCall RtEmptyArray []
+        _ <- rtCall RtNewStr [ Ptr "null", I64 "0" ]
+        rtCall RtApply [ V v, Ptr "%p", I64 "1" ]
+
+    it "the same-emission operands verify BEFORE the bump (a fresh operand passes into its own sp row)" do
+      emitted
+        ( do
+            v <- rtCall RtEmptyArray []
+            rtCall RtApply [ V v, Ptr "%p", I64 "1" ]
+        ) `shouldEqual`
+        ( "  %t1 = call i64 @pv_empty_array()\n"
+            <> "  %t2 = call i64 @pv_apply(ptr %ctx, i64 %t1, ptr %p, i64 1)\n"
+        )
+
+    it "a guest value in a raw-metadata position is a schema violation" do
+      expectCrash \_ -> emitted (rtCall RtApply [ I64 "%f", Ptr "%p", I64 "3" ])
+
+    it "a raw word in a guest-value position is a schema violation" do
+      expectCrash \_ -> emitted (rtCall RtApply [ V (unsafeTestVal "%f"), Ptr "%p", V (vImm "3") ])
+
+    it "an operand-count mismatch against the row schema is a violation" do
+      expectCrash \_ -> emitted (rtCall RtApply [ V (unsafeTestVal "%f") ])
 
   describe "guestDirect / guestMusttail" do
     it "renders the tailcc direct entry call" do
-      emitted (guestDirect { dsym: "foo$d", env: "%e", args: [ "%a", "%b" ] }) `shouldEqual`
+      emitted (guestDirect { dsym: "foo$d", env: unsafeTestVal "%e", args: [ unsafeTestVal "%a", unsafeTestVal "%b" ] }) `shouldEqual`
         "  %t1 = call tailcc i64 @foo$d(ptr %ctx, i64 %e, i64 %a, i64 %b)\n"
-      emitted (guestDirect { dsym: "foo$d", env: "%e", args: [] }) `shouldEqual`
+      emitted (guestDirect { dsym: "foo$d", env: unsafeTestVal "%e", args: [] }) `shouldEqual`
         "  %t1 = call tailcc i64 @foo$d(ptr %ctx, i64 %e)\n"
 
     it "renders the musttail variant" do
-      emitted (guestMusttail { dsym: "foo$d", env: "%e", args: [ "%a" ] }) `shouldEqual`
+      emitted (guestMusttail { dsym: "foo$d", env: unsafeTestVal "%e", args: [ unsafeTestVal "%a" ] }) `shouldEqual`
         "  %t1 = musttail call tailcc i64 @foo$d(ptr %ctx, i64 %e, i64 %a)\n"

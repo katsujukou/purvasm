@@ -21,61 +21,186 @@ count_matches() {
   grep -vE '^[[:space:]]*--' "$1" | grep -c"$flag" -- "$2" || true
 }
 
+# One-pass per-file counts for every pinned identifier (line counts, comment lines skipped) —
+# the self-test runs the whole audit once per violation class, so per-identifier grep spawns
+# would dominate its wall time.
+counts_for() {
+  awk '
+    /^[[:space:]]*--/ { next }
+    {
+      if ($0 ~ /"[^"]*call (i64|void|ptr|tailcc)/) c["call"]++
+      split("unsafeEmitRawCall unsafeEmitRawModule popFrame openFrame bumpEpoch verifyAt mintAt keyOf unsafeUseVal unsafeMintFresh machineryHandleCall", ids, " ")
+      for (i = 1; i <= 11; i++) if (index($0, ids[i]) > 0) c[ids[i]]++
+      if (index($0, "unsafeTestVal") > 0 || index($0, "unsafeValText") > 0) c["testesc"]++
+    }
+    END { for (k in c) print k "=" c[k] }
+  ' "$1"
+}
+
+# Look a count up in counts_for output (0 when absent).
+cnt() { printf '%s
+' "$1" | awk -F= -v k="$2" '$1 == k { print $2; found = 1 } END { if (!found) print 0 }'; }
+
 # Audit one backend directory; prints violations, returns non-zero if any.
 audit_dir() {
   local dir="$1" bad=0 f base n
   for req in Safepoint.purs Monad.purs Root.purs Program.purs; do
     [ -f "$dir/$req" ] || { echo "seam-audit: missing pinned file $req" >&2; bad=1; }
   done
-  for f in "$dir"/*.purs; do
-    base=$(basename "$f")
+  # RECURSIVE walk keyed on the path RELATIVE to the backend root (round 3): a nested
+  # Backend/LLVM/Internal/Evil.purs must fall to the zero-use catch-all, and a nested file
+  # merely NAMED Monad.purs must not inherit the root Monad.purs allowlist.
+  local files
+  files=$(find "$dir" -name '*.purs' | LC_ALL=C sort)
+  for f in $files; do
+    base=${f#"$dir"/}
+    C=$(counts_for "$f")
 
-    # 1) raw call-text construction (string literals building a call instruction)
-    n=$(count_matches "$f" "$CALL_RE")
+    expect() { # expect <name> <count> <message>
+      local got
+      got=$(cnt "$C" "$1")
+      [ "$got" -eq "$2" ] || { echo "seam-audit: $base: $3 (expected $2; found $got)" >&2; bad=1; }
+    }
+
     case "$base" in
       Safepoint.purs)
-        [ "$n" -eq 4 ] || { echo "seam-audit: $base: expected exactly 4 call renderers (rtCallWith/rtCallVoid/guestDirect/guestMusttail), found $n" >&2; bad=1; } ;;
+        expect call 5 "call-renderer count drifted (rtCallWith/rtCallVoid/machineryHandleCall/guestDirect/guestMusttail)"
+        expect unsafeEmitRawCall 6 "unsafeEmitRawCall count drifted"
+        expect unsafeEmitRawModule 0 "unsafeEmitRawModule outside the allowlist"
+        expect popFrame 0 "popFrame outside Root"
+        expect openFrame 0 "openFrame outside its pinned minting sites"
+        expect bumpEpoch 5 "bumpEpoch count drifted"
+        expect verifyAt 0 "verifyAt outside the Monad wrapper"
+        expect mintAt 0 "mintAt outside the Monad wrapper"
+        expect keyOf 0 "keyOf outside the bind-time key stamps"
+        expect unsafeUseVal 6 "unsafeUseVal count drifted"
+        expect unsafeMintFresh 4 "unsafeMintFresh count drifted"
+        expect testesc 0 "test-only token escape used in src"
+        expect machineryHandleCall 4 "machineryHandleCall count drifted"
+        ;;
+      Monad.purs)
+        expect call 0 "raw call text outside the seam"
+        expect unsafeEmitRawCall 4 "unsafeEmitRawCall count drifted"
+        expect unsafeEmitRawModule 6 "unsafeEmitRawModule count drifted"
+        expect popFrame 0 "popFrame outside Root"
+        expect openFrame 0 "openFrame outside its pinned minting sites"
+        expect bumpEpoch 4 "bumpEpoch count drifted"
+        expect verifyAt 2 "verifyAt count drifted (import + the tracked-epoch wrapper)"
+        expect mintAt 2 "mintAt count drifted"
+        expect keyOf 0 "keyOf outside the bind-time key stamps"
+        expect unsafeUseVal 3 "unsafeUseVal count drifted"
+        expect unsafeMintFresh 3 "unsafeMintFresh count drifted"
+        expect testesc 0 "test-only token escape used in src"
+        expect machineryHandleCall 0 "machineryHandleCall outside Root"
+        ;;
       Program.purs)
-        [ "$n" -eq 2 ] || { echo "seam-audit: $base: expected exactly 2 raw call constructions, found $n" >&2; bad=1; }
+        expect call 2 "raw call-construction count drifted"
         [ "$(count_matches "$f" 'unsafeEmitRawCall ("  %ctx = call ptr @pv_runtime_new(i64 ' F)" -eq 1 ] \
           || { echo "seam-audit: $base: the ctx-birth construction drifted from its pinned shape" >&2; bad=1; }
         [ "$(count_matches "$f" '"  call void @" <> mangle (gdefInitKey g) <> "$init(ptr %ctx)"' F)" -eq 1 ] \
-          || { echo "seam-audit: $base: the pv_init_all \$init-skeleton construction drifted from its pinned shape" >&2; bad=1; } ;;
+          || { echo "seam-audit: $base: the pv_init_all \$init-skeleton construction drifted from its pinned shape" >&2; bad=1; }
+        expect unsafeEmitRawCall 2 "unsafeEmitRawCall count drifted"
+        expect unsafeEmitRawModule 2 "unsafeEmitRawModule count drifted"
+        expect popFrame 0 "popFrame outside Root"
+        expect openFrame 2 "openFrame count drifted (import + the entry stub)"
+        expect bumpEpoch 0 "bumpEpoch outside the seam"
+        expect verifyAt 0 "verifyAt outside the Monad wrapper"
+        expect mintAt 0 "mintAt outside the Monad wrapper"
+        expect keyOf 0 "keyOf outside the bind-time key stamps"
+        expect unsafeUseVal 0 "unsafeUseVal outside the seam/prim renderers"
+        expect unsafeMintFresh 0 "unsafeMintFresh outside the seam/prim renderers"
+        expect testesc 0 "test-only token escape used in src"
+        expect machineryHandleCall 0 "machineryHandleCall outside Root"
+        ;;
+      Root.purs)
+        expect call 0 "raw call text outside the seam"
+        expect unsafeEmitRawCall 0 "unsafeEmitRawCall outside the allowlist"
+        expect unsafeEmitRawModule 0 "unsafeEmitRawModule outside the allowlist"
+        expect openFrame 4 "openFrame count drifted (export, signature, definition, framed-init wrapper)"
+        expect bumpEpoch 0 "bumpEpoch outside the seam"
+        expect verifyAt 0 "verifyAt outside the Monad wrapper"
+        expect mintAt 0 "mintAt outside the Monad wrapper"
+        expect keyOf 0 "keyOf outside the bind-time key stamps"
+        expect unsafeUseVal 0 "unsafeUseVal outside the seam/prim renderers"
+        expect unsafeMintFresh 0 "unsafeMintFresh outside the seam/prim renderers"
+        expect testesc 0 "test-only token escape used in src"
+        expect machineryHandleCall 4 "machineryHandleCall count drifted (import + frame + two root arms)"
+        ;;
+      Emit.purs)
+        expect call 0 "raw call text outside the seam"
+        expect unsafeEmitRawCall 0 "unsafeEmitRawCall outside the allowlist"
+        expect unsafeEmitRawModule 0 "unsafeEmitRawModule outside the allowlist"
+        expect popFrame 0 "popFrame outside Root"
+        expect openFrame 2 "openFrame count drifted (import + the plan-driven activation open)"
+        expect bumpEpoch 0 "bumpEpoch outside the seam"
+        expect verifyAt 0 "verifyAt outside the Monad wrapper"
+        expect mintAt 0 "mintAt outside the Monad wrapper"
+        expect keyOf 0 "keyOf outside the bind-time key stamps"
+        expect unsafeUseVal 0 "unsafeUseVal outside the seam/prim renderers"
+        expect unsafeMintFresh 0 "unsafeMintFresh outside the seam/prim renderers"
+        expect testesc 0 "test-only token escape used in src"
+        expect machineryHandleCall 0 "machineryHandleCall outside Root"
+        ;;
+      Prim.purs)
+        expect call 0 "raw call text outside the seam"
+        expect unsafeUseVal 2 "unsafeUseVal count drifted"
+        expect unsafeMintFresh 2 "unsafeMintFresh count drifted"
+        expect verifyAt 0 "verifyAt outside the Monad wrapper"
+        expect mintAt 0 "mintAt outside the Monad wrapper"
+        expect keyOf 0 "keyOf outside the bind-time key stamps"
+        expect testesc 0 "test-only token escape used in src"
+        expect popFrame 0 "popFrame outside Root"
+        expect openFrame 0 "openFrame outside its pinned minting sites"
+        expect bumpEpoch 0 "bumpEpoch outside the seam"
+        expect machineryHandleCall 0 "machineryHandleCall outside Root"
+        expect unsafeEmitRawCall 0 "unsafeEmitRawCall outside the allowlist"
+        expect unsafeEmitRawModule 0 "unsafeEmitRawModule outside the allowlist"
+        ;;
+      Value.purs)
+        expect call 0 "raw call text outside the seam"
+        expect verifyAt 4 "verifyAt count drifted"
+        expect mintAt 3 "mintAt count drifted"
+        expect keyOf 4 "keyOf count drifted"
+        expect testesc 6 "test-escape count drifted"
+        expect unsafeUseVal 0 "unsafeUseVal outside the seam/prim renderers"
+        expect unsafeMintFresh 0 "unsafeMintFresh outside the seam/prim renderers"
+        expect popFrame 0 "popFrame outside Root"
+        expect openFrame 0 "openFrame outside its pinned minting sites"
+        expect bumpEpoch 0 "bumpEpoch outside the seam"
+        expect machineryHandleCall 0 "machineryHandleCall outside Root"
+        expect unsafeEmitRawCall 0 "unsafeEmitRawCall outside the allowlist"
+        expect unsafeEmitRawModule 0 "unsafeEmitRawModule outside the allowlist"
+        ;;
+      Types.purs)
+        expect call 0 "raw call text outside the seam"
+        expect keyOf 3 "keyOf count drifted (import + the two direct-bind key stamps)"
+        expect verifyAt 0 "verifyAt outside the Monad wrapper"
+        expect mintAt 0 "mintAt outside the Monad wrapper"
+        expect testesc 0 "test-only token escape used in src"
+        expect unsafeUseVal 0 "unsafeUseVal outside the seam/prim renderers"
+        expect unsafeMintFresh 0 "unsafeMintFresh outside the seam/prim renderers"
+        expect popFrame 0 "popFrame outside Root"
+        expect openFrame 0 "openFrame outside its pinned minting sites"
+        expect bumpEpoch 0 "bumpEpoch outside the seam"
+        expect machineryHandleCall 0 "machineryHandleCall outside Root"
+        expect unsafeEmitRawCall 0 "unsafeEmitRawCall outside the allowlist"
+        expect unsafeEmitRawModule 0 "unsafeEmitRawModule outside the allowlist"
+        ;;
       *)
-        [ "$n" -eq 0 ] || { echo "seam-audit: $base: raw call text outside the seam:" >&2; grep -nE -- "$CALL_RE" "$f" >&2 || true; bad=1; } ;;
-    esac
-
-    # 2) unsafeEmitRawCall use sites (non-comment lines, imports included)
-    n=$(count_matches "$f" 'unsafeEmitRawCall')
-    case "$base" in
-      Monad.purs) [ "$n" -eq 4 ] || { echo "seam-audit: $base: unsafeEmitRawCall count drifted (expected 4: export, guard fallthrough, signature, definition; found $n)" >&2; bad=1; } ;;
-      Safepoint.purs) [ "$n" -eq 5 ] || { echo "seam-audit: $base: unsafeEmitRawCall count drifted (expected 5: import + 4 renderers; found $n)" >&2; bad=1; } ;;
-      Program.purs) [ "$n" -eq 2 ] || { echo "seam-audit: $base: unsafeEmitRawCall count drifted (expected 2: import + ctx birth; found $n)" >&2; bad=1; } ;;
-      *) [ "$n" -eq 0 ] || { echo "seam-audit: $base: unsafeEmitRawCall outside the allowlist" >&2; bad=1; } ;;
-    esac
-
-    # 3) unsafeEmitRawModule use sites
-    n=$(count_matches "$f" 'unsafeEmitRawModule')
-    case "$base" in
-      Monad.purs) [ "$n" -eq 6 ] || { echo "seam-audit: $base: unsafeEmitRawModule count drifted (expected 6: export, emitModule/emitDefine fallthroughs, doc reference in emit's crash text excluded, signature, definition; found $n)" >&2; bad=1; } ;;
-      Program.purs) [ "$n" -eq 2 ] || { echo "seam-audit: $base: unsafeEmitRawModule count drifted (expected 2: import + pv_init_all skeleton; found $n)" >&2; bad=1; } ;;
-      *) [ "$n" -eq 0 ] || { echo "seam-audit: $base: unsafeEmitRawModule outside the allowlist" >&2; bad=1; } ;;
-    esac
-
-    # 4) popFrame is Root-private (ADR-0105 §2 fused-pop discipline)
-    if [ "$base" != "Root.purs" ]; then
-      n=$(count_matches "$f" 'popFrame')
-      [ "$n" -eq 0 ] || { echo "seam-audit: $base: popFrame outside Root (pops must stay fused with their continuations)" >&2; bad=1; }
-    fi
-
-    # 5) openFrame minting sites (ADR-0105 §2 round 4: a frameless init body could otherwise
-    #    open a frame the wrapper never pops)
-    n=$(count_matches "$f" 'openFrame')
-    case "$base" in
-      Root.purs) [ "$n" -eq 4 ] || { echo "seam-audit: $base: openFrame count drifted (expected 4: export, signature, definition, framed-init wrapper; found $n)" >&2; bad=1; } ;;
-      Emit.purs) [ "$n" -eq 2 ] || { echo "seam-audit: $base: openFrame count drifted (expected 2: import + the plan-driven activation open; found $n)" >&2; bad=1; } ;;
-      Program.purs) [ "$n" -eq 2 ] || { echo "seam-audit: $base: openFrame count drifted (expected 2: import + the entry stub; found $n)" >&2; bad=1; } ;;
-      *) [ "$n" -eq 0 ] || { echo "seam-audit: $base: openFrame outside its pinned minting sites" >&2; bad=1; } ;;
+        expect call 0 "raw call text outside the seam"
+        expect unsafeEmitRawCall 0 "unsafeEmitRawCall outside the allowlist"
+        expect unsafeEmitRawModule 0 "unsafeEmitRawModule outside the allowlist"
+        expect popFrame 0 "popFrame outside Root"
+        expect openFrame 0 "openFrame outside its pinned minting sites"
+        expect bumpEpoch 0 "bumpEpoch outside the seam"
+        expect verifyAt 0 "verifyAt outside the Monad wrapper"
+        expect mintAt 0 "mintAt outside the Monad wrapper"
+        expect keyOf 0 "keyOf outside the bind-time key stamps"
+        expect unsafeUseVal 0 "unsafeUseVal outside the seam/prim renderers"
+        expect unsafeMintFresh 0 "unsafeMintFresh outside the seam/prim renderers"
+        expect testesc 0 "test-only token escape used in src"
+        expect machineryHandleCall 0 "machineryHandleCall outside Root"
+        ;;
     esac
   done
   return "$bad"
@@ -87,11 +212,11 @@ audit_dir() {
 # directory the identifiers must not appear at all.
 audit_wide() {
   local srcdir="$1" backendsub="$2" bad=0 hits
-  hits=$(grep -rn 'unsafeEmitRawCall\|unsafeEmitRawModule\|openFrame' "$srcdir" --include='*.purs' \
+  hits=$(grep -rn 'unsafeEmitRawCall\|unsafeEmitRawModule\|openFrame\|bumpEpoch\|verifyAt\|mintAt\|keyOf\|unsafeUseVal\|unsafeMintFresh\|unsafeTestVal\|unsafeValText\|machineryHandleCall' "$srcdir" --include='*.purs' \
     | grep -v "^$srcdir/$backendsub/" \
     | grep -vE ':[[:space:]]*--' || true)
   if [ -n "$hits" ]; then
-    echo "seam-audit: unsafe emitter or openFrame referenced outside the LLVM backend directory:" >&2
+    echo "seam-audit: unsafe emitter, openFrame or bumpEpoch referenced outside the LLVM backend directory:" >&2
     echo "$hits" >&2
     bad=1
   fi
@@ -104,6 +229,7 @@ selftest() {
   inject() { # $1 = description, $2 = file to write/append, $3 = content
     scratch=$(mktemp -d)
     cp "$BACKEND"/*.purs "$scratch"/
+    mkdir -p "$(dirname "$scratch/$2")"
     printf '%s\n' "$3" >> "$scratch/$2"
     if audit_dir "$scratch" > /dev/null 2>&1; then
       echo "seam-audit: SELF-TEST FAILED — not rejected: $1" >&2
@@ -120,6 +246,14 @@ selftest() {
   inject "popFrame use outside Root" "Emit.purs" 'evil tok = popFrame tok'
   inject "openFrame outside its pinned minting sites" "Liveness.purs" 'evil = openFrame'
   inject "an extra openFrame in Program.purs" "Program.purs" 'evil = openFrame'
+  inject "bumpEpoch outside the seam" "Emit.purs" 'evil = bumpEpoch'
+  inject "verifyAt with a spoofable epoch outside Monad" "Emit.purs" 'evil v = verifyAt 0 v'
+  inject "a free-form mintAt outside Monad" "Emit.purs" 'evil s = mintAt 0 s'
+  inject "unsafeUseVal outside the seam renderers" "Emit.purs" 'evil v = unsafeUseVal v'
+  inject "a test-only token escape in src" "Emit.purs" 'evil s = unsafeTestVal s'
+  inject "machineryHandleCall outside Root" "Emit.purs" 'evil = machineryHandleCall'
+  inject "a nested backend submodule smuggling a caged identifier" "Internal/Evil.purs" 'evil v = unsafeUseVal v'
+  inject "a nested file named after an allowlisted root file" "Internal/Monad.purs" 'evil s = mintAt 0 s'
   inject "a second \$init-skeleton construction in Program.purs" "Program.purs" 'evil g = "  call void @" <> mangle (gdefInitKey g) <> "$init(ptr %ctx)"'
 
   # the wide scan must reject unsafe-emitter and openFrame imports outside the backend directory

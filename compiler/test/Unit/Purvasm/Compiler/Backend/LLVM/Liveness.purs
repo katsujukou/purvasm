@@ -1,9 +1,10 @@
 -- | The ADR-0105 §2 liveness analysis, pinned on the edge classes the ADR names under the
--- | slice-2a crossing rule (a safepoint node's own operand names cross — the §1 use-at-call
--- | exemption is NOT applied; see the module preamble for why a direct SSA operand is unsound
--- | against the node's internal safepoints): branch behaviour, closure-capture escape, the
--- | self-recursion `%env` word, case/dtree conservatism, frame elision, and the §2a
--- | default-stack scale fixtures. The §4 release/debug `RootPlan`-equality contract holds by
+-- | slice-2b-1 crossing rule (§6.3: `liveAfter(N) ∪ preReadHazardOperands(N)` — an operand
+-- | read with no earlier intra-node safepoint hands over safely on the §6.1 contract, and the
+-- | §6.2 token net holds every claim against the real emission): branch behaviour,
+-- | closure-capture escape, the self-recursion `%env` word, case/dtree conservatism, the
+-- | per-recipe preRead fixture matrix, frame elision, and the §2a default-stack scale
+-- | fixtures. The §4 release/debug `RootPlan`-equality contract holds by
 -- | construction — `activationPlan` takes no ABI-profile input — and the test documents that by
 -- | asserting the plan is a pure function of (config, body) alone.
 module Test.Unit.Purvasm.Compiler.Backend.LLVM.Liveness where
@@ -29,6 +30,9 @@ var = AtomVar
 int :: Int -> Atom
 int = AtomLit <<< LInt
 
+str :: String -> Atom
+str = AtomLit <<< LString
+
 cfg0 :: ActivationConfig
 cfg0 = { params: [], captures: [], selfName: Nothing }
 
@@ -38,19 +42,19 @@ crossingOf cfg body = Set.toUnfoldable (activationPlan cfg body).crossing
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
   describe "activationPlan (crossing)" do
-    it "a safepoint node's operands cross (2a — sidenote 0011's fib case now roots its operand)" do
-      -- let a = n - 1 in f a — `a` is an operand of the call, never used after it, yet it
-      -- crosses (2a): the call's own lowering may allocate before the operand read (a sibling
-      -- boxed literal, the callee force), so a direct SSA `a` would be stale — the slice-2
-      -- gate's missing-root class. `n` likewise: its forced-prim read is a safepoint node.
+    it "the fib class stays direct (2b-1: no pre-read hazard, handed over safely)" do
+      -- let a = n - 1 in f a — `a` is read at call position 1 with no earlier materialisation
+      -- (§6.3 prefix), `n` at prim position 0: neither has a pre-read hazard nor a later use,
+      -- so both stay direct — sidenote 0011's fib case, recovered on the §6.1 handover
+      -- contract and held by the §6.2 token net.
       let
         body = Let "a" (CPrim SubInt [ var "n", int 1 ])
           (Ret (CApp (var "f") [ var "a" ]))
-      crossingOf (cfg0 { params = [ "n" ] }) body `shouldEqual` [ "a", "n" ]
+      crossingOf (cfg0 { params = [ "n" ] }) body `shouldEqual` []
 
     it "a value used after an intervening call crosses" do
-      -- let x = g () in let y = h () in x + y — `x` is live across the `h` call; both are
-      -- also operands of the forced prim (a safepoint node), so both cross (2a).
+      -- let x = g () in let y = h () in x + y — `x` crosses via liveAfter (live across the
+      -- `h` call); `y` is hazarded by `x`'s earlier force in the prim's operand order (§6.3).
       let
         body = Let "x" (CApp (var "g") [])
           ( Let "y" (CApp (var "h") [])
@@ -58,18 +62,19 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
           )
       crossingOf cfg0 body `shouldEqual` [ "x", "y" ]
 
-    it "use-at-call crosses under 2a whether or not the operand is also used later" do
+    it "consumed-at-call is direct; a later use crosses via liveAfter (2b-1)" do
       let
         mk after = Let "x" (CApp (var "g") [])
           ( Let "r" (CApp (var "f") [ var "x" ])
               (Ret after)
           )
-      -- x consumed by the f-call only: 2a still roots it (the call node reads it).
-      crossingOf cfg0 (mk (CAtom (var "r"))) `shouldEqual` [ "x" ]
-      -- x also used after the f-call: r joins via the forced-prim node's operand reads.
+      -- x consumed by the f-call only: no pre-read hazard, no later use — direct (2b-1).
+      crossingOf cfg0 (mk (CAtom (var "r"))) `shouldEqual` []
+      -- x used after the f-call crosses via liveAfter; r is hazarded by x's earlier force in
+      -- the prim's operand order (§6.3 prefix).
       crossingOf cfg0 (mk (CPrim AddInt [ var "x", var "r" ])) `shouldEqual` [ "r", "x" ]
 
-    it "a param live at a branch entry crosses the condition force; so does the condition (2a)" do
+    it "a param live at a branch entry crosses the condition force; the condition itself is direct (2b-1)" do
       -- if c then f x else 1 — the cond force precedes both branches; `c` itself is read by
       -- the safepointing condition node.
       let
@@ -78,7 +83,8 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
               (Ret (CApp (var "f") [ var "x" ]))
               (Ret (CAtom (int 1)))
           )
-      crossingOf (cfg0 { params = [ "c", "x" ] }) body `shouldEqual` [ "c", "x" ]
+      -- the condition's own read precedes its force (§6.3): `c` no longer crosses.
+      crossingOf (cfg0 { params = [ "c", "x" ] }) body `shouldEqual` [ "x" ]
 
     it "only names never read at (or live across) a safepoint stay direct" do
       -- let a = 1 + 2 in a — the all-immediate prim cannot safepoint, and the identity tail
@@ -91,31 +97,33 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
       Set.toUnfoldable plan.crossing `shouldEqual` ([] :: Array String)
       plan.anySafepoint `shouldEqual` false
       needsFrame plan `shouldEqual` false
-      -- contrast: give the same prim a var operand and its force makes the node a safepoint —
-      -- the operand crosses (2a) and the frame is back.
+      -- contrast: with TWO var operands, the second is hazarded by the first's force —
+      -- position decides under §6.3, not mere presence at a safepoint node.
       let
-        forced = Let "a" (CPrim AddInt [ var "x", int 1 ])
+        forced = Let "a" (CPrim AddInt [ var "x", var "y" ])
           (Ret (CAtom (var "a")))
-        plan' = activationPlan (cfg0 { params = [ "x" ] }) forced
-      Set.toUnfoldable plan'.crossing `shouldEqual` [ "x" ]
+        plan' = activationPlan (cfg0 { params = [ "x", "y" ] }) forced
+      Set.toUnfoldable plan'.crossing `shouldEqual` [ "y" ]
       needsFrame plan' `shouldEqual` true
 
-    it "closure captures cross at construction (2a: read inside the safepoint node)" do
-      -- let g = \p -> p + cap in g — cap is consumed by pv_make_closure; a sibling capture's
-      -- materialisation could precede its read, so 2a roots it.
+    it "closure captures are read before the first allocation and stay direct (2b-1)" do
+      -- let g = \p -> p + cap in g — every capture read fills the arg buffer BEFORE
+      -- pv_new_array/pv_make_closure allocate (§6.3), so cap has no pre-read hazard.
       let
         body = Let "g" (CLam [ "p" ] (Ret (CPrim AddInt [ var "p", var "cap" ])))
           (Ret (CAtom (var "g")))
-      crossingOf (cfg0 { params = [ "cap" ] }) body `shouldEqual` [ "cap" ]
+      -- §6.3: every capture read precedes makeClosure's first allocation — no hazard.
+      crossingOf (cfg0 { params = [ "cap" ] }) body `shouldEqual` []
 
-    it "the closure value crosses a later safepoint; its captures cross at construction (2a)" do
+    it "the closure value crosses a later safepoint; its captures stay direct (2b-1)" do
       -- let g = \p -> cap in let z = h () in g z
       let
         body = Let "g" (CLam [ "p" ] (Ret (CAtom (var "cap"))))
           ( Let "z" (CApp (var "h") [])
               (Ret (CApp (var "g") [ var "z" ]))
           )
-      crossingOf (cfg0 { params = [ "cap" ] }) body `shouldEqual` [ "cap", "g", "z" ]
+      -- g lives across the h-call (liveAfter); cap and z have no hazard and no later use.
+      crossingOf (cfg0 { params = [ "cap" ] }) body `shouldEqual` [ "g" ]
 
     it "a nested lambda body's own crossings do NOT leak into this activation (closure opacity)" do
       -- \p -> let q = f () in let s = h () in q + s — everything crossing is inside the lambda.
@@ -138,14 +146,21 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
         plan = activationPlan { params: [ "c", "m", "n" ], captures: [], selfName: Just "loop" } body
       Set.member envPseudo plan.crossing `shouldEqual` true
 
-    it "%env crosses at EVERY self-call (intra-node: it is read after the argument evaluation)" do
-      -- The use-at-call exemption does not apply to `%env`: the `SSelf` lowering evaluates the
-      -- arguments (potential force safepoints) BEFORE reading the env word, so a direct `%env`
-      -- SSA would be stale there — the slice-2 review's missing-root class.
+    it "%env crosses a self-call only when an argument's materialisation precedes its read (2b-1)" do
+      -- The `SSelf` lowering evaluates the arguments (UNFORCED — only a materialisation can
+      -- safepoint there) BEFORE reading the env word, so `%env` is hazarded exactly when some
+      -- argument materialises (§6.3's SSelf row).
       let
         body = Ret (CApp (var "loop") [ var "m" ])
         plan = activationPlan { params: [ "m" ], captures: [], selfName: Just "loop" } body
-      Set.member envPseudo plan.crossing `shouldEqual` true
+      -- §6.3: a var argument cannot materialise, so the post-argument %env read has no
+      -- pre-read hazard — recovered under 2b-1…
+      Set.member envPseudo plan.crossing `shouldEqual` false
+      -- …but an argument whose materialisation allocates (a string literal) hazards it.
+      let
+        body' = Ret (CApp (var "loop") [ str "s" ])
+        plan' = activationPlan { params: [], captures: [], selfName: Just "loop" } body'
+      Set.member envPseudo plan'.crossing `shouldEqual` true
 
     it "guard clauses are sequential: a binder used only after a failing guard crosses its safepoints" do
       -- case s of b | g () -> 1 | true -> b — `b` is read only in clause 2, but clause 1's
@@ -186,7 +201,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
       -- pins is b's.)
       Set.member "b" plan.crossing `shouldEqual` true
 
-    it "a case-arm binder crosses a safepoint inside its arm; consumed-at-call also crosses (2a)" do
+    it "a case-arm binder crosses a safepoint inside its arm; consumed-at-call stays direct (2b-1)" do
       -- case s of Just b -> let z = h () in b + z — b is live across the h call.
       let
         arm rhs = Ret
@@ -197,13 +212,13 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
           ( Let "z" (CApp (var "h") [])
               (Ret (CPrim AddInt [ var "b", var "z" ]))
           )
-        -- case s of Just b -> f b — b consumed by the call: 2a roots it all the same (the
-        -- call node reads it; the old §1 exemption is the slice-2 gate's missing-root class).
+        -- case s of Just b -> f b — b consumed at the call with no pre-read hazard: direct
+        -- under 2b-1 (the handover leg is the §6.1 contract's).
         consumed = arm (Ret (CApp (var "f") [ var "b" ]))
         planC = activationPlan (cfg0 { params = [ "s" ] }) crossing6
         planN = activationPlan (cfg0 { params = [ "s" ] }) consumed
       Set.member "b" planC.crossing `shouldEqual` true
-      Set.member "b" planN.crossing `shouldEqual` true
+      Set.member "b" planN.crossing `shouldEqual` false
       planC.loweringMayRoot `shouldEqual` true
 
     it "a LetRec group's captures are consumed at construction; later-live names cross it" do
@@ -218,6 +233,61 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
       Set.member "go" plan.crossing `shouldEqual` true
       plan.loweringMayRoot `shouldEqual` true
 
+  describe "the §6.3 preRead table (per-recipe fixture matrix, 2b-1)" do
+    it "generic CApp: an allocating earlier operand hazards a later var; the reverse is direct" do
+      crossingOf (cfg0 { params = [ "x" ] }) (Ret (CApp (var "f") [ str "s", var "x" ])) `shouldEqual` [ "x" ]
+      crossingOf (cfg0 { params = [ "x" ] }) (Ret (CApp (var "f") [ var "x", str "s" ])) `shouldEqual` []
+
+    it "saturated CCtor: the prefix rule in both directions" do
+      crossingOf (cfg0 { params = [ "x" ] }) (Ret (CCtor "C" 2 [ str "s", var "x" ])) `shouldEqual` [ "x" ]
+      crossingOf (cfg0 { params = [ "x" ] }) (Ret (CCtor "C" 2 [ var "x", str "s" ])) `shouldEqual` []
+
+    it "CArray: the prefix rule in both directions" do
+      crossingOf (cfg0 { params = [ "x" ] }) (Ret (CArray [ str "s", var "x" ])) `shouldEqual` [ "x" ]
+      crossingOf (cfg0 { params = [ "x" ] }) (Ret (CArray [ var "x", str "s" ])) `shouldEqual` []
+
+    it "unsaturated CCtor: the builder machinery hazards EVERY supplied operand" do
+      crossingOf (cfg0 { params = [ "x" ] }) (Ret (CCtor "C" 2 [ var "x" ])) `shouldEqual` [ "x" ]
+
+    it "CRecord hazards follow the CANONICAL sorted order, not source order" do
+      let
+        ls = map fst (sortRecordFields [ Tuple "a" unit, Tuple "value" unit ])
+      case ls of
+        [ l1, l2 ] -> do
+          -- var on the sorted-SECOND label: the sorted-first string materialises before it.
+          crossingOf (cfg0 { params = [ "x" ] })
+            (Ret (CRecord [ { prop: l2, val: var "x" }, { prop: l1, val: str "s" } ])) `shouldEqual` [ "x" ]
+          -- var on the sorted-FIRST label: read before the allocating field — direct.
+          crossingOf (cfg0 { params = [ "x" ] })
+            (Ret (CRecord [ { prop: l1, val: var "x" }, { prop: l2, val: str "s" } ])) `shouldEqual` []
+        other -> fail ("sortRecordFields returned an unexpected shape: " <> show other)
+
+    it "multiple CCase scrutinees: a later scrutinee is hazarded by an earlier force" do
+      let
+        plan = activationPlan (cfg0 { params = [ "s1", "s2" ] })
+          ( Ret
+              ( CCase [ var "s1", var "s2" ]
+                  [ { binders: [ BNull, BNull ], result: Uncond (Ret (CAtom (int 1))) } ]
+              )
+          )
+      Set.member "s2" plan.crossing `shouldEqual` true
+      Set.member "s1" plan.crossing `shouldEqual` false
+
+    it "CUpdate: a VARIABLE update value is hazarded (read after a record_set); the base is not" do
+      let
+        plan = activationPlan (cfg0 { params = [ "r", "v" ] })
+          (Ret (CUpdate (var "r") [ { prop: "a", val: var "v" } ]))
+      Set.member "v" plan.crossing `shouldEqual` true
+      Set.member "r" plan.crossing `shouldEqual` false
+
+    it "LetRec captures are read before the group's first allocation and stay direct" do
+      let
+        plan = activationPlan (cfg0 { params = [ "free" ] })
+          ( LetRec [ { var: "go", rhs: Ret (CLam [ "x" ] (Ret (CAtom (var "free")))) } ]
+              (Ret (CAtom (int 1)))
+          )
+      Set.member "free" plan.crossing `shouldEqual` false
+
   describe "activationPlan (frame decision)" do
     it "a leaf body with no roots on either tier elides the frame (the identity class)" do
       -- \x -> x — no safepoint node exists at all, so nothing can cross and no recipe roots:
@@ -228,7 +298,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
       Set.toUnfoldable plan.crossing `shouldEqual` ([] :: Array String)
       needsFrame plan `shouldEqual` false
 
-    it "a lowering-local root forces a frame even with no crossings; CUpdate's base crosses (2a)" do
+    it "a lowering-local root forces a frame even with no crossings; CUpdate stays lowering-tier (2b-1)" do
       -- case 1 of 1 -> 2 — no tracked name is read anywhere, but the dtree recipe declares
       -- may-root: the frame exists for the lowering tier alone.
       let
@@ -239,12 +309,13 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
         casePlan = activationPlan cfg0 caseBody
       Set.toUnfoldable casePlan.crossing `shouldEqual` ([] :: Array String)
       needsFrame casePlan `shouldEqual` true
-      -- CUpdate: the recipe roots its accumulator (lowering tier) AND 2a roots the base record
-      -- operand (it is read by a safepointing node).
+      -- CUpdate: the recipe roots its accumulator (lowering tier); the base is read FIRST
+      -- (§6.3 — no pre-read hazard) and has no later use, so the activation tier is empty
+      -- while the frame stays for the lowering roots.
       let
         body = Ret (CUpdate (var "r") [ { prop: "a", val: int 1 } ])
         plan = activationPlan (cfg0 { params = [ "r" ] }) body
-      Set.toUnfoldable plan.crossing `shouldEqual` [ "r" ]
+      Set.toUnfoldable plan.crossing `shouldEqual` ([] :: Array String)
       needsFrame plan `shouldEqual` true
 
   describe "§4 ABI-profile independence" do
@@ -327,9 +398,10 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
           (Array.reverse (Array.range 1 n))
         body = Let "a0" (CApp (var "g") []) spine
         plan = activationPlan cfg0 body
-      -- a0 is read by a1's forced prim — a safepoint node, so it crosses (2a). The pin here is
-      -- the walk finishing on the default stack, not the crossing content.
-      Set.member "a0" plan.crossing `shouldEqual` true
+      -- a0 is read at its consuming prim's FIRST position (no pre-read hazard, §6.3) and has
+      -- no later use, so it stays direct. The pin here is the walk finishing on the default
+      -- stack, not the crossing content.
+      Set.member "a0" plan.crossing `shouldEqual` false
       plan.anySafepoint `shouldEqual` true
 
     it "walks a 20k-operand array literal and a 5k-arm case on the default stack" do

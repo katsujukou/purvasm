@@ -31,8 +31,9 @@ import Prelude
 
 import Control.Monad.State.Class (gets)
 import Data.String (joinWith)
-import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, emit, fresh, freshLabel)
+import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, emit, armIncomingAt, armIncomingClosing, emitLowBitAnd, emitPhi, fresh, freshLabel, mintLoad)
 import Purvasm.Compiler.Backend.LLVM.Safepoint (RtArg(..), RtOp(..), rtCall)
+import Purvasm.Compiler.Backend.LLVM.Value (Val)
 
 -- | The ctx-header ABI version stamped into each inline object (ADR-0079 §1).
 ctxHeaderVersion :: Int
@@ -151,8 +152,9 @@ headerField off = do
   pure a
 
 -- | Read a root handle's current value: inline loads `roots_base` then the slot, `--debug` calls
--- | `pv_get`.
-abiGet :: String -> Codegen String
+-- | `pv_get`. The handle is raw metadata (a stable index); the LOADED value is a fresh token —
+-- | the reload event of ADR-0105 §6.2's `Rooted` arm.
+abiGet :: String -> Codegen Val
 abiGet handle = gets _.inlineAbi >>= case _ of
   false -> rtCall RtGet [ I64 handle ]
   true -> do
@@ -160,16 +162,14 @@ abiGet handle = gets _.inlineAbi >>= case _ of
     emit ("  " <> base <> " = load ptr, ptr %ctx")
     slot <- fresh
     emit ("  " <> slot <> " = getelementptr i64, ptr " <> base <> ", i64 " <> handle)
-    t <- fresh
-    emit ("  " <> t <> " = load i64, ptr " <> slot)
-    pure t
+    mintLoad slot
 
 -- | Settle a returned value after a call (ADR-0079): if a tail is pending, `pv_settle` reifies it;
 -- | otherwise the value passes through. Inline is a 3-block `schk`/`sslow`/`sdone` with a phi;
 -- | `--debug` is a single `pv_settle`.
-abiSettle :: String -> Codegen String
+abiSettle :: Val -> Codegen Val
 abiSettle r = gets _.inlineAbi >>= case _ of
-  false -> rtCall RtSettle [ I64 r ]
+  false -> rtCall RtSettle [ V r ]
   true -> do
     chk <- freshLabel "schk"
     slow <- freshLabel "sslow"
@@ -185,18 +185,18 @@ abiSettle r = gets _.inlineAbi >>= case _ of
     has <- fresh
     emit ("  " <> has <> " = icmp ne i64 " <> pf <> ", 0")
     emit ("  br i1 " <> has <> ", label %" <> slow <> ", label %" <> done)
-    emit (slow <> ":")
-    rs <- rtCall RtSettle [ I64 r ]
-    emit ("  br label %" <> done)
-    emit (done <> ":")
+    -- each incoming's freeze is fused with the arm boundary it proves (§6.2 round 3): the
+    -- fast arm seals as the slow block opens; the slow arm seals with its closing branch.
+    rIn <- armIncomingAt { from: chk, startNext: slow } r
+    rs <- rtCall RtSettle [ V r ]
+    rsIn <- armIncomingClosing { from: slow, merge: done } rs
     t <- fresh
-    emit ("  " <> t <> " = phi i64 [ " <> r <> ", %" <> chk <> " ], [ " <> rs <> ", %" <> slow <> " ]")
-    pure t
+    emitPhi t [ rIn, rsIn ]
 
 -- | Force a value if it is a by-need cell (ADR-0079): an immediate (low bit set) passes through; only a
 -- | pointer word calls `pv_force_if_byneed`. Always a 3-block `fchk`/`fslow`/`fdone` with a phi (the
 -- | slow path is the only safepoint), regardless of `inlineAbi`.
-forceValue :: String -> Codegen String
+forceValue :: Val -> Codegen Val
 forceValue v = do
   chk <- freshLabel "fchk"
   slow <- freshLabel "fslow"
@@ -204,14 +204,13 @@ forceValue v = do
   emit ("  br label %" <> chk)
   emit (chk <> ":")
   bit <- fresh
-  emit ("  " <> bit <> " = and i64 " <> v <> ", 1")
+  emitLowBitAnd bit v
   imm <- fresh
   emit ("  " <> imm <> " = icmp ne i64 " <> bit <> ", 0")
   emit ("  br i1 " <> imm <> ", label %" <> done <> ", label %" <> slow)
-  emit (slow <> ":")
-  forced <- rtCall RtForceIfByneed [ I64 v ]
-  emit ("  br label %" <> done)
-  emit (done <> ":")
+  -- each incoming's freeze is fused with the arm boundary it proves (§6.2 round 3).
+  vIn <- armIncomingAt { from: chk, startNext: slow } v
+  forced <- rtCall RtForceIfByneed [ V v ]
+  forcedIn <- armIncomingClosing { from: slow, merge: done } forced
   r <- fresh
-  emit ("  " <> r <> " = phi i64 [ " <> v <> ", %" <> chk <> " ], [ " <> forced <> ", %" <> slow <> " ]")
-  pure r
+  emitPhi r [ vIn, forcedIn ]

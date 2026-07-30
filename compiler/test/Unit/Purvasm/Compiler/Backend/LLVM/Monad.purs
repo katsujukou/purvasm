@@ -18,7 +18,8 @@ import Data.Maybe (Maybe(..))
 import Data.String as String
 import Effect.Aff (Aff)
 import Effect.Class (liftEffect)
-import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, Ctx, beginFn, emit, emitDefine, emitModule, emitStringConstant, foldA, forA, forA_, forWithIndexA, fresh, freshFn, freshLabel, makeCx, renderBuffer, renderChunks, renderFnBody, runCodegen, takeFn)
+import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, Ctx, beginFn, bumpEpoch, emit, emitDefine, emitGuestRet, emitModule, emitPhi, emitStringConstant, foldA, forA, forA_, forWithIndexA, fresh, freshFn, freshLabel, makeCx, closeHopArm, mintLoad, renderBuffer, renderChunks, renderFnBody, runCodegen, takeFn)
+import Purvasm.Compiler.Backend.LLVM.Value (vImm)
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
 
@@ -132,6 +133,60 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Monad" do
           emitDefine "define internal i64 @f(ptr %ctx) {\nentry:\n" body
       renderChunks ctx.md
         `shouldEqual` "define internal i64 @f(ptr %ctx) {\nentry:\n  ret i64 %v\n}\n\n"
+
+  describe "the value-token machine (ADR-0105 §6.2, round-2 surface)" do
+    it "a minted value renders through a consumer at its mint epoch" do
+      renderBuffer (snd (run (mintLoad "%slot" >>= emitGuestRet))).fn `shouldEqual`
+        ("  %t1 = load i64, ptr %slot\n" <> "  ret i64 %t1\n")
+
+    it "an immune raw word passes across bumps" do
+      renderBuffer (snd (run (bumpEpoch *> emitGuestRet (vImm "1")))).fn `shouldEqual` "  ret i64 1\n"
+
+    it "a stale token crashes at its consuming renderer (read/use separated by a safepoint)" do
+      expectCrash \_ -> run do
+        v <- mintLoad "%slot"
+        bumpEpoch
+        emitGuestRet v
+
+    it "an alias hands the token back unchanged — staleness survives the alias" do
+      expectCrash \_ -> run do
+        v <- mintLoad "%slot"
+        let aliased = v
+        bumpEpoch
+        emitGuestRet aliased
+
+    it "an incoming freezes fused with its arm's close and survives OTHER arms' bumps" do
+      let
+        body = renderBuffer
+          ( snd $ run do
+              v <- mintLoad "%slot"
+              inc <- closeHopArm { hop: "arm1", merge: "join" } v
+              bumpEpoch
+              void (emitPhi "%r" [ inc ])
+          ).fn
+      body `shouldEqual`
+        ( "  %t1 = load i64, ptr %slot\n"
+            <> "  br label %arm1\n"
+            <> "arm1:\n"
+            <> "  br label %join\n"
+            <> "  %r = phi i64 [ %t1, %arm1 ]\n"
+        )
+
+    it "closing an arm AFTER a same-arm bump crashes (the fused freeze IS the verification)" do
+      expectCrash \_ -> run do
+        v <- mintLoad "%slot"
+        bumpEpoch
+        closeHopArm { hop: "arm1", merge: "join" } v
+
+    it "an SSA register cannot be laundered as an epoch-immune raw word" do
+      expectCrash \_ -> vImm "%t9"
+
+    it "whitespace cannot smuggle an SSA register past the immediate grammar (round 3)" do
+      expectCrash \_ -> vImm " %t9"
+      expectCrash \_ -> vImm "\t%t9"
+      expectCrash \_ -> vImm "1 %t9"
+      expectCrash \_ -> vImm ""
+      expectCrash \_ -> vImm "-"
 
   describe "the raw-call guards (ADR-0105 §1 negative tests)" do
     it "emit rejects a raw call line" do

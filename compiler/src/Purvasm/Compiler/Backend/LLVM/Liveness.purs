@@ -14,16 +14,14 @@
 -- | (`Backend.LLVM.Safepoint`) — the SAME rows the emitter renders calls from — so the analysis
 -- | cannot silently drift from what a recipe actually emits.
 -- |
--- | The crossing criterion (slice 2a): at each safepoint node the backward pass unions the names
--- | live *after* the whole node AND the names the node itself reads. The §1 use-at-call
--- | exemption (operand-only consumption ≠ crossing) is deliberately NOT applied: an operand is
--- | read at its own position inside the node's lowering sequence, so a direct (unrooted) SSA
--- | value is stale whenever ANY safepoint sits between its definition and that read — including
--- | the node's own internal ones (a sibling operand's boxed-literal allocation, a sibling's
--- | force slow path, the recipe's pre-read machinery). Only a per-recipe read-order model could
--- | discharge those cases soundly; that refinement is slice 2b's, behind the emission seam. A
--- | name therefore stays direct only when its ENTIRE live range touches no safepoint node at
--- | all — which still elides the pure-leaf choreography (the `CAtom` identity class).
+-- | The crossing criterion (slice 2b-1, ADR-0105 §6.3):
+-- | `crossingContribution(N) = liveAfter(N) ∪ preReadHazardOperands(N)` — at each safepoint
+-- | node the backward pass unions the names live *after* the whole node (unchanged from 2a)
+-- | with the names of operands whose READ has a safepoint BEFORE it inside the node's own
+-- | lowering sequence (the per-recipe forward prefix scan, `preReadHazards`). An operand read
+-- | with no earlier intra-node safepoint hands over safely — the §6.1 runtime handover
+-- | contract covers it from the call boundary onward — and the §6.2 token net verifies every
+-- | one of these claims against the real emission at consumption time.
 -- |
 -- | Closures are opaque (§2): a `CLam`/`LetRec` body is walked only for its free variables (the
 -- | captures, consumed at construction) — its own crossings belong to the lifted function's
@@ -302,11 +300,11 @@ stepBackward cfg after = case _ of
         binders
     in
       -- buildGrec allocates the shared env + cells: a safepoint sequence with `kAfter` live
-      -- across it, and a may-root recipe (placeholder/env roots). The captures themselves
-      -- cross too — the recipe reads them interleaved with its allocations, so a direct
-      -- SSA operand would be stale (intra-node, like `CUpdate`'s values).
+      -- across it, and a may-root recipe (placeholder/env roots). §6.3: the outside-capture
+      -- reads ALL precede the first allocation (`readVar` loop → arg buffer → env array), so
+      -- the captures are not pre-read-hazarded.
       { live: kAfter <> captures
-      , crossing: after.crossing <> kAfter <> captures
+      , crossing: after.crossing <> kAfter
       , mayRoot: true
       , anySafepoint: true
       }
@@ -323,10 +321,59 @@ atomUses cfg = case _ of
 usesOf :: ActivationConfig -> Array Atom -> Set String
 usesOf cfg = Array.foldl (\acc a -> acc <> atomUses cfg a) Set.empty
 
+-- | The §6.3 FORWARD prefix scan (2b-1): the names of operands whose READ has a safepoint
+-- | BEFORE it inside the node — an operand is hazarded iff some EARLIER operand's
+-- | materialisation (or force, under the forced mode) can safepoint. The sibling of
+-- | `operandsMayRoot`'s suffix scan; rests on the §6.1 handover contract for the
+-- | read-to-boundary leg.
+prefixHazards :: ActivationConfig -> Boolean -> Array Atom -> Set String
+prefixHazards cfg force atoms =
+  (Array.foldl step { sp: false, out: Set.empty } atoms).out
+  where
+  canSp = if force then forcedAtomCanSafepoint else atomCanSafepoint
+
+  step st a =
+    { sp: st.sp || canSp a
+    , out: if st.sp then st.out <> atomUses cfg a else st.out
+    }
+
+-- | Per-recipe pre-read hazard declarations (§6.3, the pinned table) for the non-branching
+-- | nodes: which operand names join `crossing` at this safepoint node under 2b-1's
+-- | `crossingContribution(N) = liveAfter(N) ∪ preReadHazardOperands(N)`.
+preReadHazards :: ActivationConfig -> CExpr -> Set String
+preReadHazards cfg = case _ of
+  CAtom _ -> Set.empty
+  -- reads run L→R over (f : args); the self-call's `%env` word is read AFTER the args, so it
+  -- is hazarded by any argument materialisation (the SSelf row).
+  CApp f args ->
+    prefixHazards cfg false (Array.cons f args)
+      <> case f of
+        AtomVar x
+          | cfg.selfName == Just x, Array.any atomCanSafepoint args -> Set.singleton envPseudo
+        _ -> Set.empty
+  CPerform t -> preReadHazards cfg (CApp t [ AtomLit (LInt 0) ])
+  CPrim _ args -> prefixHazards cfg true args
+  CCtor _ arity args
+    -- the unsaturated builder closure is BUILT before the supplied args are read.
+    | Array.length args < arity && not (Array.null args) -> usesOf cfg args
+    | otherwise -> prefixHazards cfg false args
+  CArray elems -> prefixHazards cfg false elems
+  -- the emitter reads fields in SORTED order (ADR-0069 §1) — the same canonical-order pin as
+  -- `cexprMayRootLocally`.
+  CRecord fields -> prefixHazards cfg false (map snd (sortRecordFields (map (\f -> Tuple f.prop f.val) fields)))
+  -- single operand read FIRST: the acc-class elision returns (§6.3).
+  CAccessor _ _ -> Set.empty
+  -- base read first (no hazard); every update value is read after a `record_set` — and the
+  -- first-value refinement is DELIBERATELY not taken (§6.3 table note).
+  CUpdate _ ups -> usesOf cfg (map _.val ups)
+  CLam _ _ -> Set.empty
+  CIf _ _ _ -> Set.empty
+  CCase _ _ -> Set.empty
+
 -- | One computation under continuation-live set `k`. At every node that can safepoint, the
--- | names live AFTER the node AND the node's own operand names join the crossing set (the §1
--- | 2a crossing rule — an operand is read inside the node's own lowering sequence, so it is
--- | exposed to the node's internal safepoints).
+-- | crossing set gains `liveAfter(N) ∪ preReadHazardOperands(N)` (§6.3): the names live
+-- | AFTER the node, plus only those operand names whose READ has an earlier safepoint inside
+-- | the node's own lowering sequence (`preReadHazards`' per-recipe forward prefix).
 goC :: ActivationConfig -> CExpr -> Set String -> Res
 goC cfg c k = case c of
   CIf a t e ->
@@ -338,9 +385,10 @@ goC cfg c k = case c of
     in
       { live: atomUses cfg a <> branchLive
       -- the condition force precedes both branches: everything live at a branch entry is live
-      -- across it, and (2a) the condition's own names count as read at a safepoint node.
+      -- across it. The condition's OWN read precedes its force (§6.3: single operand, no
+      -- pre-read hazard), so 2b-1 drops it from the crossing term.
       , crossing: rt.crossing <> re.crossing
-          <> (if condSp then branchLive <> atomUses cfg a else Set.empty)
+          <> (if condSp then branchLive else Set.empty)
       , mayRoot: rt.mayRoot || re.mayRoot
       , anySafepoint: condSp || rt.anySafepoint || re.anySafepoint
       }
@@ -349,11 +397,12 @@ goC cfg c k = case c of
       rAlts = Array.foldl (\acc alt -> mergeRes acc (goAlt cfg alt k)) emptyRes alts
     in
       -- scrutinee forces + the dtree's own machinery precede/interleave the arm bodies:
-      -- conservative — everything live at any arm entry crosses, and the scrutinees
-      -- themselves cross (the dtree's hoisted-literal allocations may precede their
-      -- loads; the whole construct is the §3 conservative-fallback tier).
+      -- everything live at any arm entry crosses (the §3 conservative-fallback tier stands),
+      -- but the scrutinees' OWN reads follow the §6.3 prefix rule — scrutinee i is hazarded
+      -- only by an earlier scrutinee's force (each is read before it is forced and rooted;
+      -- the hoisted boxed literals allocate AFTER all scrutinee reads).
       { live: usesOf cfg scruts <> rAlts.live
-      , crossing: rAlts.crossing <> rAlts.live <> usesOf cfg scruts
+      , crossing: rAlts.crossing <> rAlts.live <> prefixHazards cfg true scruts
       , mayRoot: true
       , anySafepoint: true
       }
@@ -363,10 +412,11 @@ goC cfg c k = case c of
       -- `pv_make_closure`); its crossings belong to the lifted function's own plan.
       captures = Set.difference (goExpr cfg body Set.empty).live (Set.fromFoldable ps)
     in
-      -- closure construction is a safepoint node reading its captures (2a): a direct capture
-      -- read after a sibling capture's boxed-literal materialisation would be stale.
+      -- §6.3: ALL capture reads precede `makeClosure`'s first allocation (the read loop fills
+      -- the arg buffer before `pv_new_array`), so no capture is pre-read-hazarded — the
+      -- biggest recovered class, resting on the §6.1 buffer-handover contract.
       { live: k <> captures
-      , crossing: k <> captures
+      , crossing: k
       , mayRoot: cexprMayRootLocally c
       , anySafepoint: true
       }
@@ -374,13 +424,12 @@ goC cfg c k = case c of
     let
       sp = cexprCanSafepoint c
     in
-      -- 2a: a safepoint node's own operand names cross (see the module preamble). This
-      -- subsumes the intra-node special cases (`SSelf`'s post-argument `%env` read via
-      -- `atomUses`' self pseudo, `CUpdate`'s post-`record_set` value reads) and every
-      -- sibling-operand ordering hazard, at the price of rooting operands whose read
-      -- provably precedes the node's first internal safepoint — slice 2b's refinement.
+      -- 2b-1 (§6.3): crossingContribution(N) = liveAfter(N) ∪ preReadHazardOperands(N) —
+      -- the liveAfter term is 2a's unchanged; the operand term is refined from ALL operand
+      -- names to those whose read has a safepoint BEFORE it inside the node (the per-recipe
+      -- forward prefix), resting on the §6.1 handover contract for the handed-over leg.
       { live: k <> cexprUses cfg c
-      , crossing: if sp then k <> cexprUses cfg c else Set.empty
+      , crossing: if sp then k <> preReadHazards cfg c else Set.empty
       , mayRoot: cexprMayRootLocally c
       , anySafepoint: sp
       }

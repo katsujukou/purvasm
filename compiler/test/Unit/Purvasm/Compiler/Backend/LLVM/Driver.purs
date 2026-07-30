@@ -310,21 +310,19 @@ recipeConsistencySpec = describe "ADR-0105 recipe consistency (may-root vs emitt
     -- ADR-0105 slice 2a (plan-driven expectations): `ident` has no safepoint node at all, so
     -- its frame is elided outright — the identity-class choreography win 2a keeps.
     rootBlocks "pv_g_TestRoots_2eident$d" `shouldEqual` 0
-    -- `acc`'s param is read by the accessor's force — a safepoint node, so 2a roots it at the
-    -- prologue (the use-at-call exemption that elided this root was the slice-2 gate's
-    -- missing-root class); `CAccessor` still declares no lowering-local roots, so the single
-    -- block is exactly the prologue's.
-    rootBlocks "pv_g_TestRoots_2eacc$d" `shouldEqual` 1
-    -- CUpdate (declared may-root), EXACT: the 2a prologue root of the base-record param (1) +
-    -- the forced base rooted as the fold seed (1) + the accumulator re-rooted after the single
-    -- `record_set` (1). A recipe losing its accumulator rooting — which `>= 1` could not see
-    -- past the prologue root — drops this to 2 and fails.
-    rootBlocks "pv_g_TestRoots_2eupd$d" `shouldEqual` 3
-    -- CRecord in the emitter's sorted order: the param crosses (2a: read by an allocating
-    -- node) — one prologue block — and its reloaded operand precedes the allocating string,
-    -- so evalAtoms roots the temporary too (lowering tier; the canonical-order declaration
-    -- must agree: see Test…LLVM.Liveness's ordering counterexample over the same labels).
-    rootBlocks "pv_g_TestRoots_2erec$d" `shouldEqual` 2
+    -- `acc`'s param is read BEFORE its force (§6.3: single operand, no pre-read hazard) and
+    -- has no later use — the acc-class elision 2b-1 recovers: no roots at all.
+    rootBlocks "pv_g_TestRoots_2eacc$d" `shouldEqual` 0
+    -- CUpdate (declared may-root), EXACT: the base is direct under §6.3 (read first, no later
+    -- use) so no prologue root remains — the forced base rooted as the fold seed (1) + the
+    -- accumulator re-rooted after the single `record_set` (1). A recipe losing its
+    -- accumulator rooting drops this to 1 and fails.
+    rootBlocks "pv_g_TestRoots_2eupd$d" `shouldEqual` 2
+    -- CRecord in the emitter's sorted order: the param is read at sorted position 0 (no
+    -- pre-read hazard, §6.3) so its prologue root is gone; its raw operand precedes the
+    -- allocating string, so evalAtoms still roots the TEMPORARY (lowering tier; the
+    -- canonical-order declaration must agree — Test…LLVM.Liveness pins the ordering).
+    rootBlocks "pv_g_TestRoots_2erec$d" `shouldEqual` 1
     -- the two-tier frame decision, discriminated directly: `lowfr`'s crossing set is EMPTY
     -- (nothing reads the param), so the prologue roots nothing — the single root block is the
     -- lowering tier's (first string rooted across the second's allocation), and the frame it

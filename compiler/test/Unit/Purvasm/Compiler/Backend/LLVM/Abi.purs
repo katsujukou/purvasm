@@ -14,6 +14,7 @@ import Data.String (Pattern(..), split)
 import Data.Tuple (snd)
 import Purvasm.Compiler.Backend.LLVM.Abi (abiGet, abiSettle, abiStamp, declarations, forceValue)
 import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, makeCx, renderBuffer, runCodegen)
+import Purvasm.Compiler.Backend.LLVM.Value (unsafeTestVal)
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
 
@@ -48,7 +49,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Abi" do
 
   describe "abiSettle" do
     it "emits the 3-block pending-tail settle with the r/pv_settle phi" do
-      emitted (abiSettle "%r") `shouldEqual`
+      emitted (abiSettle (unsafeTestVal "%r")) `shouldEqual`
         ( "  br label %schk1\n"
             <> "schk1:\n"
             <> "  %t2 = getelementptr i8, ptr %ctx, i64 24\n"
@@ -64,7 +65,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Abi" do
 
   describe "forceValue" do
     it "emits the 3-block immediate-fast-path force with the v/forced phi" do
-      emitted (forceValue "%v") `shouldEqual`
+      emitted (forceValue (unsafeTestVal "%v")) `shouldEqual`
         ( "  br label %fchk1\n"
             <> "fchk1:\n"
             <> "  %t1 = and i64 %v, 1\n"

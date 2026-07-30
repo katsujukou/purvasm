@@ -31,6 +31,24 @@ module Purvasm.Compiler.Backend.LLVM.Monad
   , renderFnBody
   , emitStringConstant
   , containsCallText
+  , currentEpoch
+  , bumpEpoch
+  , unsafeUseVal
+  , unsafeMintFresh
+  , mintParam
+  , mintEnvWord
+  , mintCloWord
+  , mintLoad
+  , emitGuestStore
+  , emitGuestRet
+  , emitPayloadAshr
+  , emitLowBitAnd
+  , emitGuestSwitch
+  , PhiIncoming
+  , closeHopArm
+  , armIncomingAt
+  , armIncomingClosing
+  , emitPhi
   , beginFn
   , takeFn
   , renderBuffer
@@ -58,6 +76,7 @@ import Data.String (joinWith)
 import Data.String as String
 import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.Compiler.Backend.LLVM.Mangle (escapeStringBytes)
+import Purvasm.Compiler.Backend.LLVM.Value (Val, mintAt, verifyAt)
 import Data.Tuple (Tuple(..))
 import Purvasm.Compiler.Backend.LLVM.Types (FnInfo, Lifted, SelfCtx)
 
@@ -86,6 +105,7 @@ type Ctx =
   , selfCtx :: Maybe SelfCtx -- ^ the binding whose lambda is being emitted
   , inDirect :: Boolean -- ^ emitting a `tailcc` direct entry (`%env` exists, `musttail` legal)
   , inlineAbi :: Boolean -- ^ release inline ABI fast paths (ADR-0079); `false` under `--debug`
+  , spEpoch :: Int -- ^ ADR-0105 §6.2: the safepoint epoch — an emission-order monotone bumped ONLY by `sp = true` seam/guest emissions (verify-then-bump); value tokens are verified against it at consumption
   , rootAll :: Boolean -- ^ ADR-0105: `true` = root-on-create fallback (init bodies, `LClosure` wrappers); `false` = the activation plan drives rooting
   , crossing :: Set String -- ^ ADR-0105: the activation plan's crossing set (consulted only when `rootAll = false`)
   }
@@ -127,6 +147,7 @@ makeCx opts =
   , selfCtx: Nothing
   , inDirect: false
   , inlineAbi: opts.inlineAbi
+  , spEpoch: 0
   , rootAll: true
   , crossing: Set.empty
   }
@@ -239,7 +260,7 @@ emitStringConstant s =
 -- | `emitFunction` overrides it when an activation plan exists. (Frame state is NOT here: the
 -- | open frame is the lexical `Root.FrameToken` the emitters thread.)
 beginFn :: Codegen Unit
-beginFn = modify_ \c -> c { ssa = 0, fn = Nil, rootAll = true, crossing = Set.empty }
+beginFn = modify_ \c -> c { ssa = 0, fn = Nil, spEpoch = 0, rootAll = true, crossing = Set.empty }
 
 -- | A rendered function body whose every line went through the guarded emitters — the
 -- | constructor is private, so call-carrying body text can only re-enter the module buffer via
@@ -255,6 +276,157 @@ renderFnBody (FnBody s) = s
 -- | `beginFn` resets `ssa` at the next function.
 takeFn :: Codegen FnBody
 takeFn = state \c -> Tuple (FnBody (renderBuffer c.fn)) c { fn = Nil }
+
+-- | The current safepoint epoch (ADR-0105 §6.2) — for the phi-arm snapshots the branching
+-- | emitters record (each phi incoming is verified against the epoch at its source block's
+-- | END, not the merge point's: the emission-order monotone over-approximates across
+-- | mutually exclusive arms, and the snapshot is the path-sensitive join §6.4 pins).
+currentEpoch :: Codegen Int
+currentEpoch = state \c -> Tuple c.spEpoch c
+
+-- | Bump the safepoint epoch — called ONLY by the classified seam's `sp = true` renderers and
+-- | the guest-call emitters, exactly once per emission, AFTER the emission's operands verified
+-- | (verify-then-bump); `tools/seam-audit.sh` pins the call sites. Overflow is fail-closed
+-- | (unreachable per function — `beginFn` resets — but an epoch that wrapped would let stale
+-- | tokens verify).
+bumpEpoch :: Codegen Unit
+bumpEpoch = modify_ \c ->
+  if c.spEpoch >= 2147483646 then
+    unsafeCrashWith "Backend.LLVM.Monad.bumpEpoch: safepoint epoch overflow (fail-closed, ADR-0105 §6.4)"
+  else c { spEpoch = c.spEpoch + 1 }
+
+-- | Verify a value token against the CURRENT epoch and yield its operand text — PRIVATE
+-- | (2b-0 round 2): a public verify-to-`String` re-opens the read→use gap it exists to close
+-- | (hold the string across a bump, then interpolate). The exported surface is the fused
+-- | verify+emit renderers below, plus the audit-caged [`unsafeUseVal`] bridge for the seam's
+-- | own arg rendering.
+useVal :: Val -> Codegen String
+useVal v = state \c -> Tuple (verifyAt c.spEpoch v) c
+
+-- | Mint a token at the current epoch — PRIVATE; the exported mints are the shaped wrappers
+-- | ([`mintParam`]/[`mintEnvWord`]/[`mintCloWord`]/[`mintLoad`]) and the audit-caged
+-- | [`unsafeMintFresh`] (a free-form re-stamp is the laundering primitive).
+mintFresh :: String -> Codegen Val
+mintFresh ssa = state \c -> Tuple (mintAt c.spEpoch ssa) c
+
+-- | The seam's arg-rendering bridge (ADR-0105 §6.2): verify-to-text, `unsafe`-prefixed because
+-- | the yielded `String` must be interpolated into the SAME emission with no intervening bump —
+-- | `tools/seam-audit.sh` cages it to `Safepoint`/`Prim` (whose sequences cannot bump before
+-- | the interpolation).
+unsafeUseVal :: Val -> Codegen String
+unsafeUseVal = useVal
+
+-- | The seam's result-mint bridge (post-bump call results, inline-prim results) — audit-caged
+-- | to `Safepoint`/`Prim`; anywhere else a free-form mint could re-stamp a stale SSA.
+unsafeMintFresh :: String -> Codegen Val
+unsafeMintFresh = mintFresh
+
+-- | A function-entry parameter's token (`%pN`, minted at the prologue epoch).
+mintParam :: Int -> Codegen Val
+mintParam i = mintFresh ("%p" <> show i)
+
+-- | The `%env` word's token (a function-entry value; capture reads and self-calls inherit it).
+mintEnvWord :: Codegen Val
+mintEnvWord = mintFresh "%env"
+
+-- | The `%clo` word's token (the generic wrapper's closure parameter).
+mintCloWord :: Codegen Val
+mintCloWord = mintFresh "%clo"
+
+-- | Emit `load i64` from a pointer and mint the loaded value's token — the reload shape
+-- | (`abiGet`'s inline tail, the generic wrapper's argument loads).
+mintLoad :: String -> Codegen Val
+mintLoad ptr = do
+  t <- fresh
+  emit ("  " <> t <> " = load i64, ptr " <> ptr)
+  mintFresh t
+
+-- | Fused verify+emit renderers (ADR-0105 §6.2 round 2): each takes the guest operand as a
+-- | token and emits its consuming instruction in one step — there is no window in which a
+-- | verified-but-bare `String` can be held across a bump.
+emitGuestStore :: Val -> String -> Codegen Unit
+emitGuestStore v ptr = do
+  vS <- useVal v
+  emit ("  store i64 " <> vS <> ", ptr " <> ptr)
+
+emitGuestRet :: Val -> Codegen Unit
+emitGuestRet v = do
+  vS <- useVal v
+  emit ("  ret i64 " <> vS)
+
+-- | `dest = ashr i64 <v>, 1` — the tagged-word payload read.
+emitPayloadAshr :: String -> Val -> Codegen Unit
+emitPayloadAshr dest v = do
+  vS <- useVal v
+  emit ("  " <> dest <> " = ashr i64 " <> vS <> ", 1")
+
+-- | `dest = and i64 <v>, 1` — the immediate-bit read (force fast path, ctor dispatch).
+emitLowBitAnd :: String -> Val -> Codegen Unit
+emitLowBitAnd dest v = do
+  vS <- useVal v
+  emit ("  " <> dest <> " = and i64 " <> vS <> ", 1")
+
+-- | `switch i64 <v>, label %<default> [ <cases> ]` over a guest scrutinee.
+emitGuestSwitch :: Val -> String -> String -> Codegen Unit
+emitGuestSwitch v defaultLbl cases = do
+  vS <- useVal v
+  emit ("  switch i64 " <> vS <> ", label %" <> defaultLbl <> " [ " <> cases <> " ]")
+
+-- | A verified phi incoming (ADR-0105 §6.2 round 2): minted AT ITS ARM'S END — `phiArm` runs
+-- | the verification at call time, so the constructor-private carrier can only hold a value
+-- | that was fresh when its source block closed (only a `br` separates that from the merge).
+-- | `useValAt`-style caller-chosen epochs no longer exist on the public surface.
+newtype PhiIncoming = PhiIncoming { ssa :: String, block :: String }
+
+-- | Verify `v` and freeze it as an incoming from `block` — PRIVATE (round 3): a public
+-- | freeze does not guarantee the arm actually ENDS at the freeze, so the exported forms fuse
+-- | the freeze with the arm's close ([`closeHopArm`]) or with the next arm's start
+-- | ([`armIncomingAt`]/[`armIncomingClosing`]) — nothing of the same arm can be emitted
+-- | after its incoming is frozen.
+phiArm :: String -> Val -> Codegen PhiIncoming
+phiArm block v = do
+  vS <- useVal v
+  pure (PhiIncoming { ssa: vS, block })
+
+-- | Close a value-producing arm through a fresh single-predecessor hop block (the CIf/CCase
+-- | idiom): verify+freeze the arm's value, then emit `br %hop`, `hop:`, `br %merge` in one
+-- | step — the arm is OVER the moment its incoming exists.
+closeHopArm :: { hop :: String, merge :: String } -> Val -> Codegen PhiIncoming
+closeHopArm b v = do
+  inc <- phiArm b.hop v
+  emit ("  br label %" <> b.hop)
+  emit (b.hop <> ":")
+  emit ("  br label %" <> b.merge)
+  pure inc
+
+-- | Freeze an arm's incoming fused with STARTING the next arm's block (the Abi helpers' fast
+-- | arm, whose own terminator — the conditional branch — is already emitted): nothing of the
+-- | sealed arm can follow, because the next label opens immediately.
+armIncomingAt :: { from :: String, startNext :: String } -> Val -> Codegen PhiIncoming
+armIncomingAt b v = do
+  inc <- phiArm b.from v
+  emit (b.startNext <> ":")
+  pure inc
+
+-- | Freeze the LAST arm's incoming fused with its closing branch and the merge label — the
+-- | phi must be the merge block's first instruction, so an interloping emission between this
+-- | and [`emitPhi`] is invalid LLVM by construction (clang rejects it deterministically).
+armIncomingClosing :: { from :: String, merge :: String } -> Val -> Codegen PhiIncoming
+armIncomingClosing b v = do
+  inc <- phiArm b.from v
+  emit ("  br label %" <> b.merge)
+  emit (b.merge <> ":")
+  pure inc
+
+-- | Render `dest = phi i64 [ ssa, %block ], …` from verified incomings and mint the merged
+-- | value's token at the merge epoch (sound: each incoming was fresh at its arm's end).
+emitPhi :: String -> Array PhiIncoming -> Codegen Val
+emitPhi dest incomings = do
+  let
+    entries = joinWith ", "
+      (map (\(PhiIncoming i) -> "[ " <> i.ssa <> ", %" <> i.block <> " ]") (Array.fromFoldable incomings))
+  emit ("  " <> dest <> " = phi i64 " <> entries)
+  mintFresh dest
 
 -- | Stack-safe per-element sequencing for **data-sized** spines (2026-07-16 stack-safety bugfix):
 -- | a sequenced `State` step is a live host frame on the JS backend even inside a right-nested

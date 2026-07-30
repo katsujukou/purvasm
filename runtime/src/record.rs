@@ -439,4 +439,53 @@ mod tests {
         let n = h.new_number(1.0);
         let _ = h.record_get(n.as_word(), 10);
     }
+
+    /// ADR-0105 §6.1 handover inventory (provider-side evidence): `record_set`/`record_delete`/
+    /// `record_union` are the self-root+reload policy — each allocates internally, and under
+    /// forced-GC stress every allocation collects, so a raw operand held across the alloc would
+    /// read back garbage. Heap contents are asserted through the results.
+    #[test]
+    fn handover_record_ops_self_root_across_stress() {
+        use crate::heap::HeapPtr;
+        let mut h = Heap::new(16384);
+        h.enable_gc_stress_for_test();
+        let s = h.new_str(b"kept").as_word();
+        let sr = h.root(s);
+        let v = h.get(sr);
+        let r = h.new_record(&[10, 20], &[v, Value::int(2)]).as_word();
+        let rr = h.root(r);
+        let rv = h.get(rr);
+        let sv = h.get(sr);
+        let r2 = h.record_set(rv, 20, sv);
+        assert_eq!(
+            h.str_read(unsafe { HeapPtr::from_word(h.record_get(r2, 10)) }),
+            "kept"
+        );
+        assert_eq!(
+            h.str_read(unsafe { HeapPtr::from_word(h.record_get(r2, 20)) }),
+            "kept"
+        );
+        let r2r = h.root(r2);
+        let r2v = h.get(r2r);
+        let r3 = h.record_delete(r2v, 10);
+        assert_eq!(
+            h.str_read(unsafe { HeapPtr::from_word(h.record_get(r3, 20)) }),
+            "kept"
+        );
+        let r3r = h.root(r3);
+        let sv2 = h.get(sr);
+        let solo = h.new_record(&[30], &[sv2]).as_word();
+        let sor = h.root(solo);
+        let r3v = h.get(r3r);
+        let sov = h.get(sor);
+        let u = h.record_union(r3v, sov);
+        assert_eq!(
+            h.str_read(unsafe { HeapPtr::from_word(h.record_get(u, 20)) }),
+            "kept"
+        );
+        assert_eq!(
+            h.str_read(unsafe { HeapPtr::from_word(h.record_get(u, 30)) }),
+            "kept"
+        );
+    }
 }

@@ -654,4 +654,56 @@ mod tests {
         // does not (its callee is `Kind::ByNeed`, not `Closure`), so the total is 1, not 2.
         assert_eq!(s.entry_exact_fast_hits, 1);
     }
+
+    /// ADR-0105 §6.1 handover inventory (provider-side evidence): the over-apply path is
+    /// `apply`'s composite policy at work — `call_args` hand over allocation-free, and the
+    /// over-apply LEFTOVERS are rooted across the first call's guest allocations. Under stress
+    /// the callee's env/closure allocations each collect, and the heap-pointer leftover must
+    /// arrive intact at the second application.
+    #[test]
+    fn handover_over_apply_leftovers_root_across_stress() {
+        fn ident_body(_h: &mut Heap, _c: Value, args: &[Value]) -> Value {
+            args[0]
+        }
+        fn make_ident(h: &mut Heap, _c: Value, args: &[Value]) -> Value {
+            // captures arg0 (allocates an env + a closure) — the leftover must survive these.
+            let env = h.new_array(&[args[0]]);
+            h.new_closure(ident_body, 1, env.as_word()).as_word()
+        }
+        let mut h = Heap::new(8192);
+        h.enable_gc_stress_for_test();
+        let f = h.new_closure(make_ident, 1, Value::unit()).as_word();
+        let fr = h.root(f);
+        let x = h.new_str(b"first").as_word();
+        let xr = h.root(x);
+        let y = h.new_str(b"leftover").as_word();
+        let yr = h.root(y);
+        let fv = h.get(fr);
+        let xv = h.get(xr);
+        let yv = h.get(yr);
+        let r = h.apply(fv, &[xv, yv]);
+        assert_eq!(h.str_read(unsafe { HeapPtr::from_word(r) }), "leftover");
+    }
+
+    /// §6.1 per-row evidence: under-apply delegates to the self-rooting `new_pap` — the
+    /// heap-pointer captured argument survives the `Pap` allocation under stress, and
+    /// saturating later must deliver it intact (the composite policy's under-apply arm).
+    #[test]
+    fn handover_under_apply_pap_captures_root_across_stress() {
+        fn first2(_h: &mut Heap, _c: Value, args: &[Value]) -> Value {
+            args[0]
+        }
+        let mut h = Heap::new(8192);
+        h.enable_gc_stress_for_test();
+        let f = h.new_closure(first2, 2, Value::unit()).as_word();
+        let fr = h.root(f);
+        let x = h.new_str(b"captured").as_word();
+        let xr = h.root(x);
+        let (fv, xv) = (h.get(fr), h.get(xr));
+        let pap = h.apply(fv, &[xv]); // under-apply: new_pap roots `x` across its alloc
+        let pr = h.root(pap);
+        let pv = h.get(pr);
+        let r = h.apply(pv, &[Value::int(0)]);
+        assert_eq!(h.str_read(unsafe { HeapPtr::from_word(r) }), "captured");
+    }
 }

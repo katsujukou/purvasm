@@ -57,12 +57,13 @@ import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.Compiler.Backend.LLVM.Abi (abiGet, abiSettle, forceValue)
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (fvExpr)
 import Purvasm.Compiler.Backend.LLVM.Mangle (ctorTag, imm, immBool, immInt, immUnit, labelId, mangle, mangleForeign, sortRecordFields)
-import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, beginFn, emit, emitDefine, emitStringConstant, foldA, forA, forA_, fresh, freshFn, freshLabel, takeFn)
+import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, PhiIncoming, beginFn, emit, emitDefine, emitGuestRet, emitGuestStore, emitGuestSwitch, emitPayloadAshr, emitPhi, emitLowBitAnd, closeHopArm, emitStringConstant, foldA, forA, forA_, fresh, freshFn, freshLabel, mintCloWord, mintEnvWord, mintLoad, mintParam, takeFn)
 import Purvasm.Compiler.Backend.LLVM.Prim (inlinePrim)
 import Purvasm.Compiler.Backend.LLVM.Liveness (activationPlan, envPseudo, needsFrame)
 import Purvasm.Compiler.Backend.LLVM.Root (FrameToken, musttailWith, openFrame, retWith, rootLocal, tailcallWith)
 import Purvasm.Compiler.Backend.LLVM.Safepoint (RtArg(..), RtOp(..), guestDirect, rtCall, rtCallVoid, rtCallWith)
-import Purvasm.Compiler.Backend.LLVM.Types (Env, EnvSrc(..), FnInfo, Lifted(..), LiftedBody(..), bindDirectFnVar, bindDirectVar, bindFnVar, bindVar, lookupEnv)
+import Purvasm.Compiler.Backend.LLVM.Types (BindingV(..), Env, EnvSrc(..), FnInfo, Lifted(..), LiftedBody(..), bindDirectFnVar, bindDirectVar, bindFnVar, bindVar, lookupEnv)
+import Purvasm.Compiler.Backend.LLVM.Value (Val, vImm)
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..))
@@ -78,7 +79,7 @@ import Purvasm.Number (floatBitsHi, floatBitsLo)
 -- | frame (`needsFrame = false`) holds `Nothing` and structurally cannot mint a token — reaching
 -- | a rooting recipe then is a plan/lowering inconsistency (an under-declared may-root recipe),
 -- | not a recoverable state.
-root :: Maybe FrameToken -> String -> Codegen String
+root :: Maybe FrameToken -> Val -> Codegen String
 root = case _ of
   Just tok -> rootLocal tok
   Nothing -> \_ -> unsafeCrashWith
@@ -129,13 +130,13 @@ compareBoxed a b = case a, b of
 sortUniqBoxed :: Array Literal -> Array Literal
 sortUniqBoxed = Array.nubByEq (\a b -> compareBoxed a b == EQ) <<< Array.sortBy compareBoxed
 
--- | An atom to its i64 operand. `AtomVar` reloads through its root handle (or a global's `$root`);
--- | `Int`/`Bool` literals are immediates (no emission).
-atom :: Env -> Atom -> Codegen String
+-- | An atom to its i64 operand token. `AtomVar` reloads through its root handle (or a global's
+-- | `$root`); `Int`/`Bool` literals are epoch-immune immediates (no emission).
+atom :: Env -> Atom -> Codegen Val
 atom env = case _ of
   AtomVar x -> readVar env x
-  AtomLit (LInt n) -> pure (immInt n)
-  AtomLit (LBool b) -> pure (immBool b)
+  AtomLit (LInt n) -> pure (vImm (immInt n))
+  AtomLit (LBool b) -> pure (vImm (immBool b))
   AtomLit (LNumber f) ->
     -- Boxed `Number` (ADR-0064 §1): pass the IEEE-754 bit pattern as the i64 payload.
     rtCall RtNewNumber [ I64 (int64BitsDecimal { hi: floatBitsHi f, lo: floatBitsLo f }) ]
@@ -156,7 +157,7 @@ atom env = case _ of
       Nothing -> unsafeCrashWith ("Backend.LLVM.Emit.atom: missing native foreign arity for " <> k <> " (FSR must provide every native leaf's shape, ADR-0090)")
     addr <- fresh
     emit ("  " <> addr <> " = ptrtoint ptr @" <> mangleForeign k <> " to i64")
-    rtCall RtMakeClosure [ I64 addr, I32 (show arity), I64 immUnit ]
+    rtCall RtMakeClosure [ I64 addr, I32 (show arity), V (vImm immUnit) ]
 
 -- | Materialise a string literal as a module-level `@.str.N` byte constant (boot's `string_constant`),
 -- | returning the `getelementptr`-to-first-byte pointer operand and the byte length. An empty string is
@@ -171,13 +172,15 @@ stringConstant s = emitStringConstant s >>= case _ of
     pure (Tuple p r.len)
 
 -- | Read a variable's current value (post-safepoint): a rooted local reloads via its root handle
--- | (`pv_get`); a DIRECT local (ADR-0105: proven non-crossing) is its SSA operand as-is — no
--- | safepoint can have moved it inside its live range; a top-level global loads its
+-- | (`pv_get` — the reload mints the fresh token); a DIRECT local hands back its token AS-IS
+-- | (ADR-0105 §6.2 alias inheritance — a read is not a validity event, so a stale direct value
+-- | stays stale and the use-point check catches it); a top-level global loads its
 -- | `@<mangle>$root` handle then reloads that (ADR-0072 §2/§3).
-readVar :: Env -> String -> Codegen String
+readVar :: Env -> String -> Codegen Val
 readVar env x = case lookupEnv x env of
-  Just entry | entry.direct -> pure entry.handle
-  Just entry -> abiGet entry.handle
+  Just entry -> case entry.bind of
+    DirectV v -> pure v
+    RootedV h -> abiGet h
   Nothing -> do
     gkeys <- gets _.gkeys
     if Set.member x gkeys then do
@@ -189,12 +192,12 @@ readVar env x = case lookupEnv x env of
       unsafeCrashWith ("Backend.LLVM.Emit.readVar: unbound variable " <> x <> " (unresolved foreign?)")
 
 -- | Read the current value of a rooted handle (post-safepoint).
-getCurrent :: String -> Codegen String
+getCurrent :: String -> Codegen Val
 getCurrent = abiGet
 
 -- | An atom to its forced value: a variable is forced (a demand site, e.g. an `if` condition or a primop
 -- | operand); a literal/foreign is passed through unforced (never a cell).
-forceAtom :: Env -> Atom -> Codegen String
+forceAtom :: Env -> Atom -> Codegen Val
 forceAtom env = case _ of
   a@(AtomVar _) -> atom env a >>= forceValue
   a -> atom env a
@@ -204,7 +207,7 @@ forceAtom env = case _ of
 -- | so the common all-vars/immediates list emits no `pv_root`/`pv_get`. `force` forces each variable
 -- | (a suspension may run guest code — itself a safepoint). Byte-identical to boot's `eval_atoms`: the
 -- | evaluation+root pass runs in list order, then the reload (`pv_get`) pass.
-evalAtoms :: Maybe FrameToken -> Boolean -> Env -> Array Atom -> Codegen (Array String)
+evalAtoms :: Maybe FrameToken -> Boolean -> Env -> Array Atom -> Codegen (Array Val)
 evalAtoms frame force env atoms = do
   -- Stack-safety (2026-07-16 bugfix): both passes were per-element recursions/`traverse`s, and a
   -- sequenced `State` step is a live host frame on the JS backend — a `Regex.Core.Unicode`-scale
@@ -259,19 +262,19 @@ evalAtoms frame force env atoms = do
     Right h -> getCurrent h
 
 -- | Expect a produced value from a non-tail sub-expression (an `if`/`let` branch always yields one).
-requireValue :: Maybe String -> Codegen String
+requireValue :: Maybe Val -> Codegen Val
 requireValue = case _ of
   Just v -> pure v
   Nothing -> unsafeCrashWith "Backend.LLVM.Emit: non-tail expression produced no value"
 
 -- | Emit the current function's return: pop the shadow-stack frame (iff this activation opened
 -- | one — ADR-0105 frame elision), then `ret` — `Root.retWith`, the fused pop+terminator.
-emitRet :: Maybe FrameToken -> String -> Codegen Unit
+emitRet :: Maybe FrameToken -> Val -> Codegen Unit
 emitRet = retWith
 
 -- | Finish a produced value in the current tail context: in tail position emit the `ret` (and produce
 -- | no value); otherwise hand the operand back.
-finish :: Maybe FrameToken -> Boolean -> String -> Codegen (Maybe String)
+finish :: Maybe FrameToken -> Boolean -> Val -> Codegen (Maybe Val)
 finish frame tail v =
   if tail then do
     emitRet frame v
@@ -294,7 +297,7 @@ directTarget env f nargs = case f of
         Just s
           | s.name == x
           , Just h0 <- s.captureHandle
-          , entry.handle == h0
+          , entry.key == h0
           , s.fnInfo.arity == nargs -> pure (Just s.fnInfo)
         _ -> pure case entry.knownFn of
           Just info | info.arity == nargs -> Just info
@@ -325,7 +328,7 @@ directTarget env f nargs = case f of
   _ -> pure Nothing
 
 -- | Lower a computation. Slice-1a handles `CAtom`; the rest are later slices.
-cexpr :: Maybe FrameToken -> Env -> Boolean -> CExpr -> Codegen (Maybe String)
+cexpr :: Maybe FrameToken -> Env -> Boolean -> CExpr -> Codegen (Maybe Val)
 cexpr frame env tail = case _ of
   CAtom a -> atom env a >>= finish frame tail
   -- GER run point (ADR-0099): `perform t ≃ t unit`. Delegate to the `CApp` path so the direct /
@@ -337,14 +340,14 @@ cexpr frame env tail = case _ of
     inlinePrim op ops >>= case _ of
       Just t -> finish frame tail t
       Nothing -> do
-        t <- rtCall (RtPrim op) (map I64 ops)
+        t <- rtCall (RtPrim op) (map V ops)
         finish frame tail t
   CIf a t e -> do
     -- A Boolean demand site: force a by-need cell reaching the condition before reading its payload bit.
     c <- forceAtom env a
     -- payload != 0 ⇒ true (ADR-0064 §1).
     p <- fresh
-    emit ("  " <> p <> " = ashr i64 " <> c <> ", 1")
+    emitPayloadAshr p c
     b <- fresh
     emit ("  " <> b <> " = icmp ne i64 " <> p <> ", 0")
     lt <- freshLabel "then"
@@ -360,21 +363,17 @@ cexpr frame env tail = case _ of
       lend <- freshLabel "endif"
       emit (lt <> ":")
       vt <- requireValue =<< expr frame env false t
-      -- the block a value flows from may differ from `lt` after nested control flow.
+      -- the block a value flows from may differ from `lt` after nested control flow. The
+      -- incoming freeze IS the arm close (Monad.closeHopArm — §6.2 round 3).
       bt <- freshLabel "thenv"
-      emit ("  br label %" <> bt)
-      emit (bt <> ":")
-      emit ("  br label %" <> lend)
+      inT <- closeHopArm { hop: bt, merge: lend } vt
       emit (le <> ":")
       ve <- requireValue =<< expr frame env false e
       be <- freshLabel "elsev"
-      emit ("  br label %" <> be)
-      emit (be <> ":")
-      emit ("  br label %" <> lend)
+      inE <- closeHopArm { hop: be, merge: lend } ve
       emit (lend <> ":")
       r <- fresh
-      emit ("  " <> r <> " = phi i64 [ " <> vt <> ", %" <> bt <> " ], [ " <> ve <> ", %" <> be <> " ]")
-      pure (Just r)
+      Just <$> emitPhi r [ inT, inE ]
   CLam ps body -> do
     l <- lift env ps body
     makeClosure env l >>= finish frame tail
@@ -391,16 +390,18 @@ cexpr frame env tail = case _ of
               Just s -> pure s
               Nothing -> unsafeCrashWith "Backend.LLVM.Emit.cexpr: self-call outside a self context"
             ops <- evalAtoms frame false env args
-            envOp <- if s.envDirect then pure s.envHandle else getCurrent s.envHandle
+            envOp <- case s.envBind of
+              DirectV v -> pure v
+              RootedV h -> getCurrent h
             pure (Tuple envOp ops)
           SSentinel -> do
             ops <- evalAtoms frame false env args
-            pure (Tuple immUnit ops)
+            pure (Tuple (vImm immUnit) ops)
           SClosureEnv -> do
             all <- evalAtoms frame false env (Array.cons f args)
             case Array.uncons all of
               Just { head: fv, tail: ops } -> do
-                e <- rtCall RtReadField [ I64 fv, I64 "2" ]
+                e <- rtCall RtReadField [ V fv, I64 "2" ]
                 pure (Tuple e ops)
               Nothing -> unsafeCrashWith "Backend.LLVM.Emit.cexpr: empty CApp operand list"
           SForceCell -> do
@@ -411,8 +412,8 @@ cexpr frame env tail = case _ of
             -- but numbers `forced` first).
             forced <- fresh
             fhc <- getCurrent fh
-            rtCallWith forced RtForceIfByneed [ I64 fhc ]
-            e <- rtCall RtReadField [ I64 forced, I64 "2" ]
+            forcedVal <- rtCallWith forced RtForceIfByneed [ V fhc ]
+            e <- rtCall RtReadField [ V forcedVal, I64 "2" ]
             ops <- forA argHs getCurrent
             pure (Tuple e ops)
         inDir <- gets _.inDirect
@@ -442,7 +443,7 @@ cexpr frame env tail = case _ of
               pure Nothing
             else do
               Tuple p n <- argBuffer ops
-              t <- rtCall RtApply [ I64 fv, Ptr p, I64 (show n) ]
+              t <- rtCall RtApply [ V fv, Ptr p, I64 (show n) ]
               pure (Just t)
           Nothing -> unsafeCrashWith "Backend.LLVM.Emit.cexpr: empty CApp operand list"
   CCtor name arity args ->
@@ -465,11 +466,11 @@ cexpr frame env tail = case _ of
           ops <- evalAtoms frame false env args
           Tuple p n <- argBuffer ops
           bv <- getCurrent bh
-          t <- rtCall RtApply [ I64 bv, Ptr p, I64 (show n) ]
+          t <- rtCall RtApply [ V bv, Ptr p, I64 (show n) ]
           finish frame tail t
       else if arity == 0 then
         -- nullary → an immediate tag (ADR-0064 §1).
-        finish frame tail (imm (ctorTag name))
+        finish frame tail (vImm (imm (ctorTag name)))
       else do
         ops <- evalAtoms frame false env args
         Tuple p n <- argBuffer ops
@@ -497,14 +498,15 @@ cexpr frame env tail = case _ of
         let ids = map (\(Tuple l _) -> labelId l) sorted
         -- Values are mutually protected: a later `String`/`Number` field must not stale an earlier one.
         vals <- evalAtoms frame false env (map snd sorted)
-        Tuple idp _ <- argBuffer ids
+        -- label ids are raw metadata words, epoch-immune in the id buffer.
+        Tuple idp _ <- argBuffer (map vImm ids)
         Tuple valp _ <- argBuffer vals
         t <- rtCall RtNewRecord [ Ptr idp, Ptr valp, I64 (show n) ]
         finish frame tail t
   CAccessor a label -> do
     -- A dictionary projection (ADR-0070 §5): force a by-need record before reading its field.
     r <- forceAtom env a
-    t <- rtCall RtRecordGet [ I64 r, I64 (labelId label) ]
+    t <- rtCall RtRecordGet [ V r, I64 (labelId label) ]
     finish frame tail t
   CUpdate a ups -> do
     -- Functional update: fold `record_set` (each returns a new record). The base is forced (a by-need
@@ -514,7 +516,7 @@ cexpr frame env tail = case _ of
       ( \rh up -> do
           v <- atom env up.val
           r <- getCurrent rh
-          t <- rtCall RtRecordSet [ I64 r, I64 (labelId up.prop), I64 v ]
+          t <- rtCall RtRecordSet [ V r, I64 (labelId up.prop), V v ]
           root frame t
       )
       rh0
@@ -549,19 +551,20 @@ cexpr frame env tail = case _ of
       extract oenv parent (Tuple subOcc pr) = do
         raw <- fresh
         parentCur <- cur oenv parent
-        case pr of
+        rawVal <- case pr of
           MC.Pfield j ->
-            rtCallWith raw RtReadField [ I64 parentCur, I64 (show (1 + j)) ]
+            rtCallWith raw RtReadField [ V parentCur, I64 (show (1 + j)) ]
           MC.Pelem j ->
-            rtCallWith raw (RtPrim IndexArray) [ I64 parentCur, I64 (immInt j) ]
+            rtCallWith raw (RtPrim IndexArray) [ V parentCur, V (vImm (immInt j)) ]
           MC.Precord l ->
-            rtCallWith raw RtRecordGet [ I64 parentCur, I64 (labelId l) ]
-        h <- root frame raw
+            rtCallWith raw RtRecordGet [ V parentCur, I64 (labelId l) ]
+        h <- root frame rawVal
         pure (Array.cons (Tuple subOcc h) oenv)
 
       bindLeaf oenv binds = foldl (\e (Tuple v occ) -> bindVar e v (lookupOcc oenv occ)) env binds
 
-      -- A matched body's value reaches the phi through a fresh single-predecessor block (the CIf idiom).
+      -- A matched body's value reaches the phi through a fresh single-predecessor block (the CIf
+      -- idiom), carrying the epoch at its arm's end for the per-arm phi verification (§6.2).
       runBody env' e phis =
         if tail then do
           void (expr frame env' true e)
@@ -569,10 +572,8 @@ cexpr frame env tail = case _ of
         else do
           v <- requireValue =<< expr frame env' false e
           vb <- freshLabel "altv"
-          emit ("  br label %" <> vb)
-          emit (vb <> ":")
-          emit ("  br label %" <> merge)
-          pure (Array.cons (Tuple v vb) phis)
+          inc <- closeHopArm { hop: vb, merge } v
+          pure (Array.cons inc phis)
 
       lower oenv dt phis = case dt of
         MC.Dfail _ -> do
@@ -588,7 +589,7 @@ cexpr frame env tail = case _ of
                 -- A Boolean demand site: force a by-need guard result before reading its bit.
                 gv <- forceValue =<< requireValue =<< expr frame env' false clause.guard
                 pay <- fresh
-                emit ("  " <> pay <> " = ashr i64 " <> gv <> ", 1")
+                emitPayloadAshr pay gv
                 bb <- fresh
                 emit ("  " <> bb <> " = icmp ne i64 " <> pay <> ", 0")
                 yes <- freshLabel "gyes"
@@ -603,7 +604,7 @@ cexpr frame env tail = case _ of
           -- Dispatch by representation first (immediate nullary vs field-carrying pointer), then by tag.
           scrut <- cur oenv occ
           low <- fresh
-          emit ("  " <> low <> " = and i64 " <> scrut <> ", 1")
+          emitLowBitAnd low scrut
           isImm <- fresh
           emit ("  " <> isImm <> " = icmp eq i64 " <> low <> ", 1")
           immBlk <- freshLabel "ctimm"
@@ -619,12 +620,12 @@ cexpr frame env tail = case _ of
           -- immediates → the nullary (no-extract) arms, keyed by payload tag.
           emit (immBlk <> ":")
           itag <- fresh
-          emit ("  " <> itag <> " = ashr i64 " <> scrut <> ", 1")
+          emitPayloadAshr itag scrut
           emit ("  switch i64 " <> itag <> ", label %" <> defaultLbl <> " [ " <> casesFor Array.null <> " ]")
           -- pointers → the field-carrying arms, keyed by the tag at raw word 0.
           emit (ptrBlk <> ":")
-          ptag <- rtCall RtReadRaw [ I64 scrut, I64 "0" ]
-          emit ("  switch i64 " <> ptag <> ", label %" <> defaultLbl <> " [ " <> casesFor (not <<< Array.null) <> " ]")
+          ptag <- rtCall RtReadRaw [ V scrut, I64 "0" ]
+          emitGuestSwitch ptag defaultLbl (casesFor (not <<< Array.null))
           phis' <- foldA
             ( \acc a -> do
                 emit (a.l <> ":")
@@ -651,7 +652,7 @@ cexpr frame env tail = case _ of
                   LBool b -> immBool b
                   _ -> unsafeCrashWith "Backend.LLVM.Emit.cexpr: non-immediate literal in immediate switch"
                 cases = Array.zipWith (\(Tuple l _) lbl -> "i64 " <> immOf l <> ", label %" <> lbl) arms armLbls
-              emit ("  switch i64 " <> scrut <> ", label %" <> defaultLbl <> " [ " <> joinWith " " cases <> " ]")
+              emitGuestSwitch scrut defaultLbl (joinWith " " cases)
               phis' <- foldA
                 ( \acc (Tuple (Tuple _ sub) lbl) -> do
                     emit (lbl <> ":")
@@ -665,11 +666,11 @@ cexpr frame env tail = case _ of
           -- `len` is numbered before `cur`'s load chain (the boot numbering-order quirk).
           len <- fresh
           occCur <- cur oenv occ
-          rtCallWith len (RtPrim LengthArray) [ I64 occCur ]
+          lenVal <- rtCallWith len (RtPrim LengthArray) [ V occCur ]
           defaultLbl <- freshLabel "swdef"
           armLbls <- forA arms (const (freshLabel "swarm"))
           let cases = Array.zipWith (\(Tuple n _) lbl -> "i64 " <> immInt n <> ", label %" <> lbl) arms armLbls
-          emit ("  switch i64 " <> len <> ", label %" <> defaultLbl <> " [ " <> joinWith " " cases <> " ]")
+          emitGuestSwitch lenVal defaultLbl (joinWith " " cases)
           phis' <- foldA
             ( \acc (Tuple (Tuple _ arm) lbl) -> do
                 emit (lbl <> ":")
@@ -697,9 +698,9 @@ cexpr frame env tail = case _ of
           eq <- fresh
           boxed <- getCurrent (boxedHandle l)
           scrut <- cur oenv occ
-          rtCallWith eq (RtPrim prim) [ I64 scrut, I64 boxed ]
+          eqVal <- rtCallWith eq (RtPrim prim) [ V scrut, V boxed ]
           pay <- fresh
-          emit ("  " <> pay <> " = ashr i64 " <> eq <> ", 1")
+          emitPayloadAshr pay eqVal
           ok <- fresh
           emit ("  " <> ok <> " = icmp ne i64 " <> pay <> ", 0")
           armLbl <- freshLabel "ltarm"
@@ -723,9 +724,7 @@ cexpr frame env tail = case _ of
     else do
       emit (merge <> ":")
       r <- fresh
-      let entries = joinWith ", " (map (\(Tuple v b) -> "[ " <> v <> ", %" <> b <> " ]") (Array.reverse phis))
-      emit ("  " <> r <> " = phi i64 " <> entries)
-      pure (Just r)
+      Just <$> emitPhi r (Array.reverse phis)
 
 -- | Push a lifted lambda onto the pending-emit queue (LIFO).
 pushPending :: Lifted -> Codegen Unit
@@ -809,7 +808,7 @@ buildGrec frame named env binds = do
     binds
   -- 1. shared env array = [unit × k] ++ [outside-capture values]; root it.
   outsideVals <- forA outside (readVar env)
-  let elems = Array.replicate k immUnit <> outsideVals
+  let elems = Array.replicate k (vImm immUnit) <> outsideVals
   Tuple envP envN <- argBuffer elems
   envArr <- rtCall RtNewArray [ Ptr envP, I64 (show envN) ]
   envH <- root frame envArr
@@ -820,7 +819,7 @@ buildGrec frame named env binds = do
         ch <- root frame cell
         envp <- getCurrent envH
         cw <- getCurrent ch
-        rtCallVoid RtWriteField [ I64 envp, I64 (show i), I64 cw ]
+        rtCallVoid RtWriteField [ V envp, I64 (show i), V cw ]
         pure ch
     )
     (paramIndices k)
@@ -830,9 +829,9 @@ buildGrec frame named env binds = do
         envp <- getCurrent envH
         addr <- fresh
         emit ("  " <> addr <> " = ptrtoint ptr @" <> name <> " to i64")
-        susp <- rtCall RtMakeClosure [ I64 addr, I32 "1", I64 envp ]
+        susp <- rtCall RtMakeClosure [ I64 addr, I32 "1", V envp ]
         cellp <- getCurrent ch
-        rtCallVoid RtByneedSetSuspension [ I64 cellp, I64 susp ]
+        rtCallVoid RtByneedSetSuspension [ V cellp, V susp ]
     )
     (Array.zip suspNames cellHs)
   -- 4. bind each member to its cell — function members carry their direct-call info.
@@ -846,7 +845,7 @@ buildGrec frame named env binds = do
 
 -- | Lower an expression. The `Let`/`LetRec` spine is walked with `tailRecM` (stack-safe); the tail flag
 -- | is constant along the spine and applies to the final `Ret`.
-expr :: Maybe FrameToken -> Env -> Boolean -> Expr -> Codegen (Maybe String)
+expr :: Maybe FrameToken -> Env -> Boolean -> Expr -> Codegen (Maybe Val)
 expr frame env0 tail = tailRecM step <<< Tuple env0
   where
   step (Tuple env e) = case e of
@@ -885,8 +884,9 @@ expr frame env0 tail = tailRecM step <<< Tuple env0
       pure (Loop (Tuple env' body))
 
 -- | Materialise an i64 arg buffer for a call (an `alloca` holding the operands), returning the pointer
--- | operand and count. Zero args → a null pointer.
-argBuffer :: Array String -> Codegen (Tuple String Int)
+-- | operand and count. Zero args → a null pointer. Each operand token is verified at ITS store
+-- | (ADR-0105 §6.2 — the buffer handover consumption point; verification only, no epoch bump).
+argBuffer :: Array Val -> Codegen (Tuple String Int)
 argBuffer operands =
   let
     n = Array.length operands
@@ -904,7 +904,7 @@ argBuffer operands =
             Just v -> do
               p <- fresh
               emit ("  " <> p <> " = getelementptr [" <> show n <> " x i64], ptr " <> buf <> ", i64 0, i64 " <> show i)
-              emit ("  store i64 " <> v <> ", ptr " <> p)
+              emitGuestStore v p
               pure (Loop (i + 1))
         )
         0
@@ -914,17 +914,17 @@ argBuffer operands =
 
 -- | Build a closure value for a lifted lambda: assemble the captured-env array from the current values
 -- | of its free variables, then `pv_make_closure` over the lifted function's address.
-makeClosure :: Env -> Lifted -> Codegen String
+makeClosure :: Env -> Lifted -> Codegen Val
 makeClosure env (Lifted l) = do
   envWord <- case l.captures of
-    [] -> pure immUnit
+    [] -> pure (vImm immUnit)
     caps -> do
       vals <- forA caps (readVar env)
       Tuple p n <- argBuffer vals
       rtCall RtNewArray [ Ptr p, I64 (show n) ]
   addr <- fresh
   emit ("  " <> addr <> " = ptrtoint ptr @" <> l.name <> " to i64")
-  rtCall RtMakeClosure [ I64 addr, I32 (show (Array.length l.params)), I64 envWord ]
+  rtCall RtMakeClosure [ I64 addr, I32 (show (Array.length l.params)), V envWord ]
 
 -- | Register an inline lambda for hoisting and return its `Lifted` record (captures fixed in sorted
 -- | order). A top-level global is read via its `$root` handle, never captured — except a global shadowed
@@ -977,27 +977,36 @@ emitFunction (Lifted l) = do
     cr <- gets _.crossing
     pure (\n -> rootAll || Set.member n cr)
   let
-    bindParam env (Tuple p i) =
+    -- a parameter is a function-entry value: its token mints at the prologue epoch (§6.2).
+    bindParam env (Tuple p i) = do
+      pTok <- mintParam i
       if shouldRootName p then do
-        h <- root mtok ("%p" <> show i)
+        h <- root mtok pTok
         pure (bindVar env p h)
-      else pure (bindDirectVar env p ("%p" <> show i))
+      else pure (bindDirectVar env p pTok)
   env1 <- foldA bindParam Nil (Array.mapWithIndex (\i p -> Tuple p i) l.params)
+  -- the `%env` word is itself a function-entry value; its token mints once at the prologue
+  -- (the capture reads and any later self-call inherit it — never re-stamped, §6.2).
+  envTok <- mintEnvWord
   -- captures: positional reads from the env word `%env` (the shared/captured array); a capture that is
   -- a known recursive-group function member carries its direct-call info (`captureFns`). `selfHandle`
-  -- is the handle of the captured self binding (a member calling itself through its capture).
+  -- is the identity of the captured self binding (a member calling itself through its capture).
   let
     stepCap (Tuple env sh) (Tuple i c) = do
-      v <- rtCall RtReadField [ I64 "%env", I64 (show i) ]
-      Tuple h direct <-
-        if shouldRootName c then root mtok v <#> \h -> Tuple h false
-        else pure (Tuple v true)
-      let sh' = if Just c == l.selfName then Just h else sh
+      v <- rtCall RtReadField [ V envTok, I64 (show i) ]
+      env' <- case Array.find (\(Tuple k _) -> k == c) l.captureFns of
+        Just (Tuple _ info) ->
+          if shouldRootName c then root mtok v <#> \h -> bindFnVar env c h info
+          else pure (bindDirectFnVar env c v info)
+        Nothing ->
+          if shouldRootName c then root mtok v <#> \h -> bindVar env c h
+          else pure (bindDirectVar env c v)
       let
-        env' = case Array.find (\(Tuple k _) -> k == c) l.captureFns of
-          Just (Tuple _ info) -> bindFnVar env c h info # \e' ->
-            if direct then bindDirectFnVar env c h info else e'
-          Nothing -> if direct then bindDirectVar env c h else bindVar env c h
+        sh' =
+          if Just c == l.selfName then case lookupEnv c env' of
+            Just en -> Just en.key
+            Nothing -> sh
+          else sh
       pure (Tuple env' sh')
   Tuple env2 selfHandle <- case l.captures of
     [] -> pure (Tuple env1 Nothing)
@@ -1005,20 +1014,20 @@ emitFunction (Lifted l) = do
   -- the self-call shortcut (ADR-0076 §2): while this body runs, a saturated call to `selfName`
   -- re-enters this very function with this very `%env`. Root the env word iff the plan says the
   -- `%env` pseudo-name crosses (a self-call sits after a safepoint — the raw `%env` SSA value
-  -- would be stale); otherwise the raw operand is exact at every self-call.
+  -- would be stale); otherwise the inherited prologue token is exact at every self-call (and
+  -- the §6.2 use-point check holds the plan to that claim).
   savedSelf <- gets _.selfCtx
   savedDirect <- gets _.inDirect
   case l.selfName of
     Just nm -> do
-      Tuple envH envDir <-
-        if shouldRootName envPseudo then root mtok "%env" <#> \h -> Tuple h false
-        else pure (Tuple "%env" true)
+      envBind <-
+        if shouldRootName envPseudo then RootedV <$> root mtok envTok
+        else pure (DirectV envTok)
       modify_ \c -> c
         { selfCtx = Just
             { name: nm
             , captureHandle: selfHandle
-            , envHandle: envH
-            , envDirect: envDir
+            , envBind
             , fnInfo: { dsym: l.name <> "$d", arity, src: SSelf }
             }
         }
@@ -1042,19 +1051,19 @@ emitFunction (Lifted l) = do
   -- generic wrapper
   beginFn
   envw <- case l.captures of
-    [] -> pure immUnit
-    _ -> rtCall RtReadField [ I64 "%clo", I64 "2" ]
+    [] -> pure (vImm immUnit)
+    _ -> do
+      cloTok <- mintCloWord
+      rtCall RtReadField [ V cloTok, I64 "2" ]
   args <- flip forA
     ( \i -> do
         p <- fresh
         emit ("  " <> p <> " = getelementptr i64, ptr %args, i64 " <> show i)
-        v <- fresh
-        emit ("  " <> v <> " = load i64, ptr " <> p)
-        pure v
+        mintLoad p
     )
     (paramIndices arity)
   r <- guestDirect { dsym: l.name <> "$d", env: envw, args }
-  emit ("  ret i64 " <> r)
+  emitGuestRet r
   wbody <- takeFn
   emitDefine
     ( "define internal i64 @" <> l.name <> "(ptr %ctx, i64 %clo, ptr %args, i64 %nargs) {\n"

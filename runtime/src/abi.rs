@@ -1344,4 +1344,25 @@ mod tests {
             &too_big,
         );
     }
+
+    /// ADR-0105 §6.1 per-row evidence: `pv_settle`'s DISCARD policy — with a tail pending, the
+    /// placeholder `r` is dropped and the stashed `(f, args)` run through `apply` (which owns
+    /// its rooting) under forced-GC stress; the stashed heap argument must arrive intact.
+    #[test]
+    fn handover_settle_discards_placeholder_and_runs_pending_tail_under_stress() {
+        fn ident(_h: &mut Heap, _c: crate::Value, args: &[crate::Value]) -> crate::Value {
+            args[0]
+        }
+        let mut h = Heap::new(8192);
+        h.enable_gc_stress_for_test();
+        let f = h.new_closure(ident, 1, TaggedWord::unit()).as_word();
+        let fr = h.root(f);
+        let s = h.new_str(b"tail-arg").as_word();
+        let sr = h.root(s);
+        let (fv, sv) = (h.get(fr), h.get(sr));
+        h.set_pending_tail(fv, vec![sv]);
+        let r = unsafe { pv_settle(&mut h as *mut Heap, TaggedWord::unit().to_bits()) };
+        let rp = unsafe { crate::heap::HeapPtr::from_word(TaggedWord::from_bits(r)) };
+        assert_eq!(h.str_read(rp), "tail-arg");
+    }
 }

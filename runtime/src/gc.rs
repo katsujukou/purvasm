@@ -2687,4 +2687,46 @@ mod tests {
             cur = h.read_field(p, 1);
         }
     }
+
+    /// ADR-0105 §6.1 handover inventory (provider-side evidence): `new_closure_raw` is the
+    /// self-root+reload policy for its env word — the closure's own allocation collects under
+    /// stress, and the env must arrive relocated (a raw env word held across the alloc would be
+    /// stale). Read back through the closure's env slot to the string payload.
+    #[test]
+    fn handover_new_closure_env_self_roots_across_stress() {
+        fn unit_body(_h: &mut Heap, _c: TaggedWord, _a: &[TaggedWord]) -> TaggedWord {
+            TaggedWord::unit()
+        }
+        let mut h = Heap::new(4096);
+        h.enable_gc_stress_for_test();
+        let s = h.new_str(b"env-payload").as_word();
+        let sr = h.root(s);
+        let sv = h.get(sr);
+        let env = h.new_array(&[sv]).as_word();
+        let er = h.root(env);
+        let envw = h.get(er);
+        let clo = h.new_closure(unit_body, 1, envw);
+        let envr = h.read_field(clo, 2);
+        let elem = h.read_field(unsafe { HeapPtr::from_word(envr) }, 0);
+        assert_eq!(
+            h.str_read(unsafe { HeapPtr::from_word(elem) }),
+            "env-payload"
+        );
+    }
+
+    /// §6.1: `new_record` composes the self-rooting `new_array` with rooted intermediates —
+    /// under stress its several internal allocations each collect, and the field values must
+    /// still arrive intact.
+    #[test]
+    fn handover_new_record_composition_survives_stress() {
+        let mut h = Heap::new(8192);
+        h.enable_gc_stress_for_test();
+        let s = h.new_str(b"field-value").as_word();
+        let sr = h.root(s);
+        let sv = h.get(sr);
+        let r = h.new_record(&[7, 9], &[sv, TaggedWord::int(3)]).as_word();
+        let f = h.record_get(r, 7);
+        assert_eq!(h.str_read(unsafe { HeapPtr::from_word(f) }), "field-value");
+        assert_eq!(h.record_get(r, 9).as_int(), 3);
+    }
 }

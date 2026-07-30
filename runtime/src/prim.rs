@@ -564,4 +564,109 @@ mod tests {
             assert_eq!(h.header(jp).kind(), Kind::Str);
         }
     }
+
+    /// ADR-0105 §6.1 handover inventory (provider-side evidence): the boxed-`Number` family is
+    /// the consume/snapshot-before-safepoint policy (the module contract above — inputs read
+    /// into locals BEFORE any allocation). Under stress the result box's allocation collects,
+    /// which would garble a raw input still held across it.
+    #[test]
+    fn handover_number_prims_snapshot_before_alloc_under_stress() {
+        let mut h = Heap::new(4096);
+        h.enable_gc_stress_for_test();
+        let a = h.new_number(1.5).as_word();
+        let ar = h.root(a);
+        let b = h.new_number(2.25).as_word();
+        let br = h.root(b);
+        let av = h.get(ar).to_bits();
+        let bv = h.get(br).to_bits();
+        let r = unsafe { pv_prim_add_number(&mut h as *mut Heap, av, bv) };
+        let rp = unsafe { HeapPtr::from_word(TaggedWord::from_bits(r)) };
+        assert_eq!(f64::from_bits(h.number_bits(rp)), 3.75);
+    }
+
+    /// §6.1 per-row evidence: `sub`/`mul`/`div` are INDEPENDENT implementations of the
+    /// snapshot policy (the `add` test alone cannot vouch for them).
+    #[test]
+    fn handover_sub_mul_div_number_snapshot_under_stress() {
+        let mut h = Heap::new(8192);
+        h.enable_gc_stress_for_test();
+        let mk = |h: &mut Heap, x: f64| {
+            let n = h.new_number(x).as_word();
+            h.root(n)
+        };
+        let a = mk(&mut h, 5.5);
+        let b = mk(&mut h, 2.25);
+        let (av, bv) = (h.get(a).to_bits(), h.get(b).to_bits());
+        let d = unsafe { pv_prim_sub_number(&mut h as *mut Heap, av, bv) };
+        let dp = unsafe { HeapPtr::from_word(TaggedWord::from_bits(d)) };
+        assert_eq!(f64::from_bits(h.number_bits(dp)), 3.25);
+        let c = mk(&mut h, 1.5);
+        let e = mk(&mut h, 2.5);
+        let (cv, ev) = (h.get(c).to_bits(), h.get(e).to_bits());
+        let m = unsafe { pv_prim_mul_number(&mut h as *mut Heap, cv, ev) };
+        let mp = unsafe { HeapPtr::from_word(TaggedWord::from_bits(m)) };
+        assert_eq!(f64::from_bits(h.number_bits(mp)), 3.75);
+        let f = mk(&mut h, 7.5);
+        let g = mk(&mut h, 2.5);
+        let (fv, gv) = (h.get(f).to_bits(), h.get(g).to_bits());
+        let q = unsafe { pv_prim_div_number(&mut h as *mut Heap, fv, gv) };
+        let qp = unsafe { HeapPtr::from_word(TaggedWord::from_bits(q)) };
+        assert_eq!(f64::from_bits(h.number_bits(qp)), 3.0);
+    }
+
+    /// §6.1 per-row evidence: `pv_prim_record_set` takes a DYNAMIC `Str` key (a guest heap
+    /// value held across the update's allocations) and INSERTS on an absent label — the
+    /// branch `Heap::record_set` (which faults on absent) never takes.
+    #[test]
+    fn handover_prim_record_set_dynamic_key_inserts_absent_under_stress() {
+        let mut h = Heap::new(16384);
+        h.enable_gc_stress_for_test();
+        let kept = h.new_str(b"kept").as_word();
+        let keptr = h.root(kept);
+        let kv = h.get(keptr);
+        let r = h.new_record(&[10], &[kv]).as_word();
+        let rr = h.root(r);
+        let key = h.new_str(b"b").as_word();
+        let keyr = h.root(key);
+        let ins = h.new_str(b"inserted").as_word();
+        let insr = h.root(ins);
+        let (keyv, insv, rv) = (
+            h.get(keyr).to_bits(),
+            h.get(insr).to_bits(),
+            h.get(rr).to_bits(),
+        );
+        let r2 = unsafe { pv_prim_record_set(&mut h as *mut Heap, keyv, insv, rv) };
+        let r2w = TaggedWord::from_bits(r2);
+        let bid = h.str_label_id(h.get(keyr));
+        let got = h.record_get(r2w, bid);
+        assert_eq!(h.str_read(unsafe { HeapPtr::from_word(got) }), "inserted");
+        let still = h.record_get(r2w, 10);
+        assert_eq!(h.str_read(unsafe { HeapPtr::from_word(still) }), "kept");
+    }
+
+    /// §6.1: array `Append` is snapshot-then-delegate — elements are copied into a host vector
+    /// with no intervening allocation, then the self-rooting `new_array` builds the result.
+    #[test]
+    fn handover_array_append_snapshots_then_delegates_under_stress() {
+        let mut h = Heap::new(8192);
+        h.enable_gc_stress_for_test();
+        let s1 = h.new_str(b"one").as_word();
+        let s1r = h.root(s1);
+        let v1 = h.get(s1r);
+        let a1 = h.new_array(&[v1]).as_word();
+        let a1r = h.root(a1);
+        let s2 = h.new_str(b"two").as_word();
+        let s2r = h.root(s2);
+        let v2 = h.get(s2r);
+        let a2 = h.new_array(&[v2]).as_word();
+        let a2r = h.root(a2);
+        let a1v = h.get(a1r).to_bits();
+        let a2v = h.get(a2r).to_bits();
+        let joined = unsafe { pv_prim_append(&mut h as *mut Heap, a1v, a2v) };
+        let jp = unsafe { HeapPtr::from_word(TaggedWord::from_bits(joined)) };
+        let e0 = h.read_field(jp, 0);
+        let e1 = h.read_field(jp, 1);
+        assert_eq!(h.str_read(unsafe { HeapPtr::from_word(e0) }), "one");
+        assert_eq!(h.str_read(unsafe { HeapPtr::from_word(e1) }), "two");
+    }
 }

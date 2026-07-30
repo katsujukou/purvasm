@@ -12,6 +12,7 @@ import Data.Map as Map
 import Data.Set as Set
 import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, makeCx, renderBuffer, runCodegen)
 import Purvasm.Compiler.Backend.LLVM.Prim (inlinePrim, primSym)
+import Purvasm.Compiler.Backend.LLVM.Value (Val, unsafeTestVal, unsafeValText)
 import Purvasm.Compiler.Primitive (PrimOp(..))
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
@@ -23,6 +24,11 @@ run m =
     Tuple a ctx = runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true }) m
   in
     Tuple a (renderBuffer ctx.fn)
+
+-- A test operand token: epoch-immune, so the §6.2 use-point check passes and the goldens stay
+-- about the emitted shape.
+tv :: String -> Val
+tv = unsafeTestVal
 
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.Backend.LLVM.Prim" do
@@ -45,7 +51,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Prim" do
 
   describe "inlinePrim" do
     it "emits a 32-bit add (untag, add, re-tag), trunc temp before its ashr" do
-      let Tuple r body = run (inlinePrim AddInt [ "%a", "%b" ])
+      let Tuple r body = run (map (map unsafeValText) (inlinePrim AddInt [ tv "%a", tv "%b" ]))
       r `shouldEqual` Just "%t8"
       body `shouldEqual`
         ( "  %t2 = ashr i64 %a, 1\n"
@@ -59,7 +65,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Prim" do
         )
 
     it "emits a signed less-than comparison re-tagged as a Boolean" do
-      let Tuple r body = run (inlinePrim LtInt [ "%a", "%b" ])
+      let Tuple r body = run (map (map unsafeValText) (inlinePrim LtInt [ tv "%a", tv "%b" ]))
       r `shouldEqual` Just "%t8"
       body `shouldEqual`
         ( "  %t2 = ashr i64 %a, 1\n"
@@ -73,7 +79,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Prim" do
         )
 
     it "emits Boolean equality over the operands' truthiness" do
-      let Tuple r body = run (inlinePrim EqBool [ "%a", "%b" ])
+      let Tuple r body = run (map (map unsafeValText) (inlinePrim EqBool [ tv "%a", tv "%b" ]))
       r `shouldEqual` Just "%t8"
       body `shouldEqual`
         ( "  %t2 = ashr i64 %a, 1\n"
@@ -87,7 +93,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Prim" do
         )
 
     it "emits Boolean negation" do
-      let Tuple r body = run (inlinePrim NotBool [ "%a" ])
+      let Tuple r body = run (map (map unsafeValText) (inlinePrim NotBool [ tv "%a" ]))
       r `shouldEqual` Just "%t6"
       body `shouldEqual`
         ( "  %t2 = ashr i64 %a, 1\n"
@@ -99,7 +105,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Prim" do
         )
 
     it "emits a 32-bit bitwise and (the bin32 shape)" do
-      let Tuple r body = run (inlinePrim AndInt [ "%a", "%b" ])
+      let Tuple r body = run (map (map unsafeValText) (inlinePrim AndInt [ tv "%a", tv "%b" ]))
       r `shouldEqual` Just "%t8"
       body `shouldEqual`
         ( "  %t2 = ashr i64 %a, 1\n"
@@ -113,7 +119,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Prim" do
         )
 
     it "emits a left shift with the count masked & 31" do
-      let Tuple r body = run (inlinePrim ShlInt [ "%a", "%b" ])
+      let Tuple r body = run (map (map unsafeValText) (inlinePrim ShlInt [ tv "%a", tv "%b" ]))
       r `shouldEqual` Just "%t9"
       body `shouldEqual`
         ( "  %t2 = ashr i64 %a, 1\n"
@@ -128,7 +134,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Prim" do
         )
 
     it "emits the zero-fill right shift as a masked lshr (signed 32 re-tag via sext)" do
-      let Tuple r body = run (inlinePrim ZshrInt [ "%a", "%b" ])
+      let Tuple r body = run (map (map unsafeValText) (inlinePrim ZshrInt [ tv "%a", tv "%b" ]))
       r `shouldEqual` Just "%t9"
       body `shouldEqual`
         ( "  %t2 = ashr i64 %a, 1\n"
@@ -143,7 +149,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Prim" do
         )
 
     it "emits complement as xor -1" do
-      let Tuple r body = run (inlinePrim ComplementInt [ "%a" ])
+      let Tuple r body = run (map (map unsafeValText) (inlinePrim ComplementInt [ tv "%a" ]))
       r `shouldEqual` Just "%t6"
       body `shouldEqual`
         ( "  %t2 = ashr i64 %a, 1\n"
@@ -155,7 +161,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Prim" do
         )
 
     it "returns Nothing for ops with no inline form (div, boxed)" do
-      fst (run (inlinePrim DivInt [ "%a", "%b" ])) `shouldEqual` Nothing
-      fst (run (inlinePrim AddNumber [ "%a", "%b" ])) `shouldEqual` Nothing
+      fst (run (map (map unsafeValText) (inlinePrim DivInt [ tv "%a", tv "%b" ]))) `shouldEqual` Nothing
+      fst (run (map (map unsafeValText) (inlinePrim AddNumber [ tv "%a", tv "%b" ]))) `shouldEqual` Nothing
   where
   fst (Tuple a _) = a

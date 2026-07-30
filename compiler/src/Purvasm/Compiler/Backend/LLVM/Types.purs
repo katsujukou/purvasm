@@ -11,6 +11,7 @@ import Data.List as List
 import Data.Maybe (Maybe(..))
 import Data.Set (Set)
 import Data.Tuple (Tuple(..), snd)
+import Purvasm.Compiler.Backend.LLVM.Value (Val, keyOf)
 import Purvasm.Compiler.MiddleEnd.ANF (Expr)
 
 -- | How a direct call site obtains the callee's env word (ADR-0076 §2).
@@ -68,15 +69,20 @@ data Gdef
   | Gcaf String Expr -- ^ key, strict value
   | Grec (Array (Tuple String Expr)) -- ^ recursive-group members: keys + bodies
 
--- | An environment entry: the variable's rooted `pv_get` handle, plus static function info when the
--- | binding is a known lambda (a direct-call candidate, ADR-0076 §2).
+-- | How a variable binding is realised (ADR-0105 §2/§6): a non-crossing definition holds its
+-- | value token DIRECTLY (alias bindings inherit the token unchanged — never re-stamped); a
+-- | crossing definition holds its shadow-stack root handle and every read reloads through it.
+data BindingV
+  = DirectV Val
+  | RootedV String
+
+-- | An environment entry: the variable's binding realisation, plus static function info when
+-- | the binding is a known lambda (a direct-call candidate, ADR-0076 §2).
 type EnvEntry =
-  { handle :: String
-  -- | ADR-0105 slice 2: `true` = `handle` is the value's SSA operand DIRECTLY (a non-crossing
-  -- | definition: no root slot exists, no reload happens — valid because no safepoint can
-  -- | intervene inside its live range); `false` = `handle` is a shadow-stack root handle and
-  -- | every use reloads through it.
-  , direct :: Boolean
+  { bind :: BindingV
+  , key :: String
+  -- ^ identity KEY stamped at bind time (comparison bookkeeping for directTarget, never an
+  -- operand; the caged Value.keyOf runs only here)
   , knownFn :: Maybe FnInfo
   }
 
@@ -88,37 +94,37 @@ type Env = List (Tuple String EnvEntry)
 -- | shadows `Prelude`'s `bind` in a consumer that opens this module — do-notation's implicit `bind`
 -- | would otherwise become ambiguous.
 bindVar :: Env -> String -> String -> Env
-bindVar env x handle = Tuple x { handle, direct: false, knownFn: Nothing } : env
+bindVar env x handle = Tuple x { bind: RootedV handle, key: handle, knownFn: Nothing } : env
 
--- | Bind a NON-CROSSING definition to its SSA operand directly (ADR-0105 §3: no slot, no store,
--- | no reload) — only sound when the activation plan proves no safepoint sits inside its live range.
-bindDirectVar :: Env -> String -> String -> Env
-bindDirectVar env x v = Tuple x { handle: v, direct: true, knownFn: Nothing } : env
+-- | Bind a NON-CROSSING definition to its value token directly (ADR-0105 §3: no slot, no store,
+-- | no reload) — only sound when the activation plan proves no safepoint sits inside its live
+-- | range; the token is stored AS GIVEN (§6.2 alias inheritance — binding is not a validity
+-- | event and must not re-stamp).
+bindDirectVar :: Env -> String -> Val -> Env
+bindDirectVar env x v = Tuple x { bind: DirectV v, key: keyOf v, knownFn: Nothing } : env
 
 -- | Bind a variable that is statically a known lambda — its saturated calls may go direct.
 bindFnVar :: Env -> String -> String -> FnInfo -> Env
-bindFnVar env x handle fn = Tuple x { handle, direct: false, knownFn: Just fn } : env
+bindFnVar env x handle fn = Tuple x { bind: RootedV handle, key: handle, knownFn: Just fn } : env
 
--- | `bindDirectVar` for a known-lambda binding (ADR-0105): the SSA operand directly plus the
+-- | `bindDirectVar` for a known-lambda binding (ADR-0105): the value token directly plus the
 -- | direct-call info.
-bindDirectFnVar :: Env -> String -> String -> FnInfo -> Env
-bindDirectFnVar env x v fn = Tuple x { handle: v, direct: true, knownFn: Just fn } : env
+bindDirectFnVar :: Env -> String -> Val -> FnInfo -> Env
+bindDirectFnVar env x v fn = Tuple x { bind: DirectV v, key: keyOf v, knownFn: Just fn } : env
 
 -- | Look a variable up in the local scope, most-recent binding first.
 lookupEnv :: String -> Env -> Maybe EnvEntry
 lookupEnv x = map snd <<< List.find (\(Tuple k _) -> k == x)
 
 -- | The binding whose lambda is currently being emitted (boot's `self_ctx` tuple): the source name, its
--- | entry-time capture handle when the name is captured (`Nothing` when it resolves as a global), the
--- | rooted handle of this activation's `%env` word (reloaded at self-calls, since the raw `%env` SSA
--- | value is stale after any safepoint), and its own direct-entry info.
+-- | entry-time capture identity when the name is captured (`Nothing` when it resolves as a global —
+-- | compared via `valKey`/handle, bookkeeping only), this activation's `%env` word binding (a
+-- | direct token when the plan proved `%env` non-crossing, else a rooted handle reloaded at
+-- | self-calls), and its own direct-entry info.
 type SelfCtx =
   { name :: String
   , captureHandle :: Maybe String
-  , envHandle :: String
-  -- | ADR-0105: `true` = `%env` never crosses a safepoint before a self-call, so `envHandle`
-  -- | is the raw `%env` SSA operand itself (no slot); `false` = a rooted handle, reloaded at use.
-  , envDirect :: Boolean
+  , envBind :: BindingV
   , fnInfo :: FnInfo
   }
 
