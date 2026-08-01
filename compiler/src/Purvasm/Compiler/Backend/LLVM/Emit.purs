@@ -54,16 +54,16 @@ import Data.Set as Set
 import Data.String.Common (joinWith)
 import Data.Tuple (Tuple(..), fst, snd)
 import Partial.Unsafe (unsafeCrashWith)
-import Purvasm.Compiler.Backend.LLVM.Abi (abiGet, abiSettle, forceValue)
+import Purvasm.Compiler.Backend.LLVM.Abi (abiSettle, forceValue)
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (fvExpr)
 import Purvasm.Compiler.Backend.LLVM.Mangle (ctorTag, imm, immBool, immInt, immUnit, labelId, mangle, mangleForeign, sortRecordFields)
-import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, PhiIncoming, beginFn, emit, emitDefine, emitGuestRet, emitGuestStore, emitGuestSwitch, emitPayloadAshr, emitPhi, emitLowBitAnd, closeHopArm, emitStringConstant, foldA, forA, forA_, fresh, freshFn, freshLabel, mintCloWord, mintEnvWord, mintLoad, mintParam, takeFn)
+import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, PhiIncoming, beginFn, emit, emitAnfLabel, emitDefine, snapshotReloads, emitGuestRet, emitGuestStore, emitGuestSwitch, emitPayloadAshr, emitPhi, emitLowBitAnd, closeHopArm, emitStringConstant, foldA, forA, forA_, fresh, freshFn, freshLabel, mintCloWord, mintEnvWord, mintLoad, mintParam, takeFn)
 import Purvasm.Compiler.Backend.LLVM.Prim (inlinePrim)
 import Purvasm.Compiler.Backend.LLVM.Liveness (activationPlan, envPseudo, needsFrame)
 import Purvasm.Compiler.Backend.LLVM.Root (FrameToken, musttailWith, openFrame, retWith, rootLocal, tailcallWith)
-import Purvasm.Compiler.Backend.LLVM.Safepoint (RtArg(..), RtOp(..), guestDirect, rtCall, rtCallVoid, rtCallWith)
+import Purvasm.Compiler.Backend.LLVM.Safepoint (RtArg(..), RtOp(..), guestDirect, rtCall, rtCallVoid)
 import Purvasm.Compiler.Backend.LLVM.Types (BindingV(..), Env, EnvSrc(..), FnInfo, Lifted(..), LiftedBody(..), bindDirectFnVar, bindDirectVar, bindFnVar, bindVar, lookupEnv)
-import Purvasm.Compiler.Backend.LLVM.Value (Val, vImm)
+import Purvasm.Compiler.Backend.LLVM.Value (Val, vImm, vRootedGlobal, vRootedLocal)
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..))
@@ -130,8 +130,8 @@ compareBoxed a b = case a, b of
 sortUniqBoxed :: Array Literal -> Array Literal
 sortUniqBoxed = Array.nubByEq (\a b -> compareBoxed a b == EQ) <<< Array.sortBy compareBoxed
 
--- | An atom to its i64 operand token. `AtomVar` reloads through its root handle (or a global's
--- | `$root`); `Int`/`Bool` literals are epoch-immune immediates (no emission).
+-- | An atom to its i64 operand token. A rooted `AtomVar` yields its slot's rooted token (the
+-- | renderer reloads at consumption); `Int`/`Bool` literals are epoch-immune immediates.
 atom :: Env -> Atom -> Codegen Val
 atom env = case _ of
   AtomVar x -> readVar env x
@@ -171,29 +171,25 @@ stringConstant s = emitStringConstant s >>= case _ of
     emit ("  " <> p <> " = getelementptr [" <> show r.len <> " x i8], ptr " <> r.name <> ", i64 0, i64 0")
     pure (Tuple p r.len)
 
--- | Read a variable's current value (post-safepoint): a rooted local reloads via its root handle
--- | (`pv_get` — the reload mints the fresh token); a DIRECT local hands back its token AS-IS
--- | (ADR-0105 §6.2 alias inheritance — a read is not a validity event, so a stale direct value
--- | stays stale and the use-point check catches it); a top-level global loads its
--- | `@<mangle>$root` handle then reloads that (ADR-0072 §2/§3).
+-- | Read a variable: a DIRECT local hands back its token AS-IS (ADR-0105 §6.2 alias
+-- | inheritance — a read is not a validity event, so a stale direct value stays stale and the
+-- | use-point check catches it); a rooted local yields its ROOTED token — NO reload emits
+-- | here (ADR-0105 §6.4): the renderer-owned reload cache materialises the current value at
+-- | consumption (hit → reuse, miss → reload just before the consuming instruction). A
+-- | top-level global yields a rooted token over its `@<mangle>$root` cell the same way (the
+-- | read only registers the extern reference).
 readVar :: Env -> String -> Codegen Val
 readVar env x = case lookupEnv x env of
   Just entry -> case entry.bind of
     DirectV v -> pure v
-    RootedV h -> abiGet h
+    RootedV h -> pure (vRootedLocal h)
   Nothing -> do
     gkeys <- gets _.gkeys
     if Set.member x gkeys then do
       modify_ \c -> c { externs = Set.insert x c.externs }
-      handle <- fresh
-      emit ("  " <> handle <> " = load i64, ptr @" <> mangle x <> "$root")
-      abiGet handle
+      pure (vRootedGlobal ("@" <> mangle x <> "$root"))
     else
       unsafeCrashWith ("Backend.LLVM.Emit.readVar: unbound variable " <> x <> " (unresolved foreign?)")
-
--- | Read the current value of a rooted handle (post-safepoint).
-getCurrent :: String -> Codegen Val
-getCurrent = abiGet
 
 -- | An atom to its forced value: a variable is forced (a demand site, e.g. an `if` condition or a primop
 -- | operand); a literal/foreign is passed through unforced (never a cell).
@@ -203,20 +199,20 @@ forceAtom env = case _ of
   a -> atom env a
 
 -- | Evaluate a list of atoms to their **current** value operands, mutually protected against each
--- | other's safepoints (ADR-0072 §6): an atom is rooted+reloaded only when a *later* atom can safepoint,
--- | so the common all-vars/immediates list emits no `pv_root`/`pv_get`. `force` forces each variable
--- | (a suspension may run guest code — itself a safepoint). Byte-identical to boot's `eval_atoms`: the
--- | evaluation+root pass runs in list order, then the reload (`pv_get`) pass.
+-- | other's safepoints (ADR-0072 §6): an atom is rooted only when a *later* atom can safepoint,
+-- | so the common all-vars/immediates list emits no `pv_root`. `force` forces each variable
+-- | (a suspension may run guest code — itself a safepoint). A rooted atom flows on as its
+-- | rooted token; the consuming renderer reloads on cache miss (ADR-0105 §6.4).
 evalAtoms :: Maybe FrameToken -> Boolean -> Env -> Array Atom -> Codegen (Array Val)
 evalAtoms frame force env atoms = do
-  -- Stack-safety (2026-07-16 bugfix): both passes were per-element recursions/`traverse`s, and a
-  -- sequenced `State` step is a live host frame on the JS backend — a `Regex.Core.Unicode`-scale
-  -- array literal (1,290 operands) was ~0.5× the default stack. Both passes are `tailRecM` loops
-  -- now, in the same element order; the later-safepoint test is a precomputed suffix scan (the
-  -- per-element `any` over the remainder was also quadratic in the array length).
-  slots <- tailRecM evalStep { i: 0, acc: Nil }
-  reloaded <- tailRecM reloadStep { rem: slots, acc: Nil }
-  pure (Array.fromFoldable (List.reverse reloaded))
+  -- Stack-safety (2026-07-16 bugfix): a sequenced `State` step is a live host frame on the JS
+  -- backend — a `Regex.Core.Unicode`-scale array literal (1,290 operands) was ~0.5× the
+  -- default stack — so the pass is a `tailRecM` loop with a precomputed suffix scan for the
+  -- later-safepoint test. (The former second pass — eager reload of every rooted slot — is
+  -- retired by ADR-0105 §6.4: a rooted slot yields its rooted token and the consumption
+  -- renderer reloads on cache miss.)
+  vals <- tailRecM evalStep { i: 0, acc: Nil }
+  pure (Array.fromFoldable (List.reverse vals))
   where
   canSafepoint = case _ of
     AtomLit (LInt _) -> false
@@ -238,28 +234,17 @@ evalAtoms frame force env atoms = do
   laterCan = Array.fromFoldable
     (Array.foldr (\a st -> { flag: st.flag || canSafepoint a, out: st.flag : st.out }) { flag: false, out: Nil } atoms).out
 
-  -- Evaluate+root in list order; `Left` = raw operand, `Right` = rooted handle (reloaded in a second
-  -- pass), mirroring boot's ``` `Raw / `Rooted ``` split. `acc` is reversed; `evalStep` un-reverses
-  -- at `Done` so `reloadStep` runs in list order.
+  -- Evaluate+root in list order: an atom a LATER atom can stale gets a slot and flows on as
+  -- its rooted token; everything else flows as-is.
   evalStep st = case Array.index atoms st.i of
-    Nothing -> pure (Done (List.reverse st.acc))
+    Nothing -> pure (Done st.acc)
     Just a -> do
-      slot <-
-        if isImmediate a then Left <$> one a
+      v <-
+        if isImmediate a then one a
         else do
-          v <- one a
-          if fromMaybe false (Array.index laterCan st.i) then Right <$> root frame v else pure (Left v)
-      pure (Loop { i: st.i + 1, acc: Cons slot st.acc })
-
-  reloadStep st = case st.rem of
-    Nil -> pure (Done st.acc)
-    Cons s rest -> do
-      r <- reload s
-      pure (Loop { rem: rest, acc: Cons r st.acc })
-
-  reload = case _ of
-    Left v -> pure v
-    Right h -> getCurrent h
+          v0 <- one a
+          if fromMaybe false (Array.index laterCan st.i) then vRootedLocal <$> root frame v0 else pure v0
+      pure (Loop { i: st.i + 1, acc: Cons v st.acc })
 
 -- | Expect a produced value from a non-tail sub-expression (an `if`/`let` branch always yields one).
 requireValue :: Maybe Val -> Codegen Val
@@ -352,26 +337,29 @@ cexpr frame env tail = case _ of
     emit ("  " <> b <> " = icmp ne i64 " <> p <> ", 0")
     lt <- freshLabel "then"
     le <- freshLabel "else"
+    -- the construct's branch-point snapshot (§6.4): taken after the condition's own
+    -- consumption, so its reloads are shared into both arms and the join.
+    snap <- snapshotReloads
     emit ("  br i1 " <> b <> ", label %" <> lt <> ", label %" <> le)
     if tail then do
-      emit (lt <> ":")
+      emitAnfLabel snap lt
       void (expr frame env true t)
-      emit (le <> ":")
+      emitAnfLabel snap le
       void (expr frame env true e)
       pure Nothing
     else do
       lend <- freshLabel "endif"
-      emit (lt <> ":")
+      emitAnfLabel snap lt
       vt <- requireValue =<< expr frame env false t
       -- the block a value flows from may differ from `lt` after nested control flow. The
       -- incoming freeze IS the arm close (Monad.closeHopArm — §6.2 round 3).
       bt <- freshLabel "thenv"
       inT <- closeHopArm { hop: bt, merge: lend } vt
-      emit (le <> ":")
+      emitAnfLabel snap le
       ve <- requireValue =<< expr frame env false e
       be <- freshLabel "elsev"
       inE <- closeHopArm { hop: be, merge: lend } ve
-      emit (lend <> ":")
+      emitAnfLabel snap lend
       r <- fresh
       Just <$> emitPhi r [ inT, inE ]
   CLam ps body -> do
@@ -390,9 +378,10 @@ cexpr frame env tail = case _ of
               Just s -> pure s
               Nothing -> unsafeCrashWith "Backend.LLVM.Emit.cexpr: self-call outside a self context"
             ops <- evalAtoms frame false env args
-            envOp <- case s.envBind of
-              DirectV v -> pure v
-              RootedV h -> getCurrent h
+            let
+              envOp = case s.envBind of
+                DirectV v -> v
+                RootedV h -> vRootedLocal h
             pure (Tuple envOp ops)
           SSentinel -> do
             ops <- evalAtoms frame false env args
@@ -407,15 +396,9 @@ cexpr frame env tail = case _ of
           SForceCell -> do
             fh <- atom env f >>= root frame
             argHs <- forA args (\a -> atom env a >>= root frame)
-            -- `forced` is numbered before `getCurrent fh`'s load chain (boot: `let forced = fresh in
-            -- emit … forced (get_current fh)` — OCaml right-to-left arg eval emits the load chain first
-            -- but numbers `forced` first).
-            forced <- fresh
-            fhc <- getCurrent fh
-            forcedVal <- rtCallWith forced RtForceIfByneed [ V fhc ]
+            forcedVal <- rtCall RtForceIfByneed [ V (vRootedLocal fh) ]
             e <- rtCall RtReadField [ V forcedVal, I64 "2" ]
-            ops <- forA argHs getCurrent
-            pure (Tuple e ops)
+            pure (Tuple e (map vRootedLocal argHs))
         inDir <- gets _.inDirect
         if tail && inDir then do
           -- musttail (ADR-0076 §3): the fused pop+musttail+ret — every operand (env word
@@ -465,8 +448,7 @@ cexpr frame env tail = case _ of
           bh <- root frame builder
           ops <- evalAtoms frame false env args
           Tuple p n <- argBuffer ops
-          bv <- getCurrent bh
-          t <- rtCall RtApply [ V bv, Ptr p, I64 (show n) ]
+          t <- rtCall RtApply [ V (vRootedLocal bh), Ptr p, I64 (show n) ]
           finish frame tail t
       else if arity == 0 then
         -- nullary → an immediate tag (ADR-0064 §1).
@@ -515,18 +497,18 @@ cexpr frame env tail = case _ of
     rhFinal <- foldA
       ( \rh up -> do
           v <- atom env up.val
-          r <- getCurrent rh
-          t <- rtCall RtRecordSet [ V r, I64 (labelId up.prop), V v ]
+          t <- rtCall RtRecordSet [ V (vRootedLocal rh), I64 (labelId up.prop), V v ]
           root frame t
       )
       rh0
       ups
-    getCurrent rhFinal >>= finish frame tail
+    finish frame tail (vRootedLocal rhFinal)
   CCase scruts alts -> do
     -- The shared Maranget decision tree (ADR-0083) lowered to LLVM. Occurrences — scrutinees and every
-    -- extracted sub-value — are rooted and re-read (`getCurrent`): the tree shares sub-occurrences
-    -- across rows, and a guarded row's fall-through reuses them after its guard body may have
-    -- safepointed. Boxed literals are pre-rooted once at entry so the tree walk never allocates.
+    -- extracted sub-value — are rooted and read through their rooted tokens (the renderer-owned
+    -- reload cache, ADR-0105 §6.4): the tree shares sub-occurrences across rows, and a guarded
+    -- row's fall-through reuses them after its guard body may have safepointed. Boxed literals
+    -- are pre-rooted once at entry so the tree walk never allocates.
     let { scrutBinds, tree } = MatchCompile.compile scruts alts
     -- Root each scrutinee (forced — matching dereferences its structure).
     occEnv0 <- forA scrutBinds (\(Tuple occ a) -> Tuple occ <$> (forceAtom env a >>= root frame))
@@ -535,29 +517,30 @@ cexpr frame env tail = case _ of
       (\l -> Tuple l <$> (atom env (AtomLit l) >>= root frame))
     failLabel <- freshLabel "nomatch"
     merge <- if tail then pure "" else freshLabel "casejoin"
+    -- the case-level snapshot: taken after the scrutinee/boxed-literal rooting (pre-dispatch),
+    -- so it dominates every path into the fail block and the join.
+    caseSnap <- snapshotReloads
     let
       lookupOcc oenv occ = case Array.find (\(Tuple k _) -> k == occ) oenv of
         Just (Tuple _ h) -> h
         Nothing -> unsafeCrashWith ("Backend.LLVM.Emit.cexpr: unbound case occurrence " <> occ)
 
-      cur oenv occ = getCurrent (lookupOcc oenv occ)
+      cur oenv occ = vRootedLocal (lookupOcc oenv occ)
 
       boxedHandle l = case Array.find (\(Tuple k _) -> k == l) litEnv of
         Just (Tuple _ h) -> h
         Nothing -> unsafeCrashWith "Backend.LLVM.Emit.cexpr: boxed literal not hoisted"
 
       -- Read a sub-value raw (allocation-free), then root it — extending `oenv` (most-recent first).
-      -- `raw` is numbered before `cur`'s load chain (the boot numbering-order quirk, as `SForceCell`).
       extract oenv parent (Tuple subOcc pr) = do
-        raw <- fresh
-        parentCur <- cur oenv parent
+        let parentCur = cur oenv parent
         rawVal <- case pr of
           MC.Pfield j ->
-            rtCallWith raw RtReadField [ V parentCur, I64 (show (1 + j)) ]
+            rtCall RtReadField [ V parentCur, I64 (show (1 + j)) ]
           MC.Pelem j ->
-            rtCallWith raw (RtPrim IndexArray) [ V parentCur, V (vImm (immInt j)) ]
+            rtCall (RtPrim IndexArray) [ V parentCur, V (vImm (immInt j)) ]
           MC.Precord l ->
-            rtCallWith raw RtRecordGet [ V parentCur, I64 (labelId l) ]
+            rtCall RtRecordGet [ V parentCur, I64 (labelId l) ]
         h <- root frame rawVal
         pure (Array.cons (Tuple subOcc h) oenv)
 
@@ -594,21 +577,25 @@ cexpr frame env tail = case _ of
                 emit ("  " <> bb <> " = icmp ne i64 " <> pay <> ", 0")
                 yes <- freshLabel "gyes"
                 no <- freshLabel "gno"
+                snap <- snapshotReloads
                 emit ("  br i1 " <> bb <> ", label %" <> yes <> ", label %" <> no)
-                emit (yes <> ":")
+                emitAnfLabel snap yes
                 acc' <- runBody env' clause.rhs acc
-                emit (no <> ":")
+                emitAnfLabel snap no
                 guards rest acc'
           guards clauses phis
         MC.DswitchCtor occ arms default -> do
           -- Dispatch by representation first (immediate nullary vs field-carrying pointer), then by tag.
-          scrut <- cur oenv occ
+          let scrut = cur oenv occ
           low <- fresh
           emitLowBitAnd low scrut
           isImm <- fresh
           emit ("  " <> isImm <> " = icmp eq i64 " <> low <> ", 1")
           immBlk <- freshLabel "ctimm"
           ptrBlk <- freshLabel "ctptr"
+          -- branch-point snapshot (§6.4): the scrutinee's reload above is shared into the
+          -- representation arms, the tag arms and the default.
+          snap <- snapshotReloads
           emit ("  br i1 " <> isImm <> ", label %" <> immBlk <> ", label %" <> ptrBlk)
           defaultLbl <- freshLabel "ctdef"
           armLbls <- forA arms (\(Tuple tag arm) -> { tag, arm, l: _ } <$> freshLabel "ctarm")
@@ -618,23 +605,23 @@ cexpr frame env tail = case _ of
                   (Array.filter (\a -> keep a.arm.extracts) armLbls)
               )
           -- immediates → the nullary (no-extract) arms, keyed by payload tag.
-          emit (immBlk <> ":")
+          emitAnfLabel snap immBlk
           itag <- fresh
           emitPayloadAshr itag scrut
           emit ("  switch i64 " <> itag <> ", label %" <> defaultLbl <> " [ " <> casesFor Array.null <> " ]")
           -- pointers → the field-carrying arms, keyed by the tag at raw word 0.
-          emit (ptrBlk <> ":")
+          emitAnfLabel snap ptrBlk
           ptag <- rtCall RtReadRaw [ V scrut, I64 "0" ]
           emitGuestSwitch ptag defaultLbl (casesFor (not <<< Array.null))
           phis' <- foldA
             ( \acc a -> do
-                emit (a.l <> ":")
+                emitAnfLabel snap a.l
                 oenv' <- foldA (\oe ex -> extract oe occ ex) oenv a.arm.extracts
                 lower oenv' a.arm.sub acc
             )
             phis
             armLbls
-          emit (defaultLbl <> ":")
+          emitAnfLabel snap defaultLbl
           lower oenv default phis'
         MC.DswitchLit occ arms default -> case Array.uncons arms of
           Nothing -> lower oenv default phis
@@ -643,7 +630,7 @@ cexpr frame env tail = case _ of
             LString _ -> lowerBoxedChain oenv occ arms default phis
             _ -> do
               -- Immediate literals → a direct LLVM switch on the tagged word.
-              scrut <- cur oenv occ
+              let scrut = cur oenv occ
               defaultLbl <- freshLabel "swdef"
               armLbls <- forA arms (const (freshLabel "swarm"))
               let
@@ -653,33 +640,32 @@ cexpr frame env tail = case _ of
                   _ -> unsafeCrashWith "Backend.LLVM.Emit.cexpr: non-immediate literal in immediate switch"
                 cases = Array.zipWith (\(Tuple l _) lbl -> "i64 " <> immOf l <> ", label %" <> lbl) arms armLbls
               emitGuestSwitch scrut defaultLbl (joinWith " " cases)
+              snap <- snapshotReloads
               phis' <- foldA
                 ( \acc (Tuple (Tuple _ sub) lbl) -> do
-                    emit (lbl <> ":")
+                    emitAnfLabel snap lbl
                     lower oenv sub acc
                 )
                 phis
                 (Array.zip arms armLbls)
-              emit (defaultLbl <> ":")
+              emitAnfLabel snap defaultLbl
               lower oenv default phis'
         MC.DswitchLen occ arms default -> do
-          -- `len` is numbered before `cur`'s load chain (the boot numbering-order quirk).
-          len <- fresh
-          occCur <- cur oenv occ
-          lenVal <- rtCallWith len (RtPrim LengthArray) [ V occCur ]
+          lenVal <- rtCall (RtPrim LengthArray) [ V (cur oenv occ) ]
           defaultLbl <- freshLabel "swdef"
           armLbls <- forA arms (const (freshLabel "swarm"))
           let cases = Array.zipWith (\(Tuple n _) lbl -> "i64 " <> immInt n <> ", label %" <> lbl) arms armLbls
           emitGuestSwitch lenVal defaultLbl (joinWith " " cases)
+          snap <- snapshotReloads
           phis' <- foldA
             ( \acc (Tuple (Tuple _ arm) lbl) -> do
-                emit (lbl <> ":")
+                emitAnfLabel snap lbl
                 oenv' <- foldA (\oe ex -> extract oe occ ex) oenv arm.extracts
                 lower oenv' arm.sub acc
             )
             phis
             (Array.zip arms armLbls)
-          emit (defaultLbl <> ":")
+          emitAnfLabel snap defaultLbl
           lower oenv default phis'
         MC.DexpandRecord occ extracts sub -> do
           oenv' <- foldA (\oe ex -> extract oe occ ex) oenv extracts
@@ -694,24 +680,21 @@ cexpr frame env tail = case _ of
             prim = case l of
               LNumber _ -> EqNumber
               _ -> EqString
-          -- `eq` is numbered before the two reload chains (the boot numbering-order quirk).
-          eq <- fresh
-          boxed <- getCurrent (boxedHandle l)
-          scrut <- cur oenv occ
-          eqVal <- rtCallWith eq (RtPrim prim) [ V scrut, V boxed ]
+          eqVal <- rtCall (RtPrim prim) [ V (cur oenv occ), V (vRootedLocal (boxedHandle l)) ]
           pay <- fresh
           emitPayloadAshr pay eqVal
           ok <- fresh
           emit ("  " <> ok <> " = icmp ne i64 " <> pay <> ", 0")
           armLbl <- freshLabel "ltarm"
           next <- freshLabel "ltnext"
+          snap <- snapshotReloads
           emit ("  br i1 " <> ok <> ", label %" <> armLbl <> ", label %" <> next)
-          emit (armLbl <> ":")
+          emitAnfLabel snap armLbl
           phis' <- lower oenv sub phis
-          emit (next <> ":")
+          emitAnfLabel snap next
           lowerBoxedChain oenv occ rest default phis'
     phis <- lower occEnv0 tree []
-    emit (failLabel <> ":")
+    emitAnfLabel caseSnap failLabel
     rtCallVoid RtCaseFail []
     emit "  unreachable"
     if tail then pure Nothing
@@ -722,7 +705,7 @@ cexpr frame env tail = case _ of
     else if Array.null phis then
       unsafeCrashWith "Backend.LLVM.Emit.cexpr: non-tail CCase reached no arm body (all-fail decision tree)"
     else do
-      emit (merge <> ":")
+      emitAnfLabel caseSnap merge
       r <- fresh
       Just <$> emitPhi r (Array.reverse phis)
 
@@ -817,21 +800,17 @@ buildGrec frame named env binds = do
     ( \i -> do
         cell <- rtCall RtNewByneedPlaceholder []
         ch <- root frame cell
-        envp <- getCurrent envH
-        cw <- getCurrent ch
-        rtCallVoid RtWriteField [ V envp, I64 (show i), V cw ]
+        rtCallVoid RtWriteField [ V (vRootedLocal envH), I64 (show i), V (vRootedLocal ch) ]
         pure ch
     )
     (paramIndices k)
   -- 3. build each suspension closure over the shared env; backpatch it into its cell.
   flip forA_
     ( \(Tuple name ch) -> do
-        envp <- getCurrent envH
         addr <- fresh
         emit ("  " <> addr <> " = ptrtoint ptr @" <> name <> " to i64")
-        susp <- rtCall RtMakeClosure [ I64 addr, I32 "1", V envp ]
-        cellp <- getCurrent ch
-        rtCallVoid RtByneedSetSuspension [ V cellp, V susp ]
+        susp <- rtCall RtMakeClosure [ I64 addr, I32 "1", V (vRootedLocal envH) ]
+        rtCallVoid RtByneedSetSuspension [ V (vRootedLocal ch), V susp ]
     )
     (Array.zip suspNames cellHs)
   -- 4. bind each member to its cell — function members carry their direct-call info.
@@ -959,9 +938,9 @@ emitFunction (Lifted l) = do
   beginFn
   -- ADR-0105 slice 2: the activation plan decides which definitions get root slots and whether a
   -- frame exists at all. An `LClosure` wrapper keeps the conservative root-on-create fallback
-  -- (rootAll, always framed); an `LBody` is plan-driven. Rooted definitions reload through their
-  -- slot on EVERY use (the between-safepoints SSA cache is a deferred refinement) — the win here
-  -- is the non-crossing population's slots/stores/reloads disappearing entirely.
+  -- (rootAll, always framed); an `LBody` is plan-driven. A rooted definition's reads flow as its
+  -- rooted token, materialised through the renderer-owned reload cache at consumption (§6.4:
+  -- one reload per slot per safepoint window/ANF block, not one per use).
   plan <- case l.body of
     LBody e -> do
       let p = activationPlan { params: l.params, captures: l.captures, selfName: l.selfName } e

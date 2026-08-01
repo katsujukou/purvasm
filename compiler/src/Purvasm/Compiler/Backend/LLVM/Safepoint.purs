@@ -28,11 +28,12 @@ module Purvasm.Compiler.Backend.LLVM.Safepoint
   , rtSafepoint
   , rtSym
   , rtCall
-  , rtCallWith
   , rtCallVoid
   , machineryHandleCall
   , guestDirect
-  , guestMusttail
+  , PreparedCall
+  , prepareMusttail
+  , emitPreparedMusttail
   , guestCallSafepoint
   ) where
 
@@ -44,7 +45,7 @@ import Data.Generic.Rep (class Generic)
 import Data.String (joinWith)
 import Data.Tuple (Tuple(..))
 import Partial.Unsafe (unsafeCrashWith)
-import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, bumpEpoch, forA, fresh, unsafeEmitRawCall, unsafeMintFresh, unsafeUseVal)
+import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, bumpEpoch, currentEpoch, forA, fresh, unsafeEmitRawCall, unsafeMintFresh, unsafeUseVal)
 import Purvasm.Compiler.Backend.LLVM.Prim (primArity, primSym)
 import Purvasm.Compiler.Backend.LLVM.Value (Val)
 import Purvasm.Compiler.Primitive (PrimOp(..))
@@ -189,8 +190,8 @@ rtSym :: RtOp -> String
 rtSym = _.sym <<< rtDesc
 
 -- | A direct/`musttail` guest call always runs guest code — the classification the `CApp`/
--- | `CPerform` transfer arms consume for [`guestDirect`]/[`guestMusttail`] (and the generic
--- | `RtApply` path).
+-- | `CPerform` transfer arms consume for [`guestDirect`] and the [`prepareMusttail`]/
+-- | [`emitPreparedMusttail`] pair (and the generic `RtApply` path).
 guestCallSafepoint :: Boolean
 guestCallSafepoint = true
 
@@ -221,12 +222,12 @@ checkedArgs desc args = do
       else forA args (checkedArg desc.sym RVal)
   pure (joinWith ", " ((if desc.ctx then [ "ptr %ctx" ] else []) <> rendered))
 
--- | Emit a value-returning runtime call into a caller-supplied result temp, returning the
--- | result's token. The caller-side `fresh` exists for the boot-numbering sites where the
--- | result temp is numbered BEFORE the operand's own emission (OCaml right-to-left argument
--- | evaluation in `codegen_llvm.ml` — e.g. the `SForceCell` force, the dtree `extract` reads);
--- | everything else uses [`rtCall`]. Verify-then-bump (ADR-0105 §6.4): operands verify against
--- | the PRE-call epoch; an `sp = true` row then bumps exactly once and the result token is
+-- | Emit a value-returning runtime call into a caller-supplied result temp — PRIVATE since
+-- | 2b-2 phase 2: the boot-numbering sites that reserved the result temp before the operand
+-- | emission (`SForceCell`, the dtree `extract` reads) are retired with the read-site reload
+-- | choreography, so [`rtCall`] is the only public form. Verify-then-bump (ADR-0105 §6.4):
+-- | operands verify against the PRE-call epoch (a rooted operand reload-on-miss emits here,
+-- | before the call line); an `sp = true` row then bumps exactly once and the result token is
 -- | minted post-bump.
 rtCallWith :: String -> RtOp -> Array RtArg -> Codegen Val
 rtCallWith t op args =
@@ -291,16 +292,37 @@ guestDirect c = do
   bumpEpoch
   unsafeMintFresh r
 
--- | Emit a `musttail` direct guest call (the caller emits the mandatory `ret` of the result and
--- | pops its frame BEFORE this — ADR-0064 §4). Always a safepoint; verify-then-bump.
-guestMusttail :: { dsym :: String, env :: Val, args :: Array Val } -> Codegen Val
-guestMusttail c = do
+-- | A `musttail` guest call whose operands were resolved and VERIFIED before the caller's
+-- | frame pop (ADR-0105 §6.4, the 2b-2 blocker). The HANDOVER happens at the call, not at
+-- | prepare — so the sealed text also carries its PREPARE-TIME EPOCH, and consumption
+-- | fail-closed asserts the epoch is unchanged: nothing that can safepoint may sit between
+-- | prepare and emit (the frame pop is a non-safepoint machinery row and passes). Opaque:
+-- | the sealed text cannot be extracted or altered.
+newtype PreparedCall = PreparedCall { dsym :: String, argText :: String, epoch :: Int }
+
+-- | Resolve/verify a `musttail` call's operands BEFORE the frame pop and seal the rendered
+-- | argument text with the prepare-time epoch. (The result temp is NOT reserved here — it
+-- | must number after the pop's own temps.)
+prepareMusttail :: { dsym :: String, env :: Val, args :: Array Val } -> Codegen PreparedCall
+prepareMusttail c = do
   envS <- unsafeUseVal c.env
   argSs <- forA c.args unsafeUseVal
-  r <- fresh
-  unsafeEmitRawCall ("  " <> r <> " = musttail call tailcc i64 @" <> c.dsym <> "(ptr %ctx, i64 " <> envS <> foldMap (\o -> ", i64 " <> o) argSs <> ")")
-  bumpEpoch
-  unsafeMintFresh r
+  e <- currentEpoch
+  pure (PreparedCall { dsym: c.dsym, argText: "(ptr %ctx, i64 " <> envS <> foldMap (\o -> ", i64 " <> o) argSs <> ")", epoch: e })
+
+-- | Emit a prepared `musttail` call AFTER the pop (the caller emits the mandatory `ret` of
+-- | the result — ADR-0064 §4). Fail-closed: a safepoint between prepare and here would have
+-- | staled the sealed operands before their handover, so an epoch drift crashes.
+emitPreparedMusttail :: PreparedCall -> Codegen Val
+emitPreparedMusttail (PreparedCall c) = do
+  e <- currentEpoch
+  if e /= c.epoch then
+    unsafeCrashWith "Safepoint.emitPreparedMusttail: a safepoint intervened between prepare and emission (ADR-0105 §6.4 — the sealed operands are stale before their handover)"
+  else do
+    r <- fresh
+    unsafeEmitRawCall ("  " <> r <> " = musttail call tailcc i64 @" <> c.dsym <> c.argText)
+    bumpEpoch
+    unsafeMintFresh r
 
 -- | The safepoint classification of each primop's OWN runtime operation (operand forcing is a
 -- | separate `RtForceIfByneed` concern, accounted by the `CPrim` transfer). Anything allocating

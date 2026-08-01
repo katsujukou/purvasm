@@ -91,20 +91,20 @@ entry:
   call void @pv_init_all(ptr %ctx)
   %t2 = getelementptr i8, ptr %ctx, i64 8
   %t1 = load i64, ptr %t2
-  %t3 = load i64, ptr @pv_g_Slice1_2eidentInt$root
-  %t4 = load ptr, ptr %ctx
-  %t5 = getelementptr i64, ptr %t4, i64 %t3
-  %t6 = load i64, ptr %t5
   br label %fchk1
 fchk1:
-  %t7 = and i64 %t6, 1
-  %t8 = icmp ne i64 %t7, 0
+  %t4 = load i64, ptr @pv_g_Slice1_2eidentInt$root
+  %t5 = load ptr, ptr %ctx
+  %t6 = getelementptr i64, ptr %t5, i64 %t4
+  %t7 = load i64, ptr %t6
+  %t3 = and i64 %t7, 1
+  %t8 = icmp ne i64 %t3, 0
   br i1 %t8, label %fdone3, label %fslow2
 fslow2:
-  %t9 = call i64 @pv_force_if_byneed(ptr %ctx, i64 %t6)
+  %t9 = call i64 @pv_force_if_byneed(ptr %ctx, i64 %t7)
   br label %fdone3
 fdone3:
-  %t10 = phi i64 [ %t6, %fchk1 ], [ %t9, %fslow2 ]
+  %t10 = phi i64 [ %t7, %fchk1 ], [ %t9, %fslow2 ]
   call void @pv_print_int(i64 %t10)
   %t11 = getelementptr i8, ptr %ctx, i64 8
   store i64 %t1, ptr %t11

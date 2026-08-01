@@ -71,7 +71,8 @@ data Gdef
 
 -- | How a variable binding is realised (ADR-0105 §2/§6): a non-crossing definition holds its
 -- | value token DIRECTLY (alias bindings inherit the token unchanged — never re-stamped); a
--- | crossing definition holds its shadow-stack root handle and every read reloads through it.
+-- | crossing definition holds its shadow-stack root handle; a read yields the rooted token
+-- | and the renderer-owned reload cache materialises its current value at consumption (§6.4).
 data BindingV
   = DirectV Val
   | RootedV String
@@ -119,8 +120,8 @@ lookupEnv x = map snd <<< List.find (\(Tuple k _) -> k == x)
 -- | The binding whose lambda is currently being emitted (boot's `self_ctx` tuple): the source name, its
 -- | entry-time capture identity when the name is captured (`Nothing` when it resolves as a global —
 -- | compared via `valKey`/handle, bookkeeping only), this activation's `%env` word binding (a
--- | direct token when the plan proved `%env` non-crossing, else a rooted handle reloaded at
--- | self-calls), and its own direct-entry info.
+-- | direct token when the plan proved `%env` non-crossing, else a rooted handle resolved
+-- | through the reload cache at self-calls), and its own direct-entry info.
 type SelfCtx =
   { name :: String
   , captureHandle :: Maybe String

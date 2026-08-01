@@ -12,7 +12,7 @@ import Data.Map as Map
 import Data.Set as Set
 import Data.String (Pattern(..), split)
 import Data.Tuple (snd)
-import Purvasm.Compiler.Backend.LLVM.Abi (abiGet, abiSettle, abiStamp, declarations, forceValue)
+import Purvasm.Compiler.Backend.LLVM.Abi (abiSettle, abiStamp, declarations, forceValue)
 import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, makeCx, renderBuffer, runCodegen)
 import Purvasm.Compiler.Backend.LLVM.Value (unsafeTestVal)
 import Test.Spec (Spec, describe, it)
@@ -38,14 +38,6 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Abi" do
             <> "@llvm.used = appending global [1 x ptr] [ptr @pv_abi_stamp], section \"llvm.metadata\"\n"
         )
       abiStamp false `shouldEqual` ""
-
-  describe "abiGet" do
-    it "reads a handle's value via roots_base + slot" do
-      emitted (abiGet "%h") `shouldEqual`
-        ( "  %t1 = load ptr, ptr %ctx\n"
-            <> "  %t2 = getelementptr i64, ptr %t1, i64 %h\n"
-            <> "  %t3 = load i64, ptr %t2\n"
-        )
 
   describe "abiSettle" do
     it "emits the 3-block pending-tail settle with the r/pv_settle phi" do

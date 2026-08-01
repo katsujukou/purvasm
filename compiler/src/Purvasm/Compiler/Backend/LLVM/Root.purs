@@ -45,8 +45,8 @@ import Data.Maybe (Maybe(..))
 import Data.Tuple (Tuple(..))
 import Purvasm.Compiler.Backend.LLVM.Abi (headerField, offRootsCap, offRootsLen)
 import Purvasm.Compiler.Backend.LLVM.Mangle (immUnit, mangle)
-import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, beginFn, emit, emitDefine, emitGuestRet, emitGuestStore, forA_, fresh, freshLabel, takeFn)
-import Purvasm.Compiler.Backend.LLVM.Safepoint (RtArg(..), RtOp(..), guestMusttail, machineryHandleCall, rtCall, rtCallVoid)
+import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, beginFn, emit, emitDefine, emitGuestRet, emitGuestStore, emitRetResolved, forA, forA_, fresh, freshLabel, resolveGuest, snapshotVal, takeFn, touchVal, unsafeEmitChainLabel)
+import Purvasm.Compiler.Backend.LLVM.Safepoint (RtArg(..), RtOp(..), emitPreparedMusttail, machineryHandleCall, prepareMusttail, rtCall, rtCallVoid)
 import Purvasm.Compiler.Backend.LLVM.Value (Val, vImm)
 
 -- | Witness of THIS activation's open shadow-stack frame, carrying the frame's mark operand.
@@ -89,16 +89,22 @@ popIfOpen = case _ of
 -- | the fused pop+terminator (a pop with a live continuation is not expressible through this).
 retWith :: Maybe FrameToken -> Val -> Codegen Unit
 retWith frame v = do
+  -- resolve BEFORE the pop (§6.4): under the Rooted arm this is where a reload would emit,
+  -- and the handle must still be live. Emission-identical today (resolution emits nothing).
+  r <- resolveGuest v
   popIfOpen frame
-  emitGuestRet v
+  emitRetResolved r
 
 -- | Terminate the current path with a `musttail` direct call (ADR-0076 §3): pop this frame
 -- | first — the callee opens its own — with every operand computed before the pop; no safepoint
 -- | in between (the ADR-0064 §4 pop-before-`musttail` discipline), then the mandatory `ret`.
 musttailWith :: Maybe FrameToken -> { dsym :: String, env :: Val, args :: Array Val } -> Codegen Unit
 musttailWith frame c = do
+  -- two-phase (§6.4, the pinned 2b-2 blocker): operands resolve/verify BEFORE the pop; after
+  -- it only the sealed call renders, then the mandatory ret of its fresh result.
+  prepared <- prepareMusttail c
   popIfOpen frame
-  r <- guestMusttail c
+  r <- emitPreparedMusttail prepared
   emitGuestRet r
 
 -- | Terminate the current path via the trampoline (ADR-0071 §4): stash the pending tail
@@ -141,8 +147,13 @@ emitInitFnFramed name body = do
   beginFn
   tok <- openFrame
   pairs <- body tok
+  -- read each candidate back into an epoch-checked Fresh token BEFORE the pop (ADR-0105
+  -- §6.4): after it the transient slots are dead — the permanent tier's own rooting stores
+  -- overwrite that region — so a rooted candidate must not resolve through its slot later
+  -- (and a stale one crashes instead of reloading).
+  snapped <- forA pairs (\(Tuple key v) -> Tuple key <$> snapshotVal v)
   popFrame tok
-  storePermanentRoots pairs
+  storePermanentRoots snapped
   finishInitFn name
 
 -- | Plant each `(globalKey, value)` candidate as a permanent init-region handle stored into
@@ -168,12 +179,16 @@ emitRoot :: Val -> Codegen String
 emitRoot v = gets _.inlineAbi >>= case _ of
   false -> machineryHandleCall RtRoot [ V v ]
   true -> do
+    -- resolve the operand while emission is still legal (ADR-0105 §6.4): its consumptions
+    -- below sit inside this chain's arms (the rfast store, the rslow pv_root), where a
+    -- rooted miss's reload would not dominate the join.
+    touchVal v
     chk <- freshLabel "rchk"
     fast <- freshLabel "rfast"
     slow <- freshLabel "rslow"
     done <- freshLabel "rdone"
     emit ("  br label %" <> chk)
-    emit (chk <> ":")
+    unsafeEmitChainLabel chk
     lenp <- headerField offRootsLen
     len <- fresh
     emit ("  " <> len <> " = load i64, ptr " <> lenp)
@@ -183,7 +198,7 @@ emitRoot v = gets _.inlineAbi >>= case _ of
     full <- fresh
     emit ("  " <> full <> " = icmp eq i64 " <> len <> ", " <> cap)
     emit ("  br i1 " <> full <> ", label %" <> slow <> ", label %" <> fast)
-    emit (fast <> ":")
+    unsafeEmitChainLabel fast
     base <- fresh
     emit ("  " <> base <> " = load ptr, ptr %ctx")
     slot <- fresh
@@ -193,11 +208,11 @@ emitRoot v = gets _.inlineAbi >>= case _ of
     emit ("  " <> len1 <> " = add i64 " <> len <> ", 1")
     emit ("  store i64 " <> len1 <> ", ptr " <> lenp)
     emit ("  br label %" <> done)
-    emit (slow <> ":")
+    unsafeEmitChainLabel slow
     -- the handle is a raw index (both arms; `pv_root` returns the same bare index).
     hs <- machineryHandleCall RtRoot [ V v ]
     emit ("  br label %" <> done)
-    emit (done <> ":")
+    unsafeEmitChainLabel done
     h <- fresh
     emit ("  " <> h <> " = phi i64 [ " <> len <> ", %" <> fast <> " ], [ " <> hs <> ", %" <> slow <> " ]")
     pure h

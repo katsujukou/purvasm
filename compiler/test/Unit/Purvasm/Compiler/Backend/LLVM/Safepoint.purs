@@ -24,7 +24,7 @@ import Effect.Class (liftEffect)
 import Purvasm.Compiler.Backend.LLVM.Abi (declarations)
 import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, makeCx, renderBuffer, runCodegen)
 import Purvasm.Compiler.Backend.LLVM.Value (unsafeTestVal, vImm)
-import Purvasm.Compiler.Backend.LLVM.Safepoint (RtArg(..), RtOp(..), guestCallSafepoint, guestDirect, guestMusttail, rtCall, rtCallVoid, rtCallWith, rtSafepoint, rtSym)
+import Purvasm.Compiler.Backend.LLVM.Safepoint (RtArg(..), RtOp(..), emitPreparedMusttail, guestCallSafepoint, guestDirect, prepareMusttail, rtCall, rtCallVoid, rtSafepoint, rtSym)
 import Purvasm.Compiler.Primitive (PrimOp(..))
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
@@ -85,6 +85,12 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Safepoint" do
     it "pins SetArray as non-allocating (ADR-0052 linear-builder in-place store)" do
       rtSafepoint (RtPrim SetArray) `shouldEqual` false
 
+    it "pins pv_get as NOT a safepoint — the tie Monad's renderer-owned reload assumes (§6.4)" do
+      -- Monad.emitReload emits the pv_get line itself (the one audited raw call outside the
+      -- seam) and does NOT bump; if this row ever became sp = true, that reload would break
+      -- verify-then-bump. The classification lives here; this test ties the two modules.
+      rtSafepoint RtGet `shouldEqual` false
+
     it "classifies guest-running and allocating operations as safepoints" do
       for_ [ RtApply, RtSettle, RtForceIfByneed, RtMakeClosure, RtNewStr, RtNewNumber, RtNewArray, RtNewAdt, RtNewRecord, RtRecordSet, RtNewByneedPlaceholder, RtRunEffect ]
         \op -> rtSafepoint op `shouldEqual` true
@@ -99,7 +105,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Safepoint" do
       map rtSym (map RtPrim (Array.filter (rtSafepoint <<< RtPrim) allPrims)) `shouldEqual`
         map rtSym (map RtPrim [ AddNumber, SubNumber, MulNumber, DivNumber, IntToNumber, Append, NewArray, RecordSet, RecordDelete, RecordUnion ])
 
-  describe "rtCall / rtCallWith / rtCallVoid" do
+  describe "rtCall / rtCallVoid" do
     it "renders a ctx-taking value call" do
       emitted (rtCall RtApply [ V (unsafeTestVal "%f"), Ptr "%p", I64 "3" ]) `shouldEqual`
         "  %t1 = call i64 @pv_apply(ptr %ctx, i64 %f, ptr %p, i64 3)\n"
@@ -107,10 +113,6 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Safepoint" do
     it "renders a ctx-free value call with no operands" do
       emitted (rtCall RtEmptyArray []) `shouldEqual`
         "  %t1 = call i64 @pv_empty_array()\n"
-
-    it "renders into a caller-supplied temp (the boot numbering-order sites)" do
-      emitted (rtCallWith "%r" RtReadField [ V (unsafeTestVal "%v"), I64 "2" ]) `shouldEqual`
-        "  %r = call i64 @pv_read_field(ptr %ctx, i64 %v, i64 2)\n"
 
     it "renders void calls, with and without ctx, including i32 operands" do
       emitted (rtCallVoid RtTailcall [ V (unsafeTestVal "%f"), Ptr "%p", I64 "2" ]) `shouldEqual`
@@ -152,13 +154,32 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Safepoint" do
     it "an operand-count mismatch against the row schema is a violation" do
       expectCrash \_ -> emitted (rtCall RtApply [ V (unsafeTestVal "%f") ])
 
-  describe "guestDirect / guestMusttail" do
+  describe "guestDirect / the prepared musttail" do
     it "renders the tailcc direct entry call" do
       emitted (guestDirect { dsym: "foo$d", env: unsafeTestVal "%e", args: [ unsafeTestVal "%a", unsafeTestVal "%b" ] }) `shouldEqual`
         "  %t1 = call tailcc i64 @foo$d(ptr %ctx, i64 %e, i64 %a, i64 %b)\n"
       emitted (guestDirect { dsym: "foo$d", env: unsafeTestVal "%e", args: [] }) `shouldEqual`
         "  %t1 = call tailcc i64 @foo$d(ptr %ctx, i64 %e)\n"
 
-    it "renders the musttail variant" do
-      emitted (guestMusttail { dsym: "foo$d", env: unsafeTestVal "%e", args: [ unsafeTestVal "%a" ] }) `shouldEqual`
+    it "renders the musttail variant through the two-phase prepared form (§6.4)" do
+      emitted (prepareMusttail { dsym: "foo$d", env: unsafeTestVal "%e", args: [ unsafeTestVal "%a" ] } >>= emitPreparedMusttail) `shouldEqual`
         "  %t1 = musttail call tailcc i64 @foo$d(ptr %ctx, i64 %e, i64 %a)\n"
+
+    it "a safepoint between prepare and emission crashes fail-closed (§6.4)" do
+      -- the HANDOVER happens at the call: an intervening allocation stales the sealed
+      -- operands before the callee ever sees them.
+      expectCrash \_ -> emitted do
+        prepared <- prepareMusttail { dsym: "foo$d", env: unsafeTestVal "%e", args: [] }
+        _ <- rtCall RtNewStr [ Ptr "null", I64 "0" ]
+        emitPreparedMusttail prepared
+
+    it "non-safepoint work between prepare and emission passes (the pop-shaped positive)" do
+      emitted
+        ( do
+            prepared <- prepareMusttail { dsym: "foo$d", env: unsafeTestVal "%e", args: [] }
+            _ <- rtCall RtEmptyArray []
+            emitPreparedMusttail prepared
+        ) `shouldEqual`
+        ( "  %t1 = call i64 @pv_empty_array()\n"
+            <> "  %t2 = musttail call tailcc i64 @foo$d(ptr %ctx, i64 %e)\n"
+        )

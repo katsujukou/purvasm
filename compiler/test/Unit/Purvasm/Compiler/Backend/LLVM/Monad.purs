@@ -18,14 +18,18 @@ import Data.Maybe (Maybe(..))
 import Data.String as String
 import Effect.Aff (Aff)
 import Effect.Class (liftEffect)
-import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, Ctx, beginFn, bumpEpoch, emit, emitDefine, emitGuestRet, emitModule, emitPhi, emitStringConstant, foldA, forA, forA_, forWithIndexA, fresh, freshFn, freshLabel, makeCx, closeHopArm, mintLoad, renderBuffer, renderChunks, renderFnBody, runCodegen, takeFn)
-import Purvasm.Compiler.Backend.LLVM.Value (vImm)
+import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, Ctx, beginFn, bumpEpoch, emit, emitAnfLabel, emitDefine, emitGuestRet, emitGuestStore, emitModule, emitPhi, emitRetResolved, emitStringConstant, foldA, forA, forA_, forWithIndexA, fresh, freshFn, freshLabel, makeCx, closeHopArm, mintLoad, renderBuffer, renderChunks, renderFnBody, resolveGuest, runCodegen, snapshotReloads, snapshotVal, takeFn, armIncomingAt, touchVal, unsafeEmitChainLabel)
+import Purvasm.Compiler.Backend.LLVM.Value (vImm, vRootedGlobal, vRootedLocal)
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
 
 -- The default fresh state used across these cases.
 run :: forall a. Codegen a -> Tuple a Ctx
 run = runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true })
+
+-- The --debug entry-call state (the pv_get reload leg).
+runDebug :: forall a. Codegen a -> Tuple a Ctx
+runDebug = runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: false })
 
 -- Force a pure emission inside the Effect runtime so its guard `unsafeCrashWith` surfaces as a
 -- caught exception: evaluation is deferred into the Effect closure — strict evaluation at
@@ -188,6 +192,206 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Monad" do
       expectCrash \_ -> vImm ""
       expectCrash \_ -> vImm "-"
 
+  describe "the renderer-owned reload cache (ADR-0105 §6.4, 2b-2 phase 2)" do
+    it "a rooted miss reloads just before the consuming instruction (inline shape)" do
+      renderBuffer (snd (run (emitGuestRet (vRootedLocal "%h")))).fn `shouldEqual`
+        ( "  %t1 = load ptr, ptr %ctx\n"
+            <> "  %t2 = getelementptr i64, ptr %t1, i64 %h\n"
+            <> "  %t3 = load i64, ptr %t2\n"
+            <> "  ret i64 %t3\n"
+        )
+
+    it "a rooted miss reloads via pv_get under --debug" do
+      renderBuffer (snd (runDebug (emitGuestRet (vRootedLocal "%h")))).fn `shouldEqual`
+        ( "  %t1 = call i64 @pv_get(ptr %ctx, i64 %h)\n"
+            <> "  ret i64 %t1\n"
+        )
+
+    it "a hit at the same epoch reuses the SSA with no emission" do
+      renderBuffer
+        ( snd $ run do
+            emitGuestStore (vRootedLocal "%h") "%p"
+            emitGuestStore (vRootedLocal "%h") "%q"
+        ).fn `shouldEqual`
+        ( "  %t1 = load ptr, ptr %ctx\n"
+            <> "  %t2 = getelementptr i64, ptr %t1, i64 %h\n"
+            <> "  %t3 = load i64, ptr %t2\n"
+            <> "  store i64 %t3, ptr %p\n"
+            <> "  store i64 %t3, ptr %q\n"
+        )
+
+    it "a safepoint bump misses and re-reloads (never a crash — the Rooted arm's contract)" do
+      renderBuffer
+        ( snd $ run do
+            emitGuestStore (vRootedLocal "%h") "%p"
+            bumpEpoch
+            emitGuestStore (vRootedLocal "%h") "%q"
+        ).fn `shouldEqual`
+        ( "  %t1 = load ptr, ptr %ctx\n"
+            <> "  %t2 = getelementptr i64, ptr %t1, i64 %h\n"
+            <> "  %t3 = load i64, ptr %t2\n"
+            <> "  store i64 %t3, ptr %p\n"
+            <> "  %t4 = load ptr, ptr %ctx\n"
+            <> "  %t5 = getelementptr i64, ptr %t4, i64 %h\n"
+            <> "  %t6 = load i64, ptr %t5\n"
+            <> "  store i64 %t6, ptr %q\n"
+        )
+
+    it "the cache key is the slot identity: distinct handles never share a reload" do
+      renderBuffer
+        ( snd $ run do
+            emitGuestStore (vRootedLocal "%h1") "%p"
+            emitGuestStore (vRootedLocal "%h2") "%q"
+        ).fn `shouldEqual`
+        ( "  %t1 = load ptr, ptr %ctx\n"
+            <> "  %t2 = getelementptr i64, ptr %t1, i64 %h1\n"
+            <> "  %t3 = load i64, ptr %t2\n"
+            <> "  store i64 %t3, ptr %p\n"
+            <> "  %t4 = load ptr, ptr %ctx\n"
+            <> "  %t5 = getelementptr i64, ptr %t4, i64 %h2\n"
+            <> "  %t6 = load i64, ptr %t5\n"
+            <> "  store i64 %t6, ptr %q\n"
+        )
+
+    it "an ANF arm label restores the branch-point snapshot: pre-branch reloads are shared" do
+      -- `%h` reloads BEFORE the snapshot (it dominates both arms); the arm labels restore
+      -- the snapshot, so the arm consumptions HIT — no per-arm re-reload (the §6.4
+      -- path-sensitive refinement of pin c's always-clear form).
+      renderBuffer
+        ( snd $ run do
+            emitGuestStore (vRootedLocal "%h") "%p"
+            snap <- snapshotReloads
+            emitAnfLabel snap "arm1"
+            emitGuestStore (vRootedLocal "%h") "%q"
+            emitAnfLabel snap "arm2"
+            emitGuestStore (vRootedLocal "%h") "%r"
+        ).fn `shouldEqual`
+        ( "  %t1 = load ptr, ptr %ctx\n"
+            <> "  %t2 = getelementptr i64, ptr %t1, i64 %h\n"
+            <> "  %t3 = load i64, ptr %t2\n"
+            <> "  store i64 %t3, ptr %p\n"
+            <> "arm1:\n"
+            <> "  store i64 %t3, ptr %q\n"
+            <> "arm2:\n"
+            <> "  store i64 %t3, ptr %r\n"
+        )
+
+    it "an arm-minted reload does NOT leak into the sibling arm (restore drops it — dominance)" do
+      renderBuffer
+        ( snd $ run do
+            snap <- snapshotReloads
+            emitAnfLabel snap "arm1"
+            emitGuestStore (vRootedLocal "%h") "%p"
+            emitAnfLabel snap "arm2"
+            emitGuestStore (vRootedLocal "%h") "%q"
+        ).fn `shouldEqual`
+        ( "arm1:\n"
+            <> "  %t1 = load ptr, ptr %ctx\n"
+            <> "  %t2 = getelementptr i64, ptr %t1, i64 %h\n"
+            <> "  %t3 = load i64, ptr %t2\n"
+            <> "  store i64 %t3, ptr %p\n"
+            <> "arm2:\n"
+            <> "  %t4 = load ptr, ptr %ctx\n"
+            <> "  %t5 = getelementptr i64, ptr %t4, i64 %h\n"
+            <> "  %t6 = load i64, ptr %t5\n"
+            <> "  store i64 %t6, ptr %q\n"
+        )
+
+    it "a pre-branch entry restored after a bumping arm misses on epoch, not on absence" do
+      renderBuffer
+        ( snd $ run do
+            emitGuestStore (vRootedLocal "%h") "%p"
+            snap <- snapshotReloads
+            emitAnfLabel snap "arm1"
+            bumpEpoch
+            emitAnfLabel snap "join"
+            emitGuestStore (vRootedLocal "%h") "%q"
+        ).fn `shouldEqual`
+        ( "  %t1 = load ptr, ptr %ctx\n"
+            <> "  %t2 = getelementptr i64, ptr %t1, i64 %h\n"
+            <> "  %t3 = load i64, ptr %t2\n"
+            <> "  store i64 %t3, ptr %p\n"
+            <> "arm1:\n"
+            <> "join:\n"
+            <> "  %t4 = load ptr, ptr %ctx\n"
+            <> "  %t5 = getelementptr i64, ptr %t4, i64 %h\n"
+            <> "  %t6 = load i64, ptr %t5\n"
+            <> "  store i64 %t6, ptr %q\n"
+        )
+
+    it "a global rooted token loads its $root handle then the slot" do
+      renderBuffer (snd (run (emitGuestRet (vRootedGlobal "@g$root")))).fn `shouldEqual`
+        ( "  %t1 = load i64, ptr @g$root\n"
+            <> "  %t2 = load ptr, ptr %ctx\n"
+            <> "  %t3 = getelementptr i64, ptr %t2, i64 %t1\n"
+            <> "  %t4 = load i64, ptr %t3\n"
+            <> "  ret i64 %t4\n"
+        )
+
+    it "a phi incoming accepts a HOT rooted token and crashes on a cold one (fail-closed)" do
+      renderBuffer
+        ( snd $ run do
+            touchVal (vRootedLocal "%h")
+            inc <- armIncomingAt { from: "a", startNext: "b" } (vRootedLocal "%h")
+            void (emitPhi "%r" [ inc ])
+        ).fn `shouldEqual`
+        ( "  %t1 = load ptr, ptr %ctx\n"
+            <> "  %t2 = getelementptr i64, ptr %t1, i64 %h\n"
+            <> "  %t3 = load i64, ptr %t2\n"
+            <> "b:\n"
+            <> "  %r = phi i64 [ %t3, %a ]\n"
+        )
+      expectCrash \_ -> run do
+        inc <- armIncomingAt { from: "a", startNext: "b" } (vRootedLocal "%cold")
+        emitPhi "%r" [ inc ]
+
+    it "snapshotVal reads back into a Fresh token: later staleness crashes instead of reloading" do
+      renderBuffer
+        ( snd $ run do
+            v <- snapshotVal (vRootedLocal "%h")
+            emitGuestRet v
+        ).fn `shouldEqual`
+        ( "  %t1 = load ptr, ptr %ctx\n"
+            <> "  %t2 = getelementptr i64, ptr %t1, i64 %h\n"
+            <> "  %t3 = load i64, ptr %t2\n"
+            <> "  ret i64 %t3\n"
+        )
+      expectCrash \_ -> run do
+        v <- snapshotVal (vRootedLocal "%h")
+        bumpEpoch
+        emitGuestRet v
+
+    it "beginFn starts cold: a pre-existing hot entry does not leak into the next function" do
+      renderBuffer
+        ( snd $ run do
+            emitGuestStore (vRootedLocal "%h") "%p"
+            beginFn
+            emitGuestStore (vRootedLocal "%h") "%q"
+        ).fn `shouldEqual`
+        ( "  %t1 = load ptr, ptr %ctx\n"
+            <> "  %t2 = getelementptr i64, ptr %t1, i64 %h\n"
+            <> "  %t3 = load i64, ptr %t2\n"
+            <> "  store i64 %t3, ptr %q\n"
+        )
+
+    it "a safepoint between resolve and the ret crashes fail-closed (§6.4)" do
+      expectCrash \_ -> run do
+        r <- mintLoad "%slot" >>= resolveGuest
+        bumpEpoch
+        emitRetResolved r
+
+    it "non-safepoint emission between resolve and the ret passes (the pop-shaped positive)" do
+      renderBuffer
+        ( snd $ run do
+            r <- mintLoad "%slot" >>= resolveGuest
+            emit "  store i64 0, ptr %root"
+            emitRetResolved r
+        ).fn `shouldEqual`
+        ( "  %t1 = load i64, ptr %slot\n"
+            <> "  store i64 0, ptr %root\n"
+            <> "  ret i64 %t1\n"
+        )
+
   describe "the raw-call guards (ADR-0105 §1 negative tests)" do
     it "emit rejects a raw call line" do
       expectCrash \_ -> run (emit "  %t1 = call i64 @evil(ptr %ctx)")
@@ -201,6 +405,49 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Monad" do
       expectCrash \_ -> run (takeFn >>= emitDefine "define @x( call i64 ) {\n")
     it "the guards pass call-free text through" do
       renderBuffer (snd (run (emit "  ret i64 1"))).fn `shouldEqual` "  ret i64 1\n"
+
+    it "emit rejects raw label text (§6.4 phase-2 round 2: the restore discipline is mechanical)" do
+      expectCrash \_ -> run (emit "arm1:")
+      expectCrash \_ -> run (emit "fchk9:")
+
+    it "emit rejects embedded newlines — the one-line contract the guards rest on (round 3)" do
+      -- two labels smuggled in one string: the mid-string colon defeats a single-line label
+      -- test, so the newline itself must be the rejection.
+      expectCrash \_ -> run (emit "arm1:\nnext:")
+      -- an instruction+label mix, and the CR spelling
+      expectCrash \_ -> run (emit "  %t1 = add i64 1, 1\nfoo:")
+      expectCrash \_ -> run (emit "arm1:\r\nnext:")
+
+    it "the safe label forms validate the name grammar — arbitrary text cannot reach raw emission (round 3)" do
+      expectCrash \_ -> run do
+        snap <- snapshotReloads
+        emitAnfLabel snap "arm1:\n  %t1 = call i64 @evil(ptr %ctx)\nnext"
+      expectCrash \_ -> run do
+        snap <- snapshotReloads
+        emitAnfLabel snap "arm1:extra"
+      expectCrash \_ -> run (unsafeEmitChainLabel "a b")
+      expectCrash \_ -> run (unsafeEmitChainLabel "a:b")
+      expectCrash \_ -> run (unsafeEmitChainLabel "a\nb")
+      expectCrash \_ -> run (unsafeEmitChainLabel "a\tb")
+      expectCrash \_ -> run (unsafeEmitChainLabel "")
+
+    it "the disciplined label forms pass: emitAnfLabel restores, the chain form keeps the cache" do
+      renderBuffer
+        ( snd $ run do
+            emitGuestStore (vRootedLocal "%h") "%p"
+            unsafeEmitChainLabel "fchk1"
+            emitGuestStore (vRootedLocal "%h") "%q"
+        ).fn `shouldEqual`
+        ( "  %t1 = load ptr, ptr %ctx\n"
+            <> "  %t2 = getelementptr i64, ptr %t1, i64 %h\n"
+            <> "  %t3 = load i64, ptr %t2\n"
+            <> "  store i64 %t3, ptr %p\n"
+            <> "fchk1:\n"
+            <> "  store i64 %t3, ptr %q\n"
+        )
+
+    it "the label guard does not false-positive indented instructions or br operands" do
+      renderBuffer (snd (run (emit "  br label %then1"))).fn `shouldEqual` "  br label %then1\n"
 
 -- --- the stack-safe spine combinators (2026-07-16 bugfix) -----------------------------------------
 --

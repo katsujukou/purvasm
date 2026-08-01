@@ -22,7 +22,6 @@ module Purvasm.Compiler.Backend.LLVM.Abi
   , declarations
   , abiStamp
   , headerField
-  , abiGet
   , abiSettle
   , forceValue
   ) where
@@ -31,7 +30,7 @@ import Prelude
 
 import Control.Monad.State.Class (gets)
 import Data.String (joinWith)
-import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, emit, armIncomingAt, armIncomingClosing, emitLowBitAnd, emitPhi, fresh, freshLabel, mintLoad)
+import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, emit, armIncomingAt, armIncomingClosing, emitLowBitAnd, emitPhi, fresh, freshLabel, touchVal, unsafeEmitChainLabel)
 import Purvasm.Compiler.Backend.LLVM.Safepoint (RtArg(..), RtOp(..), rtCall)
 import Purvasm.Compiler.Backend.LLVM.Value (Val)
 
@@ -151,31 +150,23 @@ headerField off = do
   emit ("  " <> a <> " = getelementptr i8, ptr %ctx, i64 " <> show off)
   pure a
 
--- | Read a root handle's current value: inline loads `roots_base` then the slot, `--debug` calls
--- | `pv_get`. The handle is raw metadata (a stable index); the LOADED value is a fresh token —
--- | the reload event of ADR-0105 §6.2's `Rooted` arm.
-abiGet :: String -> Codegen Val
-abiGet handle = gets _.inlineAbi >>= case _ of
-  false -> rtCall RtGet [ I64 handle ]
-  true -> do
-    base <- fresh
-    emit ("  " <> base <> " = load ptr, ptr %ctx")
-    slot <- fresh
-    emit ("  " <> slot <> " = getelementptr i64, ptr " <> base <> ", i64 " <> handle)
-    mintLoad slot
-
 -- | Settle a returned value after a call (ADR-0079): if a tail is pending, `pv_settle` reifies it;
 -- | otherwise the value passes through. Inline is a 3-block `schk`/`sslow`/`sdone` with a phi;
--- | `--debug` is a single `pv_settle`.
+-- | `--debug` is a single `pv_settle`. (The reload of a rooted handle's current value — the
+-- | retired `abiGet` — is renderer-owned now: `Monad.useVal`, ADR-0105 §6.4.)
 abiSettle :: Val -> Codegen Val
 abiSettle r = gets _.inlineAbi >>= case _ of
   false -> rtCall RtSettle [ V r ]
   true -> do
+    -- resolve the operand while emission is still legal (ADR-0105 §6.4): its first
+    -- consumption below is the fast arm's phi incoming, AFTER this chain's conditional
+    -- branch — a rooted miss there could not emit its reload.
+    touchVal r
     chk <- freshLabel "schk"
     slow <- freshLabel "sslow"
     done <- freshLabel "sdone"
     emit ("  br label %" <> chk)
-    emit (chk <> ":")
+    unsafeEmitChainLabel chk
     -- boot binds `pf` (the load result) *before* evaluating `header_field`, so the load-result temp is
     -- numbered before the getelementptr temp while the getelementptr line is emitted first (OCaml
     -- right-to-left arg eval) — matching the `%t9 = getelementptr; %t8 = load` order in boot's `.ll`.
@@ -202,7 +193,7 @@ forceValue v = do
   slow <- freshLabel "fslow"
   done <- freshLabel "fdone"
   emit ("  br label %" <> chk)
-  emit (chk <> ":")
+  unsafeEmitChainLabel chk
   bit <- fresh
   emitLowBitAnd bit v
   imm <- fresh

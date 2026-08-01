@@ -451,6 +451,22 @@ fail-closed (crash, not wrap). If the over-approximation ever produces a false-p
 assert on legitimate emission, the remedy is a path-sensitive epoch join — NEVER weakening
 the assert.
 
+> **Pin (c) refinement (2b-2 phase 2, measured — awaiting checkpoint review).** The
+> always-clear form was implemented first and CENSUSED: it *regressed* the corpus (reloads
+> +1.6%, bytes +0.3% vs the phase-1 emission on unchanged-corefn modules) — clearing at
+> `ctimm`/`ctptr`/`then`/`else` labels forfeits exactly the pre-branch reads the previous
+> choreography shared across arms (a `CCase` dispatch read the scrutinee ONCE before the
+> representation branch; always-clear re-reloads it in every arm). Pin (c) is therefore
+> refined to the path-sensitive join the pins already anticipated: an ANF-level label
+> RESTORES the reload cache to its construct's **branch-point snapshot** (`Monad.
+> ReloadSnapshot`, captured after the construct's own pre-branch consumptions, restored by
+> `emitAnfLabel` at every arm/join/fail label). Soundness: a snapshot entry was minted
+> before the branch instruction, so its SSA dominates every arm and the join; an arm's own
+> mints never survive into a sibling or the join (the restore drops them — they do not
+> dominate); and any bump (in any earlier-emitted arm) makes restored entries MISS on
+> epoch, the safe direction. The assert is untouched. Measured effect on the same corpus:
+> reloads **−4.9%**, bytes/lines **−1.0%** (root blocks unchanged).
+
 **6.5 Sequencing and gates.** 2b-0 (the epoch, the epoch-carrying operand tokens and the
 use-point verification, byte-identical on the 2a emission; PLUS the 6.1 per-entry/per-operand
 policy inventory and the provider-side forced-GC runtime tests — all gates green) → 2b-1
@@ -538,6 +554,63 @@ used for bridge removal:
 - **Type/kind refinement (never root provable immediates).** Needs representation typing the
   backend does not track; the win is bounded (immediates crossing safepoints are rare) and
   the risk profile is the same class as liveness itself. Out of scope.
+
+## Results (2026-07-31 — ADR closed)
+
+All slices (0, 1, 2/2a, 2b-0/1/2) are implemented, maintainer-reviewed and closed. Measured
+on the `--no-opt --emit-llvm` self-host closure, motivating census (slice 0, 298 objects)
+vs the final emission (302 objects — the compiler itself grew by the 0105 modules, so the
+raw totals are CONSERVATIVE; per-object figures normalise):
+
+| quantity | pre-0105 | final | reduction |
+|---|---|---|---|
+| total emitted IR | 101.4 MB / 3,027,521 lines | 77.6 MB / 2,256,572 lines | **−23.5 % / −25.5 %** |
+| per object | 340 KB / 10,159 lines | 257 KB / 7,472 lines | **−24.5 % / −26.5 %** |
+| root fast-path blocks | 87,634 | 53,908 | **−38.5 %** (−33,726) |
+| slot reloads (ctx reload heads) | 210,203 | 140,897 | **−33.0 %** (−69,306) |
+| frames fully elided | 0 % | 23.6 % of `$d` functions | — |
+
+**The reduction is accounted for, not incidental**: at ≈ 15–18 lines per root block and
+≈ 3 per reload, the deleted choreography alone is ≈ 710–820 k lines against an actual total
+reduction of ≈ 770 k — the removed IR IS the targeted root/store/reload choreography. (The
+Context's "≈ ⅔ of all lines is choreography" was never a claim that ⅔ could go: rooting for
+values that truly cross safepoints must stay.) Contribution by slice: 2a (identity class,
+deliberately conservative) IR −3.3 %; **2b-1 (read-order refinement) the bulk — IR −21.8 %,
+root blocks −36 %, reloads −29 %**; 2b-2 (reload cache) reloads a further −4.9 %, IR −1.0 %.
+The staging is itself a result: precision was raised stepwise UNDER the token/epoch net,
+never by optimistically weakening the analysis.
+
+**Run time.** The behavioural gate held green throughout (4 fixtures × release/debug ×
+forced-GC stress at up to ~1.2 × 10⁵ collections, oracle-identical), fixpoint 603/603.
+Bench (llvm leg, final): fib exponent 0.96 / 12.5× vs JS, quicksort 1.05 / 18.9× vs JS —
+strictly no regression across the slices. What the bench does NOT yet establish is a paired
+same-input/same-runtime pre-vs-final A/B, so no "0105 alone bought X %" claim is made; the
+structural claim stands (root stores are GC-observable and un-deletable by `-O2` — only
+codegen could remove them, and did, on exactly the hot paths sidenote 0011 predicted).
+
+**Measurement caveats / owed follow-up measurements** (maintainer review, at close): (a)
+pre/final are not a strict A/B (corpus grew 298 → 302); a fixed CoreFn closure through old
+vs new compiler would give the exact causal figure. (b) No controlled build-time A/B was
+taken — clang wall / max RSS / `.o`-and-binary size on the fixed closure is the first owed
+measurement. (c) All figures are `--no-opt`; the default CLI path is `--opt`, whose smaller
+input ANF may shift the ratios — one Node-hosted `--opt` census is worth taking.
+
+**Follow-up map** (maintainer-prioritised at close — measurements first, no ADR picked by
+guesswork): (1) the paired A/B above; (2) a census classifying the REMAINING 53,908 root
+blocks by cause (activation / conservative force / `CCase` occurrence / `CUpdate` /
+closure capture); (3) **provably-not-by-need analysis** — the most natural next lever, and
+the only one that hits IR and run time at once (binding provenance proving a value can
+never be a `ByNeed` cell deletes the force branch+slow path, a safepoint, its induced
+root/reload, raises frame elision beyond 23.6 %, and removes the run-time tag check); (4)
+re-profile self-host `pv_apply` call-sites/fallback classes — the RUN-TIME main lever is
+apply-count density, not rooting (ADR-0102's exact-saturated fast path bought 1.38–1.45×;
+FSR still shows 4.5–8.8 M entries at 10–20 KB inputs; the `--opt` milestone's `mod_282`
+stall is this class, not 0105's); then choose between `CCase`/dtree precision and
+apply-count reduction on the numbers. Parked as small candidates: the global `$root`
+epoch-free handle cache (≤ ~1.4 % of final lines, new store-once pin — stays profile-driven),
+`CUpdate` first-value refinement, and root-fast-path outlining into module-local helpers
+(only if clang wall/RSS remains dominated by root-block expansion — measure first: it
+trades `.ll` size against per-root call overhead, and `alwaysinline` would re-expand).
 
 #### Progress (2026-07-22): slice 0 — the stress net landed, green on the CURRENT emission
 
@@ -688,9 +761,10 @@ landed:
 - **§1 classified emission seam = `Backend.LLVM.Safepoint`.** A closed `RtOp` descriptor sum
   (one constructor per runtime entry + `RtPrim PrimOp` over `Prim.primSym`) whose row carries
   symbol / ctx-taking / return kind / **safepoint class**; ALL runtime call text is rendered
-  by `rtCall` / `rtCallWith` (caller-supplied result temp, for the boot numbering-order
-  sites: `SForceCell`, dtree `extract`, `DswitchLen`, the boxed-literal chain) / `rtCallVoid`,
-  and guest calls by `guestDirect`/`guestMusttail`. `Liveness` consults the SAME rows
+  by `rtCall` / `rtCallVoid` (the caller-supplied-temp `rtCallWith` form is private since
+  2b-2 phase 2 — the boot numbering-order sites it existed for are retired with the
+  read-site reload choreography), and guest calls by `guestDirect` and the
+  `prepareMusttail`/`emitPreparedMusttail` pair. `Liveness` consults the SAME rows
   (`primOpSafepoint = rtSafepoint (RtPrim op)`; the atom/force/per-node arms reference their
   rows), so analysis-vs-lowering drift now requires editing the shared table.
   **Non-bypassability is layered (round-2 review):** `Monad.emit` REJECTS any line containing
@@ -915,6 +989,106 @@ fresh values, but 2b-2's renderer-owned reload would fire on a `Rooted` cache mi
 first (an opaque `PreparedCall`: operands verified/reloaded BEFORE the pop; after the pop
 only the already-rendered call is emitted) — this joins §6.4's phasing note as an explicit
 precondition, not an implementation detail.
+
+#### Progress (2026-07-30): slice 2b-2 phase 2 — the `Rooted` arm + renderer-owned reload cache
+
+The §6.4 cache landed and the read-site reload choreography is RETIRED. `Value.Val` gained
+the `VRooted RootSrc` arm (`LocalSlot` handle / `GlobalSlot $root` symbol — the slot IS the
+token's identity and the §6.4(d) cache key; constructors `vRootedLocal`/`vRootedGlobal`
+audit-caged to `Emit`, the pure verifier crashes on a rooted token). `Monad.useVal` is the
+ONE reload owner: `Ctx.reloadCache` (slot → last reload's `{ssa, epoch}`) hits at the
+current epoch with zero emission, misses by emitting the reload just before the consuming
+instruction and re-caching — inline `roots_base`+slot loads, `--debug` a raw `pv_get` line
+(the one audited raw call outside the seam; a seam unit test ties it to the `RtGet` row's
+`sp = false`). Retired: `readVar`'s immediate `abiGet` (a rooted/global read now emits
+NOTHING), `Abi.abiGet` itself, the `getCurrent` sites (`SForceCell`, `CUpdate`, `CCase`
+occurrences/boxed handles, `buildGrec`), `evalAtoms`' whole reload pass, and `rtCallWith`'s
+public form (the boot numbering-order quirks it existed for). Renderers that open internal
+single-entry/single-exit chains resolve their guest operands at ENTRY (`touchVal` in
+`abiSettle`/`emitRoot`; `forceValue`'s first consumption already is) — a reload inside one
+of their arms would not dominate the join — and the phi-incoming freezers resolve through
+the non-emitting `useValHot` (a cold rooted token there is fail-closed: the arm's
+terminator is already emitted). `emitInitFnFramed` snapshot-reads (`snapshotVal`) every
+permanent-root candidate into an epoch-checked `Fresh` token BEFORE the pop: post-pop the
+transient slots are dead (the permanent tier's own rooting overwrites that region), so a
+candidate must never resolve through its slot later — staleness there crashes instead of
+reloading. ANF-level labels restore their construct's branch-point `ReloadSnapshot` (the
+measured pin-(c) refinement — see the §6.4 note: always-clear was implemented first and
+REGRESSED the census +1.6% reloads by forfeiting the pre-branch reads the old choreography
+shared across `CCase`/`CIf` arms). Verification: unit **496/496** (new cache-machine tests:
+miss/hit/bump-miss/key-identity/snapshot-restore/sibling-isolation/epoch-miss-after-restore,
+`--debug` `pv_get` shape, hot/cold phi incomings, `snapshotVal` semantics, `beginFn` cold
+start), audit green (recursive, pv_get shape-pinned, `vRooted*` caged, 21 self-test
+classes), slice1 fixture re-baselined (`mod_0.ll` unchanged; `entry.ll`: the global read's
+reload moved to its consumption), e2e 11/11, behavioural gate FULL GREEN (4 fixtures ×
+both modes × stress + debug-ABI leg), fixpoint smoke HOLDS **603/603** both compares.
+Census (unchanged-corefn modules, phase-2 vs phase-1 emission): reloads **−4.9%**
+(133,433 → 126,874), IR bytes/lines **−1.0%**, root blocks unchanged (rooting policy is
+2b-1's). Bench (llvm leg): fib exponent 0.96 / 12.5x vs-js, quicksort 1.05 / 18.9x vs-js —
+no regression (2b-1: 0.96/1.05, 19.1x). Residual identified for a possible follow-up: 22%
+of reload events are GLOBAL reads whose `$root` handle load (epoch-immune, store-once) is
+re-emitted per miss — a second, epoch-free handle-cache axis could drop ~1 line per
+repeated global miss, but it adds a new immutability assumption and sits outside this
+phase's pins, so it is left to review.
+
+**Round 2 (P2 hardening — the restore discipline is now mechanical).** The pin-(c)
+soundness relied on every ANF label in `Emit` going through `emitAnfLabel`'s restore, but a
+plain `emit (l <> ":")` could silently skip it. `Monad.emit` now REJECTS label text
+(column-zero `name:`) exactly as it rejects call text — a block label can only enter
+through `emitAnfLabel` (restore) or the audited `unsafeEmitChainLabel` (seam-internal
+single-entry/single-exit chains, cache kept; `tools/seam-audit.sh` cages it to `Abi`/`Root`
+with exact counts, pins `Emit` at zero, and self-tests both classes). The fused phi-arm
+renderers use the module-private raw form. Emission-identical (corpus content-pairing:
+298/301, diff = `Monad`/`Abi`/`Root` whose own corefn changed; `Safepoint`'s comment-only
+sync is byte-identical); unit guard negatives + chain-form/false-positive pins, audit
+green, e2e 11/11, behavioural gate + fixpoint re-run green. Retired-name comment sync:
+`guestMusttail` → the `PreparedCall` pair, `mintLoad`'s `abiGet` reference.
+
+**Round 3 (P1 — string-splitting bypasses closed).** Two residual bypasses in the round-2
+guard: (a) `emit` documented a one-LINE contract but did not reject newlines, so
+`"arm1:\nnext:"` passed both per-line guards (the mid-string colon defeats the single-line
+label test) and smuggled two raw labels; (b) the SAFE label forms fed unvalidated text to
+the raw emitter, so `emitAnfLabel snap "arm1:\n  … call …\nnext"` could carry instruction
+lines past the classified-call guard too. Fixes: `emit` now rejects `\n`/`\r`
+unconditionally (the one-line contract is enforced, making the per-line guards total), and
+the private `emitLabelRaw` under `emitAnfLabel`/`unsafeEmitChainLabel` validates the
+label-name grammar (non-empty; no newline/CR/space/tab/colon) before rendering. Regressions
+pin both families (multi-label and instruction+label smuggling via `emit`; newline/colon/
+whitespace/empty names via both safe forms). Emission-identical again (300/301 vs round 2,
+diff = `Monad`'s own corefn); unit **501/501**, audit green, e2e 11/11, behavioural gate +
+fixpoint re-run green. The §1 seam summary's renderer list is synced to the current surface
+(`rtCallWith` private, the `PreparedCall` pair).
+
+**Phase 2 — and with it slice 2b-2 — CLOSED by maintainer review 2026-07-31** (pin-(c)
+branch-point-snapshot refinement ratified; §6.5's implementation/verification conditions
+met). The global `$root` handle's epoch-free cache axis is deliberately NOT part of this
+ADR: it introduces a new immutability pin for a saving bounded to the handle-load line
+(22% of reload EVENTS, but only ~1 of their 4 lines) — recorded as a profile-driven
+follow-up candidate, to be taken up only if a future census shows it worth its pin.
+
+#### Progress (2026-07-30): slice 2b-2 phase 1 — the `PreparedCall` blocker discharged
+
+The §6.4-pinned two-phase split landed byte-identically ahead of the reload cache:
+`Safepoint.PreparedCall` (opaque — `prepareMusttail` resolves and VERIFIES every operand
+BEFORE the frame pop and seals the rendered argument text **together with the prepare-time
+epoch**; `emitPreparedMusttail` post-pop fail-closed asserts the epoch is unchanged — the
+HANDOVER happens at the call, so a safepoint between prepare and emission would stale the
+sealed operands before the callee ever sees them — then freshes the result temp, emits,
+bumps and mints; the temp must number after the pop's own temps, so it is deliberately not
+reserved at prepare time; `guestMusttail` is retired into the pair, audit counts moving
+1:1). `Root.retWith` gained the same discipline via the opaque `Monad.ResolvedGuest`
+(resolve pre-pop with the resolve-time epoch sealed in; `emitRetResolved` post-pop asserts
+epoch equality before the `ret`) — emission-identical today, and the resolution site is
+exactly where a `Rooted` operand's reload will emit while its handle is still live. Tests
+pin the prepared golden, that a safepoint between prepare/resolve and consumption CRASHES
+fail-closed (both carriers), and the pop-shaped positive control (non-safepoint work between
+the phases passes — the frame pop is a non-safepoint machinery row, so the legitimate
+`retWith`/`musttailWith` sequences are unaffected). Verification: unit **485/485**, audit
+green (counts unchanged), same-corefn identity **298/298** unchanged-input modules
+byte-identical (differs only in `Monad`/`Safepoint`/`Root`), e2e 11/11, behavioural gate
+full green (stress + debug-ABI), fixpoint smoke **603/603** both compares. Phase 2 (the
+`VRooted` operand arm + renderer-owned reload, retiring the read-site choreography) is
+next.
 
 #### Progress (2026-07-29): slice 2b-1 — the §6.3 read-order refinement landed
 
