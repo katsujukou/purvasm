@@ -11,7 +11,7 @@ import Data.List as List
 import Data.Maybe (Maybe(..))
 import Data.Set (Set)
 import Data.Tuple (Tuple(..), snd)
-import Purvasm.Compiler.Backend.LLVM.Value (Val, keyOf)
+import Purvasm.Compiler.Backend.LLVM.Value (RootedVal, Val, keyOf, rootedVal)
 import Purvasm.Compiler.MiddleEnd.ANF (Expr)
 
 -- | How a direct call site obtains the callee's env word (ADR-0076 §2).
@@ -69,13 +69,14 @@ data Gdef
   | Gcaf String Expr -- ^ key, strict value
   | Grec (Array (Tuple String Expr)) -- ^ recursive-group members: keys + bodies
 
--- | How a variable binding is realised (ADR-0105 §2/§6): a non-crossing definition holds its
--- | value token DIRECTLY (alias bindings inherit the token unchanged — never re-stamped); a
--- | crossing definition holds its shadow-stack root handle; a read yields the rooted token
--- | and the renderer-owned reload cache materialises its current value at consumption (§6.4).
+-- | How a variable binding is realised (ADR-0105 §2/§6, ADR-0106): a non-crossing definition
+-- | holds its value token DIRECTLY (alias bindings inherit the token unchanged — never
+-- | re-stamped); a crossing definition holds its BY-TYPE-rooted token (`RootedVal`, carrying
+-- | the owned slot); a read yields the rooted token and the renderer-owned reload cache
+-- | materialises its current value at consumption (§6.4).
 data BindingV
   = DirectV Val
-  | RootedV String
+  | RootedV RootedVal
 
 -- | An environment entry: the variable's binding realisation, plus static function info when
 -- | the binding is a known lambda (a direct-call candidate, ADR-0076 §2).
@@ -91,11 +92,11 @@ type EnvEntry =
 -- | boot's `(string * env_entry) list` with `List.assoc_opt`.
 type Env = List (Tuple String EnvEntry)
 
--- | Bind a variable to its rooted handle (boot's `bind`). Named `bindVar`, not `bind`, so it never
+-- | Bind a variable to its rooted token (boot's `bind`). Named `bindVar`, not `bind`, so it never
 -- | shadows `Prelude`'s `bind` in a consumer that opens this module — do-notation's implicit `bind`
 -- | would otherwise become ambiguous.
-bindVar :: Env -> String -> String -> Env
-bindVar env x handle = Tuple x { bind: RootedV handle, key: handle, knownFn: Nothing } : env
+bindVar :: Env -> String -> RootedVal -> Env
+bindVar env x rv = Tuple x { bind: RootedV rv, key: keyOf (rootedVal rv), knownFn: Nothing } : env
 
 -- | Bind a NON-CROSSING definition to its value token directly (ADR-0105 §3: no slot, no store,
 -- | no reload) — only sound when the activation plan proves no safepoint sits inside its live
@@ -105,8 +106,8 @@ bindDirectVar :: Env -> String -> Val -> Env
 bindDirectVar env x v = Tuple x { bind: DirectV v, key: keyOf v, knownFn: Nothing } : env
 
 -- | Bind a variable that is statically a known lambda — its saturated calls may go direct.
-bindFnVar :: Env -> String -> String -> FnInfo -> Env
-bindFnVar env x handle fn = Tuple x { bind: RootedV handle, key: handle, knownFn: Just fn } : env
+bindFnVar :: Env -> String -> RootedVal -> FnInfo -> Env
+bindFnVar env x rv fn = Tuple x { bind: RootedV rv, key: keyOf (rootedVal rv), knownFn: Just fn } : env
 
 -- | `bindDirectVar` for a known-lambda binding (ADR-0105): the value token directly plus the
 -- | direct-call info.

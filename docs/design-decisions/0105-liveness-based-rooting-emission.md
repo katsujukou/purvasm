@@ -595,6 +595,43 @@ taken — clang wall / max RSS / `.o`-and-binary size on the fixed closure is th
 measurement. (c) All figures are `--no-opt`; the default CLI path is `--opt`, whose smaller
 input ANF may shift the ratios — one Node-hosted `--opt` census is worth taking.
 
+**Post-close measurements (2026-08-04 — the owed (a)/(b) taken).** Paired A/B: worktree at
+`f7c8ec6` (the slice-2a parent = the last pre-0105-emission compiler) vs final, BOTH sides
+over the SAME fixed CoreFn closure, ulib and runtime `.a`; validity pinned by the two linked
+binaries emitting byte-identical output (md5) on the same input. Causal figures:
+
+| quantity | pre-0105 | final | delta |
+|---|---|---|---|
+| `.ll` (302 objects) | 103.5 MB / 3,088,294 lines | 77.6 MB / 2,256,572 lines | **−25.0 % / −26.9 %** |
+| `clang -c -O2`, all objects | 74 s | 58 s | **−21.6 %** |
+| peak per-object clang RSS | 170 MB | 137 MB | **−19.4 %** |
+| `.o` total | 26.6 MB | 24.7 MB | −7.3 % |
+| linked binary | 6,944 KB | 6,048 KB | **−12.9 %** |
+| Node full build (emit+clang+link) | 75 s | 70 s | −7 % |
+
+The IR reduction propagates almost directly into clang wall and RSS; the full-build −7 %
+and the flat native numbers below are Amdahl — the bottleneck has moved off clang. `.o` at
+−7.3 % vs binary −12.9 % is also expected: some deleted IR (header loads) was
+machine-code-foldable anyway, while root stores were not — they were real bytes. **Native
+self-host workload** (each linked binary building the same corpus, warm alternating
+rounds): old ≈ 142 s vs new ≈ 140 s — no measurable difference (±2 %): the compile path is
+apply/allocation-dominated, CONFIRMING apply-count density as the run-time lever (0105's
+run-time wins live on the frames-elided fib-class loops, per sidenote 0011). Node-hosted
+emit wall was noise-dominated (10–27 s swings) — inconclusive.
+
+**Remaining-root census (2026-08-04).** All 53,908 residual root blocks classified (zero
+unclassified; `.ll` def-line tracing of the rooted value): capture 16.4 % / apply-result
+15.4 % / field-extract 13.1 % / closure-value 11.3 % / param 10.0 % / settled-phi 9.2 % /
+forced-phi 8.1 % / **reload-reroot 6.6 %** / misc ≈ 9 %. Tier split: **init (the `rootAll`
+fallback) 15,467 = 28.7 %** vs direct 38,441. Two levers the census surfaced beyond the
+follow-up map: (A) plan-driven init tier (the 28.7 % pool; reuses the existing analysis —
+`Gcaf` first, `Grec`'s lowering-local roots separated) and (B) reload-reroot elision
+(3,553 re-roots — direct 2,685, init 868 — of already-rooted, un-forced values whose
+existing slot already GC-tracks).
+Both are taken up in ADR-0106; not-by-need's direct class is forced-phi (8.1 %), its true
+reach the crossing-set shrink from de-safepointing force — gated on a force-only-crossing
+census before its ADR is sized.
+
 **Follow-up map** (maintainer-prioritised at close — measurements first, no ADR picked by
 guesswork): (1) the paired A/B above; (2) a census classifying the REMAINING 53,908 root
 blocks by cause (activation / conservative force / `CCase` occurrence / `CUpdate` /

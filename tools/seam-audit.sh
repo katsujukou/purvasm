@@ -29,8 +29,8 @@ counts_for() {
     /^[[:space:]]*--/ { next }
     {
       if ($0 ~ /"[^"]*call (i64|void|ptr|tailcc)/) c["call"]++
-      split("unsafeEmitRawCall unsafeEmitRawModule popFrame openFrame bumpEpoch verifyAt mintAt keyOf unsafeUseVal unsafeMintFresh machineryHandleCall vRootedLocal vRootedGlobal rootedSrc unsafeEmitChainLabel", ids, " ")
-      for (i = 1; i <= 15; i++) if (index($0, ids[i]) > 0) c[ids[i]]++
+      split("unsafeEmitRawCall unsafeEmitRawModule popFrame openFrame bumpEpoch verifyAt mintAt keyOf unsafeUseVal unsafeMintFresh machineryHandleCall mkRootedLocal vRootedGlobal rootedSrc rootedFromVal mintFrameOwner unsafeMkFrameOwner unsafeEmitChainLabel emitGcafInitEngine", ids, " ")
+      for (i = 1; i <= 19; i++) if (index($0, ids[i]) > 0) c[ids[i]]++
       if (index($0, "unsafeTestVal") > 0 || index($0, "unsafeValText") > 0) c["testesc"]++
     }
     END { for (k in c) print k "=" c[k] }
@@ -98,9 +98,6 @@ audit_dir() {
         expect unsafeMintFresh 3 "unsafeMintFresh count drifted"
         expect testesc 0 "test-only token escape used in src"
         expect machineryHandleCall 0 "machineryHandleCall outside Root"
-        expect vRootedLocal 0 "rooted-token forge outside Emit"
-        expect vRootedGlobal 0 "rooted-token forge outside Emit"
-        expect rootedSrc 4 "rootedSrc count drifted (import + the three resolver arms)"
         ;;
       Program.purs)
         expect call 2 "raw call-construction count drifted"
@@ -125,7 +122,7 @@ audit_dir() {
         expect call 0 "raw call text outside the seam"
         expect unsafeEmitRawCall 0 "unsafeEmitRawCall outside the allowlist"
         expect unsafeEmitRawModule 0 "unsafeEmitRawModule outside the allowlist"
-        expect openFrame 4 "openFrame count drifted (export, signature, definition, framed-init wrapper)"
+        expect openFrame 5 "openFrame count drifted (export, signature, definition, framed-init wrapper, Gcaf engine)"
         expect bumpEpoch 0 "bumpEpoch outside the seam"
         expect verifyAt 0 "verifyAt outside the Monad wrapper"
         expect mintAt 0 "mintAt outside the Monad wrapper"
@@ -141,10 +138,7 @@ audit_dir() {
         expect unsafeEmitRawCall 0 "unsafeEmitRawCall outside the allowlist"
         expect unsafeEmitRawModule 0 "unsafeEmitRawModule outside the allowlist"
         expect popFrame 0 "popFrame outside Root"
-        expect vRootedLocal 14 "rooted-token mint count drifted"
         expect unsafeEmitChainLabel 0 "chain-label emitter outside Abi/Root (ANF labels must restore via emitAnfLabel)"
-        expect vRootedGlobal 2 "rooted-token mint count drifted (import + the global readVar arm)"
-        expect rootedSrc 0 "rootedSrc outside the Monad resolver"
         expect openFrame 2 "openFrame count drifted (import + the plan-driven activation open)"
         expect bumpEpoch 0 "bumpEpoch outside the seam"
         expect verifyAt 0 "verifyAt outside the Monad wrapper"
@@ -170,9 +164,6 @@ audit_dir() {
         expect unsafeMintFresh 0 "unsafeMintFresh outside the seam/prim renderers"
         expect testesc 0 "test-only token escape used in src"
         expect machineryHandleCall 0 "machineryHandleCall outside Root"
-        expect vRootedLocal 0 "rooted-token forge outside Emit"
-        expect vRootedGlobal 0 "rooted-token forge outside Emit"
-        expect rootedSrc 0 "rootedSrc outside the Monad resolver"
         ;;
       Prim.purs)
         expect call 0 "raw call text outside the seam"
@@ -195,9 +186,6 @@ audit_dir() {
         expect mintAt 3 "mintAt count drifted"
         expect keyOf 4 "keyOf count drifted"
         expect testesc 6 "test-escape count drifted"
-        expect vRootedLocal 3 "vRootedLocal count drifted (export, signature, definition)"
-        expect vRootedGlobal 3 "vRootedGlobal count drifted (export, signature, definition)"
-        expect rootedSrc 3 "rootedSrc count drifted (export, signature, definition)"
         expect unsafeUseVal 0 "unsafeUseVal outside the seam/prim renderers"
         expect unsafeMintFresh 0 "unsafeMintFresh outside the seam/prim renderers"
         expect popFrame 0 "popFrame outside Root"
@@ -209,7 +197,7 @@ audit_dir() {
         ;;
       Types.purs)
         expect call 0 "raw call text outside the seam"
-        expect keyOf 3 "keyOf count drifted (import + the two direct-bind key stamps)"
+        expect keyOf 5 "keyOf count drifted (import + the four bind-time key stamps)"
         expect verifyAt 0 "verifyAt outside the Monad wrapper"
         expect mintAt 0 "mintAt outside the Monad wrapper"
         expect testesc 0 "test-only token escape used in src"
@@ -224,9 +212,6 @@ audit_dir() {
         ;;
       *)
         expect call 0 "raw call text outside the seam"
-        expect vRootedLocal 0 "rooted-token forge outside Emit"
-        expect vRootedGlobal 0 "rooted-token forge outside Emit"
-        expect rootedSrc 0 "rootedSrc outside the Monad resolver"
         expect unsafeEmitChainLabel 0 "chain-label emitter outside Abi/Root"
         expect unsafeEmitRawCall 0 "unsafeEmitRawCall outside the allowlist"
         expect unsafeEmitRawModule 0 "unsafeEmitRawModule outside the allowlist"
@@ -242,6 +227,27 @@ audit_dir() {
         expect machineryHandleCall 0 "machineryHandleCall outside Root"
         ;;
     esac
+
+    # ADR-0106 forgery surface — a COMMON, TOTAL allowlist over EVERY file (slice-1 round 2:
+    # per-case pins left the other allowlisted files uncovered; a caged identifier smuggled
+    # into Program/Safepoint/Prim/Types would have passed). Default is zero everywhere.
+    allow0106() { # $1=id $2=Value $3=Monad $4=Root $5=Emit
+      local want=0
+      case "$base" in
+        Value.purs) want="$2" ;;
+        Monad.purs) want="$3" ;;
+        Root.purs) want="$4" ;;
+        Emit.purs) want="${5:-0}" ;;
+      esac
+      expect "$1" "$want" "ADR-0106 caged identifier outside its allowlist ($1)"
+    }
+    allow0106 mkRootedLocal 3 0 2 0
+    allow0106 rootedFromVal 3 0 2 0
+    allow0106 mintFrameOwner 0 5 2 0
+    allow0106 unsafeMkFrameOwner 3 2 0 0
+    allow0106 vRootedGlobal 3 0 0 2
+    allow0106 rootedSrc 3 4 5 0
+    allow0106 emitGcafInitEngine 0 0 3 2
   done
   return "$bad"
 }
@@ -252,7 +258,7 @@ audit_dir() {
 # directory the identifiers must not appear at all.
 audit_wide() {
   local srcdir="$1" backendsub="$2" bad=0 hits
-  hits=$(grep -rn 'unsafeEmitRawCall\|unsafeEmitRawModule\|openFrame\|bumpEpoch\|verifyAt\|mintAt\|keyOf\|unsafeUseVal\|unsafeMintFresh\|unsafeTestVal\|unsafeValText\|machineryHandleCall\|vRootedLocal\|vRootedGlobal\|rootedSrc\|unsafeEmitChainLabel' "$srcdir" --include='*.purs' \
+  hits=$(grep -rn 'unsafeEmitRawCall\|unsafeEmitRawModule\|openFrame\|bumpEpoch\|verifyAt\|mintAt\|keyOf\|unsafeUseVal\|unsafeMintFresh\|unsafeTestVal\|unsafeValText\|machineryHandleCall\|mkRootedLocal\|vRootedGlobal\|rootedSrc\|rootedFromVal\|mintFrameOwner\|unsafeMkFrameOwner\|unsafeEmitChainLabel\|emitGcafInitEngine' "$srcdir" --include='*.purs' \
     | grep -v "^$srcdir/$backendsub/" \
     | grep -vE ':[[:space:]]*--' || true)
   if [ -n "$hits" ]; then
@@ -292,8 +298,15 @@ selftest() {
   inject "unsafeUseVal outside the seam renderers" "Emit.purs" 'evil v = unsafeUseVal v'
   inject "a test-only token escape in src" "Emit.purs" 'evil s = unsafeTestVal s'
   inject "machineryHandleCall outside Root" "Emit.purs" 'evil = machineryHandleCall'
-  inject "a rooted-token forge outside Emit" "Liveness.purs" 'evil h = vRootedLocal h'
-  inject "an extra rooted-token forge in Emit.purs" "Emit.purs" 'evil h = vRootedLocal h'
+  inject "a rooted-token forge outside Root" "Liveness.purs" 'evil h o = mkRootedLocal h o'
+  inject "a rooted-token forge in Emit.purs (ADR-0106: fresh local roots only via ensureRooted)" "Emit.purs" 'evil h o = mkRootedLocal h o'
+  inject "a frame-owner mint outside Root" "Emit.purs" 'evil = mintFrameOwner'
+  inject "a rooted-token forge smuggled into an allowlisted file (Program)" "Program.purs" 'evil h o = mkRootedLocal h o'
+  inject "a raw FrameOwner constructor smuggled into an allowlisted file (Safepoint)" "Safepoint.purs" 'evil r = unsafeMkFrameOwner r'
+  inject "a rootedFromVal escape smuggled into Types.purs" "Types.purs" 'evil v = rootedFromVal v'
+  inject "a global rooted-token forge smuggled into Program.purs" "Program.purs" 'evil s = vRootedGlobal s'
+  inject "a rootedSrc projection smuggled into Prim.purs" "Prim.purs" 'evil v = rootedSrc v'
+  inject "the Gcaf init engine called outside Emit's fixed-shape surface" "Program.purs" 'evil k b = emitGcafInitEngine { key: k, framed: true, body: b }'
   inject "a second raw pv_get construction in Monad.purs" "Monad.purs" 'evil t = unsafeEmitRawCall ("  " <> t <> " = call i64 @pv_evil(ptr %ctx)")'
   inject "a chain-label emission in Emit.purs (ANF labels must restore)" "Emit.purs" 'evil l = unsafeEmitChainLabel l'
   inject "an extra chain-label emission in Root.purs" "Root.purs" 'evil l = unsafeEmitChainLabel l'
@@ -302,7 +315,7 @@ selftest() {
   inject "a second \$init-skeleton construction in Program.purs" "Program.purs" 'evil g = "  call void @" <> mangle (gdefInitKey g) <> "$init(ptr %ctx)"'
 
   # the wide scan must reject unsafe-emitter and openFrame imports outside the backend directory
-  for wide_bad in 'x = unsafeEmitRawCall "  smuggled"' 'x = openFrame' 'x = vRootedLocal "%t9"'; do
+  for wide_bad in 'x = unsafeEmitRawCall "  smuggled"' 'x = openFrame' 'x = mkRootedLocal "%t9"' 'x k b = emitGcafInitEngine { key: k, framed: true, body: b }'; do
     scratch=$(mktemp -d)
     mkdir -p "$scratch/src/Other" "$scratch/src/Backend/LLVM"
     cp "$BACKEND"/*.purs "$scratch/src/Backend/LLVM/"

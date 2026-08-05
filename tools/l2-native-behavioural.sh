@@ -61,6 +61,7 @@ export PURVASM_RT_A PURVASM_LIB
 
 MODULES="
 Gate.GcChurn
+Gate.InitGc
 Gate.EffectOrder
 Gate.DictDispatch
 Gate.Mixed

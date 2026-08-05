@@ -10,11 +10,18 @@
 -- |   tracked epoch. They are audit-caged (`tools/seam-audit.sh`: `Monad.purs` only): calling
 -- |   them with a fabricated epoch is the remaining spoof surface PureScript's module system
 -- |   cannot type away, so the audit pins their call sites instead;
--- | * [`vRootedLocal`]/[`vRootedGlobal`] — the `Rooted` arm's constructors (ADR-0105 §6.4, the
--- |   2b-2 reload cache): a rooted token names its root SLOT (a frame handle or a global's
--- |   `$root` cell), never an SSA value — its current value is materialised lazily by the
--- |   renderer-owned reload in `Monad.useVal` (cache hit → reuse, miss → reload). Audit-caged
--- |   to `Emit.purs` (the only binding-realisation reader);
+-- | * [`mkRootedLocal`]/[`vRootedGlobal`] — the `Rooted` arm's constructors (ADR-0105 §6.4 /
+-- |   ADR-0106): a rooted token names its root SLOT (a frame handle or a global's `$root`
+-- |   cell), never an SSA value — its current value is materialised lazily by the
+-- |   renderer-owned reload in `Monad.useVal` (cache hit → reuse, miss → reload). A local
+-- |   slot carries its two-tier [`FrameOwner`] (ADR-0106 slice 1), so `mkRootedLocal` is
+-- |   audit-caged to `Root.purs` (`ensureRooted`, the only fresh-rooting site) and returns
+-- |   the BY-TYPE-rooted [`RootedVal`]; `vRootedGlobal` stays with `Emit.purs` (the global
+-- |   `readVar` arm);
+-- | * [`RootedVal`]/[`rootedVal`]/[`rootedFromVal`] — the rooted-by-type wrapper (ADR-0106):
+-- |   `rootedVal` unwraps to an operand `Val` (one-way — the reverse REQUIRES rooting or the
+-- |   pure, total `rootedFromVal`, which succeeds only on an already-rooted token and forges
+-- |   nothing);
 -- | * [`rootedSrc`] — the `Rooted` projection the renderer resolves through (audit-caged to
 -- |   `Monad.purs`; the slot text is raw metadata — an index register or a symbol — so this is
 -- |   not an operand-text escape);
@@ -25,8 +32,15 @@
 module Purvasm.Compiler.Backend.LLVM.Value
   ( Val
   , RootSrc(..)
+  , FrameOwner
+  , unsafeMkFrameOwner
+  , sameOwner
+  , ownerActId
+  , RootedVal
+  , rootedVal
+  , rootedFromVal
   , vImm
-  , vRootedLocal
+  , mkRootedLocal
   , vRootedGlobal
   , rootedSrc
   , rootSrcKey
@@ -53,9 +67,58 @@ data Val
 -- | by its raw-index handle register, or a top-level global's `@<mangle>$root` cell (whose
 -- | stable index the reload loads first). The slot text is the token's identity — the cache
 -- | key pin (§6.4 d): shadowing mints a different handle and therefore misses, never aliases.
+-- | A local slot additionally carries its non-forgeable [`FrameOwner`] (ADR-0106 slice 1):
+-- | consumption checks the activation tier, reuse checks the whole owner.
 data RootSrc
-  = LocalSlot String
+  = LocalSlot { handle :: String, owner :: FrameOwner }
   | GlobalSlot String
+
+-- | The two-tier owner of a local root (ADR-0106 slice 1): `actId` is minted monotonically
+-- | per `beginFn` and NEVER reused (independent of the SSA numbering — `%tN` names re-mint
+-- | every activation, so equal text does not mean same activation and cannot be an owner);
+-- | `frameId` is minted per `openFrame`. `ensureRooted` requires the WHOLE owner to match;
+-- | every `LocalSlot` consumption requires at least the activation tier to match.
+-- | OPAQUE (slice-1 round 2): a public record alias was constructible anywhere, and a forged
+-- | owner plus `mkRootedLocal` would forge a "rooted by type" token for a slot that does not
+-- | exist — the only constructor is the audit-caged [`unsafeMkFrameOwner`]; the readable
+-- | surface is [`sameOwner`]/[`ownerActId`] (comparisons leak nothing constructible).
+newtype FrameOwner = FrameOwner { actId :: Int, frameId :: Int }
+
+-- | The raw `FrameOwner` constructor. The `unsafe` prefix marks what it can break (a
+-- | fabricated owner defeats the ADR-0106 ownership contract); `tools/seam-audit.sh` cages
+-- | it to `Monad.mintFrameOwner` (the state-minting site).
+unsafeMkFrameOwner :: { actId :: Int, frameId :: Int } -> FrameOwner
+unsafeMkFrameOwner = FrameOwner
+
+-- | Whole-owner equality — `ensureRooted`'s reuse test.
+sameOwner :: FrameOwner -> FrameOwner -> Boolean
+sameOwner (FrameOwner a) (FrameOwner b) = a.actId == b.actId && a.frameId == b.frameId
+
+-- | The activation tier — the consumption-side check's read (read-only; not constructible).
+ownerActId :: FrameOwner -> Int
+ownerActId (FrameOwner o) = o.actId
+
+-- | A token that is rooted BY TYPE (ADR-0106 slice 1): the only constructors are
+-- | [`mkRootedLocal`] (fresh rooting — audit-caged to `Root.ensureRooted`) and the pure,
+-- | total [`rootedFromVal`] (succeeds only on an ALREADY-rooted token — no forging surface).
+-- | [`rootedVal`] unwraps to an operand `Val`; the reverse direction does not exist.
+newtype RootedVal = RootedVal Val
+
+-- | The rooted token as an operand `Val` (one-way).
+rootedVal :: RootedVal -> Val
+rootedVal (RootedVal v) = v
+
+-- | Classify a `Val` as already-rooted — `Just` iff the token is a `VRooted` (pure and
+-- | total: it can only re-wrap an existing rooted token, never create one).
+rootedFromVal :: Val -> Maybe RootedVal
+rootedFromVal = case _ of
+  v@(VRooted _) -> Just (RootedVal v)
+  _ -> Nothing
+
+-- | Mint a fresh local rooted token from a slot handle and its owner — the ONLY fresh
+-- | `LocalSlot` constructor (audit-caged to `Root.purs`; ADR-0106 slice 1).
+mkRootedLocal :: String -> FrameOwner -> RootedVal
+mkRootedLocal handle owner = RootedVal (VRooted (LocalSlot { handle, owner }))
 
 -- | An epoch-immune raw word. The ONLY production inputs are signed decimal immediates
 -- | (scalar literals, label ids, ctor tags), so the constructor validates that WHOLE grammar —
@@ -81,10 +144,6 @@ rootedSrc :: Val -> Maybe RootSrc
 rootedSrc = case _ of
   VRooted src -> Just src
   _ -> Nothing
-
--- | A rooted token over a transient frame slot (audit-caged to `Emit`).
-vRootedLocal :: String -> Val
-vRootedLocal = VRooted <<< LocalSlot
 
 -- | A rooted token over a global's `$root` cell (audit-caged to `Emit`).
 vRootedGlobal :: String -> Val
@@ -118,7 +177,7 @@ mintAt e ssa = VFresh { ssa, epoch: e }
 -- | symbol live in disjoint namespaces, so one map serves both).
 rootSrcKey :: RootSrc -> String
 rootSrcKey = case _ of
-  LocalSlot h -> h
+  LocalSlot l -> l.handle
   GlobalSlot sym -> sym
 
 -- | The token's identity text WITHOUT verification — bookkeeping only (the bind-time

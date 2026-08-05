@@ -15,8 +15,12 @@ import Data.Set as Set
 import Data.Tuple (Tuple(..), snd)
 import Purvasm.Compiler.Backend.LLVM.Mangle (mangle)
 import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, Ctx, makeCx, renderBuffer, renderChunks, runCodegen)
-import Purvasm.Compiler.Backend.LLVM.Value (unsafeTestVal, vImm)
-import Purvasm.Compiler.Backend.LLVM.Root (emitGfunInit, emitInitFnFramed, entryTeardown, musttailWith, openFrame, retWith, rootLocal, tailcallWith)
+import Control.Monad.Error.Class (try)
+import Data.Either (isLeft)
+import Effect.Aff (Aff)
+import Effect.Class (liftEffect)
+import Purvasm.Compiler.Backend.LLVM.Value (rootedVal, unsafeTestVal, vImm, vRootedGlobal)
+import Purvasm.Compiler.Backend.LLVM.Root (emitGfunInit, emitInitFnFramed, ensureRooted, entryTeardown, musttailWith, openFrame, retWith, tailcallWith)
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
 
@@ -29,6 +33,13 @@ emittedWith inlineAbi m = renderBuffer (snd (runWith inlineAbi m)).fn
 
 emitted :: forall a. Codegen a -> String
 emitted = emittedWith true
+
+-- Force a pure emission inside the Effect runtime so its guard `unsafeCrashWith` surfaces as
+-- a caught exception (the Monad-test deferral pattern).
+expectCrash :: forall a. (Unit -> a) -> Aff Unit
+expectCrash thunk = do
+  r <- try (liftEffect (void (map (\_ -> thunk unit) (pure unit))))
+  isLeft r `shouldEqual` true
 
 -- The release-mode frame-open lines from a fresh context (mark `%t1`, header gep `%t2`).
 openLines :: String
@@ -85,16 +96,45 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Root" do
     it "opens a frame by reading roots_len (getelementptr emitted before the load)" do
       emitted openFrame `shouldEqual` openLines
 
-  describe "rootLocal" do
-    it "emits the 4-block in-capacity fast path with the len/pv_root phi (after its frame open)" do
-      emitted (openFrame >>= \tok -> rootLocal tok (unsafeTestVal "%v")) `shouldEqual`
+  describe "ensureRooted (ADR-0106 slice 1)" do
+    it "roots a Fresh value: the 4-block in-capacity fast path with the len/pv_root phi" do
+      emitted (openFrame >>= \tok -> void (ensureRooted (Just tok) (unsafeTestVal "%v"))) `shouldEqual`
         (openLines <> rootBlockAt 1 2 "%v")
 
     it "is a single pv_root entry call under --debug" do
-      emittedWith false (openFrame >>= \tok -> rootLocal tok (unsafeTestVal "%v")) `shouldEqual`
+      emittedWith false (openFrame >>= \tok -> void (ensureRooted (Just tok) (unsafeTestVal "%v"))) `shouldEqual`
         ( "  %t1 = call i64 @pv_frame(ptr %ctx)\n"
             <> "  %t2 = call i64 @pv_root(ptr %ctx, i64 %v)\n"
         )
+
+    it "REUSES an already-rooted value's slot in the same frame: zero emission" do
+      emitted
+        ( openFrame >>= \tok -> do
+            rv <- ensureRooted (Just tok) (unsafeTestVal "%v")
+            void (ensureRooted (Just tok) (rootedVal rv))
+        ) `shouldEqual` (openLines <> rootBlockAt 1 2 "%v")
+
+    it "a LocalSlot presented to a DIFFERENT frame fail-closed crashes" do
+      expectCrash \_ -> emitted
+        ( do
+            tokA <- openFrame
+            rv <- ensureRooted (Just tokA) (unsafeTestVal "%v")
+            tokB <- openFrame
+            void (ensureRooted (Just tokB) (rootedVal rv))
+        )
+
+    it "a LocalSlot with NO frame fail-closed crashes; a Fresh with no frame hits the backstop" do
+      expectCrash \_ -> emitted
+        ( do
+            tok <- openFrame
+            rv <- ensureRooted (Just tok) (unsafeTestVal "%v")
+            void (ensureRooted Nothing (rootedVal rv))
+        )
+      expectCrash \_ -> emitted (void (ensureRooted Nothing (unsafeTestVal "%v")))
+
+    it "a GlobalSlot reuses with and without a frame: zero emission" do
+      emitted (void (ensureRooted Nothing (vRootedGlobal "@g$root"))) `shouldEqual` ""
+      emitted (openFrame >>= \tok -> void (ensureRooted (Just tok) (vRootedGlobal "@g$root"))) `shouldEqual` openLines
 
   describe "retWith / musttailWith / tailcallWith / entryTeardown (the fused pop forms)" do
     it "retWith pops iff a frame is open, then rets" do
@@ -143,11 +183,23 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Root" do
               <> ("  store i64 %t12, ptr @" <> mangle "TestK" <> "$root\n")
           )
 
+    it "a GlobalSlot candidate HANDLE-COPIES into its $root: no snapshot, no root block (ADR-0106)" do
+      let
+        Tuple _ ctx = runWith true
+          (emitInitFnFramed "TestK" \_ -> pure [ Tuple "TestK" (vRootedGlobal "@src$root") ])
+      renderChunks ctx.md `shouldEqual`
+        initWrapper "TestK"
+          ( openLines
+              <> popLines 3 -- the transient frame closes with nothing in it...
+              <> "  %t4 = load i64, ptr @src$root\n" -- ...and the permanent tier copies the
+              <> ("  store i64 %t4, ptr @" <> mangle "TestK" <> "$root\n") -- source's stable handle
+          )
+
     it "framed init pins the phase order: open, body, POP, then the permanent root" do
       let
         Tuple _ ctx = runWith true
           ( emitInitFnFramed "TestK" \tok -> do
-              _ <- rootLocal tok (unsafeTestVal "%v")
+              _ <- ensureRooted (Just tok) (unsafeTestVal "%v")
               pure [ Tuple "TestK" (unsafeTestVal "%w") ]
           )
       renderChunks ctx.md `shouldEqual`

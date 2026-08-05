@@ -9,11 +9,11 @@
 -- | neither grows the JS stack with binding/emission depth. Tree recursion (`if`/`case` branches) stays
 -- | ordinary, bounded by control-flow nesting.
 -- |
--- | ADR-0105 structure: every runtime/guest call this module emits goes through the classified
--- | seam (`Backend.LLVM.Safepoint` — the same rows `Liveness` classifies from), and every
--- | transient root through `Root.rootLocal` via the activation's `FrameToken`, threaded
--- | lexically (`Maybe FrameToken` on the recipe signatures; `Nothing` = the plan elided the
--- | frame). Raw `emit` remains only for pure IR (branch/phi/gep/load/store/alloca/ptrtoint)
+-- | ADR-0105/0106 structure: every runtime/guest call this module emits goes through the
+-- | classified seam (`Backend.LLVM.Safepoint` — the same rows `Liveness` classifies from),
+-- | and every transient root through `Root.ensureRooted` (idempotent: an already-rooted
+-- | token reuses its owned slot) via the activation's `FrameToken`, threaded lexically
+-- | (`Maybe FrameToken` on the recipe signatures; `Nothing` = the plan elided the frame). Raw `emit` remains only for pure IR (branch/phi/gep/load/store/alloca/ptrtoint)
 -- | and the module-skeleton `ret` lines.
 -- |
 -- | Coverage: the whole pure-value language (ADR-0082 §3, slices 1–3) — atoms (`Var`/`Int`/`Bool`/
@@ -30,6 +30,7 @@ module Purvasm.Compiler.Backend.LLVM.Emit
   , emitRet
   , cexpr
   , expr
+  , emitGcafInit
   , buildGrec
   , argBuffer
   , makeClosure
@@ -60,10 +61,10 @@ import Purvasm.Compiler.Backend.LLVM.Mangle (ctorTag, imm, immBool, immInt, immU
 import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, PhiIncoming, beginFn, emit, emitAnfLabel, emitDefine, snapshotReloads, emitGuestRet, emitGuestStore, emitGuestSwitch, emitPayloadAshr, emitPhi, emitLowBitAnd, closeHopArm, emitStringConstant, foldA, forA, forA_, fresh, freshFn, freshLabel, mintCloWord, mintEnvWord, mintLoad, mintParam, takeFn)
 import Purvasm.Compiler.Backend.LLVM.Prim (inlinePrim)
 import Purvasm.Compiler.Backend.LLVM.Liveness (activationPlan, envPseudo, needsFrame)
-import Purvasm.Compiler.Backend.LLVM.Root (FrameToken, musttailWith, openFrame, retWith, rootLocal, tailcallWith)
+import Purvasm.Compiler.Backend.LLVM.Root (FrameToken, emitGcafInitEngine, ensureRooted, musttailWith, openFrame, retWith, tailcallWith)
 import Purvasm.Compiler.Backend.LLVM.Safepoint (RtArg(..), RtOp(..), guestDirect, rtCall, rtCallVoid)
 import Purvasm.Compiler.Backend.LLVM.Types (BindingV(..), Env, EnvSrc(..), FnInfo, Lifted(..), LiftedBody(..), bindDirectFnVar, bindDirectVar, bindFnVar, bindVar, lookupEnv)
-import Purvasm.Compiler.Backend.LLVM.Value (Val, vImm, vRootedGlobal, vRootedLocal)
+import Purvasm.Compiler.Backend.LLVM.Value (Val, rootedVal, vImm, vRootedGlobal)
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..))
@@ -72,18 +73,6 @@ import Purvasm.Compiler.MiddleEnd.MatchCompile (compile) as MatchCompile
 import Purvasm.Compiler.Primitive (PrimOp(..))
 import Purvasm.Compiler.Util.Int64Decimal (int64BitsDecimal)
 import Purvasm.Number (floatBitsHi, floatBitsLo)
-
--- | Root a transient value into THIS activation's frame and return its handle — the adapter the
--- | shared recipes use over ADR-0105 §2's `rootLocal`. The recipes are shared between framed and
--- | frameless activations, so they carry `Maybe FrameToken`; an activation whose plan elided the
--- | frame (`needsFrame = false`) holds `Nothing` and structurally cannot mint a token — reaching
--- | a rooting recipe then is a plan/lowering inconsistency (an under-declared may-root recipe),
--- | not a recoverable state.
-root :: Maybe FrameToken -> Val -> Codegen String
-root = case _ of
-  Just tok -> rootLocal tok
-  Nothing -> \_ -> unsafeCrashWith
-    "Backend.LLVM.Emit.root: transient root with no open frame (ADR-0105: an under-declared may-root lowering recipe)"
 
 -- | Does the activation plan give THIS definition a root slot? `rootAll` (the init/`LClosure`
 -- | conservative fallback) roots everything; otherwise only the plan's crossing set does.
@@ -182,7 +171,7 @@ readVar :: Env -> String -> Codegen Val
 readVar env x = case lookupEnv x env of
   Just entry -> case entry.bind of
     DirectV v -> pure v
-    RootedV h -> pure (vRootedLocal h)
+    RootedV rv -> pure (rootedVal rv)
   Nothing -> do
     gkeys <- gets _.gkeys
     if Set.member x gkeys then do
@@ -243,7 +232,7 @@ evalAtoms frame force env atoms = do
         if isImmediate a then one a
         else do
           v0 <- one a
-          if fromMaybe false (Array.index laterCan st.i) then vRootedLocal <$> root frame v0 else pure v0
+          if fromMaybe false (Array.index laterCan st.i) then rootedVal <$> ensureRooted frame v0 else pure v0
       pure (Loop { i: st.i + 1, acc: Cons v st.acc })
 
 -- | Expect a produced value from a non-tail sub-expression (an `if`/`let` branch always yields one).
@@ -381,7 +370,7 @@ cexpr frame env tail = case _ of
             let
               envOp = case s.envBind of
                 DirectV v -> v
-                RootedV h -> vRootedLocal h
+                RootedV rv -> rootedVal rv
             pure (Tuple envOp ops)
           SSentinel -> do
             ops <- evalAtoms frame false env args
@@ -394,11 +383,11 @@ cexpr frame env tail = case _ of
                 pure (Tuple e ops)
               Nothing -> unsafeCrashWith "Backend.LLVM.Emit.cexpr: empty CApp operand list"
           SForceCell -> do
-            fh <- atom env f >>= root frame
-            argHs <- forA args (\a -> atom env a >>= root frame)
-            forcedVal <- rtCall RtForceIfByneed [ V (vRootedLocal fh) ]
+            fh <- atom env f >>= ensureRooted frame
+            argHs <- forA args (\a -> atom env a >>= ensureRooted frame)
+            forcedVal <- rtCall RtForceIfByneed [ V (rootedVal fh) ]
             e <- rtCall RtReadField [ V forcedVal, I64 "2" ]
-            pure (Tuple e (map vRootedLocal argHs))
+            pure (Tuple e (map rootedVal argHs))
         inDir <- gets _.inDirect
         if tail && inDir then do
           -- musttail (ADR-0076 §3): the fused pop+musttail+ret — every operand (env word
@@ -445,10 +434,10 @@ cexpr frame env tail = case _ of
         builder <- lift env params body >>= makeClosure env
         if nargs == 0 then finish frame tail builder
         else do
-          bh <- root frame builder
+          bh <- ensureRooted frame builder
           ops <- evalAtoms frame false env args
           Tuple p n <- argBuffer ops
-          t <- rtCall RtApply [ V (vRootedLocal bh), Ptr p, I64 (show n) ]
+          t <- rtCall RtApply [ V (rootedVal bh), Ptr p, I64 (show n) ]
           finish frame tail t
       else if arity == 0 then
         -- nullary → an immediate tag (ADR-0064 §1).
@@ -493,16 +482,16 @@ cexpr frame env tail = case _ of
   CUpdate a ups -> do
     -- Functional update: fold `record_set` (each returns a new record). The base is forced (a by-need
     -- dict update); the accumulator is rooted across each value's evaluation and reloaded before the set.
-    rh0 <- forceAtom env a >>= root frame
+    rh0 <- forceAtom env a >>= ensureRooted frame
     rhFinal <- foldA
       ( \rh up -> do
           v <- atom env up.val
-          t <- rtCall RtRecordSet [ V (vRootedLocal rh), I64 (labelId up.prop), V v ]
-          root frame t
+          t <- rtCall RtRecordSet [ V (rootedVal rh), I64 (labelId up.prop), V v ]
+          ensureRooted frame t
       )
       rh0
       ups
-    finish frame tail (vRootedLocal rhFinal)
+    finish frame tail (rootedVal rhFinal)
   CCase scruts alts -> do
     -- The shared Maranget decision tree (ADR-0083) lowered to LLVM. Occurrences — scrutinees and every
     -- extracted sub-value — are rooted and read through their rooted tokens (the renderer-owned
@@ -511,10 +500,10 @@ cexpr frame env tail = case _ of
     -- are pre-rooted once at entry so the tree walk never allocates.
     let { scrutBinds, tree } = MatchCompile.compile scruts alts
     -- Root each scrutinee (forced — matching dereferences its structure).
-    occEnv0 <- forA scrutBinds (\(Tuple occ a) -> Tuple occ <$> (forceAtom env a >>= root frame))
+    occEnv0 <- forA scrutBinds (\(Tuple occ a) -> Tuple occ <$> (forceAtom env a >>= ensureRooted frame))
     -- Hoist + root every boxed literal any arm compares against.
     litEnv <- forA (sortUniqBoxed (Array.concatMap (\alt -> Array.concatMap binderBoxedLits alt.binders) alts))
-      (\l -> Tuple l <$> (atom env (AtomLit l) >>= root frame))
+      (\l -> Tuple l <$> (atom env (AtomLit l) >>= ensureRooted frame))
     failLabel <- freshLabel "nomatch"
     merge <- if tail then pure "" else freshLabel "casejoin"
     -- the case-level snapshot: taken after the scrutinee/boxed-literal rooting (pre-dispatch),
@@ -525,7 +514,7 @@ cexpr frame env tail = case _ of
         Just (Tuple _ h) -> h
         Nothing -> unsafeCrashWith ("Backend.LLVM.Emit.cexpr: unbound case occurrence " <> occ)
 
-      cur oenv occ = vRootedLocal (lookupOcc oenv occ)
+      cur oenv occ = rootedVal (lookupOcc oenv occ)
 
       boxedHandle l = case Array.find (\(Tuple k _) -> k == l) litEnv of
         Just (Tuple _ h) -> h
@@ -541,7 +530,7 @@ cexpr frame env tail = case _ of
             rtCall (RtPrim IndexArray) [ V parentCur, V (vImm (immInt j)) ]
           MC.Precord l ->
             rtCall RtRecordGet [ V parentCur, I64 (labelId l) ]
-        h <- root frame rawVal
+        h <- ensureRooted frame rawVal
         pure (Array.cons (Tuple subOcc h) oenv)
 
       bindLeaf oenv binds = foldl (\e (Tuple v occ) -> bindVar e v (lookupOcc oenv occ)) env binds
@@ -680,7 +669,7 @@ cexpr frame env tail = case _ of
             prim = case l of
               LNumber _ -> EqNumber
               _ -> EqString
-          eqVal <- rtCall (RtPrim prim) [ V (cur oenv occ), V (vRootedLocal (boxedHandle l)) ]
+          eqVal <- rtCall (RtPrim prim) [ V (cur oenv occ), V (rootedVal (boxedHandle l)) ]
           pay <- fresh
           emitPayloadAshr pay eqVal
           ok <- fresh
@@ -708,6 +697,27 @@ cexpr frame env tail = case _ of
       emitAnfLabel caseSnap merge
       r <- fresh
       Just <$> emitPhi r (Array.reverse phis)
+
+-- | Emit a `Gcaf`'s `$init` — the FIXED-SHAPE public surface (ADR-0106 slice 2): callers
+-- | supply DATA only (the key and the body `Expr`); the activation plan decides the frame
+-- | and drives the body's rooting exactly as `emitFunction` drives an `LBody` (a `Gcaf`
+-- | body is an ordinary expression with no params/captures/self), and `Root`'s engine owns
+-- | the phase order. The permanent tier is untouched: the candidate snapshots pre-pop
+-- | (`GlobalSlot` handle-copies) and roots permanently after it.
+emitGcafInit :: String -> Expr -> Codegen Unit
+emitGcafInit key e =
+  let
+    plan = activationPlan { params: [], captures: [], selfName: Nothing } e
+  in
+    emitGcafInitEngine
+      { key
+      , framed: needsFrame plan
+      , body: \mtok -> do
+          -- after the engine's beginFn (which resets to the rootAll fallback): the plan
+          -- drives this body's rooting, exactly as emitFunction's LBody arm.
+          modify_ \c -> c { rootAll = false, crossing = plan.crossing }
+          requireValue =<< expr mtok Nil false e
+      }
 
 -- | Push a lifted lambda onto the pending-emit queue (LIFO).
 pushPending :: Lifted -> Codegen Unit
@@ -794,13 +804,13 @@ buildGrec frame named env binds = do
   let elems = Array.replicate k (vImm immUnit) <> outsideVals
   Tuple envP envN <- argBuffer elems
   envArr <- rtCall RtNewArray [ Ptr envP, I64 (show envN) ]
-  envH <- root frame envArr
+  envH <- ensureRooted frame envArr
   -- 2. placeholder cells; store each into env[i] (reloading env/cell after each allocation).
   cellHs <- flip forA
     ( \i -> do
         cell <- rtCall RtNewByneedPlaceholder []
-        ch <- root frame cell
-        rtCallVoid RtWriteField [ V (vRootedLocal envH), I64 (show i), V (vRootedLocal ch) ]
+        ch <- ensureRooted frame cell
+        rtCallVoid RtWriteField [ V (rootedVal envH), I64 (show i), V (rootedVal ch) ]
         pure ch
     )
     (paramIndices k)
@@ -809,8 +819,8 @@ buildGrec frame named env binds = do
     ( \(Tuple name ch) -> do
         addr <- fresh
         emit ("  " <> addr <> " = ptrtoint ptr @" <> name <> " to i64")
-        susp <- rtCall RtMakeClosure [ I64 addr, I32 "1", V (vRootedLocal envH) ]
-        rtCallVoid RtByneedSetSuspension [ V (vRootedLocal ch), V susp ]
+        susp <- rtCall RtMakeClosure [ I64 addr, I32 "1", V (rootedVal envH) ]
+        rtCallVoid RtByneedSetSuspension [ V (rootedVal ch), V susp ]
     )
     (Array.zip suspNames cellHs)
   -- 4. bind each member to its cell — function members carry their direct-call info.
@@ -844,8 +854,8 @@ expr frame env0 tail = tailRecM step <<< Tuple env0
             }
         rootIt <- shouldRoot x
         if rootIt then do
-          h <- root frame v
-          pure (Loop (Tuple (bindFnVar env x h info) body))
+          rv <- ensureRooted frame v
+          pure (Loop (Tuple (bindFnVar env x rv info) body))
         else pure (Loop (Tuple (bindDirectFnVar env x v info) body))
       _ -> do
         mv <- cexpr frame env false c
@@ -853,8 +863,8 @@ expr frame env0 tail = tailRecM step <<< Tuple env0
           Just v -> do
             rootIt <- shouldRoot x
             if rootIt then do
-              h <- root frame v
-              pure (Loop (Tuple (bindVar env x h) body))
+              rv <- ensureRooted frame v
+              pure (Loop (Tuple (bindVar env x rv) body))
             else pure (Loop (Tuple (bindDirectVar env x v) body))
           Nothing ->
             unsafeCrashWith "Backend.LLVM.Emit.expr: non-tail cexpr produced no value"
@@ -949,7 +959,7 @@ emitFunction (Lifted l) = do
     LClosure _ -> pure Nothing
   let framed = maybe true needsFrame plan
   -- the frame capability: minted here iff the plan needs one; every rooting/pop site below
-  -- receives it lexically (ADR-0105 §2 `rootLocal` requires the token).
+  -- receives it lexically (ADR-0105 §2 `ensureRooted`'s fresh arm requires the token).
   mtok <- if framed then Just <$> openFrame else pure Nothing
   shouldRootName <- do
     rootAll <- gets _.rootAll
@@ -960,8 +970,8 @@ emitFunction (Lifted l) = do
     bindParam env (Tuple p i) = do
       pTok <- mintParam i
       if shouldRootName p then do
-        h <- root mtok pTok
-        pure (bindVar env p h)
+        rv <- ensureRooted mtok pTok
+        pure (bindVar env p rv)
       else pure (bindDirectVar env p pTok)
   env1 <- foldA bindParam Nil (Array.mapWithIndex (\i p -> Tuple p i) l.params)
   -- the `%env` word is itself a function-entry value; its token mints once at the prologue
@@ -975,10 +985,10 @@ emitFunction (Lifted l) = do
       v <- rtCall RtReadField [ V envTok, I64 (show i) ]
       env' <- case Array.find (\(Tuple k _) -> k == c) l.captureFns of
         Just (Tuple _ info) ->
-          if shouldRootName c then root mtok v <#> \h -> bindFnVar env c h info
+          if shouldRootName c then ensureRooted mtok v <#> \rv -> bindFnVar env c rv info
           else pure (bindDirectFnVar env c v info)
         Nothing ->
-          if shouldRootName c then root mtok v <#> \h -> bindVar env c h
+          if shouldRootName c then ensureRooted mtok v <#> \rv -> bindVar env c rv
           else pure (bindDirectVar env c v)
       let
         sh' =
@@ -1000,7 +1010,7 @@ emitFunction (Lifted l) = do
   case l.selfName of
     Just nm -> do
       envBind <-
-        if shouldRootName envPseudo then RootedV <$> root mtok envTok
+        if shouldRootName envPseudo then RootedV <$> ensureRooted mtok envTok
         else pure (DirectV envTok)
       modify_ \c -> c
         { selfCtx = Just

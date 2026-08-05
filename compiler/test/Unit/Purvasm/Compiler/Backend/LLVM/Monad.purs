@@ -18,8 +18,8 @@ import Data.Maybe (Maybe(..))
 import Data.String as String
 import Effect.Aff (Aff)
 import Effect.Class (liftEffect)
-import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, Ctx, beginFn, bumpEpoch, emit, emitAnfLabel, emitDefine, emitGuestRet, emitGuestStore, emitModule, emitPhi, emitRetResolved, emitStringConstant, foldA, forA, forA_, forWithIndexA, fresh, freshFn, freshLabel, makeCx, closeHopArm, mintLoad, renderBuffer, renderChunks, renderFnBody, resolveGuest, runCodegen, snapshotReloads, snapshotVal, takeFn, armIncomingAt, touchVal, unsafeEmitChainLabel)
-import Purvasm.Compiler.Backend.LLVM.Value (vImm, vRootedGlobal, vRootedLocal)
+import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, Ctx, beginFn, bumpEpoch, emit, emitAnfLabel, emitDefine, emitGuestRet, emitGuestStore, emitModule, emitPhi, emitRetResolved, emitStringConstant, foldA, forA, forA_, forWithIndexA, fresh, freshFn, freshLabel, makeCx, closeHopArm, mintLoad, renderBuffer, renderChunks, renderFnBody, resolveGuest, runCodegen, snapshotReloads, snapshotVal, takeFn, armIncomingAt, touchVal, unsafeEmitChainLabel, mintFrameOwner)
+import Purvasm.Compiler.Backend.LLVM.Value (Val, mkRootedLocal, rootedVal, unsafeMkFrameOwner, vImm, vRootedGlobal)
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
 
@@ -30,6 +30,11 @@ run = runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.
 -- The --debug entry-call state (the pv_get reload leg).
 runDebug :: forall a. Codegen a -> Tuple a Ctx
 runDebug = runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: false })
+
+-- A local rooted token owned by the DEFAULT activation (makeCx starts at actId 0) — the
+-- ADR-0106 consumption check passes until a beginFn mints a new activation.
+tRooted :: String -> Val
+tRooted h = rootedVal (mkRootedLocal h (unsafeMkFrameOwner { actId: 0, frameId: 1 }))
 
 -- Force a pure emission inside the Effect runtime so its guard `unsafeCrashWith` surfaces as a
 -- caught exception: evaluation is deferred into the Effect closure — strict evaluation at
@@ -194,7 +199,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Monad" do
 
   describe "the renderer-owned reload cache (ADR-0105 §6.4, 2b-2 phase 2)" do
     it "a rooted miss reloads just before the consuming instruction (inline shape)" do
-      renderBuffer (snd (run (emitGuestRet (vRootedLocal "%h")))).fn `shouldEqual`
+      renderBuffer (snd (run (emitGuestRet (tRooted "%h")))).fn `shouldEqual`
         ( "  %t1 = load ptr, ptr %ctx\n"
             <> "  %t2 = getelementptr i64, ptr %t1, i64 %h\n"
             <> "  %t3 = load i64, ptr %t2\n"
@@ -202,7 +207,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Monad" do
         )
 
     it "a rooted miss reloads via pv_get under --debug" do
-      renderBuffer (snd (runDebug (emitGuestRet (vRootedLocal "%h")))).fn `shouldEqual`
+      renderBuffer (snd (runDebug (emitGuestRet (tRooted "%h")))).fn `shouldEqual`
         ( "  %t1 = call i64 @pv_get(ptr %ctx, i64 %h)\n"
             <> "  ret i64 %t1\n"
         )
@@ -210,8 +215,8 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Monad" do
     it "a hit at the same epoch reuses the SSA with no emission" do
       renderBuffer
         ( snd $ run do
-            emitGuestStore (vRootedLocal "%h") "%p"
-            emitGuestStore (vRootedLocal "%h") "%q"
+            emitGuestStore (tRooted "%h") "%p"
+            emitGuestStore (tRooted "%h") "%q"
         ).fn `shouldEqual`
         ( "  %t1 = load ptr, ptr %ctx\n"
             <> "  %t2 = getelementptr i64, ptr %t1, i64 %h\n"
@@ -223,9 +228,9 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Monad" do
     it "a safepoint bump misses and re-reloads (never a crash — the Rooted arm's contract)" do
       renderBuffer
         ( snd $ run do
-            emitGuestStore (vRootedLocal "%h") "%p"
+            emitGuestStore (tRooted "%h") "%p"
             bumpEpoch
-            emitGuestStore (vRootedLocal "%h") "%q"
+            emitGuestStore (tRooted "%h") "%q"
         ).fn `shouldEqual`
         ( "  %t1 = load ptr, ptr %ctx\n"
             <> "  %t2 = getelementptr i64, ptr %t1, i64 %h\n"
@@ -240,8 +245,8 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Monad" do
     it "the cache key is the slot identity: distinct handles never share a reload" do
       renderBuffer
         ( snd $ run do
-            emitGuestStore (vRootedLocal "%h1") "%p"
-            emitGuestStore (vRootedLocal "%h2") "%q"
+            emitGuestStore (tRooted "%h1") "%p"
+            emitGuestStore (tRooted "%h2") "%q"
         ).fn `shouldEqual`
         ( "  %t1 = load ptr, ptr %ctx\n"
             <> "  %t2 = getelementptr i64, ptr %t1, i64 %h1\n"
@@ -259,12 +264,12 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Monad" do
       -- path-sensitive refinement of pin c's always-clear form).
       renderBuffer
         ( snd $ run do
-            emitGuestStore (vRootedLocal "%h") "%p"
+            emitGuestStore (tRooted "%h") "%p"
             snap <- snapshotReloads
             emitAnfLabel snap "arm1"
-            emitGuestStore (vRootedLocal "%h") "%q"
+            emitGuestStore (tRooted "%h") "%q"
             emitAnfLabel snap "arm2"
-            emitGuestStore (vRootedLocal "%h") "%r"
+            emitGuestStore (tRooted "%h") "%r"
         ).fn `shouldEqual`
         ( "  %t1 = load ptr, ptr %ctx\n"
             <> "  %t2 = getelementptr i64, ptr %t1, i64 %h\n"
@@ -281,9 +286,9 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Monad" do
         ( snd $ run do
             snap <- snapshotReloads
             emitAnfLabel snap "arm1"
-            emitGuestStore (vRootedLocal "%h") "%p"
+            emitGuestStore (tRooted "%h") "%p"
             emitAnfLabel snap "arm2"
-            emitGuestStore (vRootedLocal "%h") "%q"
+            emitGuestStore (tRooted "%h") "%q"
         ).fn `shouldEqual`
         ( "arm1:\n"
             <> "  %t1 = load ptr, ptr %ctx\n"
@@ -300,12 +305,12 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Monad" do
     it "a pre-branch entry restored after a bumping arm misses on epoch, not on absence" do
       renderBuffer
         ( snd $ run do
-            emitGuestStore (vRootedLocal "%h") "%p"
+            emitGuestStore (tRooted "%h") "%p"
             snap <- snapshotReloads
             emitAnfLabel snap "arm1"
             bumpEpoch
             emitAnfLabel snap "join"
-            emitGuestStore (vRootedLocal "%h") "%q"
+            emitGuestStore (tRooted "%h") "%q"
         ).fn `shouldEqual`
         ( "  %t1 = load ptr, ptr %ctx\n"
             <> "  %t2 = getelementptr i64, ptr %t1, i64 %h\n"
@@ -331,8 +336,8 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Monad" do
     it "a phi incoming accepts a HOT rooted token and crashes on a cold one (fail-closed)" do
       renderBuffer
         ( snd $ run do
-            touchVal (vRootedLocal "%h")
-            inc <- armIncomingAt { from: "a", startNext: "b" } (vRootedLocal "%h")
+            touchVal (tRooted "%h")
+            inc <- armIncomingAt { from: "a", startNext: "b" } (tRooted "%h")
             void (emitPhi "%r" [ inc ])
         ).fn `shouldEqual`
         ( "  %t1 = load ptr, ptr %ctx\n"
@@ -342,13 +347,13 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Monad" do
             <> "  %r = phi i64 [ %t3, %a ]\n"
         )
       expectCrash \_ -> run do
-        inc <- armIncomingAt { from: "a", startNext: "b" } (vRootedLocal "%cold")
+        inc <- armIncomingAt { from: "a", startNext: "b" } (tRooted "%cold")
         emitPhi "%r" [ inc ]
 
     it "snapshotVal reads back into a Fresh token: later staleness crashes instead of reloading" do
       renderBuffer
         ( snd $ run do
-            v <- snapshotVal (vRootedLocal "%h")
+            v <- snapshotVal (tRooted "%h")
             emitGuestRet v
         ).fn `shouldEqual`
         ( "  %t1 = load ptr, ptr %ctx\n"
@@ -357,22 +362,33 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Monad" do
             <> "  ret i64 %t3\n"
         )
       expectCrash \_ -> run do
-        v <- snapshotVal (vRootedLocal "%h")
+        v <- snapshotVal (tRooted "%h")
         bumpEpoch
         emitGuestRet v
 
-    it "beginFn starts cold: a pre-existing hot entry does not leak into the next function" do
+    it "a LocalSlot from activation A consumed after beginFn (activation B) crashes (ADR-0106)" do
+      -- the consumption-side ActivationId check itself — NOT the ensureRooted path: the
+      -- token reaches a renderer directly and must not reload a dead slot.
+      expectCrash \_ -> run do
+        emitGuestStore (tRooted "%h") "%p"
+        beginFn
+        emitGuestStore (tRooted "%h") "%q"
+
+    it "a token owned by the CURRENT activation consumes normally after beginFn (positive)" do
       renderBuffer
         ( snd $ run do
-            emitGuestStore (vRootedLocal "%h") "%p"
             beginFn
-            emitGuestStore (vRootedLocal "%h") "%q"
+            emitGuestStore (rootedVal (mkRootedLocal "%h" (unsafeMkFrameOwner { actId: 1, frameId: 2 }))) "%q"
         ).fn `shouldEqual`
         ( "  %t1 = load ptr, ptr %ctx\n"
             <> "  %t2 = getelementptr i64, ptr %t1, i64 %h\n"
             <> "  %t3 = load i64, ptr %t2\n"
             <> "  store i64 %t3, ptr %q\n"
         )
+
+    it "ActivationId / frame-counter overflow is fail-closed — never wraps into reuse (ADR-0106)" do
+      expectCrash \_ -> runCodegen ((makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true }) { actId = 2147483646 }) beginFn
+      expectCrash \_ -> runCodegen ((makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true }) { frameSeq = 2147483646 }) mintFrameOwner
 
     it "a safepoint between resolve and the ret crashes fail-closed (§6.4)" do
       expectCrash \_ -> run do
@@ -434,9 +450,9 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Monad" do
     it "the disciplined label forms pass: emitAnfLabel restores, the chain form keeps the cache" do
       renderBuffer
         ( snd $ run do
-            emitGuestStore (vRootedLocal "%h") "%p"
+            emitGuestStore (tRooted "%h") "%p"
             unsafeEmitChainLabel "fchk1"
-            emitGuestStore (vRootedLocal "%h") "%q"
+            emitGuestStore (tRooted "%h") "%q"
         ).fn `shouldEqual`
         ( "  %t1 = load ptr, ptr %ctx\n"
             <> "  %t2 = getelementptr i64, ptr %t1, i64 %h\n"

@@ -36,7 +36,7 @@ import Data.String (joinWith)
 import Data.Tuple (Tuple(..), fst, snd)
 import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.Compiler.Backend.LLVM.Abi (abiStamp, ctxHeaderVersion, declarations, forceValue)
-import Purvasm.Compiler.Backend.LLVM.Emit (buildGrec, emitPending, expr, readVar)
+import Purvasm.Compiler.Backend.LLVM.Emit (buildGrec, emitGcafInit, emitPending, expr, readVar)
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (fvExpr)
 import Purvasm.Compiler.Backend.LLVM.Mangle (immUnit, mangle, mangleForeign)
 import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, FnBody, MakeCxOptions, beginFn, emit, emitModule, forA, forA_, fresh, makeCx, renderChunks, renderFnBody, runCodegen, takeFn, unsafeEmitRawCall, unsafeEmitRawModule)
@@ -148,12 +148,9 @@ emitGdef = case _ of
     modify_ \c -> c { pending = lifted : c.pending }
     -- the frameless init is a fixed shape owned by Root — no body callback exists to misuse.
     emitGfunInit key (Array.length ps)
-  Gcaf key e ->
-    emitInitFnFramed key \tok -> do
-      mv <- expr (Just tok) Nil false e
-      case mv of
-        Just v -> pure [ Tuple key v ]
-        Nothing -> unsafeCrashWith "Program.emitGdef: Gcaf body produced no value"
+  -- ADR-0106 slice 2: the Gcaf init is plan-driven behind the fixed-shape surface — the
+  -- activation plan decides the frame; non-crossing definitions keep their direct tokens.
+  Gcaf key e -> emitGcafInit key e
   Grec binds -> case Array.head binds of
     Nothing -> unsafeCrashWith "Program.emitGdef: empty Grec"
     Just (Tuple firstKey _) ->

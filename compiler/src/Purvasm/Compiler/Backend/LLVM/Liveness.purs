@@ -92,7 +92,7 @@ envPseudo = "%env"
 
 -- | §2 frame decision: a frame is needed iff EITHER tier can produce a root site. An activation
 -- | with `needsFrame = false` opens no frame and pops none; emitting a transient root inside it
--- | is a structural error (`rootLocal` requires the frame token).
+-- | is a structural error (`ensureRooted`'s fresh arm requires the frame token, ADR-0106).
 needsFrame :: ActivationPlan -> Boolean
 needsFrame p = not (Set.isEmpty p.crossing) || p.loweringMayRoot
 

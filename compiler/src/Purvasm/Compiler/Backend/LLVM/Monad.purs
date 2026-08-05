@@ -33,6 +33,7 @@ module Purvasm.Compiler.Backend.LLVM.Monad
   , containsCallText
   , currentEpoch
   , bumpEpoch
+  , mintFrameOwner
   , unsafeUseVal
   , unsafeMintFresh
   , touchVal
@@ -85,7 +86,7 @@ import Data.String (joinWith)
 import Data.String as String
 import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.Compiler.Backend.LLVM.Mangle (escapeStringBytes)
-import Purvasm.Compiler.Backend.LLVM.Value (RootSrc(..), Val, mintAt, rootSrcKey, rootedSrc, verifyAt)
+import Purvasm.Compiler.Backend.LLVM.Value (FrameOwner, RootSrc(..), Val, mintAt, ownerActId, rootSrcKey, rootedSrc, unsafeMkFrameOwner, verifyAt)
 import Data.Tuple (Tuple(..))
 import Purvasm.Compiler.Backend.LLVM.Types (FnInfo, Lifted, SelfCtx)
 
@@ -117,6 +118,8 @@ type Ctx =
   , spEpoch :: Int -- ^ ADR-0105 §6.2: the safepoint epoch — an emission-order monotone bumped ONLY by `sp = true` seam/guest emissions (verify-then-bump); value tokens are verified against it at consumption
   , reloadCache :: Map String { ssa :: String, epoch :: Int } -- ^ ADR-0105 §6.4: the renderer-owned reload cache — slot identity (handle register / `$root` symbol) → its last reload's SSA and epoch; hit at the current epoch reuses, miss reloads and re-caches. ANF-level labels restore their construct's branch-point snapshot ([`emitAnfLabel`]); [`beginFn`] starts cold; seam-internal single-entry/single-exit chains keep it as-is
   , rootAll :: Boolean -- ^ ADR-0105: `true` = root-on-create fallback (init bodies, `LClosure` wrappers); `false` = the activation plan drives rooting
+  , actId :: Int -- ^ ADR-0106 slice 1: the current ACTIVATION identity — minted monotonically by [`beginFn`], never reused, independent of the SSA numbering; every `LocalSlot` consumption verifies its token's activation tier against this
+  , frameSeq :: Int -- ^ ADR-0106 slice 1: module-global monotonic frame counter — [`mintFrameOwner`] combines it with `actId` into the per-frame [`FrameOwner`]
   , crossing :: Set String -- ^ ADR-0105: the activation plan's crossing set (consulted only when `rootAll = false`)
   }
 
@@ -160,6 +163,8 @@ makeCx opts =
   , spEpoch: 0
   , reloadCache: Map.empty
   , rootAll: true
+  , actId: 0
+  , frameSeq: 0
   , crossing: Set.empty
   }
 
@@ -293,7 +298,10 @@ emitStringConstant s =
 -- | `emitFunction` overrides it when an activation plan exists. (Frame state is NOT here: the
 -- | open frame is the lexical `Root.FrameToken` the emitters thread.)
 beginFn :: Codegen Unit
-beginFn = modify_ \c -> c { ssa = 0, fn = Nil, spEpoch = 0, reloadCache = Map.empty, rootAll = true, crossing = Set.empty }
+beginFn = modify_ \c ->
+  if c.actId >= 2147483646 then
+    unsafeCrashWith "Backend.LLVM.Monad.beginFn: ActivationId overflow (fail-closed, ADR-0106 — an activation identity is never reused)"
+  else c { ssa = 0, fn = Nil, spEpoch = 0, reloadCache = Map.empty, rootAll = true, crossing = Set.empty, actId = c.actId + 1 }
 
 -- | A rendered function body whose every line went through the guarded emitters — the
 -- | constructor is private, so call-carrying body text can only re-enter the module buffer via
@@ -309,6 +317,15 @@ renderFnBody (FnBody s) = s
 -- | `beginFn` resets `ssa` at the next function.
 takeFn :: Codegen FnBody
 takeFn = state \c -> Tuple (FnBody (renderBuffer c.fn)) c { fn = Nil }
+
+-- | Mint the owner identity for a frame being opened (ADR-0106 slice 1): the current
+-- | activation plus a module-global monotonic frame number. Audit-caged to `Root.purs`
+-- | (`openFrame`, the only frame-minting site); overflow is fail-closed like the epoch.
+mintFrameOwner :: Codegen FrameOwner
+mintFrameOwner = state \c ->
+  if c.frameSeq >= 2147483646 then
+    unsafeCrashWith "Backend.LLVM.Monad.mintFrameOwner: frame counter overflow (fail-closed, ADR-0106)"
+  else let n = c.frameSeq + 1 in Tuple (unsafeMkFrameOwner { actId: c.actId, frameId: n }) c { frameSeq = n }
 
 -- | The current safepoint epoch (ADR-0105 §6.2) — for the phi-arm snapshots the branching
 -- | emitters record (each phi incoming is verified against the epoch at its source block's
@@ -341,6 +358,7 @@ useVal :: Val -> Codegen String
 useVal v = case rootedSrc v of
   Nothing -> state \c -> Tuple (verifyAt c.spEpoch v) c
   Just src -> do
+    checkSlotActivation src
     let key = rootSrcKey src
     c <- get
     case Map.lookup key c.reloadCache of
@@ -351,6 +369,25 @@ useVal v = case rootedSrc v of
         modify_ \s -> s { reloadCache = Map.insert key { ssa, epoch: c.spEpoch } s.reloadCache }
         pure ssa
 
+-- | The ADR-0106 consumption-side check, run before ANY `LocalSlot` consumption
+-- | (reload-on-miss included): a token whose activation tier differs from the CURRENT
+-- | activation names a slot in a dead (or foreign) frame — reloading it would read freed
+-- | shadow-stack memory, so it crashes instead. `GlobalSlot` is exempt (permanent root).
+checkSlotActivation :: RootSrc -> Codegen Unit
+checkSlotActivation = case _ of
+  GlobalSlot _ -> pure unit
+  LocalSlot l -> do
+    c <- get
+    if ownerActId l.owner == c.actId then pure unit
+    else unsafeCrashWith
+      ( "Backend.LLVM.Monad: LocalSlot consumed outside its activation (ADR-0106 — dead-slot reload): "
+          <> l.handle
+          <> " owned by activation "
+          <> show (ownerActId l.owner)
+          <> ", current "
+          <> show c.actId
+      )
+
 -- | Resolve a `Rooted` token's cached text WITHOUT emission — the phi-incoming path, where the
 -- | arm's terminator is already emitted and a reload would be invalid LLVM: a cold rooted
 -- | token there is fail-closed (the renderer must consume/touch the operand at its ENTRY,
@@ -359,6 +396,7 @@ useValHot :: Val -> Codegen String
 useValHot v = case rootedSrc v of
   Nothing -> state \c -> Tuple (verifyAt c.spEpoch v) c
   Just src -> do
+    checkSlotActivation src
     c <- get
     case Map.lookup (rootSrcKey src) c.reloadCache of
       Just e | e.epoch == c.spEpoch -> pure e.ssa
@@ -373,7 +411,7 @@ useValHot v = case rootedSrc v of
 -- | and `tools/seam-audit.sh` pins this call site.
 emitReload :: RootSrc -> Codegen String
 emitReload = case _ of
-  LocalSlot h -> reloadSlot h
+  LocalSlot l -> reloadSlot l.handle
   GlobalSlot sym -> do
     h <- fresh
     emit ("  " <> h <> " = load i64, ptr " <> sym)
