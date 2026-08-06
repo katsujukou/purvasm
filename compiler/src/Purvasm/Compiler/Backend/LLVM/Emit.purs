@@ -60,7 +60,7 @@ import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (fvExpr)
 import Purvasm.Compiler.Backend.LLVM.Mangle (ctorTag, imm, immBool, immInt, immUnit, labelId, mangle, mangleForeign, sortRecordFields)
 import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, PhiIncoming, beginFn, emit, emitAnfLabel, emitDefine, snapshotReloads, emitGuestRet, emitGuestStore, emitGuestSwitch, emitPayloadAshr, emitPhi, emitLowBitAnd, closeHopArm, emitStringConstant, foldA, forA, forA_, fresh, freshFn, freshLabel, mintCloWord, mintEnvWord, mintLoad, mintParam, takeFn)
 import Purvasm.Compiler.Backend.LLVM.Prim (inlinePrim)
-import Purvasm.Compiler.Backend.LLVM.Liveness (activationPlan, envPseudo, needsFrame)
+import Purvasm.Compiler.Backend.LLVM.Liveness (activationPlan, atomCanSafepoint, envPseudo, forcedAtomCanSafepoint, needsFrame)
 import Purvasm.Compiler.Backend.LLVM.Root (FrameToken, emitGcafInitEngine, ensureRooted, musttailWith, openFrame, retWith, tailcallWith)
 import Purvasm.Compiler.Backend.LLVM.Safepoint (RtArg(..), RtOp(..), guestDirect, rtCall, rtCallVoid)
 import Purvasm.Compiler.Backend.LLVM.Types (BindingV(..), Env, EnvSrc(..), FnInfo, Lifted(..), LiftedBody(..), bindDirectFnVar, bindDirectVar, bindFnVar, bindVar, lookupEnv)
@@ -203,13 +203,11 @@ evalAtoms frame force env atoms = do
   vals <- tailRecM evalStep { i: 0, acc: Nil }
   pure (Array.fromFoldable (List.reverse vals))
   where
-  canSafepoint = case _ of
-    AtomLit (LInt _) -> false
-    AtomLit (LBool _) -> false
-    AtomLit (LNumber _) -> true
-    AtomLit (LString _) -> true
-    AtomForeign _ -> true
-    AtomVar _ -> force
+  -- the SAME row-derived classifiers the liveness analysis consults (seam single-source;
+  -- a hardcoded arm here is exactly the analysis-vs-lowering drift class the seam exists to
+  -- prevent — found live by the 2026-08-06 force counterfactual, where flipping the row
+  -- moved the plan but not this pass).
+  canSafepoint = if force then forcedAtomCanSafepoint else atomCanSafepoint
 
   isImmediate = case _ of
     AtomLit (LInt _) -> true
