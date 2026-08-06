@@ -152,5 +152,6 @@ language and are kept out of version control.)
 | [0104](0104-retire-boot-byte-identity-gate.md) | Retire the boot byte-identity gate: correctness anchors move to the behavioural oracle and the self-host fixpoint | Accepted |
 | [0105](0105-liveness-based-rooting-emission.md) | Liveness-based rooting emission for the native LLVM backend | Accepted |
 | [0106](0106-residual-rooting-choreography.md) | Closing the residual rooting choreography: reload-reroot elision and the plan-driven `Gcaf` init tier | Accepted |
+| [0107](0107-provably-not-by-need.md) | Provably-not-by-need operands: elide the force, de-safepoint the site | Accepted |
 
 ## Scope
