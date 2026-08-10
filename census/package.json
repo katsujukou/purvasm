@@ -1,0 +1,20 @@
+{
+  "name": "purvasm-census",
+  "version": "0.1.0",
+  "description": "Re-runnable compiler measurements (ADR-0107 by-need demand-site census)",
+  "keywords": [
+    "purescript",
+    "purvasm"
+  ],
+  "license": "MIT",
+  "author": "Katsujukou Kineya",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "compile": "cd .. && spago build -p census",
+    "test:unit": "cd .. && spago test -p census",
+    "test": "pnpm run test:unit",
+    "format": "purs-tidy format-in-place src test",
+    "check": "purs-tidy check src test"
+  }
+}

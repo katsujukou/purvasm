@@ -1,0 +1,27 @@
+package:
+  name: census
+  dependencies:
+    - argparse-basic
+    - arrays
+    - cli
+    - cli-lib
+    - compiler
+    - console
+    - effect
+    - either
+    - fmt
+    - lists
+    - maybe
+    - node-process
+    - ordered-collections
+    - prelude
+    - refs
+    - run
+    - strings
+    - tailrec
+    - tuples
+  test:
+    main: Test.Unit.Purvasm.Census
+    dependencies:
+      - spec
+      - spec-node
