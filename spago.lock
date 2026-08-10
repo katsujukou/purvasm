@@ -149,6 +149,38 @@
           "dependencies": []
         }
       },
+      "census": {
+        "path": "census",
+        "core": {
+          "dependencies": [
+            "argparse-basic",
+            "arrays",
+            "cli",
+            "cli-lib",
+            "compiler",
+            "console",
+            "effect",
+            "either",
+            "fmt",
+            "lists",
+            "maybe",
+            "node-process",
+            "ordered-collections",
+            "prelude",
+            "refs",
+            "run",
+            "strings",
+            "tailrec",
+            "tuples"
+          ]
+        },
+        "test": {
+          "dependencies": [
+            "spec",
+            "spec-node"
+          ]
+        }
+      },
       "cli": {
         "path": "cli",
         "core": {

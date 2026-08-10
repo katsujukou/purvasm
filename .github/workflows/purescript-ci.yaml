@@ -32,6 +32,7 @@ jobs:
         with:
           filters: |
             code:
+              - 'census/**'
               - 'compiler/**'
               - 'cli/**'
               - 'cli-lib/**'
@@ -40,6 +41,12 @@ jobs:
               - 'ulib-tools/**'
               - 'spago.yaml'
               - 'spago.lock'
+              # The ADR-0107 measurement harnesses are load-bearing (the census carries the
+              # accounting gate; the A/B carries the OWED run-time measurement contract — there is
+              # no run-time claim yet), so a change to either must at least reach the syntax check
+              # below.
+              - 'tools/byneed-census.sh'
+              - 'tools/byneed-ab.sh'
               - 'flake.nix'
               - 'flake.lock'
               - '.github/workflows/purescript-ci.yaml'
@@ -104,6 +111,19 @@ jobs:
 
       - name: Test (compiler unit)
         run: spago test -p compiler -m Test.Unit.Purvasm.Compiler
+
+      # ADR-0107 measurement infrastructure: the lattice's laws plus the emission-fidelity matrix
+      # (counted demand sites == `fchk` chains the real emitter emits). The latter is what keeps a
+      # re-run census honest if the emitter's force sites ever move.
+      - name: Test (census unit)
+        run: spago test -p census -m Test.Unit.Purvasm.Census
+
+      # The full two-leg census (both corpora) is a manual milestone — it compiles the whole
+      # self-host closure twice per mode. What IS standing here is that the runner stays runnable:
+      # a syntax error in the harness that carries the accounting gate must not sit undetected
+      # until someone next re-measures.
+      - name: Check (by-need measurement harnesses parse)
+        run: bash -n tools/byneed-census.sh && bash -n tools/byneed-ab.sh
 
       # The byte-identity oracle: in-process and fixture-based, no boot shell-out.
       - name: Test (compiler E2E)

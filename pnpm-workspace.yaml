@@ -1,4 +1,5 @@
 packages:
+  - "./census/**"
   - "./cli/**"
   - "./compiler/**"
   - "./ulib-tools/**"
