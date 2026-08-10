@@ -6,6 +6,7 @@ module Test.Unit.Purvasm.Compiler.MiddleEnd.ANF.FreeVars where
 import Prelude
 
 import Data.Set (Set)
+import Data.Array as Array
 import Data.Set as Set
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (binderVars, cfExpr, fvCexpr, fvExpr)
 import Purvasm.Compiler.Binder (Binder(..))
@@ -53,3 +54,24 @@ spec = describe "Purvasm.Compiler.MiddleEnd.ANF.FreeVars" do
       let
         e = Ret (CApp (AtomForeign "Data.X.y") [ AtomVar "z", AtomForeign "Data.X.w" ])
       elems (cfExpr e) `shouldEqual` [ "Data.X.w", "Data.X.y" ]
+
+  -- ADR-0107 slice 1 made these hot: `activationFacts` calls `fvExpr` on every activation body, and
+  -- self-host bodies carry `Let` spines thousands of bindings long. Both walks are spine-iterative;
+  -- these fixtures are what keeps them that way (they overflow the default stack if either reverts
+  -- to structural recursion), and they assert the RESULT too, not merely the absence of a crash.
+  describe "deep-spine stack safety" do
+    it "fvExpr walks a 100k-binding spine and still resolves scoping" do
+      let
+        spine = Array.foldr
+          (\i acc -> Let ("v" <> show i) (CAtom (AtomVar ("free" <> show (i `mod` 3)))) acc)
+          (Ret (CApp (AtomVar "g") [ AtomVar "v0" ]))
+          (Array.range 0 100000)
+      elems (fvExpr Set.empty spine) `shouldEqual` [ "free0", "free1", "free2", "g" ]
+
+    it "cfExpr walks a 100k-binding spine" do
+      let
+        spine = Array.foldr
+          (\i acc -> Let ("v" <> show i) (CAtom (AtomForeign ("M.f" <> show (i `mod` 2)))) acc)
+          (Ret (CAtom (AtomVar "v0")))
+          (Array.range 0 100000)
+      elems (cfExpr spine) `shouldEqual` [ "M.f0", "M.f1" ]

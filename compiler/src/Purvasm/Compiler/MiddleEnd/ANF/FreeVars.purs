@@ -4,10 +4,13 @@
 -- | the bytecode side (ADR-0088 §2 — the reachability edges are the free **global** refs `fvExpr` returns;
 -- | the required foreigns are `cfExpr`). A faithful transcription of boot's `binder_vars`/`fv_*`/`cf_*`.
 -- |
--- | Stack-safety note: the array folds are `foldl` (safe), but the `Expr` tree recursion is ordinary
--- | structural recursion, so a very deep ANF `Let` spine recurses to its length. The values are pure
--- | `Set`s (no bearing on emitted-artifact bytes), so an iterative-spine rewrite is a result-preserving
--- | hardening deferred until real large modules exercise it.
+-- | Stack-safety: the array folds are `foldl` (safe), and the `Let`/`LetRec` SPINE is walked with a
+-- | pure `tailRec` loop and folded back with a stack-safe `foldl`, so recursion depth is control-flow
+-- | nesting only, never spine length. (This was a deferred hardening — "until real large modules
+-- | exercise it" — and ADR-0107 slice 1 exercised it: `activationFacts` calls `fvExpr` on every
+-- | activation body, and the self-host corpus carries `Let` spines thousands of bindings long, which
+-- | overflowed the host stack immediately. Set union is commutative and idempotent, so the rewritten
+-- | traversal order returns the same sets.)
 module Purvasm.Compiler.MiddleEnd.ANF.FreeVars
   ( binderVars
   , fvAtom
@@ -20,7 +23,10 @@ module Purvasm.Compiler.MiddleEnd.ANF.FreeVars
 
 import Prelude
 
+import Control.Monad.Rec.Class (Step(..), tailRec)
+import Data.Either (Either(..))
 import Data.Foldable (foldl)
+import Data.List (List(..), (:))
 import Data.Set (Set)
 import Data.Set as Set
 import Purvasm.Compiler.Binder (Binder(..))
@@ -48,17 +54,35 @@ fvAtom bound = case _ of
 fvAtoms :: Set String -> Array Atom -> Set String
 fvAtoms bound = foldl (\a x -> Set.union a (fvAtom bound x)) Set.empty
 
--- | An expression's free variables (a `Let`/`LetRec`/`CLam`/binder adds to `bound`).
+-- | One collected spine step, with the `bound` set in force AT that step (it grows as the walk
+-- | descends, so each step's contribution must be computed under its own).
+data SpineStep
+  = SLet (Set String) CExpr
+  | SLetRec (Set String) (Array { var :: String, rhs :: Expr })
+
+-- | An expression's free variables (a `Let`/`LetRec`/`CLam`/binder adds to `bound`). The spine is
+-- | iterative (see the module note); branch/lambda nesting recurses as before.
 fvExpr :: Set String -> Expr -> Set String
-fvExpr bound = case _ of
-  Ret c -> fvCexpr bound c
-  Let x c body -> Set.union (fvCexpr bound c) (fvExpr (Set.insert x bound) body)
-  LetRec binds body ->
-    let
-      bound' = foldl (\s b -> Set.insert b.var s) bound binds
-      rhs = foldl (\a b -> Set.union a (fvExpr bound' b.rhs)) Set.empty binds
-    in
-      Set.union rhs (fvExpr bound' body)
+fvExpr bound0 e0 =
+  let
+    spine = tailRec
+      ( \st -> case st.e of
+          Let x c rest ->
+            Loop { e: rest, bound: Set.insert x st.bound, acc: SLet st.bound c : st.acc }
+          LetRec binds rest ->
+            let
+              bound' = foldl (\s b -> Set.insert b.var s) st.bound binds
+            in
+              Loop { e: rest, bound: bound', acc: SLetRec bound' binds : st.acc }
+          Ret c -> Done { steps: st.acc, tail: fvCexpr st.bound c }
+      )
+      { e: e0, bound: bound0, acc: Nil }
+  in
+    foldl step spine.tail spine.steps
+  where
+  step acc = case _ of
+    SLet b c -> Set.union acc (fvCexpr b c)
+    SLetRec b binds -> foldl (\a r -> Set.union a (fvExpr b r.rhs)) acc binds
 
 -- | A computation's free variables.
 fvCexpr :: Set String -> CExpr -> Set String
@@ -94,11 +118,24 @@ fvAlt bound alt =
 
 -- | Every foreign key an expression references (a superset over dead bindings is harmless — the
 -- | dead-strip link drops an unreferenced leaf, ADR-0073 §3).
+-- | Spine-iterative for the same reason as `fvExpr` (the module note): a self-host `Let` spine is
+-- | thousands of bindings long.
 cfExpr :: Expr -> Set String
-cfExpr = case _ of
-  Ret c -> cfCexpr c
-  Let _ c body -> Set.union (cfCexpr c) (cfExpr body)
-  LetRec binds body -> foldl (\a b -> Set.union a (cfExpr b.rhs)) (cfExpr body) binds
+cfExpr e0 =
+  let
+    spine = tailRec
+      ( \st -> case st.e of
+          Let _ c rest -> Loop { e: rest, acc: Left c : st.acc }
+          LetRec binds rest -> Loop { e: rest, acc: Right binds : st.acc }
+          Ret c -> Done { steps: st.acc, tail: cfCexpr c }
+      )
+      { e: e0, acc: Nil }
+  in
+    foldl step spine.tail spine.steps
+  where
+  step acc = case _ of
+    Left c -> Set.union acc (cfCexpr c)
+    Right binds -> foldl (\a r -> Set.union a (cfExpr r.rhs)) acc binds
 
 cfCexpr :: CExpr -> Set String
 cfCexpr = case _ of
