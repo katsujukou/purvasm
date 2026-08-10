@@ -85,6 +85,7 @@ import Data.Set as Set
 import Data.String (joinWith)
 import Data.String as String
 import Partial.Unsafe (unsafeCrashWith)
+import Purvasm.Compiler.Backend.LLVM.ByNeed (FactMap, noFacts)
 import Purvasm.Compiler.Backend.LLVM.Mangle (escapeStringBytes)
 import Purvasm.Compiler.Backend.LLVM.Value (FrameOwner, RootSrc(..), Val, mintAt, ownerActId, rootSrcKey, rootedSrc, unsafeMkFrameOwner, verifyAt)
 import Data.Tuple (Tuple(..))
@@ -120,7 +121,9 @@ type Ctx =
   , rootAll :: Boolean -- ^ ADR-0105: `true` = root-on-create fallback (init bodies, `LClosure` wrappers); `false` = the activation plan drives rooting
   , actId :: Int -- ^ ADR-0106 slice 1: the current ACTIVATION identity — minted monotonically by [`beginFn`], never reused, independent of the SSA numbering; every `LocalSlot` consumption verifies its token's activation tier against this
   , frameSeq :: Int -- ^ ADR-0106 slice 1: module-global monotonic frame counter — [`mintFrameOwner`] combines it with `actId` into the per-frame [`FrameOwner`]
+  , byNeedOn :: Boolean -- ^ ADR-0107: whether the lattice is enabled for this module (the measurement counterfactual switches it off; `byNeed` below then stays empty)
   , crossing :: Set String -- ^ ADR-0105: the activation plan's crossing set (consulted only when `rootAll = false`)
+  , byNeed :: FactMap -- ^ ADR-0107 §2: the activation plan's by-need decision set — the SAME value the plan classified force sites with. Empty (⇒ every force emitted) outside a planned activation, so an un-planned body is conservative by construction
   }
 
 -- | The emitter monad: a pure `State` over `Ctx`. `State` is `MonadRec`, so the deep linear spines
@@ -136,6 +139,7 @@ type MakeCxOptions =
   , xfns :: Map String FnInfo
   , foreignArity :: Map String Int
   , inlineAbi :: Boolean
+  , byNeed :: Boolean -- ^ ADR-0107: the by-need lattice. `false` is the MEASUREMENT counterfactual (`PURVASM_BYNEED_OFF=1`) — the plan and the emitter switch together, so no elision and no plan change
   }
 
 -- | A fresh emitter state: all counters 0, all buffers empty, all reference sets/maps empty
@@ -160,12 +164,14 @@ makeCx opts =
   , selfCtx: Nothing
   , inDirect: false
   , inlineAbi: opts.inlineAbi
+  , byNeedOn: opts.byNeed
   , spEpoch: 0
   , reloadCache: Map.empty
   , rootAll: true
   , actId: 0
   , frameSeq: 0
   , crossing: Set.empty
+  , byNeed: noFacts
   }
 
 -- | Run an emission, returning the value and the final state.
@@ -301,7 +307,7 @@ beginFn :: Codegen Unit
 beginFn = modify_ \c ->
   if c.actId >= 2147483646 then
     unsafeCrashWith "Backend.LLVM.Monad.beginFn: ActivationId overflow (fail-closed, ADR-0106 — an activation identity is never reused)"
-  else c { ssa = 0, fn = Nil, spEpoch = 0, reloadCache = Map.empty, rootAll = true, crossing = Set.empty, actId = c.actId + 1 }
+  else c { ssa = 0, fn = Nil, spEpoch = 0, reloadCache = Map.empty, rootAll = true, crossing = Set.empty, byNeed = noFacts, actId = c.actId + 1 }
 
 -- | A rendered function body whose every line went through the guarded emitters — the
 -- | constructor is private, so call-carrying body text can only re-enter the module buffer via

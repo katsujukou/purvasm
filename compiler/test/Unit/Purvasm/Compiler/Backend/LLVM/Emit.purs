@@ -36,7 +36,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Emit" do
   describe "emitFunction" do
     it "emits the tailcc $d entry and the generic wrapper for identInt" do
       let
-        ctx = snd $ runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true })
+        ctx = snd $ runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true, byNeed: true })
           (emitFunction identIntLifted)
       -- ADR-0105 slice 2 (re-baselined, §4 emission-class licence = the behavioural gate):
       -- `identInt = \x -> x` has NO safepoint and no crossing definition, so the plan elides the
@@ -65,7 +65,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Emit" do
       let
         emitLl body = renderChunks
           ( _.md $ snd $ runCodegen
-              (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true })
+              (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true, byNeed: true })
               ( emitFunction
                   ( Lifted
                       { name: "pv_g_Test_2ef"
@@ -86,7 +86,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Emit" do
     let
       gcafLl gkeys e = renderChunks
         ( _.md $ snd $ runCodegen
-            (makeCx { gkeys: Set.fromFoldable gkeys, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true })
+            (makeCx { gkeys: Set.fromFoldable gkeys, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true, byNeed: true })
             (emitGcafInit "TestK" e)
         )
     it "a frameless Gcaf: no frame open, no transient root, no pop — the permanent root still lands" do

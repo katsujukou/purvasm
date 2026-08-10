@@ -21,7 +21,7 @@ import Test.Spec.Assertions (shouldEqual)
 run :: forall a. Codegen a -> Tuple a String
 run m =
   let
-    Tuple a ctx = runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true }) m
+    Tuple a ctx = runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true, byNeed: true }) m
   in
     Tuple a (renderBuffer ctx.fn)
 

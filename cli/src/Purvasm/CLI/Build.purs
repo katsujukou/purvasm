@@ -282,11 +282,20 @@ cmd opts = do
     Nothing -> pure false
     Just "1" -> pure true
     Just other -> throw (Fmt.fmt @"PURVASM_EMIT_DEBUG_ABI: expected absent or \"1\", got {other}" { other: show other })
+  -- Measurement-only knob (ADR-0107 slice 1): `PURVASM_BYNEED_OFF=1` disables the by-need lattice
+  -- in the PLAN and the emitter together, giving the counterfactual build the accounting identity
+  -- is measured against (deleted chains == elided occurrences). Deliberately an env knob, not a CLI
+  -- flag: it is a measurement vehicle, not a user-facing build mode — and fail-closed like the
+  -- ABI-profile selector, since a typo silently meaning "lattice on" would void the measurement.
+  byNeedOff <- lookupEnv "PURVASM_BYNEED_OFF" >>= case _ of
+    Nothing -> pure false
+    Just "1" -> pure true
+    Just other -> throw (Fmt.fmt @"PURVASM_BYNEED_OFF: expected absent or \"1\", got {other}" { other: show other })
   let
     action = mkAction opts ulibDir buildDir fsEnv modIdx irBuf
 
     backend :: Backend LlvmContext String
-    backend = llvmBackend { isEffect: not opts.value, heapWords: defaultHeapWords, debug: debugAbi }
+    backend = llvmBackend { isEffect: not opts.value, heapWords: defaultHeapWords, debug: debugAbi, byNeed: not byNeedOff }
     buildOpts =
       { entryModule: opts.entryModule
       , entryName: opts.entryName

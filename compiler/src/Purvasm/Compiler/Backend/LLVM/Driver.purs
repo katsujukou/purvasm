@@ -12,7 +12,10 @@
 module Purvasm.Compiler.Backend.LLVM.Driver
   ( LlvmBackendOptions
   , LlvmContext
+  , EntryProgram
   , gdefsOfModule
+  , moduleGdefs
+  , entryProgram
   , llvmBackend
   ) where
 
@@ -26,7 +29,7 @@ import Data.Maybe (Maybe(..), isNothing)
 import Data.Set as Set
 import Data.Tuple (Tuple(..))
 import PureScript.CoreFn.Module (Module) as CF
-import Purvasm.Compiler (Backend, ForeignSigMap)
+import Purvasm.Compiler (Backend, EntryInput, ForeignSigMap, LoweredModule)
 import Purvasm.Compiler.Backend.LLVM.Interface (interfaceOfAnf)
 import Purvasm.Compiler.Backend.LLVM.Monad (MakeCxOptions)
 import Purvasm.Compiler.Backend.LLVM.Program (classifyDecl, classifyNonrec, entryLl, gdefInitKey, gdefKeys, moduleLl, surfaceFn)
@@ -76,6 +79,9 @@ type LlvmBackendOptions =
   { isEffect :: Boolean
   , heapWords :: Int
   , debug :: Boolean
+  -- | ADR-0107: the by-need lattice. `false` is the MEASUREMENT counterfactual — the plan and the
+  -- | emitter switch together, so it changes what is emitted but never what it means.
+  , byNeed :: Boolean
   }
 
 -- | The LLVM backend's cross-module context (ADR-0087 §2 / ADR-0104 §5-1) — a merge-able bag of
@@ -182,6 +188,39 @@ nativeRequiredLowering leaves =
 lowerModuleDecls :: Map String Int -> AnfModule -> AnfModule
 lowerModuleDecls leaves m = m { decls = map (mapDeclBodies (nativeRequiredLowering leaves)) m.decls }
 
+-- | One module object's `Gdef`s, exactly as emitted: the synthesised foreign gdefs (key-sorted) then the
+-- | module's own decls under the required lowering. Named and exported so `lowerModule` and any
+-- | out-of-tree ANF analysis (the `census` tool's ADR-0107 by-need walk) read the SAME gdefs from ONE
+-- | derivation — an analysis that re-derived its own would silently drift from what codegen sees
+-- | (a native leaf still an `AtomVar`, a literal builtin still a reference).
+moduleGdefs :: LoweredModule -> Array Gdef
+moduleGdefs lm =
+  let
+    leaves = nativeLeafArities lm.foreignSigs
+  in
+    synthForeignGdefs lm <> map classifyDecl (lowerModuleDecls leaves lm.module).decls
+
+-- | The entry/init object's inputs, exactly as emitted: the whole program's gdefs in linked-spine order
+-- | (all foreign gdefs key-sorted, then every module's decls in dependency order) and the entry
+-- | expression under the required lowering. Shared by `lowerEntry` and the census tool for the same
+-- | single-derivation reason as `moduleGdefs`.
+entryProgram :: EntryInput -> EntryProgram
+entryProgram input =
+  let
+    allLeaves = foldl (\acc lm -> Map.union (nativeLeafArities lm.foreignSigs) acc) Map.empty input.modules
+    allForeigns = Array.sortWith gdefInitKey (Array.concatMap synthForeignGdefs input.modules)
+    allDecls = Array.concatMap (\lm -> map classifyDecl (lowerModuleDecls (nativeLeafArities lm.foreignSigs) lm.module).decls) input.modules
+  in
+    { leaves: allLeaves, gdefs: allForeigns <> allDecls, entry: nativeRequiredLowering allLeaves input.entry }
+
+-- | The entry object's emission inputs (`entryProgram`): the program-wide native-leaf arities, the
+-- | linked-spine gdefs, and the lowered entry expression.
+type EntryProgram =
+  { leaves :: Map String Int
+  , gdefs :: Array Gdef
+  , entry :: Expr
+  }
+
 -- | The LLVM backend as an ADR-0087 `Backend` (the neutral `build` driver's pure codegen capability):
 -- | per-module `.ll` (`lowerModule`), the whole-program init/entry `.ll` (`lowerEntry`), the module `.pmi`
 -- | (`interfaceOf`), and the cross-module context facts (surface / `gkeys`) contributed per module
@@ -191,7 +230,7 @@ lowerModuleDecls leaves m = m { decls = map (mapDeclBodies (nativeRequiredLoweri
 llvmBackend :: LlvmBackendOptions -> Backend LlvmContext String
 llvmBackend opts =
   { emptyContext:
-      { cxOpts: { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: not opts.debug }
+      { cxOpts: { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: not opts.debug, byNeed: opts.byNeed }
       , isEffect: opts.isEffect
       , heapWords: opts.heapWords
       }
@@ -206,6 +245,7 @@ llvmBackend opts =
           , xfns: Map.union newer.cxOpts.xfns older.cxOpts.xfns
           , foreignArity: Map.empty
           , inlineAbi: not opts.debug
+          , byNeed: opts.byNeed
           }
       , isEffect: opts.isEffect
       , heapWords: opts.heapWords
@@ -224,7 +264,7 @@ llvmBackend opts =
       in
         -- `foreignArity` is a per-module base — `lowerModule`/`lowerEntry` override it with the module's
         -- own native-leaf arities (`nativeLeafArities lm.foreignSigs`), threaded from FSR (ADR-0090).
-        { cxOpts: { gkeys, xfns, foreignArity: Map.empty, inlineAbi: not opts.debug }
+        { cxOpts: { gkeys, xfns, foreignArity: Map.empty, inlineAbi: not opts.debug, byNeed: opts.byNeed }
         , isEffect: opts.isEffect
         , heapWords: opts.heapWords
         }
@@ -233,24 +273,18 @@ llvmBackend opts =
   , interfaceOf: \_ lm -> interfaceOfAnf lm.source (map classifyDecl lm.module.decls)
   , lowerModule: \ctx lm ->
       let
-        leaves = nativeLeafArities lm.foreignSigs
         -- Foreign gdefs first (boot's `foreign_groups`, key-sorted by `synthForeignGdefs`), then the
         -- module's own decls — the per-module view of boot's `foreign_groups @ module_reached`.
-        gdefs = synthForeignGdefs lm <> map classifyDecl (lowerModuleDecls leaves lm.module).decls
+        gdefs = moduleGdefs lm
         defined = Set.fromFoldable (Array.concatMap gdefKeys gdefs)
       in
-        moduleLl (ctx.cxOpts { foreignArity = leaves }) defined gdefs
+        moduleLl (ctx.cxOpts { foreignArity = nativeLeafArities lm.foreignSigs }) defined gdefs
   , lowerEntry: \ctx input ->
       let
-        -- the entry object's leaf set spans every module's leaves (the entry stub reaches any of them).
-        allLeaves = foldl (\acc lm -> Map.union (nativeLeafArities lm.foreignSigs) acc) Map.empty input.modules
         -- Match boot's linked spine `foreign_groups @ module_reached`: **all** foreign gdefs across the
         -- program, sorted by key, precede **all** module decls (in dependency-spine order). `reachableGdefs`
         -- then prunes to the entry's closure, preserving this order for `pv_init_all`.
-        allForeigns = Array.sortWith gdefInitKey (Array.concatMap synthForeignGdefs input.modules)
-        allDecls = Array.concatMap (\lm -> map classifyDecl (lowerModuleDecls (nativeLeafArities lm.foreignSigs) lm.module).decls) input.modules
+        p = entryProgram input
       in
-        entryLl (ctx.cxOpts { foreignArity = allLeaves }) ctx.isEffect ctx.heapWords
-          (allForeigns <> allDecls)
-          (nativeRequiredLowering allLeaves input.entry)
+        entryLl (ctx.cxOpts { foreignArity = p.leaves }) ctx.isEffect ctx.heapWords p.gdefs p.entry
   }

@@ -57,6 +57,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Program" do
           , xfns: Map.empty
           , foreignArity: Map.empty
           , inlineAbi: true
+          , byNeed: true
           }
         -- post-opt object keys: the clone is now materialised here; `Other.ext` is *not* defined here.
         defined = Set.fromFoldable [ cloneKey, "M.user", "M.userExt" ]
@@ -83,6 +84,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Program" do
           , xfns: Map.empty
           , foreignArity: Map.empty
           , inlineAbi: true
+          , byNeed: true
           }
         gdefs = [ Gcaf cloneKey (Ret (CAtom (AtomLit (LInt 1)))) ]
         entry = Ret (CAtom (AtomVar cloneKey)) -- the entry references the clone directly

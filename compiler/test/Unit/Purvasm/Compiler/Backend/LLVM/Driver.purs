@@ -68,7 +68,7 @@ buildIR fixture opts = do
   modBuf <- liftEffect (Ref.new [])
   entryBuf <- liftEffect (Ref.new Nothing)
   let
-    backend = llvmBackend { isEffect: opts.isEffect, heapWords: 1048576, debug: false }
+    backend = llvmBackend { isEffect: opts.isEffect, heapWords: 1048576, debug: false, byNeed: true }
     action =
       { workdir: "."
       , maxOptimizeIter: 1

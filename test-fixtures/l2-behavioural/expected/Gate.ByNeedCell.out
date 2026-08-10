@@ -1,0 +1,11 @@
+byneed-cell:start
+accessor:cell-15:21
+alias-prim:22:42
+alias-if:gt
+churn:7631
+meet-accessor:cell-15:21
+meet-prim:19
+container:cell-15:80
+case-node:cell-15:21
+update:cell-15!:121:59
+byneed-cell:done

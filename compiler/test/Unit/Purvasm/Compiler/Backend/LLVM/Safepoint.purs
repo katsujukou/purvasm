@@ -31,7 +31,7 @@ import Test.Spec.Assertions (shouldEqual)
 
 emitted :: forall a. Codegen a -> String
 emitted m = renderBuffer
-  (snd (runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true }) m)).fn
+  (snd (runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true, byNeed: true }) m)).fn
 
 -- Force a pure emission inside the Effect runtime so its guard `unsafeCrashWith` surfaces as a
 -- caught exception (evaluation deferred into the Effect closure — the `Monad`-test pattern).

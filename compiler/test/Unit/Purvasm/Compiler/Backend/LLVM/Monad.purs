@@ -25,11 +25,11 @@ import Test.Spec.Assertions (shouldEqual)
 
 -- The default fresh state used across these cases.
 run :: forall a. Codegen a -> Tuple a Ctx
-run = runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true })
+run = runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true, byNeed: true })
 
 -- The --debug entry-call state (the pv_get reload leg).
 runDebug :: forall a. Codegen a -> Tuple a Ctx
-runDebug = runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: false })
+runDebug = runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: false, byNeed: true })
 
 -- A local rooted token owned by the DEFAULT activation (makeCx starts at actId 0) — the
 -- ADR-0106 consumption check passes until a beginFn mints a new activation.
@@ -387,8 +387,8 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Monad" do
         )
 
     it "ActivationId / frame-counter overflow is fail-closed — never wraps into reuse (ADR-0106)" do
-      expectCrash \_ -> runCodegen ((makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true }) { actId = 2147483646 }) beginFn
-      expectCrash \_ -> runCodegen ((makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true }) { frameSeq = 2147483646 }) mintFrameOwner
+      expectCrash \_ -> runCodegen ((makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true, byNeed: true }) { actId = 2147483646 }) beginFn
+      expectCrash \_ -> runCodegen ((makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true, byNeed: true }) { frameSeq = 2147483646 }) mintFrameOwner
 
     it "a safepoint between resolve and the ret crashes fail-closed (§6.4)" do
       expectCrash \_ -> run do

@@ -60,7 +60,8 @@ import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (fvExpr)
 import Purvasm.Compiler.Backend.LLVM.Mangle (ctorTag, imm, immBool, immInt, immUnit, labelId, mangle, mangleForeign, sortRecordFields)
 import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, PhiIncoming, beginFn, emit, emitAnfLabel, emitDefine, snapshotReloads, emitGuestRet, emitGuestStore, emitGuestSwitch, emitPayloadAshr, emitPhi, emitLowBitAnd, closeHopArm, emitStringConstant, foldA, forA, forA_, fresh, freshFn, freshLabel, mintCloWord, mintEnvWord, mintLoad, mintParam, takeFn)
 import Purvasm.Compiler.Backend.LLVM.Prim (inlinePrim)
-import Purvasm.Compiler.Backend.LLVM.Liveness (activationPlan, atomCanSafepoint, envPseudo, forcedAtomCanSafepoint, needsFrame)
+import Purvasm.Compiler.Backend.LLVM.ByNeed (elidesForce, elidesForcedValue)
+import Purvasm.Compiler.Backend.LLVM.Liveness (activationPlanWith, atomCanSafepoint, envPseudo, forcedAtomCanSafepoint, needsFrame)
 import Purvasm.Compiler.Backend.LLVM.Root (FrameToken, emitGcafInitEngine, ensureRooted, musttailWith, openFrame, retWith, tailcallWith)
 import Purvasm.Compiler.Backend.LLVM.Safepoint (RtArg(..), RtOp(..), guestDirect, rtCall, rtCallVoid)
 import Purvasm.Compiler.Backend.LLVM.Types (BindingV(..), Env, EnvSrc(..), FnInfo, Lifted(..), LiftedBody(..), bindDirectFnVar, bindDirectVar, bindFnVar, bindVar, lookupEnv)
@@ -182,10 +183,17 @@ readVar env x = case lookupEnv x env of
 
 -- | An atom to its forced value: a variable is forced (a demand site, e.g. an `if` condition or a primop
 -- | operand); a literal/foreign is passed through unforced (never a cell).
+-- |
+-- | ADR-0107 slice 1: a variable whose binding the activation's decision set proves is never a
+-- | by-need cell is passed through too — forcing a non-cell was always a no-op, so eliding a
+-- | PROVEN non-cell preserves behaviour and removes the chain (and its safepoint, which the plan
+-- | already accounted for from the SAME decision set).
 forceAtom :: Env -> Atom -> Codegen Val
-forceAtom env = case _ of
-  a@(AtomVar _) -> atom env a >>= forceValue
-  a -> atom env a
+forceAtom env a = do
+  facts <- gets _.byNeed
+  case a of
+    AtomVar _ | not (elidesForce facts a) -> atom env a >>= forceValue
+    _ -> atom env a
 
 -- | Evaluate a list of atoms to their **current** value operands, mutually protected against each
 -- | other's safepoints (ADR-0072 §6): an atom is rooted only when a *later* atom can safepoint,
@@ -194,21 +202,27 @@ forceAtom env = case _ of
 -- | rooted token; the consuming renderer reloads on cache miss (ADR-0105 §6.4).
 evalAtoms :: Maybe FrameToken -> Boolean -> Env -> Array Atom -> Codegen (Array Val)
 evalAtoms frame force env atoms = do
+  facts <- gets _.byNeed
   -- Stack-safety (2026-07-16 bugfix): a sequenced `State` step is a live host frame on the JS
   -- backend — a `Regex.Core.Unicode`-scale array literal (1,290 operands) was ~0.5× the
   -- default stack — so the pass is a `tailRecM` loop with a precomputed suffix scan for the
   -- later-safepoint test. (The former second pass — eager reload of every rooted slot — is
   -- retired by ADR-0105 §6.4: a rooted slot yields its rooted token and the consumption
   -- renderer reloads on cache miss.)
-  vals <- tailRecM evalStep { i: 0, acc: Nil }
+  let
+    -- the SAME row-derived classifiers the liveness analysis consults, over the SAME decision
+    -- set the plan published (ADR-0107 §2) — a hardcoded arm here is exactly the
+    -- analysis-vs-lowering drift class the seam exists to prevent, found live by the
+    -- 2026-08-06 force counterfactual where flipping the row moved the plan but not this pass.
+    canSafepoint = if force then forcedAtomCanSafepoint facts else atomCanSafepoint
+
+    -- `laterCan !! i` ⇔ the original `any canSafepoint rest` at element `i`.
+    laterCan :: Array Boolean
+    laterCan = Array.fromFoldable
+      (Array.foldr (\a st -> { flag: st.flag || canSafepoint a, out: st.flag : st.out }) { flag: false, out: Nil } atoms).out
+  vals <- tailRecM (evalStep laterCan) { i: 0, acc: Nil }
   pure (Array.fromFoldable (List.reverse vals))
   where
-  -- the SAME row-derived classifiers the liveness analysis consults (seam single-source;
-  -- a hardcoded arm here is exactly the analysis-vs-lowering drift class the seam exists to
-  -- prevent — found live by the 2026-08-06 force counterfactual, where flipping the row
-  -- moved the plan but not this pass).
-  canSafepoint = if force then forcedAtomCanSafepoint else atomCanSafepoint
-
   isImmediate = case _ of
     AtomLit (LInt _) -> true
     AtomLit (LBool _) -> true
@@ -216,14 +230,9 @@ evalAtoms frame force env atoms = do
 
   one = if force then forceAtom env else atom env
 
-  -- `laterCan !! i` ⇔ the original `any canSafepoint rest` at element `i`.
-  laterCan :: Array Boolean
-  laterCan = Array.fromFoldable
-    (Array.foldr (\a st -> { flag: st.flag || canSafepoint a, out: st.flag : st.out }) { flag: false, out: Nil } atoms).out
-
   -- Evaluate+root in list order: an atom a LATER atom can stale gets a slot and flows on as
   -- its rooted token; everything else flows as-is.
-  evalStep st = case Array.index atoms st.i of
+  evalStep laterCan st = case Array.index atoms st.i of
     Nothing -> pure (Done st.acc)
     Just a -> do
       v <-
@@ -556,8 +565,13 @@ cexpr frame env tail = case _ of
             guards cls acc = case Array.uncons cls of
               Nothing -> lower oenv ft acc
               Just { head: clause, tail: rest } -> do
-                -- A Boolean demand site: force a by-need guard result before reading its bit.
-                gv <- forceValue =<< requireValue =<< expr frame env' false clause.guard
+                -- A Boolean demand site: force a by-need guard result before reading its bit —
+                -- unless the decision set proves the guard's RESULT is never a cell (ADR-0107;
+                -- the guard body is a `Bool`-producing expression, and the classifier is applied
+                -- to the SAME facts and the SAME term the plan saw).
+                facts <- gets _.byNeed
+                gv0 <- requireValue =<< expr frame env' false clause.guard
+                gv <- if elidesForcedValue facts clause.guard then pure gv0 else forceValue gv0
                 pay <- fresh
                 emitPayloadAshr pay gv
                 bb <- fresh
@@ -703,19 +717,19 @@ cexpr frame env tail = case _ of
 -- | the phase order. The permanent tier is untouched: the candidate snapshots pre-pop
 -- | (`GlobalSlot` handle-copies) and roots permanently after it.
 emitGcafInit :: String -> Expr -> Codegen Unit
-emitGcafInit key e =
+emitGcafInit key e = do
+  byNeedOn <- gets _.byNeedOn
   let
-    plan = activationPlan { params: [], captures: [], selfName: Nothing } e
-  in
-    emitGcafInitEngine
-      { key
-      , framed: needsFrame plan
-      , body: \mtok -> do
-          -- after the engine's beginFn (which resets to the rootAll fallback): the plan
-          -- drives this body's rooting, exactly as emitFunction's LBody arm.
-          modify_ \c -> c { rootAll = false, crossing = plan.crossing }
-          requireValue =<< expr mtok Nil false e
-      }
+    plan = activationPlanWith { byNeed: byNeedOn } { params: [], captures: [], selfName: Nothing } e
+  emitGcafInitEngine
+    { key
+    , framed: needsFrame plan
+    , body: \mtok -> do
+        -- after the engine's beginFn (which resets to the rootAll fallback): the plan
+        -- drives this body's rooting, exactly as emitFunction's LBody arm.
+        modify_ \c -> c { rootAll = false, crossing = plan.crossing, byNeed = plan.byNeed }
+        requireValue =<< expr mtok Nil false e
+    }
 
 -- | Push a lifted lambda onto the pending-emit queue (LIFO).
 pushPending :: Lifted -> Codegen Unit
@@ -951,8 +965,9 @@ emitFunction (Lifted l) = do
   -- one reload per slot per safepoint window/ANF block, not one per use).
   plan <- case l.body of
     LBody e -> do
-      let p = activationPlan { params: l.params, captures: l.captures, selfName: l.selfName } e
-      modify_ \c -> c { rootAll = false, crossing = p.crossing }
+      byNeedOn <- gets _.byNeedOn
+      let p = activationPlanWith { byNeed: byNeedOn } { params: l.params, captures: l.captures, selfName: l.selfName } e
+      modify_ \c -> c { rootAll = false, crossing = p.crossing, byNeed = p.byNeed }
       pure (Just p)
     LClosure _ -> pure Nothing
   let framed = maybe true needsFrame plan

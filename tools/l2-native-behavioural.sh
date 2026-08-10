@@ -66,6 +66,7 @@ Gate.EffectOrder
 Gate.DictDispatch
 Gate.Mixed
 Gate.RootStress
+Gate.ByNeedCell
 "
 
 # The debug runtime staticlib for the debug-ABI-profile leg (assertions on, generation-checked

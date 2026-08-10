@@ -15,7 +15,8 @@ import Data.Array as Array
 import Data.Maybe (Maybe(..))
 import Data.Set as Set
 import Data.Tuple (Tuple(..), fst)
-import Purvasm.Compiler.Backend.LLVM.Liveness (ActivationConfig, activationPlan, cexprMayRootLocally, envPseudo, needsFrame, operandsMayRoot, primOpSafepoint)
+import Purvasm.Compiler.Backend.LLVM.ByNeed (activationFacts, elidesForcedValue, noFacts)
+import Purvasm.Compiler.Backend.LLVM.Liveness (ActivationConfig, activationPlan, activationPlanWith, cexprMayRootLocally, envPseudo, needsFrame, operandsMayRoot, primOpSafepoint)
 import Purvasm.Compiler.Backend.LLVM.Mangle (sortRecordFields)
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Literal (Literal(..))
@@ -201,6 +202,47 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
       -- pins is b's.)
       Set.member "b" plan.crossing `shouldEqual` true
 
+    -- ADR-0107 §2: the guard-result force is classified through the SAME decision set the emitter
+    -- elides with. A guard whose RESULT the lattice proves (`CPrim EqInt`) emits no chain, so it
+    -- must not be a safepoint here either — a term-only classifier would keep rooting across a
+    -- force that no longer exists (conservative, but a second derivation, and the accounting would
+    -- charge the crossing to a chain that was never emitted).
+    it "a PROVEN guard result is no longer a post-guard safepoint (the shared decision)" do
+      let
+        -- The sibling of the test above, with the guard's RESULT provable: `1 == 2` is a
+        -- scalar-primitive result over immediates, so it has no internal safepoint of its own and
+        -- the lattice proves the value the force would receive. `b` is the discriminator (an
+        -- arm-bound name used only in clause 2 — a name live at CASE entry would cross anyway
+        -- under the dtree's arm-entry conservatism, which is what makes `b` the right probe).
+        guarded g = Ret
+          ( CCase [ var "s" ]
+              [ { binders: [ BVar "b" ]
+                , result: Guarded
+                    [ { guard: g, rhs: Ret (CAtom (int 1)) }
+                    , { guard: Ret (CAtom (AtomLit (LBool true))), rhs: Ret (CAtom (var "b")) }
+                    ]
+                }
+              ]
+          )
+        provenBody = guarded (Ret (CPrim EqInt [ int 1, int 2 ]))
+        opaqueBody = guarded (Ret (CAtom (var "q")))
+        cfg = cfg0 { params = [ "s", "q" ] }
+      -- with the lattice OFF the post-guard force is a safepoint, so `b` crosses it …
+      Set.member "b" (activationPlanWith { byNeed: false } cfg provenBody).crossing `shouldEqual` true
+      -- … with it ON the emitter emits no chain there, so the analysis must not root across one;
+      -- the unprovable guard (a bare variable — `May`) still makes `b` cross.
+      Set.member "b" (activationPlanWith { byNeed: true } cfg provenBody).crossing `shouldEqual` false
+      Set.member "b" (activationPlanWith { byNeed: true } cfg opaqueBody).crossing `shouldEqual` true
+      -- and the plan PUBLISHES that decision set, so the emitter reads the same one rather than
+      -- computing its own (`FactMap` is opaque, so this is checked through the decision).
+      let published = (activationPlanWith { byNeed: true } cfg provenBody).byNeed
+      elidesForcedValue published (Ret (CPrim EqInt [ int 1, int 2 ])) `shouldEqual` true
+      elidesForcedValue (activationFacts [ "s", "q" ] provenBody) (Ret (CPrim EqInt [ int 1, int 2 ]))
+        `shouldEqual` true
+      -- the OFF plan publishes the disabled set: nothing decides, so nothing elides.
+      elidesForcedValue (activationPlanWith { byNeed: false } cfg provenBody).byNeed
+        (Ret (CPrim EqInt [ int 1, int 2 ])) `shouldEqual` false
+
     it "a case-arm binder crosses a safepoint inside its arm; consumed-at-call stays direct (2b-1)" do
       -- case s of Just b -> let z = h () in b + z — b is live across the h call.
       let
@@ -342,25 +384,25 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
       case map fst (sortRecordFields [ Tuple "a" unit, Tuple "value" unit ]) of
         [ l1, l2 ] -> do
           let fields = [ { prop: l2, val: AtomLit (LString "s") }, { prop: l1, val: var "x" } ]
-          operandsMayRoot false (map _.val fields) `shouldEqual` false -- the naive source order
-          cexprMayRootLocally (CRecord fields) `shouldEqual` true -- the canonical order
+          operandsMayRoot noFacts false (map _.val fields) `shouldEqual` false -- the naive source order
+          cexprMayRootLocally noFacts (CRecord fields) `shouldEqual` true -- the canonical order
         other -> fail ("sortRecordFields returned " <> show (Array.length other) <> " labels")
 
     it "is linear: 20k non-immediate no-safepoint operands decide instantly" do
       -- unforced vars can never safepoint → false; the per-index suffix re-scan this pins
       -- against was O(n²) here (never exercised by all-immediate fixtures).
-      operandsMayRoot false (Array.replicate 20000 (var "x")) `shouldEqual` false
+      operandsMayRoot noFacts false (Array.replicate 20000 (var "x")) `shouldEqual` false
 
     it "roots only when a later operand can safepoint" do
       -- [x, 1]: nothing after x can safepoint → no rooting; [x, y] forced: y forces → x rooted.
-      operandsMayRoot true [ var "x", int 1 ] `shouldEqual` false
-      operandsMayRoot true [ var "x", var "y" ] `shouldEqual` true
+      operandsMayRoot noFacts true [ var "x", int 1 ] `shouldEqual` false
+      operandsMayRoot noFacts true [ var "x", var "y" ] `shouldEqual` true
       -- unforced vars never safepoint as operands → no rooting even with two vars
-      operandsMayRoot false [ var "x", var "y" ] `shouldEqual` false
+      operandsMayRoot noFacts false [ var "x", var "y" ] `shouldEqual` false
       -- a later boxed literal allocates even unforced
-      operandsMayRoot false [ var "x", AtomLit (LString "s") ] `shouldEqual` true
+      operandsMayRoot noFacts false [ var "x", AtomLit (LString "s") ] `shouldEqual` true
       -- immediates are never rooted
-      operandsMayRoot true [ int 1, var "x" ] `shouldEqual` false
+      operandsMayRoot noFacts true [ int 1, var "x" ] `shouldEqual` false
 
   describe "primOpSafepoint (the §1 table, prim rows)" do
     it "classifies the allocating vs non-allocating prim families" do
@@ -374,17 +416,17 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
       primOpSafepoint RecordGet `shouldEqual` false
       primOpSafepoint NumberToInt `shouldEqual` false
 
-  describe "cexprMayRootLocally (the lowering-tier declarations)" do
+  describe "cexprMayRootLocally noFacts (the lowering-tier declarations)" do
     it "declares the recipes that root temporaries" do
-      cexprMayRootLocally (CUpdate (var "r") []) `shouldEqual` true
-      cexprMayRootLocally (CCase [ var "s" ] []) `shouldEqual` true
-      cexprMayRootLocally (CApp (var "f") []) `shouldEqual` true
-      cexprMayRootLocally (CAtom (var "x")) `shouldEqual` false
-      cexprMayRootLocally (CAccessor (var "d") "f") `shouldEqual` false
+      cexprMayRootLocally noFacts (CUpdate (var "r") []) `shouldEqual` true
+      cexprMayRootLocally noFacts (CCase [ var "s" ] []) `shouldEqual` true
+      cexprMayRootLocally noFacts (CApp (var "f") []) `shouldEqual` true
+      cexprMayRootLocally noFacts (CAtom (var "x")) `shouldEqual` false
+      cexprMayRootLocally noFacts (CAccessor (var "d") "f") `shouldEqual` false
       -- ctor: saturated with no later-safepoint operands needs no operand roots
-      cexprMayRootLocally (CCtor "T" 2 [ var "a", int 1 ]) `shouldEqual` false
+      cexprMayRootLocally noFacts (CCtor "T" 2 [ var "a", int 1 ]) `shouldEqual` false
       -- unsaturated with supplied fields roots the builder
-      cexprMayRootLocally (CCtor "T" 2 [ var "a" ]) `shouldEqual` true
+      cexprMayRootLocally noFacts (CCtor "T" 2 [ var "a" ]) `shouldEqual` true
 
   describe "§2a scale (default stack)" do
     it "walks a 50k-binding Let spine on the default stack" do
