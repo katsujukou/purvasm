@@ -150,8 +150,8 @@ Normative properties:
 
   `directTarget` remains the ONE source of `MissReason` — it just no longer pretends to be the one
   source of everything a call site is. Recording the outcome at the classifier and the form at the
-  arm would be two half-events that could disagree; one event per emitted call, written by the arm
-  that emits it, cannot.
+  arm would be two half-events that could disagree; one event per accounted guest-call occurrence,
+  written by the arm that emits it, cannot.
 - **Counts are over EMISSION OCCURRENCES.** As in ADR-0107 §2, one source call site can be emitted
   more than once (`MatchCompile` duplicates rows into specialised submatrices), so the identity
   below is stated over occurrences, and events are recorded per emitted occurrence.
@@ -163,7 +163,10 @@ same driver, same snapshotted-input harness), reporting per object per `MissReas
 occurrences, plus the direct-call occurrences for the denominator.
 
 **Gate (the identity that makes it self-checking):** for every emitted object, the events must
-account for EVERY emitted call, in the form the emitter actually uses. The naive
+account for every GUEST-call occurrence, in the form the emitter actually uses. "Guest call" is the
+scope of these six classes and of nothing else: the runtime machinery a lowering also emits
+(`pv_root`, `pv_new_str`, `pv_force_if_byneed`, …) is emitted as an LLVM `call` too, and is
+deliberately outside this accounting — it belongs to ADR-0105's seam, not to dispatch. The naive
 "`generic == Σ MissReason`" is FALSE against today's `Emit`, in both directions:
 
 - a generic call in TAIL position emits a **`pv_tailcall` trampoline store** (`tailcallWith`), not
@@ -287,6 +290,67 @@ total would let a large `Record`/`Str` mass hide (or invent) an apply-path alloc
 attributing the host buffers to a `Kind` would invent GC pressure that does not exist.
 
 All of it lives in the step-3 profile schema, never in the dispatch counts.
+
+#### Progress (2026-08-08): steps 1 and 2 — the classifier, the events, and the static census
+
+**Step 1.** `directTarget` returns `Either MissReason FnInfo`, the tree mirrored leaf-for-leaf (no
+new control flow, no priority list — the self-call shortcut still falls through). The ownership
+input is the object's `defined` key set, threaded through the codegen context: `moduleLl` passes its
+own object's keys, `entryLl` passes the EMPTY set. Each lowering arm records a closed `CallEvent`,
+and `moduleLlWithEvents`/`entryLlWithEvents` return the events beside the `.ll` of the same
+emission. `CallClass` is a TYPE; a class becomes a string once, at the report edge.
+
+**Emission is byte-identical** — same CoreFn closure, pre- and post-change compiler, `diff -r`
+clean over all 303 objects — so the events cost nothing but their own bookkeeping.
+
+**Step 2.** `census apply` is `llvmBackend` with ONLY its two artifact producers replaced
+(`Driver.moduleEmission`/`entryEmission` — the very functions `lowerModule`/`lowerEntry` take their
+`.ir` from). Context, merge, per-module contribution, interface and codegen options are the real
+backend's values, so each object is emitted under exactly the options the shipping build uses and
+the census reads the events off THAT emission. `tools/apply-census.sh` reconciles per object, and
+both axes are gated: the six call forms against the `.ll`, and every generic class against the sum
+of its own reasons (with `unknown-key` fail-closed at zero — a form-only gate would pass while the
+reason rows, which are the actual ranking, were short or mis-keyed).
+
+**Results (`--opt`, entry `Purvasm.CLI.Native`, 304 objects, all gates exact).**
+
+| call form | count | share of call sites |
+| --- | ---: | ---: |
+| `generic-apply` | 13,931 | 57.3 % |
+| `generic-tail` | 5,080 | 20.9 % |
+| `direct-nontail` | 3,492 | 14.4 % |
+| `direct-musttail` | 1,729 | 7.1 % |
+| `structural-apply` | 98 | 0.4 % |
+| `wrapper-entry` | 14,935 | (per FUNCTION, not a call site) |
+
+**78.5 % of call sites are generic.** Why, by reason (share of the 19,011 classified generic sites):
+
+| reason | apply | tail | total | share |
+| --- | ---: | ---: | ---: | ---: |
+| `local-unknown-fn` | 6,064 | 3,112 | 9,176 | **48.3 %** |
+| `callee-not-var` | 3,184 | 465 | 3,649 | 19.2 % |
+| `own-object-not-fn` | 1,782 | 979 | 2,761 | 14.5 % |
+| `dep-no-direct-fact` | 1,801 | 369 | 2,170 | 11.4 % |
+| arity mismatches (3 kinds) | 1,100 | 155 | 1,255 | 6.6 % |
+| `unknown-key` | 0 | 0 | 0 | 0 % |
+
+Two readings, both pinned as STATIC (site counts, not executions — step 3 is what ranks by
+execution, and a reason at 48 % of sites may carry far more or far less of the dispatches):
+
+- the dominant class by a wide margin is the **higher-order call** — a callee that is a parameter,
+  a capture or a `let`-bound value, about which the emitter has no function fact at all;
+- `unknown-key` is zero, exactly as §1 predicted for a diagnostic class that `readVar` would have
+  crashed on. The prediction was worth making: a non-zero count would have been a compiler bug
+  surfacing in a measurement, and the gate now fails closed on it.
+
+**A gotcha the gate caught on its first run, worth recording.** One object of 304 disagreed:
+`Backend.LLVM.Root` — the compiler's own emitter — reported one `musttail` more than the events
+did. The corpus IS the compiler, so a module that emits LLVM carries the emitted syntax as string
+constants: `@.str.29 = … c" = musttail call tailcc i64 @"`. A text search over the `.ll` counted the
+compiler's own output syntax as a call. Every needle is now anchored to the two-space instruction
+indent. This is the third counting caveat in that harness (after `declare` lines and the
+`musttail`/direct double-match), and all three were found by the accounting identity rather than by
+reading the script.
 
 ## Consequences
 
