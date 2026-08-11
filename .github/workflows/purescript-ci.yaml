@@ -41,12 +41,13 @@ jobs:
               - 'ulib-tools/**'
               - 'spago.yaml'
               - 'spago.lock'
-              # The ADR-0107 measurement harnesses are load-bearing (the census carries the
-              # accounting gate; the A/B carries the OWED run-time measurement contract — there is
-              # no run-time claim yet), so a change to either must at least reach the syntax check
-              # below.
+              # The ADR-0107/0108 measurement harnesses are load-bearing (the two censuses carry
+              # accounting gates; the A/B carries the OWED run-time measurement contract — there is
+              # no run-time claim yet), so a change to any of them must at least reach the syntax
+              # check below.
               - 'tools/byneed-census.sh'
               - 'tools/byneed-ab.sh'
+              - 'tools/apply-census.sh'
               - 'flake.nix'
               - 'flake.lock'
               - '.github/workflows/purescript-ci.yaml'
@@ -122,8 +123,8 @@ jobs:
       # self-host closure twice per mode. What IS standing here is that the runner stays runnable:
       # a syntax error in the harness that carries the accounting gate must not sit undetected
       # until someone next re-measures.
-      - name: Check (by-need measurement harnesses parse)
-        run: bash -n tools/byneed-census.sh && bash -n tools/byneed-ab.sh
+      - name: Check (measurement harnesses parse)
+        run: bash -n tools/byneed-census.sh && bash -n tools/byneed-ab.sh && bash -n tools/apply-census.sh
 
       # The byte-identity oracle: in-process and fixture-based, no boot shell-out.
       - name: Test (compiler E2E)

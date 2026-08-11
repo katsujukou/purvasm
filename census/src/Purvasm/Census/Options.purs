@@ -15,12 +15,15 @@ import Purvasm.CLI.Effect.Env (ENV)
 import Purvasm.CLI.Effect.Filesystem (FS)
 import Purvasm.CLI.Effect.Log (LOG)
 import Purvasm.CLI.Effect.Process (PROC)
+import Purvasm.Census.Apply.Cmd as Apply
 import Purvasm.Census.ByNeed.Cmd as ByNeed
 import Run (EFFECT, Run)
 import Run.Except (EXCEPT)
 import Type.Row (type (+))
 
-data Command = ByNeed ByNeed.Options
+data Command
+  = ByNeed ByNeed.Options
+  | Apply Apply.Options
 
 command :: ArgParser Command
 command =
@@ -28,12 +31,16 @@ command =
     [ ArgParser.command [ "byneed" ]
         "Census the ADR-0107 by-need demand sites of a program's compilation closure."
         ((ByNeed <$> ByNeed.options) <* ArgParser.flagHelp)
+    , ArgParser.command [ "apply" ]
+        "Census the ADR-0108 call sites of a program: how each was lowered, and why a generic one stayed generic."
+        ((Apply <$> Apply.options) <* ArgParser.flagHelp)
     ]
     <* ArgParser.flagHelp
 
 dispatch :: forall r. Command -> Run (ENV + LOG + FS + PROC + EXCEPT String + EFFECT + r) Unit
 dispatch = case _ of
   ByNeed opts -> ByNeed.cmd opts
+  Apply opts -> Apply.cmd opts
 
 parse :: Array String -> Either ArgParser.ArgError Command
 parse =
