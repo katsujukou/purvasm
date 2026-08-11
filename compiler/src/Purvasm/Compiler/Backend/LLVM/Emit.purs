@@ -26,6 +26,7 @@
 -- | rather than emit wrong IR.
 module Purvasm.Compiler.Backend.LLVM.Emit
   ( atom
+  , directTarget
   , readVar
   , emitRet
   , cexpr
@@ -58,9 +59,10 @@ import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.Compiler.Backend.LLVM.Abi (abiSettle, forceValue)
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (fvExpr)
 import Purvasm.Compiler.Backend.LLVM.Mangle (ctorTag, imm, immBool, immInt, immUnit, labelId, mangle, mangleForeign, sortRecordFields)
-import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, PhiIncoming, beginFn, emit, emitAnfLabel, emitDefine, snapshotReloads, emitGuestRet, emitGuestStore, emitGuestSwitch, emitPayloadAshr, emitPhi, emitLowBitAnd, closeHopArm, emitStringConstant, foldA, forA, forA_, fresh, freshFn, freshLabel, mintCloWord, mintEnvWord, mintLoad, mintParam, takeFn)
+import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, PhiIncoming, beginFn, recordCall, emit, emitAnfLabel, emitDefine, snapshotReloads, emitGuestRet, emitGuestStore, emitGuestSwitch, emitPayloadAshr, emitPhi, emitLowBitAnd, closeHopArm, emitStringConstant, foldA, forA, forA_, fresh, freshFn, freshLabel, mintCloWord, mintEnvWord, mintLoad, mintParam, takeFn)
 import Purvasm.Compiler.Backend.LLVM.Prim (inlinePrim)
 import Purvasm.Compiler.Backend.LLVM.ByNeed (elidesForce, elidesForcedValue)
+import Purvasm.Compiler.Backend.LLVM.CallClass (CallEvent(..), MissReason(..))
 import Purvasm.Compiler.Backend.LLVM.Liveness (activationPlanWith, atomCanSafepoint, envPseudo, forcedAtomCanSafepoint, needsFrame)
 import Purvasm.Compiler.Backend.LLVM.Root (FrameToken, emitGcafInitEngine, ensureRooted, musttailWith, openFrame, retWith, tailcallWith)
 import Purvasm.Compiler.Backend.LLVM.Safepoint (RtArg(..), RtOp(..), guestDirect, rtCall, rtCallVoid)
@@ -269,7 +271,11 @@ finish frame tail v =
 -- | enclosing self binding, then this module's own globals, then the export surface — so a local
 -- | rebinding never masquerades as the function, and same-module facts win over the interface. A
 -- | cross-module hit is recorded in `xdecls` for its per-signature `declare tailcc` extern.
-directTarget :: Env -> Atom -> Int -> Codegen (Maybe FnInfo)
+-- | ADR-0108 §1: the decision AND, when it is negative, the reason. The tree is unchanged — every
+-- | leaf simply names its outcome instead of collapsing to `Nothing`. Note the self-call shortcuts
+-- | are not leaves: a shortcut whose shape does not match FALLS THROUGH to the local/global
+-- | lookups and can still resolve directly, which is why there is no "self shape" reason.
+directTarget :: Env -> Atom -> Int -> Codegen (Either MissReason FnInfo)
 directTarget env f nargs = case f of
   AtomVar x -> case lookupEnv x env of
     Just entry -> do
@@ -279,10 +285,11 @@ directTarget env f nargs = case f of
           | s.name == x
           , Just h0 <- s.captureHandle
           , entry.key == h0
-          , s.fnInfo.arity == nargs -> pure (Just s.fnInfo)
+          , s.fnInfo.arity == nargs -> pure (Right s.fnInfo)
         _ -> pure case entry.knownFn of
-          Just info | info.arity == nargs -> Just info
-          _ -> Nothing
+          Just info | info.arity == nargs -> Right info
+          Just _ -> Left MissArityLocal
+          Nothing -> Left MissLocalUnknownFn
     Nothing -> do
       gkeys <- gets _.gkeys
       if Set.member x gkeys then do
@@ -291,22 +298,30 @@ directTarget env f nargs = case f of
           Just s
             | s.name == x
             , Nothing <- s.captureHandle
-            , s.fnInfo.arity == nargs -> pure (Just s.fnInfo)
+            , s.fnInfo.arity == nargs -> pure (Right s.fnInfo)
           _ -> do
             gfns <- gets _.gfns
             case Map.lookup x gfns of
-              Just info | info.arity == nargs -> pure (Just info)
+              Just info | info.arity == nargs -> pure (Right info)
               -- own-module fact says unsaturated: never fall through to the surface.
-              Just _ -> pure Nothing
+              Just _ -> pure (Left MissArityOwnModule)
               Nothing -> do
                 xfns <- gets _.xfns
                 case Map.lookup x xfns of
                   Just info | info.arity == nargs -> do
                     modify_ \c -> c { xdecls = Map.insert info.dsym info.arity c.xdecls }
-                    pure (Just info)
-                  _ -> pure Nothing
-      else pure Nothing
-  _ -> pure Nothing
+                    pure (Right info)
+                  Just _ -> pure (Left MissArityCrossModule)
+                  -- Neither a direct fact of this object nor a published one. WHICH it is needs the
+                  -- ownership input (ADR-0108 §1): a key this object defines is an own-object
+                  -- non-function (a `Gcaf`); anything else is a dependency with no published
+                  -- direct-call fact. The entry object defines nothing, so it only ever reaches the
+                  -- dependency arm.
+                  Nothing -> do
+                    defined <- gets _.defined
+                    pure (Left (if Set.member x defined then MissOwnObjectNotFn else MissDepNoDirectFact))
+      else pure (Left MissUnknownKey)
+  _ -> pure (Left MissCalleeNotVar)
 
 -- | Lower a computation. Slice-1a handles `CAtom`; the rest are later slices.
 cexpr :: Maybe FrameToken -> Env -> Boolean -> CExpr -> Codegen (Maybe Val)
@@ -363,7 +378,7 @@ cexpr frame env tail = case _ of
     makeClosure env l >>= finish frame tail
   CApp f args -> do
     directTarget env f (Array.length args) >>= case _ of
-      Just info -> do
+      Right info -> do
         -- Direct known-arity call (ADR-0076 §2/§3): the env word is derived per the callee's shape;
         -- a cell force is a safepoint (the suspension may run guest code), so operands are re-read
         -- from their roots after it.
@@ -399,9 +414,11 @@ cexpr frame env tail = case _ of
         if tail && inDir then do
           -- musttail (ADR-0076 §3): the fused pop+musttail+ret — every operand (env word
           -- included) is computed before the pop; no safepoint in between.
+          recordCall (DirectMusttail info)
           musttailWith frame { dsym: info.dsym, env: envOp, args: ops }
           pure Nothing
         else do
+          recordCall (DirectNonTail info)
           r <- guestDirect { dsym: info.dsym, env: envOp, args: ops }
           -- Settle (ADR-0076 §3): the callee may have stashed a generic tail bounce no enclosing
           -- `pv_apply` loop will take on this direct path — run it to a real value.
@@ -410,17 +427,21 @@ cexpr frame env tail = case _ of
             emitRet frame r'
             pure Nothing
           else pure (Just r')
-      Nothing -> do
+      Left reason -> do
         -- `f` and the args are mutually protected: a foreign callee or a `String` arg may allocate.
         all <- evalAtoms frame false env (Array.cons f args)
         case Array.uncons all of
           Just { head: fv, tail: ops } ->
             if tail then do
               -- Trampoline tail call (ADR-0071 §4): stash the pending tail, pop this frame, return.
+              -- NOTE (ADR-0108 §2): this is a `pv_tailcall` STORE, not a `pv_apply` — the generic
+              -- tail class is invisible in `pv_apply` counts, which is why it has its own column.
+              recordCall (GenericTail reason)
               Tuple p n <- argBuffer ops
               tailcallWith frame { fv, argp: p, nargs: n }
               pure Nothing
             else do
+              recordCall (GenericApply reason)
               Tuple p n <- argBuffer ops
               t <- rtCall RtApply [ V fv, Ptr p, I64 (show n) ]
               pure (Just t)
@@ -441,6 +462,10 @@ cexpr frame env tail = case _ of
         builder <- lift env params body >>= makeClosure env
         if nargs == 0 then finish frame tail builder
         else do
+          -- A generic apply the classifier never sees: the callee is a closure this arm just
+          -- synthesised, so there is no call site for `directTarget` to have an opinion about
+          -- (ADR-0108 §2's `structural-apply` class — reported, not folded into a reason).
+          recordCall StructuralApply
           bh <- ensureRooted frame builder
           ops <- evalAtoms frame false env args
           Tuple p n <- argBuffer ops
@@ -1050,7 +1075,10 @@ emitFunction (Lifted l) = do
         <> "entry:\n"
     )
     body
-  -- generic wrapper
+  -- generic wrapper. Its `guestDirect` is a direct call in the `.ll` but NOT a call site: it is
+  -- emitted once per lifted FUNCTION, so it gets its own accounting column (ADR-0108 §2) and the
+  -- object's direct-call count is `direct-nontail + wrapper-entry`, never one of them alone.
+  recordCall WrapperEntry
   beginFn
   envw <- case l.captures of
     [] -> pure (vImm immUnit)

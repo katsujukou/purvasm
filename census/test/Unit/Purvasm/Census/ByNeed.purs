@@ -52,7 +52,7 @@ emittedChains :: Boolean -> Array Gdef -> Int
 emittedChains byNeed gdefs =
   let
     keys = Set.fromFoldable (gdefs >>= gdefKeys)
-    ir = moduleLl { gkeys: keys, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true, byNeed } keys gdefs
+    ir = moduleLl { gkeys: keys, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true, defined: keys, byNeed } keys gdefs
   in
     Array.length (String.split (Pattern "\nfchk") ir) - 1
 

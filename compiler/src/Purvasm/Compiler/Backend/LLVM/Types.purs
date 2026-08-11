@@ -23,6 +23,15 @@ data EnvSrc
 
 derive instance Eq EnvSrc
 
+-- | For test diagnostics: an `FnInfo` mismatch is unreadable without it (ADR-0108's classification
+-- | matrix compares whole `FnInfo`s).
+instance showEnvSrc :: Show EnvSrc where
+  show = case _ of
+    SSelf -> "SSelf"
+    SSentinel -> "SSentinel"
+    SClosureEnv -> "SClosureEnv"
+    SForceCell -> "SForceCell"
+
 -- | A statically-known function a saturated call can enter directly: its direct-entry symbol, its
 -- | arity, and how to obtain the env operand.
 type FnInfo =

@@ -60,6 +60,7 @@ module Purvasm.Compiler.Backend.LLVM.Monad
   , armIncomingClosing
   , emitPhi
   , beginFn
+  , recordCall
   , takeFn
   , renderBuffer
   , renderChunks
@@ -86,6 +87,7 @@ import Data.String (joinWith)
 import Data.String as String
 import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.Compiler.Backend.LLVM.ByNeed (FactMap, noFacts)
+import Purvasm.Compiler.Backend.LLVM.CallClass (CallEvent)
 import Purvasm.Compiler.Backend.LLVM.Mangle (escapeStringBytes)
 import Purvasm.Compiler.Backend.LLVM.Value (FrameOwner, RootSrc(..), Val, mintAt, ownerActId, rootSrcKey, rootedSrc, unsafeMkFrameOwner, verifyAt)
 import Data.Tuple (Tuple(..))
@@ -121,6 +123,8 @@ type Ctx =
   , rootAll :: Boolean -- ^ ADR-0105: `true` = root-on-create fallback (init bodies, `LClosure` wrappers); `false` = the activation plan drives rooting
   , actId :: Int -- ^ ADR-0106 slice 1: the current ACTIVATION identity — minted monotonically by [`beginFn`], never reused, independent of the SSA numbering; every `LocalSlot` consumption verifies its token's activation tier against this
   , frameSeq :: Int -- ^ ADR-0106 slice 1: module-global monotonic frame counter — [`mintFrameOwner`] combines it with `actId` into the per-frame [`FrameOwner`]
+  , defined :: Set String -- ^ ADR-0108 §1: the keys THIS OBJECT defines — the ownership input `directTarget` needs to tell an own-object non-function from a dependency with no published fact. The entry object defines nothing, so it passes the empty set
+  , callEvents :: List CallEvent -- ^ ADR-0108 §1: one event per accounted guest-call occurrence (NOT every emitted `call` — runtime machinery is out of scope), in emission order (reversed), written by the arm that emits it. Per OBJECT — [`beginFn`] must not reset it
   , byNeedOn :: Boolean -- ^ ADR-0107: whether the lattice is enabled for this module (the measurement counterfactual switches it off; `byNeed` below then stays empty)
   , crossing :: Set String -- ^ ADR-0105: the activation plan's crossing set (consulted only when `rootAll = false`)
   , byNeed :: FactMap -- ^ ADR-0107 §2: the activation plan's by-need decision set — the SAME value the plan classified force sites with. Empty (⇒ every force emitted) outside a planned activation, so an un-planned body is conservative by construction
@@ -139,6 +143,7 @@ type MakeCxOptions =
   , xfns :: Map String FnInfo
   , foreignArity :: Map String Int
   , inlineAbi :: Boolean
+  , defined :: Set String -- ^ ADR-0108 §1: the object's own defined keys (`entryLl` passes the empty set)
   , byNeed :: Boolean -- ^ ADR-0107: the by-need lattice. `false` is the MEASUREMENT counterfactual (`PURVASM_BYNEED_OFF=1`) — the plan and the emitter switch together, so no elision and no plan change
   }
 
@@ -164,6 +169,8 @@ makeCx opts =
   , selfCtx: Nothing
   , inDirect: false
   , inlineAbi: opts.inlineAbi
+  , defined: opts.defined
+  , callEvents: Nil
   , byNeedOn: opts.byNeed
   , spEpoch: 0
   , reloadCache: Map.empty
@@ -308,6 +315,16 @@ beginFn = modify_ \c ->
   if c.actId >= 2147483646 then
     unsafeCrashWith "Backend.LLVM.Monad.beginFn: ActivationId overflow (fail-closed, ADR-0106 — an activation identity is never reused)"
   else c { ssa = 0, fn = Nil, spEpoch = 0, reloadCache = Map.empty, rootAll = true, crossing = Set.empty, byNeed = noFacts, actId = c.actId + 1 }
+
+-- | Record one emitted call (ADR-0108 §1). Called by the lowering arm that emits the call, so the
+-- | form and the outcome are decided in one place and cannot disagree. The log is per OBJECT — it
+-- | deliberately survives [`beginFn`], because an object's accounting spans every function it
+-- | emits, and it is emission-ordered (consed, reversed by the reader).
+-- |
+-- | Recording is NOT emission: nothing here writes to a buffer, mints an SSA name or bumps the
+-- | epoch, so an object's `.ll` is byte-identical with the log ignored.
+recordCall :: CallEvent -> Codegen Unit
+recordCall ev = modify_ \c -> c { callEvents = ev : c.callEvents }
 
 -- | A rendered function body whose every line went through the guarded emitters — the
 -- | constructor is private, so call-carrying body text can only re-enter the module buffer via

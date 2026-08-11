@@ -15,7 +15,9 @@ module Purvasm.Compiler.Backend.LLVM.Program
   , classifyDecl
   , reachableGdefs
   , moduleLl
+  , moduleLlWithEvents
   , entryLl
+  , entryLlWithEvents
   , surfaceFn
   , foreignKeysOf
   ) where
@@ -35,6 +37,7 @@ import Data.Set as Set
 import Data.String (joinWith)
 import Data.Tuple (Tuple(..), fst, snd)
 import Partial.Unsafe (unsafeCrashWith)
+import Purvasm.Compiler.Backend.LLVM.CallClass (CallEvent)
 import Purvasm.Compiler.Backend.LLVM.Abi (abiStamp, ctxHeaderVersion, declarations, forceValue)
 import Purvasm.Compiler.Backend.LLVM.Emit (buildGrec, emitGcafInit, emitPending, expr, readVar)
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (fvExpr)
@@ -252,7 +255,13 @@ xfnDecls = do
 -- | Emit one module object's `.ll`: its own root-handle globals + inits + internal code, plus `external`
 -- | decls for other modules' globals and cross-module `$d` externs. No `pv_init_all`/`@main`.
 moduleLl :: MakeCxOptions -> Set String -> Array Gdef -> String
-moduleLl opts defined gdefs =
+moduleLl opts defined gdefs = (moduleLlWithEvents opts defined gdefs).ir
+
+-- | `moduleLl`, also returning the object's ADR-0108 §1 call events — the SAME emission, so the
+-- | events describe the `.ll` beside them rather than a re-derivation of it. The census reads this;
+-- | the backend reads `moduleLl` and never sees the events.
+moduleLlWithEvents :: MakeCxOptions -> Set String -> Array Gdef -> { ir :: String, events :: Array CallEvent }
+moduleLlWithEvents opts defined gdefs =
   let
     -- The optimiser's Specialize pass (ADR-0089) materialises caller-homed `$spec$` clones as new
     -- module-local top-level gdefs *during* optimisation, so they are absent from the pre-optimisation
@@ -262,7 +271,10 @@ moduleLl opts defined gdefs =
     -- `defined`, so a locally-defined clone is never wrongly declared `external`; under `--no-opt` there are
     -- no clones and `defined ⊆ opts.gkeys`, so the union is a no-op (the reference lowering's emission is
     -- unchanged).
-    Tuple parts ctx = runCodegen (makeCx (opts { gkeys = Set.union opts.gkeys defined })) do
+    -- ADR-0108 §1: `defined` is also the object's OWNERSHIP input — it is what lets `directTarget`
+    -- tell a key this object defines but does not export as a function (a `Gcaf`) from a dependency
+    -- with no published direct-call fact.
+    Tuple parts ctx = runCodegen (makeCx (opts { gkeys = Set.union opts.gkeys defined, defined = defined })) do
       emitGdefs gdefs
       emitPending
       extern <- externGlobalDecls defined
@@ -270,30 +282,40 @@ moduleLl opts defined gdefs =
       xfn <- xfnDecls
       pure { extern, foreign_, xfn }
   in
-    "; ModuleID = 'purvasm.module'\n\n"
-      <> declarations
-      <> "\n"
-      <> abiStamp opts.inlineAbi
-      <> "\n"
-      <> parts.extern
-      <> "\n"
-      <> parts.foreign_
-      <> "\n"
-      <> parts.xfn
-      <> "\n\n"
-      <> renderChunks ctx.globals
-      <> "\n"
-      <> renderChunks ctx.md
+    { ir:
+        "; ModuleID = 'purvasm.module'\n\n"
+          <> declarations
+          <> "\n"
+          <> abiStamp opts.inlineAbi
+          <> "\n"
+          <> parts.extern
+          <> "\n"
+          <> parts.foreign_
+          <> "\n"
+          <> parts.xfn
+          <> "\n\n"
+          <> renderChunks ctx.globals
+          <> "\n"
+          <> renderChunks ctx.md
+    , events: Array.reverse (Array.fromFoldable ctx.callEvents)
+    }
 
 -- | Emit the init/entry object: `pv_init_all` (reachable inits in dependency order) + the `@main` stub.
 entryLl :: MakeCxOptions -> Boolean -> Int -> Array Gdef -> Expr -> String
-entryLl opts isEffect heapWords gdefs entry =
+entryLl opts isEffect heapWords gdefs entry = (entryLlWithEvents opts isEffect heapWords gdefs entry).ir
+
+-- | `entryLl`, also returning its ADR-0108 §1 call events (see `moduleLlWithEvents`).
+entryLlWithEvents :: MakeCxOptions -> Boolean -> Int -> Array Gdef -> Expr -> { ir :: String, events :: Array CallEvent }
+entryLlWithEvents opts isEffect heapWords gdefs entry =
   let
     -- Fold every emitted gdef's key (incl. optimiser `$spec$` clones, see `moduleLl`) into `gkeys` so both
     -- reachability (`pv_init_all` must call a referenced clone's `$init`, else its `$root` stays the `0`
     -- sentinel) and `readVar` see them. A no-op under `--no-opt` (no clones; keys ⊆ `opts.gkeys`).
     gkeys' = Set.union opts.gkeys (Set.fromFoldable (Array.concatMap gdefKeys gdefs))
-    opts' = opts { gkeys = gkeys' }
+    -- ADR-0108 §1: the entry object DEFINES NOTHING — it declares and calls the reachable `$init`s
+    -- (`externGlobalDecls Set.empty` below: everything it references is `external`). So its
+    -- ownership set is empty, and every global callee here classifies as a dependency.
+    opts' = opts { gkeys = gkeys', defined = Set.empty }
     reach = reachableGdefs gkeys' entry gdefs
     Tuple parts ctx = runCodegen (makeCx opts') do
       emitInitAll reach
@@ -305,25 +327,28 @@ entryLl opts isEffect heapWords gdefs entry =
       pure { entryBody, extern, foreign_, xfn }
     initDecls = joinWith "\n" (map (\g -> "declare void @" <> mangle (gdefInitKey g) <> "$init(ptr)") reach)
   in
-    "; ModuleID = 'purvasm.init'\n\n"
-      <> declarations
-      <> "\n"
-      <> abiStamp opts.inlineAbi
-      <> "\n"
-      <> initDecls
-      <> "\n"
-      <> parts.extern
-      <> "\n"
-      <> parts.foreign_
-      <> "\n"
-      <> parts.xfn
-      <> "\n\n"
-      <> renderChunks ctx.globals
-      <> "\n"
-      <> renderChunks ctx.md
-      <> "\ndefine i32 @main() {\nentry:\n"
-      <> renderFnBody parts.entryBody
-      <> "}\n"
+    { ir:
+        "; ModuleID = 'purvasm.init'\n\n"
+          <> declarations
+          <> "\n"
+          <> abiStamp opts.inlineAbi
+          <> "\n"
+          <> initDecls
+          <> "\n"
+          <> parts.extern
+          <> "\n"
+          <> parts.foreign_
+          <> "\n"
+          <> parts.xfn
+          <> "\n\n"
+          <> renderChunks ctx.globals
+          <> "\n"
+          <> renderChunks ctx.md
+          <> "\ndefine i32 @main() {\nentry:\n"
+          <> renderFnBody parts.entryBody
+          <> "}\n"
+    , events: Array.reverse (Array.fromFoldable ctx.callEvents)
+    }
 
 -- | Build the cross-module export surface (`xfns`) from the published call facts (`surface`): an exported
 -- | top-level function whose natively-lowered shape agrees with the `.pmi` fact becomes direct-callable.

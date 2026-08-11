@@ -14,6 +14,7 @@ import Test.Unit.Purvasm.Compiler.Bytecode.Lower as Bytecode.Lower
 import Test.Unit.Purvasm.Compiler.Bytecode.Lower.Match as Bytecode.Lower.Match
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Abi as Backend.LLVM.Abi
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.ByNeed as Backend.LLVM.ByNeed
+import Test.Unit.Purvasm.Compiler.Backend.LLVM.CallClass as Backend.LLVM.CallClass
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Driver as Backend.LLVM.Driver
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Emit as Backend.LLVM.Emit
 import Test.Unit.Purvasm.Compiler.MiddleEnd.ANF.FreeVars as MiddleEnd.ANF.FreeVars
@@ -72,6 +73,7 @@ main = runSpecAndExitProcess [ consoleReporter ] do
   Backend.LLVM.Interface.spec
   Backend.LLVM.Emit.spec
   Backend.LLVM.ByNeed.spec
+  Backend.LLVM.CallClass.spec
   Backend.LLVM.Liveness.spec
   Backend.LLVM.Driver.spec
   Backend.Bytecode.spec
