@@ -57,12 +57,13 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-: "${PURVASM_LIB:=$ROOT/dist/ulib}"
-export PURVASM_LIB
-
-for required in "$COREFN_DIR/$ENTRY_MODULE/corefn.json" "$PURVASM_LIB"; do
-  [ -e "$required" ] || { echo "apply-census.sh: missing $required" >&2; exit 1; }
-done
+# The CoreFn closure is required either way. The ulib deliberately is NOT checked here: under
+# --toolchain it comes from the snapshot (checked in that branch), and demanding an ambient or
+# tree-default one first would make a COMPLETE `{output,cli,census,ulib}` snapshot fail over a
+# `dist/ulib` the run never touches — which is the opposite of the self-contained contract the
+# option advertises.
+[ -e "$COREFN_DIR/$ENTRY_MODULE/corefn.json" ] ||
+  { echo "apply-census.sh: missing $COREFN_DIR/$ENTRY_MODULE/corefn.json" >&2; exit 1; }
 
 WORK="${APPLY_WORK:-$ROOT/_build/apply-census-$MODE_LABEL}"
 rm -rf "$WORK"; mkdir -p "$WORK"
@@ -89,6 +90,11 @@ if [ -n "$TOOLCHAIN" ]; then
   echo "   toolchain:      $TOOLCHAIN (no build, no re-snapshot)"
   echo "   corefn closure: $SNAP_COREFN"
 else
+  : "${PURVASM_LIB:=$ROOT/dist/ulib}"
+  export PURVASM_LIB
+  [ -e "$PURVASM_LIB" ] ||
+    { echo "apply-census.sh: missing $PURVASM_LIB" >&2; exit 1; }
+
   echo "== building (${MODE_LABEL}) =========================================="
   spago build -p census >"$WORK/spago.log" 2>&1 ||
     { echo "apply-census.sh: spago build failed; see $WORK/spago.log" >&2; exit 1; }
