@@ -28,6 +28,10 @@
 #      instruction indent, which globals (`@…`) and `declare` lines do not have.
 #
 # Usage: tools/apply-census.sh [--opt|--no-opt] [--entry MODULE] [--corefn-dir DIR] [--out FILE]
+#        tools/apply-census.sh ... --toolchain DIR   (run from a caller-pinned toolchain snapshot:
+#        DIR/{output,cli/index.node.js,census/index.js,ulib}; nothing is built or re-snapshotted, and
+#        --corefn-dir is taken as-is. Used by apply-profile.sh --selfhost so the census and the
+#        profiled binary share ONE compiler, not just one CoreFn closure.)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
@@ -38,6 +42,7 @@ ENTRY_MODULE=Purvasm.CLI.Native
 ENTRY_NAME=main
 COREFN_DIR=output
 OUT=apply-census.tsv
+TOOLCHAIN=
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -47,6 +52,7 @@ while [ $# -gt 0 ]; do
     --entry-name) ENTRY_NAME="$2"; shift 2 ;;
     --corefn-dir) COREFN_DIR="$2"; shift 2 ;;
     --out) OUT="$2"; shift 2 ;;
+    --toolchain) TOOLCHAIN="$2"; shift 2 ;;
     *) echo "apply-census.sh: unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -61,38 +67,63 @@ done
 WORK="${APPLY_WORK:-$ROOT/_build/apply-census-$MODE_LABEL}"
 rm -rf "$WORK"; mkdir -p "$WORK"
 
-echo "== building (${MODE_LABEL}) =========================================="
-spago build -p census >"$WORK/spago.log" 2>&1 ||
-  { echo "apply-census.sh: spago build failed; see $WORK/spago.log" >&2; exit 1; }
-
-# --- pin the inputs (see byneed-census.sh: `output/` is BOTH compiler JS and the default closure)
-echo "== snapshotting inputs (compiler JS, CoreFn closure, wrappers, ulib) ="
-cp -R "$ROOT/output" "$WORK/output"
-mkdir -p "$WORK/cli" "$WORK/census"
-cp "$ROOT/cli/index.node.js" "$WORK/cli/index.node.js"
-cp "$ROOT/census/index.js" "$WORK/census/index.js"
-cp -R "$PURVASM_LIB" "$WORK/ulib"
-if [ "$(cd "$COREFN_DIR" 2>/dev/null && pwd -P)" = "$(cd "$ROOT/output" && pwd -P)" ]; then
-  SNAP_COREFN="$WORK/output"
+if [ -n "$TOOLCHAIN" ]; then
+  # --- caller-supplied toolchain -----------------------------------------------------------------
+  # The CLASSIFIER is an input too. Snapshotting only the CoreFn pins what is measured but not what
+  # measures it: this script's own `spago build` + re-snapshot of `output/` would re-derive the
+  # compiler from whatever the tree holds NOW, so a long-running caller (apply-profile.sh --selfhost
+  # spends hours in its earlier legs) could census with a different compiler than the one whose
+  # sites it is reporting. With --toolchain, everything is the caller's pinned copy and nothing is
+  # rebuilt; the CoreFn dir is taken as-is because it is by contract already inside that snapshot.
+  # `output/` is part of the contract, not an extra: both wrappers resolve the compiled modules
+  # RELATIVE TO THEMSELVES (`<dir>/cli/../output`), so a toolchain without it silently resolves to
+  # nothing and node dies with ERR_MODULE_NOT_FOUND at the first leg.
+  for required in "$TOOLCHAIN/output" "$TOOLCHAIN/cli/index.node.js" "$TOOLCHAIN/census/index.js" "$TOOLCHAIN/ulib"; do
+    [ -e "$required" ] || { echo "apply-census.sh: --toolchain is missing $required" >&2; exit 1; }
+  done
+  CLI_JS="$TOOLCHAIN/cli/index.node.js"
+  CENSUS_JS="$TOOLCHAIN/census/index.js"
+  SNAP_COREFN="$COREFN_DIR"
+  export PURVASM_LIB="$TOOLCHAIN/ulib"
+  echo "== using caller-pinned toolchain ==================================="
+  echo "   toolchain:      $TOOLCHAIN (no build, no re-snapshot)"
+  echo "   corefn closure: $SNAP_COREFN"
 else
-  cp -R "$COREFN_DIR" "$WORK/corefn"
-  SNAP_COREFN="$WORK/corefn"
+  echo "== building (${MODE_LABEL}) =========================================="
+  spago build -p census >"$WORK/spago.log" 2>&1 ||
+    { echo "apply-census.sh: spago build failed; see $WORK/spago.log" >&2; exit 1; }
+
+  # --- pin the inputs (see byneed-census.sh: `output/` is BOTH compiler JS and the default closure)
+  echo "== snapshotting inputs (compiler JS, CoreFn closure, wrappers, ulib) ="
+  cp -R "$ROOT/output" "$WORK/output"
+  mkdir -p "$WORK/cli" "$WORK/census"
+  cp "$ROOT/cli/index.node.js" "$WORK/cli/index.node.js"
+  cp "$ROOT/census/index.js" "$WORK/census/index.js"
+  cp -R "$PURVASM_LIB" "$WORK/ulib"
+  if [ "$(cd "$COREFN_DIR" 2>/dev/null && pwd -P)" = "$(cd "$ROOT/output" && pwd -P)" ]; then
+    SNAP_COREFN="$WORK/output"
+  else
+    cp -R "$COREFN_DIR" "$WORK/corefn"
+    SNAP_COREFN="$WORK/corefn"
+  fi
+  CLI_JS="$WORK/cli/index.node.js"
+  CENSUS_JS="$WORK/census/index.js"
+  export PURVASM_LIB="$WORK/ulib"
+  echo "   corefn closure: $COREFN_DIR → $SNAP_COREFN"
 fi
-export PURVASM_LIB="$WORK/ulib"
-echo "   corefn closure: $COREFN_DIR → $SNAP_COREFN"
 # measurement knobs are harness-owned
-unset PURVASM_BYNEED_OFF PURVASM_EMIT_DEBUG_ABI PURVASM_GC_STRESS PURVASM_STATS PURVASM_HEAP_WORDS
+unset PURVASM_BYNEED_OFF PURVASM_EMIT_DEBUG_ABI PURVASM_GC_STRESS PURVASM_STATS PURVASM_HEAP_WORDS PURVASM_PROFILE_APPLY
 
 echo "== leg 1: native .ll emission ======================================"
 # shellcheck disable=SC2086
-node "$WORK/cli/index.node.js" build \
+node "$CLI_JS" build \
   --corefn-dir "$SNAP_COREFN" --entry "$ENTRY_MODULE" --entry-name "$ENTRY_NAME" \
   --outdir "$WORK/build" --emit-llvm $MODE_FLAG >"$WORK/build.log" 2>&1 ||
   { echo "apply-census.sh: build leg failed; see $WORK/build.log" >&2; exit 1; }
 
 echo "== leg 2: census ==================================================="
 # shellcheck disable=SC2086
-node "$WORK/census/index.js" apply \
+node "$CENSUS_JS" apply \
   --corefn-dir "$SNAP_COREFN" --entry "$ENTRY_MODULE" --entry-name "$ENTRY_NAME" \
   --workdir "$WORK/census-work" --out "$WORK/$OUT" $MODE_FLAG >"$WORK/census.log" 2>&1 ||
   { echo "apply-census.sh: census leg failed; see $WORK/census.log" >&2; exit 1; }
