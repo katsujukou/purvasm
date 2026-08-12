@@ -165,6 +165,9 @@ pub struct Heap {
     /// `None` (the default) means every instrumentation point below is a single flag check and
     /// nothing else — no formatting, clock reads, or counter writes on the hot path.
     stats: Option<Stats>,
+    /// ADR-0108 §3: the apply profile, present only after an instrumented program registers its
+    /// slot layout. `None` in every normal build — nothing counts and nothing prints.
+    apply_profile: Option<crate::applyprofile::ApplyProfile>,
     /// GC-stress mode (ADR-0105 §5, test-only instrumentation): when set, [`alloc`](Heap::alloc)
     /// collects at **every** entry — the safepoint superset — so every missing-root window
     /// deterministically contains a collection (what it guarantees is the window being *exercised*;
@@ -231,6 +234,7 @@ impl Heap {
             pending_tail: None,
             trace: false,
             stats: None,
+            apply_profile: None,
             gc_stress: false,
         }
     }
@@ -340,6 +344,30 @@ impl Heap {
     #[inline]
     pub(crate) fn stats(&self) -> Option<&Stats> {
         self.stats.as_ref()
+    }
+
+    /// Install the ADR-0108 §3 apply profile (an instrumented program registers it at start-up).
+    #[inline]
+    pub(crate) fn set_apply_profile(&mut self, p: crate::applyprofile::ApplyProfile) {
+        self.apply_profile = Some(p);
+    }
+
+    /// Count one execution of profile `slot`. `false` means the slot is out of range OR no profile
+    /// is registered — both are layout errors in an instrumented build (a normal build never calls
+    /// this), and the ABI entry aborts on them.
+    #[inline]
+    pub(crate) fn apply_profile_bump(&mut self, slot: usize) -> bool {
+        match self.apply_profile.as_mut() {
+            Some(p) => p.bump(slot),
+            None => false,
+        }
+    }
+
+    /// The registered apply profile, if this program was built instrumented. Read by
+    /// `pv_runtime_free` to decide whether to emit the second schema line.
+    #[inline]
+    pub(crate) fn apply_profile(&self) -> Option<&crate::applyprofile::ApplyProfile> {
+        self.apply_profile.as_ref()
     }
 
     /// Mutable access to the apply/GC counters (ADR-0102 §3) for the instrumentation points in

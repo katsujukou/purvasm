@@ -82,6 +82,13 @@ pub unsafe extern "C" fn pv_runtime_free(ctx: *mut Heap) {
             if let Some(stats) = heap(ctx).stats() {
                 eprintln!("{}", stats.format());
             }
+            // ADR-0108 §3: the SECOND schema, on its own line and versioned apart from
+            // `purvasm-stats:v1`. Printed iff this program was built instrumented (that is what
+            // registers a profile) — a normal build has none and prints nothing, and the line is
+            // NOT gated on `PURVASM_STATS`: an instrumented binary exists only to produce it.
+            if let Some(profile) = heap(ctx).apply_profile() {
+                eprintln!("{}", profile.format());
+            }
             drop(Box::from_raw(ctx));
         }
     })
@@ -305,6 +312,67 @@ pub extern "C" fn pv_abi_check(version: u32) {
         );
         std::process::abort();
     }
+}
+
+// --- ADR-0108 §3 apply profile (instrumented builds only) -------------------------------------------
+
+/// Register the apply profile's slot layout, called once from an INSTRUMENTED entry stub before
+/// `pv_init_all`. `names` is the compiler's `\n`-separated label blob of `names_len` bytes,
+/// describing exactly `slots` labels — the compiler owns the layout, the runtime only labels its
+/// counters from it (ADR-0108 §3).
+///
+/// Aborts if the blob and the slot count disagree: that is a compiler/runtime layout mismatch, and
+/// counting into mislabelled slots would produce a plausible, wrong ranking — the failure mode this
+/// whole ADR exists to avoid.
+///
+/// # Safety
+/// `ctx` is a live context; `names` points to `names_len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn pv_applyprofile_register(
+    ctx: *mut Heap,
+    names: *const u8,
+    names_len: u64,
+    slots: u64,
+) {
+    guard(|| {
+        let bytes = std::slice::from_raw_parts(names, names_len as usize);
+        let blob = match std::str::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("purvasm: apply-profile slot names are not valid UTF-8");
+                std::process::abort();
+            }
+        };
+        match crate::applyprofile::ApplyProfile::register(blob, slots as usize) {
+            Some(p) => heap(ctx).set_apply_profile(p),
+            None => {
+                eprintln!(
+                    "purvasm: apply-profile layout mismatch: object declares {slots} slot(s), blob describes a different set"
+                );
+                std::process::abort();
+            }
+        }
+    })
+}
+
+/// Count one execution of profile `slot` (ADR-0108 §3). Emitted by an instrumented build
+/// immediately before the generic dispatch it describes — a tail dispatch does not come back.
+///
+/// Aborts on an out-of-range slot, for the same reason `pv_applyprofile_register` aborts on a
+/// layout mismatch.
+///
+/// # Safety
+/// `ctx` is a live context.
+#[no_mangle]
+pub unsafe extern "C" fn pv_applyprofile_bump(ctx: *mut Heap, slot: u64) {
+    guard(|| {
+        if !heap(ctx).apply_profile_bump(slot as usize) {
+            eprintln!(
+                "purvasm: apply-profile slot {slot} is out of range (unregistered or stale layout)"
+            );
+            std::process::abort();
+        }
+    })
 }
 
 // --- shadow-stack rooting (ADR-0071 §5) -------------------------------------------------------------

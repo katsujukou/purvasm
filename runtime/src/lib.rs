@@ -37,6 +37,7 @@
 
 pub mod abi;
 pub mod apply;
+pub mod applyprofile;
 pub mod byneed;
 pub mod effect;
 pub mod gc;
