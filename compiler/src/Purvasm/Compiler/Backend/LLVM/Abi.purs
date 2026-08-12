@@ -20,6 +20,7 @@ module Purvasm.Compiler.Backend.LLVM.Abi
   , offPendingTail
   , defaultHeapWords
   , declarations
+  , profileDeclarations
   , abiStamp
   , headerField
   , abiSettle
@@ -125,6 +126,20 @@ declarations = joinWith "\n"
   , "declare void @pv_byneed_set_suspension(ptr, i64, i64)"
   , "declare i64 @pv_force_if_byneed(ptr, i64)"
   ]
+
+-- | The ADR-0108 §3 profile symbols' `declare` lines, emitted ONLY by an instrumented object.
+-- |
+-- | Deliberately NOT part of `declarations`: that block is emitted by every object, so putting them
+-- | there would change the bytes of every uninstrumented `.ll` — and the whole contract of the
+-- | instrumented build is that the shipped emission is unchanged by its existence. Returns a
+-- | leading-newline-prefixed block so it appends to `declarations` without disturbing it, or `""`.
+profileDeclarations :: Boolean -> String
+profileDeclarations profileApply
+  | not profileApply = ""
+  | otherwise = "\n" <> joinWith "\n"
+      [ "declare void @pv_applyprofile_register(ptr, ptr, i64, i64)"
+      , "declare void @pv_applyprofile_bump(ptr, i64)"
+      ]
 
 -- | The per-object link-time ABI stamp (ADR-0079 §1): an inline object carries a kept-alive reference
 -- | to `pv_ctx_abi_v<N>` so a version/profile mismatch fails at link. Entry-call (`--debug`) objects

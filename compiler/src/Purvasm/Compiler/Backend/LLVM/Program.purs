@@ -37,12 +37,12 @@ import Data.Set as Set
 import Data.String (joinWith)
 import Data.Tuple (Tuple(..), fst, snd)
 import Partial.Unsafe (unsafeCrashWith)
-import Purvasm.Compiler.Backend.LLVM.CallClass (CallEvent)
-import Purvasm.Compiler.Backend.LLVM.Abi (abiStamp, ctxHeaderVersion, declarations, forceValue)
+import Purvasm.Compiler.Backend.LLVM.CallClass (CallEvent, profileSlotNames)
+import Purvasm.Compiler.Backend.LLVM.Abi (abiStamp, ctxHeaderVersion, declarations, forceValue, profileDeclarations)
 import Purvasm.Compiler.Backend.LLVM.Emit (buildGrec, emitGcafInit, emitPending, expr, readVar)
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (fvExpr)
 import Purvasm.Compiler.Backend.LLVM.Mangle (immUnit, mangle, mangleForeign)
-import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, FnBody, MakeCxOptions, beginFn, emit, emitModule, forA, forA_, fresh, makeCx, renderChunks, renderFnBody, runCodegen, takeFn, unsafeEmitRawCall, unsafeEmitRawModule)
+import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, FnBody, MakeCxOptions, beginFn, emit, emitModule, emitStringConstant, forA, forA_, fresh, makeCx, renderChunks, renderFnBody, runCodegen, takeFn, unsafeEmitRawCall, unsafeEmitRawModule)
 import Purvasm.Compiler.Backend.LLVM.Root (emitGfunInit, emitInitFnFramed, entryTeardown, openFrame)
 import Purvasm.Compiler.Backend.LLVM.Safepoint (RtArg(..), RtOp(..), rtCall, rtCallVoid)
 import Purvasm.Compiler.Backend.LLVM.Types (CallFact(..), EnvSrc(..), FnInfo, Gdef(..), Lifted(..), LiftedBody(..), SplitOutput)
@@ -201,6 +201,21 @@ emitInitAll gdefs =
 
 -- | Emit the `@main` entry stub body: `pv_runtime_new` → `pv_abi_check` → `pv_init_all` → evaluate the
 -- | entry → print (pure) or run+drain (effect) → free → return. Returns the body text.
+-- | ADR-0108 §3: register the profile's slot names with the runtime (instrumented builds only).
+-- |
+-- | The blob is the slot names joined by `\n`, in slot order; the runtime sizes its counter array
+-- | from the count and labels each counter from the blob. Nothing is emitted in a normal build, so
+-- | the shipped entry object is byte-identical.
+emitApplyProfileRegister :: Codegen Unit
+emitApplyProfileRegister = do
+  profiling <- gets _.profileApply
+  when profiling do
+    let names = joinWith "\n" profileSlotNames
+    emitStringConstant names >>= case _ of
+      Nothing -> unsafeCrashWith "Program.emitApplyProfileRegister: empty slot-name blob"
+      Just c -> rtCallVoid RtApplyProfileRegister
+        [ Ptr c.name, I64 (show c.len), I64 (show (Array.length profileSlotNames)) ]
+
 emitEntryStub :: Boolean -> Int -> Expr -> Codegen FnBody
 emitEntryStub isEffect heapWords entry = do
   beginFn
@@ -209,6 +224,11 @@ emitEntryStub isEffect heapWords entry = do
   -- emitter is allowlisted for exactly this line in `tools/seam-audit.sh`.
   unsafeEmitRawCall ("  %ctx = call ptr @pv_runtime_new(i64 " <> show heapWords <> ")")
   rtCallVoid RtAbiCheck [ I32 (show ctxHeaderVersion) ]
+  -- ADR-0108 §3, instrumented builds only: hand the runtime THIS compiler's slot names, so the
+  -- profile's schema is labelled from the one definition of the layout (`CallClass.profileSlotNames`)
+  -- rather than from a copy in the runtime that could drift from it. Registration precedes
+  -- `pv_init_all` because a CAF init can already dispatch.
+  emitApplyProfileRegister
   rtCallVoid RtInitAll []
   -- the entry's roots are transient under its own frame; the permanent tier exists only
   -- inside `Root`'s init wrappers (`emitGfunInit` / `emitInitFnFramed`), so the entry stub
@@ -285,6 +305,7 @@ moduleLlWithEvents opts defined gdefs =
     { ir:
         "; ModuleID = 'purvasm.module'\n\n"
           <> declarations
+          <> profileDeclarations opts.profileApply
           <> "\n"
           <> abiStamp opts.inlineAbi
           <> "\n"
@@ -330,6 +351,7 @@ entryLlWithEvents opts isEffect heapWords gdefs entry =
     { ir:
         "; ModuleID = 'purvasm.init'\n\n"
           <> declarations
+          <> profileDeclarations opts.profileApply
           <> "\n"
           <> abiStamp opts.inlineAbi
           <> "\n"

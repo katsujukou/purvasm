@@ -22,12 +22,12 @@ import Data.Either (Either(..))
 import Data.Foldable (for_)
 import Data.List (List(..))
 import Data.Map as Map
-import Data.Maybe (Maybe(..))
+import Data.Maybe (Maybe(..), fromMaybe)
 import Data.Set as Set
 import Data.String (Pattern(..))
 import Data.String as String
 import Data.Tuple (Tuple(..), fst, snd)
-import Purvasm.Compiler.Backend.LLVM.CallClass (CallClass(..), CallEvent(..), MissReason(..), callClassName, callClasses, callEventClass)
+import Purvasm.Compiler.Backend.LLVM.CallClass (CallClass(..), CallEvent(..), MissReason(..), callClassName, callClasses, callEventClass, profileSlot, profileSlotNames)
 import Purvasm.Compiler.Backend.LLVM.Emit (directTarget)
 import Purvasm.Compiler.Backend.LLVM.Monad (MakeCxOptions, makeCx, mintParam, runCodegen)
 import Purvasm.Compiler.Backend.LLVM.Program (entryLlWithEvents, gdefKeys, moduleLlWithEvents)
@@ -56,6 +56,7 @@ opts o =
   , foreignArity: Map.empty
   , inlineAbi: true
   , defined: Set.fromFoldable o.defined
+  , profileApply: false
   , byNeed: true
   }
 
@@ -99,7 +100,7 @@ emittedForms gdefs =
     keys = Set.fromFoldable (gdefs >>= gdefKeys)
     ir =
       ( moduleLlWithEvents
-          { gkeys: keys, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true, defined: keys, byNeed: true }
+          { gkeys: keys, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true, defined: keys, profileApply: false, byNeed: true }
           keys
           gdefs
       ).ir
@@ -123,7 +124,7 @@ recordedForms gdefs =
     keys = Set.fromFoldable (gdefs >>= gdefKeys)
     events =
       ( moduleLlWithEvents
-          { gkeys: keys, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true, defined: keys, byNeed: true }
+          { gkeys: keys, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true, defined: keys, profileApply: false, byNeed: true }
           keys
           gdefs
       ).events
@@ -142,7 +143,7 @@ eventsOf gdefs =
     keys = Set.fromFoldable (gdefs >>= gdefKeys)
   in
     ( moduleLlWithEvents
-        { gkeys: keys, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true, defined: keys, byNeed: true }
+        { gkeys: keys, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true, defined: keys, profileApply: false, byNeed: true }
         keys
         gdefs
     ).events
@@ -306,6 +307,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.CallClass" do
           , foreignArity: Map.empty
           , inlineAbi: true
           , defined: Set.fromFoldable [ callee ]
+          , profileApply: false
           , byNeed: true
           }
         -- a call at the WRONG arity, so no direct fact matches and the leaf is an ownership question
@@ -319,3 +321,111 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.CallClass" do
       Array.filter (_ == MissDepNoDirectFact) reasons `shouldEqual` [ MissDepNoDirectFact ]
       Array.filter (_ == MissOwnObjectNotFn) reasons `shouldEqual` []
 
+  -- ADR-0108 §3. The slot layout is an ABI: an instrumented program hands these names to the
+  -- runtime, which sizes and labels its counters from them. What must hold is that the names and
+  -- the indices are ONE mapping (the runtime is handed the names but computes nothing), and that
+  -- the classes which cannot execute a dispatch get no slot at all.
+  describe "the dynamic profile's slot space" do
+    it "has a slot for every (generic form × executable reason), plus structural-apply" do
+      -- 2 forms × 7 reasons (every MissReason except the unreachable `unknown-key`) + 1
+      Array.length profileSlotNames `shouldEqual` 15
+      Array.nub profileSlotNames `shouldEqual` profileSlotNames
+      Array.filter (String.contains (Pattern "unknown-key")) profileSlotNames `shouldEqual` []
+
+    it "maps each event to the slot whose NAME describes it (names and indices are one mapping)" do
+      let
+        named ev = profileSlot ev >>= \i -> Array.index profileSlotNames i
+      named (GenericApply MissLocalUnknownFn) `shouldEqual` Just "generic-apply/local-unknown-fn"
+      named (GenericTail MissLocalUnknownFn) `shouldEqual` Just "generic-tail/local-unknown-fn"
+      named (GenericApply MissArityCrossModule) `shouldEqual` Just "generic-apply/arity-cross-module"
+      named StructuralApply `shouldEqual` Just "structural-apply"
+
+    it "gives no slot to what cannot execute a dispatch" do
+      -- direct calls are not dispatches; a wrapper entry is per function; `unknown-key` cannot be
+      -- emitted at all (§1) — instrumenting it would reserve a counter pinned at zero.
+      profileSlot (DirectNonTail (fnInfo "M.f$d" 1)) `shouldEqual` Nothing
+      profileSlot (DirectMusttail (fnInfo "M.f$d" 1)) `shouldEqual` Nothing
+      profileSlot WrapperEntry `shouldEqual` Nothing
+      profileSlot (GenericApply MissUnknownKey) `shouldEqual` Nothing
+      profileSlot (GenericTail MissUnknownKey) `shouldEqual` Nothing
+
+    it "keeps every slot index inside the layout it declares" do
+      let
+        slots = Array.mapMaybe profileSlot
+          [ GenericApply MissCalleeNotVar, GenericTail MissArityLocal, StructuralApply ]
+      Array.filter (\i -> i < 0 || i >= Array.length profileSlotNames) slots `shouldEqual` []
+
+  describe "instrumentation is opt-in and inert when off" do
+    it "emits no profile symbols in a normal build" do
+      let
+        gdefs = [ Gfun "M.f" [ "g", "x" ] (Ret (CApp (var "g") [ var "x" ])) ]
+        keys = Set.fromFoldable (gdefs >>= gdefKeys)
+        irOf profileApply =
+          ( moduleLlWithEvents
+              { gkeys: keys, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true, defined: keys, profileApply, byNeed: true }
+              keys
+              gdefs
+          ).ir
+      String.contains (Pattern "pv_applyprofile") (irOf false) `shouldEqual` false
+      String.contains (Pattern "call void @pv_applyprofile_bump") (irOf true) `shouldEqual` true
+      -- the declares travel with the instrumentation, never with the shipped block
+      String.contains (Pattern "declare void @pv_applyprofile_bump") (irOf false) `shouldEqual` false
+      String.contains (Pattern "declare void @pv_applyprofile_bump") (irOf true) `shouldEqual` true
+
+    -- ADR-0108 §3 counts DISPATCHES. A bump emitted before operand materialisation would count
+    -- intentions instead: `evalAtoms`/`argBuffer` can force a by-need cell or allocate, and what
+    -- runs between the bump and the dispatch is exactly the code that might not reach it. The
+    -- contract is therefore positional, and positional contracts drift silently — so it is pinned
+    -- on the emitted text, per instrumented dispatch form.
+    it "emits each bump immediately before its dispatch, after operand materialisation" do
+      let
+        -- one generic apply (non-tail, `$r` forces the result), one generic tail, one structural
+        -- apply (an unsaturated 2-ary constructor applied to one field).
+        gdefs =
+          [ Gfun "M.ap" [ "g", "x" ] (Let "$r" (CApp (var "g") [ var "x" ]) (Ret (CAtom (var "$r"))))
+          , Gfun "M.tl" [ "g", "x" ] (Ret (CApp (var "g") [ var "x" ]))
+          , Gfun "M.st" [ "x" ] (Ret (CCtor "M.Pair" 2 [ var "x" ]))
+          ]
+        keys = Set.fromFoldable (gdefs >>= gdefKeys)
+        ir =
+          ( moduleLlWithEvents
+              { gkeys: keys, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true, defined: keys, profileApply: true, byNeed: true }
+              keys
+              gdefs
+          ).ir
+        -- Instruction lines only: `declare void @pv_applyprofile_bump(…)` matches a bare symbol
+        -- needle, so the walk is anchored to the two-space instruction indent — the same caveat the
+        -- census harness carries.
+        lines = Array.filter (String.contains (Pattern "  ")) (String.split (Pattern "\n") ir)
+        symbolOf l = fromMaybe l (Array.head (String.split (Pattern "(") (fromMaybe l (Array.last (String.split (Pattern "@") l)))))
+        -- The FIRST call after each bump. Between the two there may be pure loads (the callee is
+        -- re-read from its root, ADR-0105's verify-then-use), which cannot fail to reach the
+        -- dispatch; what must not appear is another CALL — a force, an allocation or a
+        -- materialisation that could divert or allocate between counting and dispatching.
+        nextCallAfter i =
+          Array.findMap
+            (\l -> if String.contains (Pattern "call ") l then Just (symbolOf l) else Nothing)
+            (Array.drop (i + 1) lines)
+        followers =
+          Array.mapMaybe
+            ( \i -> case Array.index lines i of
+                Just l | String.contains (Pattern "@pv_applyprofile_bump") l -> nextCallAfter i
+                _ -> Nothing
+            )
+            (Array.range 0 (Array.length lines - 1))
+      -- one bump per instrumented dispatch, and each one's next call IS its dispatch
+      Array.length followers `shouldEqual` 3
+      Array.sort (Array.nub followers) `shouldEqual` [ "pv_apply", "pv_tailcall" ]
+
+    it "records the same events either way (instrumentation observes, it does not classify)" do
+      let
+        gdefs = [ Gfun "M.f" [ "g", "x" ] (Ret (CApp (var "g") [ var "x" ])) ]
+        keys = Set.fromFoldable (gdefs >>= gdefKeys)
+        eventsWith profileApply =
+          map callEventClass
+            ( moduleLlWithEvents
+                { gkeys: keys, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true, defined: keys, profileApply, byNeed: true }
+                keys
+                gdefs
+            ).events
+      eventsWith true `shouldEqual` eventsWith false

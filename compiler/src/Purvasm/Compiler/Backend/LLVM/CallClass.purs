@@ -23,10 +23,14 @@ module Purvasm.Compiler.Backend.LLVM.CallClass
   , callClassName
   , callEventClass
   , callClasses
+  , profileSlotNames
+  , profileSlot
   ) where
 
 import Prelude
 
+import Data.Array as Array
+import Data.Maybe (Maybe(..))
 import Purvasm.Compiler.Backend.LLVM.Types (FnInfo)
 
 -- | Why a call site could not be lowered to a direct known-arity call. The constructors mirror the
@@ -140,3 +144,53 @@ callClassName = case _ of
 -- | not a class missing from THIS list).
 callClasses :: Array CallClass
 callClasses = [ CDirectNonTail, CDirectMusttail, CGenericApply, CGenericTail, CStructuralApply, CWrapperEntry ]
+
+-- --- ADR-0108 §3: the dynamic profile's slot space -------------------------------------------------
+
+-- | The reasons a generic dispatch can EXECUTE with. `MissUnknownKey` is deliberately absent: it
+-- | cannot reach a dispatch in a valid build (`readVar` crashes first, §1), so instrumenting it
+-- | would reserve a counter that must always read zero.
+profiledReasons :: Array MissReason
+profiledReasons =
+  [ MissCalleeNotVar
+  , MissLocalUnknownFn
+  , MissArityLocal
+  , MissArityOwnModule
+  , MissOwnObjectNotFn
+  , MissDepNoDirectFact
+  , MissArityCrossModule
+  ]
+
+-- | The generic FORMS a dispatch can take. A reason means a different thing in each — different
+-- | emitted operation, different lever — so the counters are the product, never the sum.
+profiledForms :: Array CallClass
+profiledForms = [ CGenericApply, CGenericTail ]
+
+-- | The profile's slot names, IN SLOT ORDER — `(form × reason)` then the structural apply, which
+-- | has no reason to key on.
+-- |
+-- | This array is the ONE definition of the profile's layout. An instrumented program hands it to
+-- | the runtime at start-up (`pv_applyprofile_register`), so the runtime labels its counters from
+-- | the compiler's own names instead of a mirrored copy that could drift — adding a `MissReason`
+-- | here changes the emitted blob and the printed schema together.
+profileSlotNames :: Array String
+profileSlotNames =
+  (profiledForms >>= \f -> map (\r -> callClassName f <> "/" <> missReasonName r) profiledReasons)
+    <> [ callClassName CStructuralApply ]
+
+-- | The slot an executing dispatch bumps, or `Nothing` for the events that are not instrumented:
+-- | the direct forms (they are not dispatches), the wrapper entry (per function, not per call), and
+-- | `MissUnknownKey` (unreachable, per `profiledReasons`).
+profileSlot :: CallEvent -> Maybe Int
+profileSlot = case _ of
+  GenericApply r -> slotOf CGenericApply r
+  GenericTail r -> slotOf CGenericTail r
+  StructuralApply -> Just (Array.length profiledForms * Array.length profiledReasons)
+  DirectNonTail _ -> Nothing
+  DirectMusttail _ -> Nothing
+  WrapperEntry -> Nothing
+  where
+  slotOf form r = do
+    fi <- Array.elemIndex form profiledForms
+    ri <- Array.elemIndex r profiledReasons
+    pure (fi * Array.length profiledReasons + ri)

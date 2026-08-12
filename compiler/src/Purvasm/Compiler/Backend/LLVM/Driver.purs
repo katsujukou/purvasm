@@ -82,6 +82,9 @@ type LlvmBackendOptions =
   { isEffect :: Boolean
   , heapWords :: Int
   , debug :: Boolean
+  -- | ADR-0108 §3: emit the apply-profile instrumentation. An opt-in MEASUREMENT build; the shipped
+  -- | emission is byte-identical with this off.
+  , profileApply :: Boolean
   -- | ADR-0107: the by-need lattice. `false` is the MEASUREMENT counterfactual — the plan and the
   -- | emitter switch together, so it changes what is emitted but never what it means.
   , byNeed :: Boolean
@@ -233,7 +236,7 @@ type EntryProgram =
 llvmBackend :: LlvmBackendOptions -> Backend LlvmContext String
 llvmBackend opts =
   { emptyContext:
-      { cxOpts: { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: not opts.debug, defined: Set.empty, byNeed: opts.byNeed }
+      { cxOpts: { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: not opts.debug, defined: Set.empty, profileApply: false, byNeed: opts.byNeed }
       , isEffect: opts.isEffect
       , heapWords: opts.heapWords
       }
@@ -249,6 +252,7 @@ llvmBackend opts =
           , foreignArity: Map.empty
           , inlineAbi: not opts.debug
           , defined: Set.empty
+          , profileApply: opts.profileApply
           , byNeed: opts.byNeed
           }
       , isEffect: opts.isEffect
@@ -268,7 +272,7 @@ llvmBackend opts =
       in
         -- `foreignArity` is a per-module base — `lowerModule`/`lowerEntry` override it with the module's
         -- own native-leaf arities (`nativeLeafArities lm.foreignSigs`), threaded from FSR (ADR-0090).
-        { cxOpts: { gkeys, xfns, foreignArity: Map.empty, inlineAbi: not opts.debug, defined: Set.empty, byNeed: opts.byNeed }
+        { cxOpts: { gkeys, xfns, foreignArity: Map.empty, inlineAbi: not opts.debug, defined: Set.empty, profileApply: false, byNeed: opts.byNeed }
         , isEffect: opts.isEffect
         , heapWords: opts.heapWords
         }

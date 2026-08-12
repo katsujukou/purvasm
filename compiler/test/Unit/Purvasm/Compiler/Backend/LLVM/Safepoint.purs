@@ -21,7 +21,7 @@ import Data.String (Pattern(..), contains)
 import Data.Tuple (snd)
 import Effect.Aff (Aff)
 import Effect.Class (liftEffect)
-import Purvasm.Compiler.Backend.LLVM.Abi (declarations)
+import Purvasm.Compiler.Backend.LLVM.Abi (declarations, profileDeclarations)
 import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, makeCx, renderBuffer, runCodegen)
 import Purvasm.Compiler.Backend.LLVM.Value (unsafeTestVal, vImm)
 import Purvasm.Compiler.Backend.LLVM.Safepoint (RtArg(..), RtOp(..), emitPreparedMusttail, guestCallSafepoint, guestDirect, prepareMusttail, rtCall, rtCallVoid, rtSafepoint, rtSym)
@@ -31,7 +31,7 @@ import Test.Spec.Assertions (shouldEqual)
 
 emitted :: forall a. Codegen a -> String
 emitted m = renderBuffer
-  (snd (runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true, defined: Set.empty, byNeed: true }) m)).fn
+  (snd (runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true, defined: Set.empty, profileApply: false, byNeed: true }) m)).fn
 
 -- Force a pure emission inside the Effect runtime so its guard `unsafeCrashWith` surfaces as a
 -- caught exception (evaluation deferred into the Effect closure — the `Monad`-test pattern).
@@ -68,15 +68,29 @@ allPrims = allOf
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.Backend.LLVM.Safepoint" do
   describe "rtSym" do
-    it "every row's symbol has a matching declare in Abi.declarations (mechanical sweep)" do
-      -- sanity-pin the mechanical enumeration itself: 29 non-prim rows + 38 prim rows.
-      Array.length allRtOps `shouldEqual` (29 + Array.length allPrims)
+    it "every row's symbol has a matching declare (mechanical sweep)" do
+      -- sanity-pin the mechanical enumeration itself: 31 non-prim rows + 38 prim rows.
+      Array.length allRtOps `shouldEqual` (31 + Array.length allPrims)
       Array.length allPrims `shouldEqual` 38
       -- `pv_init_all` is the program's OWN symbol (defined by the entry object's emission, not
       -- part of the runtime's declared ABI surface), so it is the one row exempt from the sweep.
-      let runtimeDeclared op = rtSym op /= "pv_init_all"
+      --
+      -- The sweep spans BOTH declare blocks: ADR-0108 §3's profile symbols are declared only by an
+      -- instrumented object (`profileDeclarations`), because putting them in the always-emitted
+      -- block would change every shipped `.ll`. The invariant the sweep protects — no row without a
+      -- declare — is unchanged; what widened is where a declare may live.
+      let
+        runtimeDeclared op = rtSym op /= "pv_init_all"
+        declared = declarations <> profileDeclarations true
       for_ (Array.filter runtimeDeclared allRtOps) \op ->
-        contains (Pattern ("@" <> rtSym op <> "(")) declarations `shouldEqual` true
+        contains (Pattern ("@" <> rtSym op <> "(")) declared `shouldEqual` true
+
+    it "the profile symbols are declared ONLY by an instrumented object" do
+      -- the other side of the split: a shipped object must not carry them.
+      for_ [ "pv_applyprofile_register", "pv_applyprofile_bump" ] \sym -> do
+        contains (Pattern ("@" <> sym <> "(")) declarations `shouldEqual` false
+        contains (Pattern ("@" <> sym <> "(")) (profileDeclarations true) `shouldEqual` true
+      profileDeclarations false `shouldEqual` ""
 
   describe "rtSafepoint" do
     it "pins pv_tailcall as NOT a safepoint (ADR-0105 §1 stash-to-take)" do

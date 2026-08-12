@@ -291,11 +291,19 @@ cmd opts = do
     Nothing -> pure false
     Just "1" -> pure true
     Just other -> throw (Fmt.fmt @"PURVASM_BYNEED_OFF: expected absent or \"1\", got {other}" { other: show other })
+  -- Measurement-only knob (ADR-0108 §3): `PURVASM_PROFILE_APPLY=1` emits the apply-profile
+  -- instrumentation — a counter bump before each generic dispatch plus the start-up slot
+  -- registration. An instrumented binary is a MEASUREMENT vehicle, never the shipped emission, and
+  -- it prints `purvasm-applyprofile:v1` on exit. Fail-closed like the other `PURVASM_*` knobs.
+  profileApply <- lookupEnv "PURVASM_PROFILE_APPLY" >>= case _ of
+    Nothing -> pure false
+    Just "1" -> pure true
+    Just other -> throw (Fmt.fmt @"PURVASM_PROFILE_APPLY: expected absent or \"1\", got {other}" { other: show other })
   let
     action = mkAction opts ulibDir buildDir fsEnv modIdx irBuf
 
     backend :: Backend LlvmContext String
-    backend = llvmBackend { isEffect: not opts.value, heapWords: defaultHeapWords, debug: debugAbi, byNeed: not byNeedOff }
+    backend = llvmBackend { isEffect: not opts.value, heapWords: defaultHeapWords, debug: debugAbi, profileApply, byNeed: not byNeedOff }
     buildOpts =
       { entryModule: opts.entryModule
       , entryName: opts.entryName

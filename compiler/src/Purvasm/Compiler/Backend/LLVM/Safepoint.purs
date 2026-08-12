@@ -89,6 +89,10 @@ data RtOp
   | RtDrainOutput
   | RtPrintInt
   | RtRuntimeFree
+  -- ADR-0108 §3 measurement instrumentation (an OPT-IN build only; `sp = false` — a counter bump
+  -- neither allocates nor runs guest code, so the activation plan is unchanged by it)
+  | RtApplyProfileRegister
+  | RtApplyProfileBump
   -- the `pv_prim_*` family (symbol/ctx from `Prim.primSym`)
   | RtPrim PrimOp
 
@@ -174,6 +178,8 @@ rtDesc = case _ of
   RtDrainOutput -> { sym: "pv_drain_output", ctx: true, void: true, sp: false, schema: Fixed [] }
   RtPrintInt -> { sym: "pv_print_int", ctx: false, void: true, sp: false, schema: Fixed [ RVal ] }
   RtRuntimeFree -> { sym: "pv_runtime_free", ctx: true, void: true, sp: false, schema: Fixed [] }
+  RtApplyProfileRegister -> { sym: "pv_applyprofile_register", ctx: true, void: true, sp: false, schema: Fixed [ RPtr, RI64, RI64 ] }
+  RtApplyProfileBump -> { sym: "pv_applyprofile_bump", ctx: true, void: true, sp: false, schema: Fixed [ RI64 ] }
   RtPrim op ->
     let
       Tuple sym ctx = primSym op

@@ -62,7 +62,7 @@ import Purvasm.Compiler.Backend.LLVM.Mangle (ctorTag, imm, immBool, immInt, immU
 import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, PhiIncoming, beginFn, recordCall, emit, emitAnfLabel, emitDefine, snapshotReloads, emitGuestRet, emitGuestStore, emitGuestSwitch, emitPayloadAshr, emitPhi, emitLowBitAnd, closeHopArm, emitStringConstant, foldA, forA, forA_, fresh, freshFn, freshLabel, mintCloWord, mintEnvWord, mintLoad, mintParam, takeFn)
 import Purvasm.Compiler.Backend.LLVM.Prim (inlinePrim)
 import Purvasm.Compiler.Backend.LLVM.ByNeed (elidesForce, elidesForcedValue)
-import Purvasm.Compiler.Backend.LLVM.CallClass (CallEvent(..), MissReason(..))
+import Purvasm.Compiler.Backend.LLVM.CallClass (CallEvent(..), MissReason(..), profileSlot)
 import Purvasm.Compiler.Backend.LLVM.Liveness (activationPlanWith, atomCanSafepoint, envPseudo, forcedAtomCanSafepoint, needsFrame)
 import Purvasm.Compiler.Backend.LLVM.Root (FrameToken, emitGcafInitEngine, ensureRooted, musttailWith, openFrame, retWith, tailcallWith)
 import Purvasm.Compiler.Backend.LLVM.Safepoint (RtArg(..), RtOp(..), guestDirect, rtCall, rtCallVoid)
@@ -76,6 +76,21 @@ import Purvasm.Compiler.MiddleEnd.MatchCompile (compile) as MatchCompile
 import Purvasm.Compiler.Primitive (PrimOp(..))
 import Purvasm.Compiler.Util.Int64Decimal (int64BitsDecimal)
 import Purvasm.Number (floatBitsHi, floatBitsLo)
+
+-- | Record one guest-call occurrence (ADR-0108 §1) and, in an INSTRUMENTED build only (§3), emit
+-- | its counter bump. One helper for both so a lowering arm cannot record an event and forget the
+-- | counter — the static census and the dynamic profile then describe the same occurrences.
+-- |
+-- | The bump is `sp = false` in the seam: it neither allocates nor runs guest code, so the
+-- | activation plan — and therefore the rooting — is identical with instrumentation on or off. It is
+-- | emitted BEFORE the dispatch, because a tail dispatch does not return here.
+noteCall :: CallEvent -> Codegen Unit
+noteCall ev = do
+  recordCall ev
+  profiling <- gets _.profileApply
+  when profiling case profileSlot ev of
+    Just slot -> rtCallVoid RtApplyProfileBump [ I64 (show slot) ]
+    Nothing -> pure unit
 
 -- | Does the activation plan give THIS definition a root slot? `rootAll` (the init/`LClosure`
 -- | conservative fallback) roots everything; otherwise only the plan's crossing set does.
@@ -414,11 +429,11 @@ cexpr frame env tail = case _ of
         if tail && inDir then do
           -- musttail (ADR-0076 §3): the fused pop+musttail+ret — every operand (env word
           -- included) is computed before the pop; no safepoint in between.
-          recordCall (DirectMusttail info)
+          noteCall (DirectMusttail info)
           musttailWith frame { dsym: info.dsym, env: envOp, args: ops }
           pure Nothing
         else do
-          recordCall (DirectNonTail info)
+          noteCall (DirectNonTail info)
           r <- guestDirect { dsym: info.dsym, env: envOp, args: ops }
           -- Settle (ADR-0076 §3): the callee may have stashed a generic tail bounce no enclosing
           -- `pv_apply` loop will take on this direct path — run it to a real value.
@@ -436,13 +451,18 @@ cexpr frame env tail = case _ of
               -- Trampoline tail call (ADR-0071 §4): stash the pending tail, pop this frame, return.
               -- NOTE (ADR-0108 §2): this is a `pv_tailcall` STORE, not a `pv_apply` — the generic
               -- tail class is invisible in `pv_apply` counts, which is why it has its own column.
-              recordCall (GenericTail reason)
+              --
+              -- `noteCall` sits AFTER operand materialisation, immediately before the dispatch:
+              -- the counter it emits (§3) counts DISPATCHES, and `evalAtoms`/`argBuffer` can force
+              -- a by-need cell or allocate. Announcing the dispatch before the work that might not
+              -- reach it would make the dynamic count a count of intentions.
               Tuple p n <- argBuffer ops
+              noteCall (GenericTail reason)
               tailcallWith frame { fv, argp: p, nargs: n }
               pure Nothing
             else do
-              recordCall (GenericApply reason)
               Tuple p n <- argBuffer ops
+              noteCall (GenericApply reason)
               t <- rtCall RtApply [ V fv, Ptr p, I64 (show n) ]
               pure (Just t)
           Nothing -> unsafeCrashWith "Backend.LLVM.Emit.cexpr: empty CApp operand list"
@@ -465,10 +485,11 @@ cexpr frame env tail = case _ of
           -- A generic apply the classifier never sees: the callee is a closure this arm just
           -- synthesised, so there is no call site for `directTarget` to have an opinion about
           -- (ADR-0108 §2's `structural-apply` class — reported, not folded into a reason).
-          recordCall StructuralApply
           bh <- ensureRooted frame builder
           ops <- evalAtoms frame false env args
           Tuple p n <- argBuffer ops
+          -- after materialisation, immediately before the dispatch — see the `CApp` generic arms.
+          noteCall StructuralApply
           t <- rtCall RtApply [ V (rootedVal bh), Ptr p, I64 (show n) ]
           finish frame tail t
       else if arity == 0 then
@@ -1078,7 +1099,7 @@ emitFunction (Lifted l) = do
   -- generic wrapper. Its `guestDirect` is a direct call in the `.ll` but NOT a call site: it is
   -- emitted once per lifted FUNCTION, so it gets its own accounting column (ADR-0108 §2) and the
   -- object's direct-call count is `direct-nontail + wrapper-entry`, never one of them alone.
-  recordCall WrapperEntry
+  noteCall WrapperEntry
   beginFn
   envw <- case l.captures of
     [] -> pure (vImm immUnit)

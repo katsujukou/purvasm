@@ -125,6 +125,7 @@ type Ctx =
   , frameSeq :: Int -- ^ ADR-0106 slice 1: module-global monotonic frame counter — [`mintFrameOwner`] combines it with `actId` into the per-frame [`FrameOwner`]
   , defined :: Set String -- ^ ADR-0108 §1: the keys THIS OBJECT defines — the ownership input `directTarget` needs to tell an own-object non-function from a dependency with no published fact. The entry object defines nothing, so it passes the empty set
   , callEvents :: List CallEvent -- ^ ADR-0108 §1: one event per accounted guest-call occurrence (NOT every emitted `call` — runtime machinery is out of scope), in emission order (reversed), written by the arm that emits it. Per OBJECT — [`beginFn`] must not reset it
+  , profileApply :: Boolean -- ^ ADR-0108 §3: whether this object is instrumented
   , byNeedOn :: Boolean -- ^ ADR-0107: whether the lattice is enabled for this module (the measurement counterfactual switches it off; `byNeed` below then stays empty)
   , crossing :: Set String -- ^ ADR-0105: the activation plan's crossing set (consulted only when `rootAll = false`)
   , byNeed :: FactMap -- ^ ADR-0107 §2: the activation plan's by-need decision set — the SAME value the plan classified force sites with. Empty (⇒ every force emitted) outside a planned activation, so an un-planned body is conservative by construction
@@ -144,6 +145,7 @@ type MakeCxOptions =
   , foreignArity :: Map String Int
   , inlineAbi :: Boolean
   , defined :: Set String -- ^ ADR-0108 §1: the object's own defined keys (`entryLl` passes the empty set)
+  , profileApply :: Boolean -- ^ ADR-0108 §3: emit the measurement instrumentation (counter bumps + the start-up registration). An OPT-IN build only — the shipped emission must be byte-identical with this off
   , byNeed :: Boolean -- ^ ADR-0107: the by-need lattice. `false` is the MEASUREMENT counterfactual (`PURVASM_BYNEED_OFF=1`) — the plan and the emitter switch together, so no elision and no plan change
   }
 
@@ -171,6 +173,7 @@ makeCx opts =
   , inlineAbi: opts.inlineAbi
   , defined: opts.defined
   , callEvents: Nil
+  , profileApply: opts.profileApply
   , byNeedOn: opts.byNeed
   , spEpoch: 0
   , reloadCache: Map.empty

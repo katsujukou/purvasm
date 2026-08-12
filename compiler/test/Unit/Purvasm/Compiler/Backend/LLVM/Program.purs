@@ -58,6 +58,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Program" do
           , foreignArity: Map.empty
           , inlineAbi: true
           , defined: Set.empty
+          , profileApply: false
           , byNeed: true
           }
         -- post-opt object keys: the clone is now materialised here; `Other.ext` is *not* defined here.
@@ -86,6 +87,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Program" do
           , foreignArity: Map.empty
           , inlineAbi: true
           , defined: Set.empty
+          , profileApply: false
           , byNeed: true
           }
         gdefs = [ Gcaf cloneKey (Ret (CAtom (AtomLit (LInt 1)))) ]

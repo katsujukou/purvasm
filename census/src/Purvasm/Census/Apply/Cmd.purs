@@ -139,6 +139,7 @@ cmd opts = do
       { isEffect: not opts.value
       , heapWords: defaultHeapWords
       , debug: false
+      , profileApply: false
       -- the ADR-0107 lattice stays ON: the census must describe the emission that ships.
       , byNeed: true
       }
