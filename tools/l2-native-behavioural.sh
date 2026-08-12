@@ -86,7 +86,7 @@ done
 # runs fine against the release runtime, so everything would stay green while inline-ABI coverage
 # silently vanished). The harness unsets both up front; each owned leg passes `=1` explicitly to
 # its own child process only.
-unset PURVASM_GC_STRESS PURVASM_EMIT_DEBUG_ABI
+unset PURVASM_GC_STRESS PURVASM_EMIT_DEBUG_ABI PURVASM_PROFILE_APPLY PURVASM_BYNEED_OFF
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

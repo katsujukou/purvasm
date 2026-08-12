@@ -69,6 +69,13 @@ BOOT="$ROOT/boot/_build/default/bin/main.exe"
 : "${PURVASM_LIB:=$ROOT/dist/ulib}"
 export PURVASM_RT_A PURVASM_LIB
 
+# Emission-affecting knobs are HARNESS-OWNED (ADR-0108 §3 review). Not setting a variable does not
+# make it absent: an ambient PURVASM_BYNEED_OFF / PURVASM_EMIT_DEBUG_ABI / PURVASM_PROFILE_APPLY
+# changes what the compiler emits, and in a DIFFERENTIAL it changes both sides equally — so the
+# comparison stays green while no longer being about the emission that ships. Any leg that wants one
+# of these must pass it to its own child process explicitly.
+unset PURVASM_BYNEED_OFF PURVASM_EMIT_DEBUG_ABI PURVASM_PROFILE_APPLY
+
 # The running compiler binaries' heap (PURVASM_HEAP_WORDS overrides the baked size, ADR-0102 §4).
 # The whole-closure self-compile needs a real heap; the baked default targets small programs.
 : "${FIXPOINT_HEAP_WORDS:=134217728}"
