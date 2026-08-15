@@ -38,7 +38,7 @@ spec = describe "Purvasm.Census.Apply.Report" do
         , DirectNonTail fn
         , DirectMusttail fn
         , StructuralApply
-        , GenericApply MissCalleeNotVar
+        , GenericApply MissCalleeForeign
         , GenericTail MissLocalUnknownFn
         ]
     Array.filter (_ == "M\tclass\tdirect-nontail\t2") rows `shouldEqual` [ "M\tclass\tdirect-nontail\t2" ]

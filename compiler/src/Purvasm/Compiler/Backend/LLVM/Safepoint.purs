@@ -93,6 +93,8 @@ data RtOp
   -- neither allocates nor runs guest code, so the activation plan is unchanged by it)
   | RtApplyProfileRegister
   | RtApplyProfileBump
+  -- | ADR-0108 §4 drill: count against an emitted KEY string (instrumented builds only)
+  | RtApplyProfileKey
   -- the `pv_prim_*` family (symbol/ctx from `Prim.primSym`)
   | RtPrim PrimOp
 
@@ -180,6 +182,9 @@ rtDesc = case _ of
   RtRuntimeFree -> { sym: "pv_runtime_free", ctx: true, void: true, sp: false, schema: Fixed [] }
   RtApplyProfileRegister -> { sym: "pv_applyprofile_register", ctx: true, void: true, sp: false, schema: Fixed [ RPtr, RI64, RI64 ] }
   RtApplyProfileBump -> { sym: "pv_applyprofile_bump", ctx: true, void: true, sp: false, schema: Fixed [ RI64 ] }
+  -- ADR-0108 §4: like the bump, `sp = false` — the drill must not move the activation plan, or the
+  -- instrumented build would stop being a measurement of the shipped one.
+  RtApplyProfileKey -> { sym: "pv_applyprofile_key", ctx: true, void: true, sp: false, schema: Fixed [ RPtr, RI64 ] }
   RtPrim op ->
     let
       Tuple sym ctx = primSym op

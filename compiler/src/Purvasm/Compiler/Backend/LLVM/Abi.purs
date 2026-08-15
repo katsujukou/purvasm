@@ -138,7 +138,7 @@ profileDeclarations profileApply
   | not profileApply = ""
   | otherwise = "\n" <> joinWith "\n"
       [ "declare void @pv_applyprofile_register(ptr, ptr, i64, i64)"
-      , "declare void @pv_applyprofile_bump(ptr, i64)"
+      , "declare void @pv_applyprofile_bump(ptr, i64)\ndeclare void @pv_applyprofile_key(ptr, ptr, i64)"
       ]
 
 -- | The per-object link-time ABI stamp (ADR-0079 §1): an inline object carries a kept-alive reference

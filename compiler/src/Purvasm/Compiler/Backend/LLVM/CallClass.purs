@@ -38,8 +38,14 @@ import Purvasm.Compiler.Backend.LLVM.Types (FnInfo)
 -- | self-call shortcut that does not apply FALLS THROUGH and can still resolve directly, so
 -- | "the shortcut missed" is not an outcome and has no constructor.
 data MissReason
-  -- | the callee atom is a literal / foreign / computed value, not a variable
-  = MissCalleeNotVar
+  -- | the callee atom is a FOREIGN symbol. The emitter holds an arity fact for many of these
+  -- | (`Ctx.foreignArity`) and does not consult it here — whether that is a lever is exactly what
+  -- | ADR-0108 §4 measures, so this class must not be merged with the one below.
+  = MissCalleeForeign
+  -- | the callee atom is a LITERAL. A DIAGNOSTIC class, like `MissUnknownKey`: applying a literal
+  -- | is not something a well-typed program does, so a non-zero count is a compiler-bug candidate
+  -- | rather than an optimisation lever (ADR-0108 §4 slice 1) — it is measured, never assumed zero.
+  | MissCalleeLiteral
   -- | a local binding with no `knownFn` fact (a parameter, a capture, a `let`-bound value)
   | MissLocalUnknownFn
   -- | a local `knownFn` whose arity ≠ this call's argument count
@@ -70,7 +76,8 @@ instance showMissReason :: Show MissReason where
 -- | The report name (also the census's TSV token).
 missReasonName :: MissReason -> String
 missReasonName = case _ of
-  MissCalleeNotVar -> "callee-not-var"
+  MissCalleeForeign -> "callee-foreign"
+  MissCalleeLiteral -> "callee-literal"
   MissLocalUnknownFn -> "local-unknown-fn"
   MissArityLocal -> "arity-local"
   MissUnknownKey -> "unknown-key"
@@ -152,7 +159,8 @@ callClasses = [ CDirectNonTail, CDirectMusttail, CGenericApply, CGenericTail, CS
 -- | would reserve a counter that must always read zero.
 profiledReasons :: Array MissReason
 profiledReasons =
-  [ MissCalleeNotVar
+  [ MissCalleeForeign
+  , MissCalleeLiteral
   , MissLocalUnknownFn
   , MissArityLocal
   , MissArityOwnModule

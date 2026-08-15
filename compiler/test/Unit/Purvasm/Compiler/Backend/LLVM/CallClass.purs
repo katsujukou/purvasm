@@ -151,9 +151,10 @@ eventsOf gdefs =
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.Backend.LLVM.CallClass" do
   describe "directTarget names every leaf of its decision tree" do
-    it "a non-variable callee" do
-      classify base (int 1) 1 `shouldEqual` Left MissCalleeNotVar
-      classify base (AtomForeign "M.leaf") 1 `shouldEqual` Left MissCalleeNotVar
+    it "a non-variable callee, split by which atom it is (ADR-0108 §4)" do
+      -- the split is TOTAL: ANF has three atoms and the third is the variable case above.
+      classify base (AtomForeign "M.leaf") 1 `shouldEqual` Left MissCalleeForeign
+      classify base (int 1) 1 `shouldEqual` Left MissCalleeLiteral
 
     it "a local binding with no known-function fact" do
       classify base (var "someLocal") 1 `shouldEqual` Left MissLocalUnknownFn
@@ -284,8 +285,8 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.CallClass" do
         samples =
           [ DirectNonTail (fnInfo "d" 1)
           , DirectMusttail (fnInfo "d" 1)
-          , GenericApply MissCalleeNotVar
-          , GenericTail MissCalleeNotVar
+          , GenericApply MissCalleeForeign
+          , GenericTail MissCalleeForeign
           , StructuralApply
           , WrapperEntry
           ]
@@ -327,14 +328,17 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.CallClass" do
   -- the classes which cannot execute a dispatch get no slot at all.
   describe "the dynamic profile's slot space" do
     it "has a slot for every (generic form × executable reason), plus structural-apply" do
-      -- 2 forms × 7 reasons (every MissReason except the unreachable `unknown-key`) + 1
-      Array.length profileSlotNames `shouldEqual` 15
+      -- 2 forms × 8 reasons (every MissReason except the unreachable `unknown-key`) + 1.
+      -- `callee-literal` HAS a slot although it is expected to read zero: ADR-0108 §4 measures it
+      -- rather than assuming it, and a class with no counter cannot be measured.
+      Array.length profileSlotNames `shouldEqual` 17
       Array.nub profileSlotNames `shouldEqual` profileSlotNames
       Array.filter (String.contains (Pattern "unknown-key")) profileSlotNames `shouldEqual` []
 
     it "maps each event to the slot whose NAME describes it (names and indices are one mapping)" do
       let
         named ev = profileSlot ev >>= \i -> Array.index profileSlotNames i
+      named (GenericApply MissCalleeLiteral) `shouldEqual` Just "generic-apply/callee-literal"
       named (GenericApply MissLocalUnknownFn) `shouldEqual` Just "generic-apply/local-unknown-fn"
       named (GenericTail MissLocalUnknownFn) `shouldEqual` Just "generic-tail/local-unknown-fn"
       named (GenericApply MissArityCrossModule) `shouldEqual` Just "generic-apply/arity-cross-module"
@@ -352,7 +356,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.CallClass" do
     it "keeps every slot index inside the layout it declares" do
       let
         slots = Array.mapMaybe profileSlot
-          [ GenericApply MissCalleeNotVar, GenericTail MissArityLocal, StructuralApply ]
+          [ GenericApply MissCalleeForeign, GenericTail MissArityLocal, StructuralApply ]
       Array.filter (\i -> i < 0 || i >= Array.length profileSlotNames) slots `shouldEqual` []
 
   describe "instrumentation is opt-in and inert when off" do
@@ -402,9 +406,15 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.CallClass" do
         -- re-read from its root, ADR-0105's verify-then-use), which cannot fail to reach the
         -- dispatch; what must not appear is another CALL — a force, an allocation or a
         -- materialisation that could divert or allocate between counting and dispatching.
+        -- The drill (§4) puts a SECOND profile call between the slot bump and the dispatch, so the
+        -- invariant is "no call other than a profile call intervenes" — the profile family is
+        -- allowed to precede its own dispatch, nothing else is.
         nextCallAfter i =
           Array.findMap
-            (\l -> if String.contains (Pattern "call ") l then Just (symbolOf l) else Nothing)
+            ( \l ->
+                if String.contains (Pattern "call ") l && not (String.contains (Pattern "@pv_applyprofile_") l) then Just (symbolOf l)
+                else Nothing
+            )
             (Array.drop (i + 1) lines)
         followers =
           Array.mapMaybe
@@ -416,6 +426,67 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.CallClass" do
       -- one bump per instrumented dispatch, and each one's next call IS its dispatch
       Array.length followers `shouldEqual` 3
       Array.sort (Array.nub followers) `shouldEqual` [ "pv_apply", "pv_tailcall" ]
+
+    -- ADR-0108 §4. The drill answers "which foreign, at what arity status" — so what is pinned is
+    -- the KEY's content, not merely that a call happened: a key that lost its arity status, or
+    -- reported `known-match` for a partial application, would still reconcile perfectly against the
+    -- slot counter while answering the question wrongly.
+    it "drills a foreign callee by symbol, form and arity status — and nothing else" do
+      let
+        gdefs =
+          [ Gfun "M.ap" [ "x" ] (Let "$r" (CApp (AtomForeign "M.leaf") [ var "x" ]) (Ret (CAtom (var "$r"))))
+          , Gfun "M.tl" [ "x" ] (Ret (CApp (AtomForeign "M.leaf") [ var "x" ]))
+          , Gfun "M.part" [ "x" ] (Ret (CApp (AtomForeign "M.two") [ var "x" ]))
+          -- a NON-foreign generic dispatch: drilled classes are opt-in, so this must add no key
+          , Gfun "M.other" [ "g", "x" ] (Ret (CApp (var "g") [ var "x" ]))
+          ]
+        keys = Set.fromFoldable (gdefs >>= gdefKeys)
+        ir =
+          ( moduleLlWithEvents
+              { gkeys: keys
+              , xfns: Map.empty
+              , foreignArity: Map.fromFoldable [ Tuple "M.leaf" 1, Tuple "M.two" 2 ]
+              , inlineAbi: true
+              , defined: keys
+              , profileApply: true
+              , byNeed: true
+              }
+              keys
+              gdefs
+          ).ir
+        has needle = String.contains (Pattern needle) ir
+        keyCalls = Array.length (String.split (Pattern "call void @pv_applyprofile_key(") ir) - 1
+      -- saturated foreign call, both forms
+      has "M.leaf|apply|known-match" `shouldEqual` true
+      has "M.leaf|tail|known-match" `shouldEqual` true
+      -- a 2-ary leaf applied to one argument is exactly what a direct lowering could NOT capture
+      has "M.two|tail|known-mismatch" `shouldEqual` true
+      has "M.two|tail|known-match" `shouldEqual` false
+      -- three foreign dispatches → three keys; the local-unknown callee contributes none
+      keyCalls `shouldEqual` 3
+
+    it "emits no drill at all when instrumentation is off" do
+      let
+        gdefs = [ Gfun "M.f" [ "x" ] (Ret (CApp (AtomForeign "M.leaf") [ var "x" ])) ]
+        keys = Set.fromFoldable (gdefs >>= gdefKeys)
+        irOf profileApply =
+          ( moduleLlWithEvents
+              { gkeys: keys
+              , xfns: Map.empty
+              , foreignArity: Map.fromFoldable [ Tuple "M.leaf" 1 ]
+              , inlineAbi: true
+              , defined: keys
+              , profileApply
+              , byNeed: true
+              }
+              keys
+              gdefs
+          ).ir
+      String.contains (Pattern "pv_applyprofile_key") (irOf false) `shouldEqual` false
+      -- and the key text itself must not leak into a shipped object as a dead string constant
+      String.contains (Pattern "M.leaf|") (irOf false) `shouldEqual` false
+      -- `Ret (CApp …)` is a TAIL dispatch, so this is the tail key — the form axis is real
+      String.contains (Pattern "M.leaf|tail|known-match") (irOf true) `shouldEqual` true
 
     it "records the same events either way (instrumentation observes, it does not classify)" do
       let

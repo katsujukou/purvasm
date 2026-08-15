@@ -69,8 +69,8 @@ spec :: Spec Unit
 spec = describe "Purvasm.Compiler.Backend.LLVM.Safepoint" do
   describe "rtSym" do
     it "every row's symbol has a matching declare (mechanical sweep)" do
-      -- sanity-pin the mechanical enumeration itself: 31 non-prim rows + 38 prim rows.
-      Array.length allRtOps `shouldEqual` (31 + Array.length allPrims)
+      -- sanity-pin the mechanical enumeration itself: 32 non-prim rows + 38 prim rows.
+      Array.length allRtOps `shouldEqual` (32 + Array.length allPrims)
       Array.length allPrims `shouldEqual` 38
       -- `pv_init_all` is the program's OWN symbol (defined by the entry object's emission, not
       -- part of the runtime's declared ABI surface), so it is the one row exempt from the sweep.
@@ -87,7 +87,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Safepoint" do
 
     it "the profile symbols are declared ONLY by an instrumented object" do
       -- the other side of the split: a shipped object must not carry them.
-      for_ [ "pv_applyprofile_register", "pv_applyprofile_bump" ] \sym -> do
+      for_ [ "pv_applyprofile_register", "pv_applyprofile_bump", "pv_applyprofile_key" ] \sym -> do
         contains (Pattern ("@" <> sym <> "(")) declarations `shouldEqual` false
         contains (Pattern ("@" <> sym <> "(")) (profileDeclarations true) `shouldEqual` true
       profileDeclarations false `shouldEqual` ""

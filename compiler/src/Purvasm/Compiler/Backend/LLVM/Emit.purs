@@ -92,6 +92,33 @@ noteCall ev = do
     Just slot -> rtCallVoid RtApplyProfileBump [ I64 (show slot) ]
     Nothing -> pure unit
 
+-- | ADR-0108 §4 drill: attribute ONE dispatch whose callee is a foreign symbol, by
+-- | `(symbol × call form × arity status)`. Instrumented builds only; a normal build emits nothing,
+-- | and a dispatch on any other callee is not drilled at all.
+-- |
+-- | The arity status is the question the drill exists to answer. `Ctx.foreignArity` holds each
+-- | native leaf's PHYSICAL closure arity (ADR-0090), and `directTarget` currently declines every
+-- | non-variable callee without consulting it — so `known-match` counts the dispatches a direct
+-- | lowering through that fact could actually have captured, and `known-mismatch` counts the
+-- | partial/over applications it could not. A lever is only as big as the first number.
+noteForeignDrill :: Atom -> Int -> String -> Codegen Unit
+noteForeignDrill callee nargs form = case callee of
+  AtomForeign k -> do
+    profiling <- gets _.profileApply
+    when profiling do
+      known <- gets (Map.lookup k <<< _.foreignArity)
+      let
+        status = case known of
+          Just a | a == nargs -> "known-match"
+          Just _ -> "known-mismatch"
+          -- Unreachable by construction: `atom` crashes on a foreign leaf with no arity fact, and
+          -- the operands were materialised before this point. Labelled rather than crashed twice,
+          -- so a future wiring change surfaces as a visible bucket instead of a second abort.
+          Nothing -> "arity-unknown"
+      Tuple p len <- stringConstant (k <> "|" <> form <> "|" <> status)
+      rtCallVoid RtApplyProfileKey [ Ptr p, I64 (show len) ]
+  _ -> pure unit
+
 -- | Does the activation plan give THIS definition a root slot? `rootAll` (the init/`LClosure`
 -- | conservative fallback) roots everything; otherwise only the plan's crossing set does.
 shouldRoot :: String -> Codegen Boolean
@@ -336,7 +363,11 @@ directTarget env f nargs = case f of
                     defined <- gets _.defined
                     pure (Left (if Set.member x defined then MissOwnObjectNotFn else MissDepNoDirectFact))
       else pure (Left MissUnknownKey)
-  _ -> pure (Left MissCalleeNotVar)
+  -- ANF has exactly three atoms, so the non-variable callees are these two and the split is total
+  -- (ADR-0108 §4 slice 1). They are kept apart because they mean opposite things: a foreign callee
+  -- is a candidate lever, a literal callee is a bug candidate.
+  AtomForeign _ -> pure (Left MissCalleeForeign)
+  AtomLit _ -> pure (Left MissCalleeLiteral)
 
 -- | Lower a computation. Slice-1a handles `CAtom`; the rest are later slices.
 cexpr :: Maybe FrameToken -> Env -> Boolean -> CExpr -> Codegen (Maybe Val)
@@ -458,11 +489,13 @@ cexpr frame env tail = case _ of
               -- reach it would make the dynamic count a count of intentions.
               Tuple p n <- argBuffer ops
               noteCall (GenericTail reason)
+              noteForeignDrill f (Array.length args) "tail"
               tailcallWith frame { fv, argp: p, nargs: n }
               pure Nothing
             else do
               Tuple p n <- argBuffer ops
               noteCall (GenericApply reason)
+              noteForeignDrill f (Array.length args) "apply"
               t <- rtCall RtApply [ V fv, Ptr p, I64 (show n) ]
               pure (Just t)
           Nothing -> unsafeCrashWith "Backend.LLVM.Emit.cexpr: empty CApp operand list"
