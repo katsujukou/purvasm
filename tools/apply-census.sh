@@ -181,9 +181,15 @@ objects=$(wc -l <"$WORK/joined.tsv" | tr -d ' ')
 #
 #   generic-apply == Σ generic-apply/<reason>      generic-tail == Σ generic-tail/<reason>
 #
-# `unknown-key` is fail-closed at ZERO: `readVar` crashes on such a callee, so a successfully
-# emitted object cannot contain one. A non-zero count is a compiler bug report, not a lever
-# (ADR-0108 §1), and must not be reported as a ranked reason.
+# TWO reasons are fail-closed at ZERO, because both are diagnostics rather than levers and a
+# non-zero count of either is a compiler bug report that must not be ranked (ADR-0108 §1/§4):
+#
+#   unknown-key     `readVar` crashes on such a callee, so a successfully emitted object cannot
+#                   contain one;
+#   callee-literal  applying a literal is not something a well-typed program does. The ADR gives it
+#                   the same contract as unknown-key, so the GATE gives it the same treatment —
+#                   otherwise the contract is prose and a literal application appearing in dead code
+#                   would census green.
 awk -F'\t' '
   /^#/ { next }
   $3 == "class"  && $4 == "generic-apply" { ga[$1] = $5; seen[$1] = 1 }
@@ -193,6 +199,7 @@ awk -F'\t' '
     if (p[1] == "generic-apply") ra[$1] += $5
     else if (p[1] == "generic-tail") rt[$1] += $5
     if (p[2] == "unknown-key") uk[$1] += $5
+    if (p[2] == "callee-literal") cl[$1] += $5
     seen[$1] = 1
   }
   END {
@@ -203,6 +210,8 @@ awk -F'\t' '
         printf "%s\tgeneric-tail class %d != Σ reasons %d\n", o, gt[o], rt[o]
       if (uk[o] + 0 != 0)
         printf "%s\tunknown-key %d (COMPILER BUG: readVar cannot have emitted this object)\n", o, uk[o]
+      if (cl[o] + 0 != 0)
+        printf "%s\tcallee-literal %d (COMPILER BUG: a well-typed program does not apply a literal)\n", o, cl[o]
     }
   }
 ' "$WORK/$OUT" | sort >"$WORK/reason-violations.tsv"
@@ -242,7 +251,7 @@ if [ "$reason_bad" -ne 0 ]; then
   head -10 "$WORK/reason-violations.tsv" >&2
   rc=1
 else
-  echo "OK: every generic class equals the sum of its reasons, and unknown-key is 0"
+  echo "OK: every generic class equals the sum of its reasons; unknown-key and callee-literal are 0"
 fi
 [ "$rc" -eq 0 ] || exit 1
 echo "report: $WORK/$OUT"

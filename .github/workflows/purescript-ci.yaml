@@ -127,6 +127,12 @@ jobs:
       - name: Check (measurement harnesses parse)
         run: bash -n tools/byneed-census.sh && bash -n tools/byneed-ab.sh && bash -n tools/apply-census.sh && bash -n tools/apply-profile.sh
 
+      # The ADR-0108 §4 drill gate, self-tested against injected faults. Unlike the censuses this
+      # needs no build, no ulib and no runtime — it drives the real `reconcile_drill` over TSV
+      # fixtures — so it runs as a standing test rather than a syntax check.
+      - name: Test (drill gate self-test)
+        run: tools/apply-profile.sh --self-test
+
       # The byte-identity oracle: in-process and fixture-based, no boot shell-out.
       - name: Test (compiler E2E)
         run: spago test -p compiler -m Test.E2E.Purvasm.Compiler

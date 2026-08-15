@@ -46,6 +46,7 @@
 # Usage (from the repo root, inside `nix develop`):
 #   tools/apply-profile.sh [MODULE ...]
 #   tools/apply-profile.sh --selfhost [--build-mode opt|no-opt] [--work-mode opt|no-opt]
+#   tools/apply-profile.sh --self-test    (assert the drill gate fails on injected faults; no build)
 #
 # Prerequisites (located, not built): the staged ulib (`dist/ulib`), the RELEASE runtime staticlib
 # (or $PURVASM_RT_A), `clang`, `node`, and fixture CoreFn in `output/` (workspace `spago build`).
@@ -58,6 +59,7 @@ ROOT="$PWD"
 : "${PURVASM_LIB:=$ROOT/dist/ulib}"
 
 SELFHOST=0
+SELF_TEST=0
 BUILD_FLAG=            # --opt
 WORK_FLAG=
 WORK_MODE_SET=0
@@ -71,6 +73,7 @@ mode_flag() { case "$1" in opt) echo "" ;; no-opt) echo "--no-opt" ;;
 while [ $# -gt 0 ]; do
   case "$1" in
     --selfhost) SELFHOST=1; shift ;;
+    --self-test) SELF_TEST=1; shift ;;
     --build-mode) BUILD_FLAG=$(mode_flag "$2") || exit 2; shift 2 ;;
     --work-mode) WORK_FLAG=$(mode_flag "$2") || exit 2; WORK_MODE_SET=1; shift 2 ;;
     --entry) ENTRY_MODULE="$2"; shift 2 ;;
@@ -90,6 +93,108 @@ fi
 # The dispatch-heavy fixtures by default: the population this census is about is generic dispatch,
 # so a corpus of straight-line arithmetic would report a green gate over nothing.
 [ -n "$MODULES" ] || MODULES="Gate.DictDispatch Gate.Mixed Gate.GcChurn Gate.ByNeedCell"
+
+# Token-bounded numeric extraction from a named schema line; empty/non-numeric → "".
+field_of() { # $1=file  $2=schema prefix  $3=field name
+  local v
+  v="$(grep "^$2 " "$1" | tr ' ' '\n' | sed -n "s/^$3=\([0-9][0-9]*\)\$/\1/p")"
+  case "$v" in *[!0-9]* | "") echo "" ;; *) echo "$v" ;; esac
+}
+
+# ADR-0108 §4: the drill's keys, `<key>\t<count>`. Absent when nothing drilled ran — which is a
+# fact about the run, not an error, so this does not fail on an empty line.
+drill_of() { # $1=stderr file  $2=out tsv
+  : >"$2"
+  grep '^purvasm-applyprofile-keys:v1 ' "$1" | tr ' ' '\n' \
+    | sed -n 's/^\([^=]*\)=\([0-9][0-9]*\)$/\1\t\2/p' >>"$2"
+}
+
+# The §4 cross-mechanism identity: the keyed counters and the fixed slots are written by different
+# code down different paths, so their agreement is evidence, not arithmetic.
+#
+#   Σ keys == slot[generic-apply/callee-foreign] + slot[generic-tail/callee-foreign]
+#
+# A drilled dispatch that bumped a slot but no key (or vice versa) breaks it — which is exactly the
+# mistake a per-site emission is prone to, since the two bumps are emitted by different call sites
+# in the emitter.
+reconcile_drill() { # $1=slots tsv  $2=keys tsv
+  local slots keys
+  slots=$(awk -F'\t' '$1 ~ /\/callee-foreign$/ { s += $2 } END { print s + 0 }' "$1")
+  keys=$(awk -F'\t' '{ s += $2 } END { print s + 0 }' "$2")
+  if [ "$slots" = "$keys" ]; then echo "$keys == $slots"; else echo "$keys != $slots"; return 1; fi
+}
+
+# Parse the profile line of a run into `<slot>\t<count>`; fails if it is absent or duplicated.
+slots_of() { # $1=stderr file  $2=out tsv
+  local n
+  n="$(grep -c '^purvasm-applyprofile:v1 ' "$1" || true)"
+  [ "$n" = "1" ] || { echo "PROFILE-SCHEMA(x$n)"; return 1; }
+  grep '^purvasm-applyprofile:v1 ' "$1" | tr ' ' '\n' \
+    | sed -n 's/^\([a-z-]*\/*[a-z-]*\)=\([0-9][0-9]*\)$/\1\t\2/p' >"$2"
+  return 0
+}
+
+# The two identities. Echoes two verdict strings; returns non-zero if either fails.
+reconcile() { # $1=slots tsv  $2=stderr file
+  local sum_apply sum_tail rt_apply rt_tail rcl=0
+  sum_apply=$(awk -F'\t' 'index($1,"generic-apply/")==1 || $1=="structural-apply" { s += $2 } END { print s+0 }' "$1")
+  sum_tail=$(awk -F'\t' 'index($1,"generic-tail/")==1 { s += $2 } END { print s+0 }' "$1")
+  rt_apply="$(field_of "$2" 'purvasm-stats:v1' pv_apply_entries)"
+  rt_tail="$(field_of "$2" 'purvasm-stats:v1' pv_tailcall_writes)"
+  if [ -z "$rt_apply" ] || [ -z "$rt_tail" ]; then
+    echo "STATS-SCHEMA"; echo "STATS-SCHEMA"; return 1
+  fi
+  # A run that dispatched nothing reconciles vacuously.
+  if [ "$rt_apply" -eq 0 ] && [ "$rt_tail" -eq 0 ]; then
+    echo "VACUOUS(0)"; echo "VACUOUS(0)"; return 1
+  fi
+  if [ "$sum_apply" = "$rt_apply" ]; then echo "$sum_apply == $rt_apply"; else echo "$sum_apply != $rt_apply"; rcl=1; fi
+  if [ "$sum_tail" = "$rt_tail" ]; then echo "$sum_tail == $rt_tail"; else echo "$sum_tail != $rt_tail"; rcl=1; fi
+  return "$rcl"
+}
+
+ranking() { # $1=slots tsv (aggregated: slot, count)
+  echo
+  printf '%-42s %14s %8s\n' "slot" "executions" "share"
+  awk -F'\t' '{ n[$1] += $2; tot += $2 }
+    END { for (s in n) if (n[s] > 0) printf "%-42s %14d %7.1f%%\n", s, n[s], 100 * n[s] / tot }' "$1" \
+    | sort -k2 -rn
+  echo
+  printf '%-24s %14s %8s\n' "reason (both forms)" "executions" "share"
+  awk -F'\t' '{ split($1, p, "/"); if (p[1] == "structural-apply") next; r[p[2]] += $2; tot += $2 }
+    END { for (k in r) printf "%-24s %14d %7.1f%%\n", k, r[k], 100 * r[k] / tot }' "$1" \
+    | sort -k2 -rn
+}
+
+# --- self-test of the drill gate ----------------------------------------------------------------
+# A gate is only worth its runtime if it FAILS on the thing it claims to catch. The case that
+# motivates this one — key emission or the third schema line vanishing entirely — produces an empty
+# key file, which an earlier version of this script reported as "nothing to check". So the failure
+# modes are injected here and the gate's verdict asserted.
+#
+# It runs BEFORE the prerequisite checks, the toolchain build and the snapshot, and uses its own
+# temp dir: the whole test is TSV fixtures against the real `reconcile_drill`, so requiring a built
+# compiler, a staged ulib or a runtime staticlib to run it would be a cost with no coverage —
+# and would stop it being usable as a cheap standing regression test.
+if [ "$SELF_TEST" = "1" ]; then
+  t="$(mktemp -d)"; trap 'rm -rf "$t"' EXIT; st_rc=0
+  check() { # $1=label  $2=expected pass|fail  $3=slots content  $4=keys content
+    printf '%b' "$3" >"$t/slots.tsv"; printf '%b' "$4" >"$t/keys.tsv"
+    if reconcile_drill "$t/slots.tsv" "$t/keys.tsv" >/dev/null 2>&1; then got=pass; else got=fail; fi
+    if [ "$got" = "$2" ]; then printf '  ok    %-46s (%s)\n' "$1" "$got"
+    else printf '  FAIL  %-46s (expected %s, got %s)\n' "$1" "$2" "$got"; st_rc=1; fi
+  }
+  echo "== self-test: the drill gate ======================================="
+  check "keys agree with slots"            pass "generic-apply/callee-foreign\t5\n" "a|apply|known-match\t5\n"
+  check "keys short of slots"              fail "generic-apply/callee-foreign\t5\n" "a|apply|known-match\t4\n"
+  check "SCHEMA GONE: no keys, live slots" fail "generic-apply/callee-foreign\t5\n" ""
+  check "no foreign at all: 0 vs 0"        pass "generic-apply/local-unknown-fn\t9\n" ""
+  check "both forms summed"                pass "generic-apply/callee-foreign\t5\ngeneric-tail/callee-foreign\t2\n" "a|apply|known-match\t5\nb|tail|known-match\t2\n"
+  check "a non-foreign slot is not counted" fail "generic-apply/callee-foreign\t5\ngeneric-apply/local-unknown-fn\t9\n" "a|apply|known-match\t14\n"
+  [ "$st_rc" -eq 0 ] && echo "OK: the drill gate fails on every injected fault" ||
+    echo "FAIL: the drill gate did not catch an injected fault" >&2
+  exit "$st_rc"
+fi
 
 for tool in "$PURVASM_RT_A" "$PURVASM_LIB" "$ROOT/output/$ENTRY_MODULE/corefn.json"; do
   [ -e "$tool" ] || { echo "missing prerequisite: $tool" >&2; exit 2; }
@@ -138,56 +243,8 @@ unset PURVASM_PROFILE_APPLY PURVASM_BYNEED_OFF PURVASM_EMIT_DEBUG_ABI PURVASM_GC
 # The running binaries' heap, pinned so both legs of any comparison see one allocator regime.
 : "${PROFILE_HEAP_WORDS:=134217728}"
 
-# Token-bounded numeric extraction from a named schema line; empty/non-numeric → "".
-field_of() { # $1=file  $2=schema prefix  $3=field name
-  local v
-  v="$(grep "^$2 " "$1" | tr ' ' '\n' | sed -n "s/^$3=\([0-9][0-9]*\)\$/\1/p")"
-  case "$v" in *[!0-9]* | "") echo "" ;; *) echo "$v" ;; esac
-}
-
-# Parse the profile line of a run into `<slot>\t<count>`; fails if it is absent or duplicated.
-slots_of() { # $1=stderr file  $2=out tsv
-  local n
-  n="$(grep -c '^purvasm-applyprofile:v1 ' "$1" || true)"
-  [ "$n" = "1" ] || { echo "PROFILE-SCHEMA(x$n)"; return 1; }
-  grep '^purvasm-applyprofile:v1 ' "$1" | tr ' ' '\n' \
-    | sed -n 's/^\([a-z-]*\/*[a-z-]*\)=\([0-9][0-9]*\)$/\1\t\2/p' >"$2"
-  return 0
-}
-
-# The two identities. Echoes two verdict strings; returns non-zero if either fails.
-reconcile() { # $1=slots tsv  $2=stderr file
-  local sum_apply sum_tail rt_apply rt_tail rcl=0
-  sum_apply=$(awk -F'\t' 'index($1,"generic-apply/")==1 || $1=="structural-apply" { s += $2 } END { print s+0 }' "$1")
-  sum_tail=$(awk -F'\t' 'index($1,"generic-tail/")==1 { s += $2 } END { print s+0 }' "$1")
-  rt_apply="$(field_of "$2" 'purvasm-stats:v1' pv_apply_entries)"
-  rt_tail="$(field_of "$2" 'purvasm-stats:v1' pv_tailcall_writes)"
-  if [ -z "$rt_apply" ] || [ -z "$rt_tail" ]; then
-    echo "STATS-SCHEMA"; echo "STATS-SCHEMA"; return 1
-  fi
-  # A run that dispatched nothing reconciles vacuously.
-  if [ "$rt_apply" -eq 0 ] && [ "$rt_tail" -eq 0 ]; then
-    echo "VACUOUS(0)"; echo "VACUOUS(0)"; return 1
-  fi
-  if [ "$sum_apply" = "$rt_apply" ]; then echo "$sum_apply == $rt_apply"; else echo "$sum_apply != $rt_apply"; rcl=1; fi
-  if [ "$sum_tail" = "$rt_tail" ]; then echo "$sum_tail == $rt_tail"; else echo "$sum_tail != $rt_tail"; rcl=1; fi
-  return "$rcl"
-}
-
-ranking() { # $1=slots tsv (aggregated: slot, count)
-  echo
-  printf '%-42s %14s %8s\n' "slot" "executions" "share"
-  awk -F'\t' '{ n[$1] += $2; tot += $2 }
-    END { for (s in n) if (n[s] > 0) printf "%-42s %14d %7.1f%%\n", s, n[s], 100 * n[s] / tot }' "$1" \
-    | sort -k2 -rn
-  echo
-  printf '%-24s %14s %8s\n' "reason (both forms)" "executions" "share"
-  awk -F'\t' '{ split($1, p, "/"); if (p[1] == "structural-apply") next; r[p[2]] += $2; tot += $2 }
-    END { for (k in r) printf "%-24s %14d %7.1f%%\n", k, r[k], 100 * r[k] / tot }' "$1" \
-    | sort -k2 -rn
-}
-
 rc=0
+
 
 if [ "$SELFHOST" = "1" ]; then
   BUILD_LABEL=${BUILD_FLAG:---opt}; WORK_LABEL=${WORK_FLAG:---opt}
@@ -246,6 +303,40 @@ if [ "$SELFHOST" = "1" ]; then
 
   ranking "$WORK/slots.tsv"
 
+  # --- ADR-0108 §4: the drill -------------------------------------------------------------------
+  # The reconciliation is UNCONDITIONAL. Skipping it when no keys were parsed would make the gate
+  # vacuous exactly when it matters most: if key emission, the third schema line, or the parse
+  # regressed away entirely, an empty file would be reported as "nothing to check" while the slots
+  # still counted hundreds of millions of foreign dispatches. Absent keys are Σ = 0, and 0 is only
+  # correct against a slot total of 0.
+  drill_of "$WORK/prof.err" "$WORK/keys.tsv"
+  dverd="$(reconcile_drill "$WORK/slots.tsv" "$WORK/keys.tsv")" || rc=1
+  echo
+  printf 'Σ drill keys vs the callee-foreign slots        : %s\n' "$dverd"
+  case "$dverd" in *"!="*) rc=1 ;; esac
+
+  if [ -s "$WORK/keys.tsv" ]; then
+    echo
+    echo "== the drill: foreign dispatches by (symbol × form × arity status) =="
+    printf '%-52s %14s %8s\n' "key" "executions" "share"
+    sort -k2 -rn -t $'\t' "$WORK/keys.tsv" \
+      | awk -F'\t' -v tot="$(awk -F'\t' '{s+=$2} END {print s+0}' "$WORK/keys.tsv")" \
+          'NR <= 25 { printf "%-52s %14d %7.1f%%\n", $1, $2, 100 * $2 / tot }'
+    printf '(top 25 of %s keys)\n' "$(wc -l <"$WORK/keys.tsv" | tr -d ' ')"
+
+    # The number the ADR turns on: how much of the foreign mass is at an arity the emitter already
+    # knows AND that matches the call. That is the population a direct lowering could capture; the
+    # rest cannot be captured by that lever no matter how it is written.
+    echo
+    printf '%-16s %14s %8s\n' "arity status" "executions" "share"
+    awk -F'\t' '{ n = split($1, p, "|"); st[p[n]] += $2; tot += $2 }
+      END { for (k in st) printf "%-16s %14d %7.1f%%\n", k, st[k], 100 * st[k] / tot }' \
+      "$WORK/keys.tsv" | sort -k2 -rn
+  else
+    echo
+    echo "NOTE: no drill keys recorded — reconciled above as 0, which passes only against 0 slots."
+  fi
+
   # --- the static census, over THIS run's snapshot ----------------------------------------------
   # The site-vs-execution comparison is only meaningful if both sides describe the same corpus, and
   # "both harnesses snapshot `output/`" does NOT give that: they snapshot at different times, and a
@@ -297,8 +388,8 @@ if [ "$SELFHOST" = "1" ]; then
   echo "corpus:   the compiler as built $BUILD_LABEL — sites and executions from ONE snapshot"
   echo "inputs:   $WORK (snapshot), heap $PROFILE_HEAP_WORDS words"
 else
-  printf '%-18s %-10s %-22s %-22s\n' MODULE STDOUT "Σapply vs pv_apply" "Σtail vs pv_tailcall"
-  : >"$WORK/slots.tsv"
+  printf '%-18s %-8s %-20s %-20s %-16s\n' MODULE STDOUT "Σapply vs pv_apply" "Σtail vs pv_tailcall" "drill vs slots"
+  : >"$WORK/slots.tsv"; : >"$WORK/keys.tsv"
   for mod in $MODULES; do
     base="$WORK/$(echo "$mod" | tr . _)"
     mkdir -p "$base"
@@ -330,13 +421,28 @@ else
     v0="$(echo "$verd" | sed -n 1p)"
     v1="$(echo "$verd" | sed -n 2p)"
     case "$v0$v1" in *"!="* | *VACUOUS* | *SCHEMA*) rc=1 ;; esac
-    printf '%-18s %-10s %-22s %-22s\n' "$mod" "$stdout_verdict" "$v0" "$v1"
+    # ADR-0108 §4: the drill reconciles against the very slot it drills, per fixture —
+    # unconditionally, for the reason given in the `--selfhost` leg: an empty key file must be
+    # compared as 0, never reported as "nothing to check".
+    drill_of "$base/err" "$base/keys.tsv"
+    dv="$(reconcile_drill "$base/slots.tsv" "$base/keys.tsv")" || rc=1
+    case "$dv" in *"!="*) rc=1 ;; esac
+    cat "$base/keys.tsv" >>"$WORK/keys.tsv"
+    printf '%-18s %-8s %-20s %-20s %-16s\n' "$mod" "$stdout_verdict" "$v0" "$v1" "$dv"
     cat "$base/slots.tsv" >>"$WORK/slots.tsv"
   done
 
   echo
   echo "== executions by (form × reason), all fixtures ======================"
   ranking "$WORK/slots.tsv"
+  if [ -s "$WORK/keys.tsv" ]; then
+    echo
+    echo "== the drill: foreign dispatches by arity status, all fixtures ======"
+    awk -F'\t' '{ n = split($1, p, "|"); st[p[n]] += $2; tot += $2 }
+      END { for (k in st) printf "%-16s %14d %7.1f%%\n", k, st[k], 100 * st[k] / tot }' \
+      "$WORK/keys.tsv" | sort -k2 -rn
+  fi
+
   echo
   echo "NOTE: this ranking describes THESE FIXTURES. The ADR's ranking — the one comparable with"
   echo "      the static census — comes from \`--selfhost\`, which profiles the compiler itself."
