@@ -544,6 +544,31 @@
             "spec-node"
           ]
         }
+      },
+      "vm": {
+        "path": "vm",
+        "core": {
+          "dependencies": [
+            "arrays",
+            "effect",
+            "foldable-traversable",
+            "integers",
+            "lists",
+            "maybe",
+            "numbers",
+            "ordered-collections",
+            "prelude",
+            "refs",
+            "strings",
+            "tuples"
+          ]
+        },
+        "test": {
+          "dependencies": [
+            "spec",
+            "spec-node"
+          ]
+        }
       }
     },
     "package_set": {

@@ -1,0 +1,20 @@
+package:
+  name: vm
+  dependencies:
+    - arrays
+    - effect
+    - foldable-traversable
+    - integers
+    - lists
+    - maybe
+    - numbers
+    - ordered-collections
+    - prelude
+    - refs
+    - strings
+    - tuples
+  test:
+    main: Test.Unit.Purvasm.VM
+    dependencies:
+      - spec
+      - spec-node
