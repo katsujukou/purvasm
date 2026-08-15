@@ -13,6 +13,8 @@
 //!   definition of that layout. A mirrored name table here would be a second definition, free to
 //!   drift the moment a `MissReason` is added.
 
+use std::collections::BTreeMap;
+
 /// The counters and their compiler-supplied labels. Absent (`None` on the heap) in a normal build:
 /// nothing registers, nothing counts, nothing prints.
 #[derive(Debug, Default, Clone)]
@@ -21,6 +23,15 @@ pub(crate) struct ApplyProfile {
     names: Vec<String>,
     /// Execution counts, parallel to `names`.
     counters: Vec<u64>,
+    /// ADR-0108 §4: the drill's KEYED counters, self-registering by the emitted key string.
+    ///
+    /// Slots cannot express this axis. A slot index is fixed at emission time and shared by every
+    /// object in the program, but the thing being attributed here — which foreign symbol, at what
+    /// arity status — is per-module knowledge, and no module can know the program-wide index of a
+    /// symbol another module also calls. So the key IS the identity, allocated on first sight.
+    /// The fixed slots stay the backbone: `Σ keys == the callee-foreign slots` is then a check
+    /// ACROSS two independent mechanisms, not a restatement of one.
+    keys: BTreeMap<String, u64>,
 }
 
 impl ApplyProfile {
@@ -36,6 +47,7 @@ impl ApplyProfile {
         Some(ApplyProfile {
             counters: vec![0; slots],
             names,
+            keys: BTreeMap::new(),
         })
     }
 
@@ -49,6 +61,40 @@ impl ApplyProfile {
             }
             None => false,
         }
+    }
+
+    /// Count one execution against `key` (ADR-0108 §4). Unknown keys are CREATED, not refused:
+    /// unlike a slot, a key carries its own label, so a key this run has not seen before is a new
+    /// call site being exercised — not a layout disagreement.
+    ///
+    /// Looked up BORROWED first: `entry()` would allocate and copy the key string on every call,
+    /// including the overwhelming majority that hit an existing counter. On the self-host workload
+    /// that is ~434 M allocations for 28 distinct keys. The measurement vehicle has to survive
+    /// workloads bigger than the one that motivated it, so the allocation happens once per distinct
+    /// key, on the miss.
+    pub(crate) fn bump_key(&mut self, key: &str) {
+        if let Some(c) = self.keys.get_mut(key) {
+            *c = c.saturating_add(1);
+            return;
+        }
+        self.keys.insert(key.to_owned(), 1);
+    }
+
+    /// The `purvasm-applyprofile-keys:v1` line, or `None` when the drill recorded nothing (an
+    /// uninstrumented drill, or a run that executed no drilled dispatch). A `BTreeMap` keeps the
+    /// order stable across runs of the same binary, so the line diffs.
+    pub(crate) fn format_keys(&self) -> Option<String> {
+        if self.keys.is_empty() {
+            return None;
+        }
+        let mut out = String::from("purvasm-applyprofile-keys:v1");
+        for (key, count) in self.keys.iter() {
+            out.push(' ');
+            out.push_str(key);
+            out.push('=');
+            out.push_str(&count.to_string());
+        }
+        Some(out)
     }
 
     /// The `purvasm-applyprofile:v1` line, without a trailing newline. Slots print in slot order, so
@@ -102,5 +148,37 @@ mod tests {
             "out-of-range slot is refused, not wrapped or ignored"
         );
         assert_eq!(p.format(), "purvasm-applyprofile:v1 a=1 b=2");
+    }
+
+    #[test]
+    fn keys_self_register_and_print_in_a_stable_order() {
+        let mut p = ApplyProfile::register("a\nb", 2).expect("registers");
+        assert_eq!(
+            p.format_keys(),
+            None,
+            "a drill that ran nothing prints nothing"
+        );
+        p.bump_key("z.sym|apply|known-match");
+        p.bump_key("a.sym|tail|unknown");
+        p.bump_key("z.sym|apply|known-match");
+        assert_eq!(
+            p.format_keys().expect("has keys"),
+            "purvasm-applyprofile-keys:v1 a.sym|tail|unknown=1 z.sym|apply|known-match=2",
+            "sorted by key, so two runs of one binary diff cleanly"
+        );
+    }
+
+    #[test]
+    fn the_keyed_axis_does_not_disturb_the_slot_axis() {
+        // The two mechanisms are independent by construction; the harness gate compares them, which
+        // is only meaningful if neither writes to the other.
+        let mut p = ApplyProfile::register("a\nb", 2).expect("registers");
+        p.bump_key("x|apply|unknown");
+        assert_eq!(p.format(), "purvasm-applyprofile:v1 a=0 b=0");
+        assert!(p.bump(0));
+        assert_eq!(
+            p.format_keys().expect("has keys"),
+            "purvasm-applyprofile-keys:v1 x|apply|unknown=1"
+        );
     }
 }

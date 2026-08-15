@@ -363,6 +363,19 @@ impl Heap {
         }
     }
 
+    /// Count one execution against a drill KEY (ADR-0108 §4). Returns `false` only when no profile
+    /// is registered — an unseen key is created, not refused, because a key names itself.
+    #[inline]
+    pub(crate) fn apply_profile_bump_key(&mut self, key: &str) -> bool {
+        match self.apply_profile.as_mut() {
+            Some(p) => {
+                p.bump_key(key);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The registered apply profile, if this program was built instrumented. Read by
     /// `pv_runtime_free` to decide whether to emit the second schema line.
     #[inline]

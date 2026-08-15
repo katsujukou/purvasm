@@ -88,6 +88,11 @@ pub unsafe extern "C" fn pv_runtime_free(ctx: *mut Heap) {
             // NOT gated on `PURVASM_STATS`: an instrumented binary exists only to produce it.
             if let Some(profile) = heap(ctx).apply_profile() {
                 eprintln!("{}", profile.format());
+                // ADR-0108 §4: the drill, on a THIRD line. Absent unless a drilled dispatch ran, so
+                // an instrumented build that exercises none prints the slots alone.
+                if let Some(keys) = profile.format_keys() {
+                    eprintln!("{keys}");
+                }
             }
             drop(Box::from_raw(ctx));
         }
@@ -370,6 +375,30 @@ pub unsafe extern "C" fn pv_applyprofile_bump(ctx: *mut Heap, slot: u64) {
             eprintln!(
                 "purvasm: apply-profile slot {slot} is out of range (unregistered or stale layout)"
             );
+            std::process::abort();
+        }
+    })
+}
+
+/// ADR-0108 §4: count one execution against a drill KEY — an emitted string such as
+/// `Data.Array.length|apply|known-match`. Instrumented builds only.
+///
+/// Aborts when no profile is registered, for the same reason the slot bump aborts on a bad slot: an
+/// instrumented binary that cannot record is producing a silently short measurement, and this whole
+/// mechanism exists to be reconciled against another one.
+///
+/// # Safety
+/// `ctx` is a live context; `key`/`key_len` describe a valid UTF-8 byte range.
+#[no_mangle]
+pub unsafe extern "C" fn pv_applyprofile_key(ctx: *mut Heap, key: *const u8, key_len: u64) {
+    guard(|| {
+        let bytes = std::slice::from_raw_parts(key, key_len as usize);
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            eprintln!("purvasm: apply-profile key is not valid UTF-8");
+            std::process::abort();
+        };
+        if !heap(ctx).apply_profile_bump_key(text) {
+            eprintln!("purvasm: apply-profile key {text} recorded with no profile registered");
             std::process::abort();
         }
     })
