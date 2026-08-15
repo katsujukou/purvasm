@@ -155,5 +155,7 @@ language and are kept out of version control.)
 | [0107](0107-provably-not-by-need.md) | Provably-not-by-need operands: elide the force, de-safepoint the site | Accepted |
 | [0108](0108-apply-count-attribution.md) | Apply-count attribution: one classification source, static census, then dynamic counters | Accepted |
 | [0109](0109-native-leaf-direct-lowering.md) | Native-leaf direct lowering: hoist the leaf closure, call the `pvf_` entry | Accepted |
+| [0110](0110-owned-vm-purescript-native.md) | The owned VM: a PureScript interpreter, natively compiled | Accepted |
+| [0111](0111-vm-dynamic-native-ffi.md) | VM dynamic native FFI: load the provider, apply through the runtime | Accepted |
 
 ## Scope
