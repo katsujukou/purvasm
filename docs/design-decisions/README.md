@@ -153,5 +153,7 @@ language and are kept out of version control.)
 | [0105](0105-liveness-based-rooting-emission.md) | Liveness-based rooting emission for the native LLVM backend | Accepted |
 | [0106](0106-residual-rooting-choreography.md) | Closing the residual rooting choreography: reload-reroot elision and the plan-driven `Gcaf` init tier | Accepted |
 | [0107](0107-provably-not-by-need.md) | Provably-not-by-need operands: elide the force, de-safepoint the site | Accepted |
+| [0108](0108-apply-count-attribution.md) | Apply-count attribution: one classification source, static census, then dynamic counters | Accepted |
+| [0109](0109-native-leaf-direct-lowering.md) | Native-leaf direct lowering: hoist the leaf closure, call the `pvf_` entry | Accepted |
 
 ## Scope
