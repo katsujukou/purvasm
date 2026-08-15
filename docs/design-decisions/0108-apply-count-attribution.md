@@ -62,7 +62,13 @@ one produces.
 
 ```text
 data MissReason
-  = MissCalleeNotVar        -- the callee atom is a literal / foreign / computed value
+  -- §4 slice 1 (2026-08-15) SPLIT what was `MissCalleeNotVar` into the two non-variable atoms ANF
+  -- actually has. The split is total, and the two mean opposite things — see §4.
+  = MissCalleeForeign       -- the callee atom is a FOREIGN symbol (a candidate lever: the emitter
+                            --   holds `Ctx.foreignArity` for it and does not consult it here)
+  | MissCalleeLiteral       -- the callee atom is a LITERAL (a DIAGNOSTIC class, like MissUnknownKey:
+                            --   a well-typed program does not apply a literal, so non-zero is a
+                            --   compiler-bug report and the census gate fails closed on it)
   | MissLocalUnknownFn      -- a local binding with no `knownFn` fact (a parameter, a capture, …)
   | MissArityLocal          -- a local `knownFn` whose arity ≠ the call's argument count
   | MissUnknownKey          -- neither a local binding nor a known global key (see below: a
@@ -260,6 +266,74 @@ reasons at site / function granularity (which functions, which call sites, which
 follow-up ADR is written against named code rather than an aggregate. The other reasons are
 recorded and dropped.
 
+**Step 4 plan of record (2026-08-13), against the step-3 result.** The dominant reason is
+`callee-not-var` at 433,865,148 executions. It is drilled in slices, each of which must be checked
+by an identity before the next is considered — the same discipline that made step 3 trustworthy.
+
+*Slice 1 — split the constructor.* `MissCalleeNotVar` becomes two reasons, mirroring the two
+non-variable atoms ANF actually has:
+
+```
+callee-not-var == callee-literal + callee-foreign
+```
+
+exact on BOTH axes: static sites, and dynamic executions summing to 433,865,148 on the step-3
+workload. `callee-literal == 0` is EXPECTED for well-typed input — applying a literal is not a
+thing a well-typed program does — but it is measured, not assumed. **A non-zero `callee-literal` is
+not a lever and must not be ranked as one: it is an independent compiler-bug candidate** and gets
+reported as such, the same treatment `unknown-key` already has.
+
+*Slice 2 — attribute the foreign class.* Assuming it dominates, the question a design decision needs
+answered is not "foreign calls are frequent" but:
+
+- **which foreign symbol** is dispatched, and how often;
+- **from which caller function** (added only if slice 2's per-symbol picture is split enough that the
+  symbol alone does not decide it — and call-site granularity only after that);
+- **whether the arity was known and matched**: the emitter carries `Ctx.foreignArity`, so each
+  dispatch is classified `known-match` / `known-mismatch` / `unknown`;
+- **apply vs tail**, since the two have different lowerings.
+
+`known-match` is the number that decides the ADR: it is the population a direct lowering through
+`Ctx.foreignArity` could actually capture. If it dominates, the lever is real and general; if the
+mass sits in `unknown`/`known-mismatch`, or in a handful of higher-order combinators or one
+provider, then the lever is narrow and a different design follows. Either way the answer comes from
+the count, not from the plausibility of the story.
+
+*Mechanism.* The fixed `(form × reason)` slot space cannot express this: slot indices are assigned
+at emission time and shared program-wide, while the set of foreign symbols is per-module. The drill
+therefore uses a KEYED counter (`pv_applyprofile_key`, a host-side map from an emitted string to a
+count) reported on its own line, with the fixed slots kept as the backbone. That gives a
+cross-mechanism check on top of the maintainer-pinned identities: Σ keyed foreign counters must
+equal the `callee-foreign` slot, two independent mechanisms landing on one integer.
+
+*Completion conditions (pinned).*
+
+1. ~~the sub-classification sums EXACTLY to 433,865,148 on the step-3 workload~~ — **corrected
+   2026-08-15, before the measurement was accepted.** This is unsatisfiable in that form, and the
+   reason is structural rather than incidental: the corpus IS the compiler, so adding the drill adds
+   call sites to the thing being measured. The drill cannot measure a compiler that predates the
+   drill. Replaced by two conditions that are exact and that together carry the same assurance:
+
+   a. on the STEP-3 pinned corpus, censused by the split classifier,
+      `callee-foreign + callee-literal == 3,655` — the step-3 `callee-not-var` SITE count, to the
+      unit. This pins the split as label-only: same corpus, same classifier decisions, new names;
+   b. on the corpus actually profiled, `Σ drill keys == the two callee-foreign slots`, to the unit —
+      two mechanisms written down different paths agreeing on one integer;
+
+   and any difference between the step-3 and step-4 class totals must be ACCOUNTED FOR, not merely
+   noted: one classifier is run over both CoreFn snapshots to show the delta is corpus growth rather
+   than classification drift;
+2. the whole-program apply/tail identities of §3 still hold, unchanged;
+3. uninstrumented emission stays byte-identical (same-CoreFn comparison);
+4. the instrumented compiler's emitted `.ll` set still equals the uninstrumented reference's;
+5. self-host and fixture attributions are reported separately and never merged;
+6. **any optimisation proposal arising from the numbers is a SEPARATE checkpoint.** Step 4 does not
+   implement a lowering change, and no such change is designed until the attribution is reviewed.
+
+Granularity is deliberately coarse first — constructor and foreign symbol. Caller and site
+subdivision is added only if the dominant target splits enough that it cannot be decided, because a
+census that emits 3,655 site rows is a data dump, not an answer.
+
 ### 5. Guest-heap allocation census by `Kind` — a SEPARATE axis
 
 `heap_apply_activations` is an ACTIVATION count, not an allocation count. But the deeper trap is
@@ -351,6 +425,238 @@ compiler's own output syntax as a call. Every needle is now anchored to the two-
 indent. This is the third counting caveat in that harness (after `declare` lines and the
 `musttail`/direct double-match), and all three were found by the accounting identity rather than by
 reading the script.
+
+**Step 3.** The same classifier now also bumps a counter at run time. An object built with
+`PURVASM_PROFILE_APPLY=1` emits one `pv_applyprofile_bump(slot)` per instrumented call site, where
+the slot comes from `CallClass.profileSlot` — the single mapping that also names the slots
+(`profileSlotNames`), handed to the runtime at start-up so the runtime labels nothing itself. Only
+what can execute a dispatch gets a slot: the two generic forms × the executable reasons, plus
+`structural-apply` — seven reasons at the time of writing, **eight after §4 split `callee-not-var`**
+(17 slots). Direct calls, wrapper entries and `unknown-key` get none — reserving a counter that is
+pinned at zero by construction would invite reading it as evidence.
+
+`callee-literal`, added by that split, is the one deliberate exception to that rule: it is also
+expected to read zero, but §4 requires it MEASURED rather than assumed, and a class with no counter
+cannot be measured. The census gate fail-closes on it instead.
+
+Three properties keep instrumentation from contaminating what it measures, and each is asserted
+rather than argued:
+
+- **the shipped path is byte-unchanged.** The profile symbols are declared by `profileDeclarations`,
+  emitted only into an instrumented object, so an uninstrumented emission of the whole self-host
+  closure is byte-identical to the pre-step-1 baseline (`diff -r`, exit 0). A seam sweep pins both
+  directions: every `RtOp` has a declare *somewhere*, and these two have one *only* in the
+  instrumented block;
+- **classification is unchanged by being counted.** The recorded event stream is identical with
+  instrumentation on and off — the bump observes the classifier, it does not participate in it;
+- **the program is unchanged by being profiled.** Both new seam rows are `sp = false`, so the
+  activation plan (ADR-0105) does not move, and `tools/apply-profile.sh` asserts each instrumented
+  binary's output against the uninstrumented one (fixtures: the expected trace; `--selfhost`: the
+  emitted `.ll` set);
+- **the bump counts dispatches, not intentions.** `noteCall` sits after `evalAtoms`/`argBuffer`,
+  immediately before the dispatch instruction — those steps can force a by-need cell or allocate,
+  and announcing a dispatch before the work that might not reach it would count something else.
+  Between a bump and its dispatch the only permitted instructions are pure loads (the callee's
+  re-read from its root, ADR-0105 verify-then-use); a unit test walks the emitted text and asserts
+  that the first CALL after each bump is that bump's own dispatch.
+
+The reconciliation is the assurance argument, and it is EXACT — two independently-derived numbers
+landing on the same integer, never a tolerance:
+
+```
+Σ generic-apply/<reason> + structural-apply == pv_apply_entries
+Σ generic-tail/<reason>                     == pv_tailcall_writes
+```
+
+The right-hand sides are counters the runtime already kept for its own reasons; the left-hand sides
+come from the compiler's classification. A mis-slotted event, a bump on a path with no call, or a
+call on a path with no bump all break an equality. Four dispatch-heavy fixtures reconcile on both
+axes, with unperturbed stdout:
+
+| fixture | Σ apply | `pv_apply_entries` | Σ tail | `pv_tailcall_writes` |
+| --- | ---: | ---: | ---: | ---: |
+| `Gate.DictDispatch` | 25,537 | 25,537 | 2,015 | 2,015 |
+| `Gate.Mixed` | 22,985 | 22,985 | 2,805 | 2,805 |
+| `Gate.GcChurn` | 6,060 | 6,060 | 2,002 | 2,002 |
+| `Gate.ByNeedCell` | 27,035 | 27,035 | 5 | 5 |
+
+**The measurement this ADR exists for** — the self-host build, since that is the workload whose
+2.67 B dispatches motivated the ADR. It is a checked-in harness leg, not a one-off:
+
+```
+tools/apply-profile.sh --selfhost --build-mode opt --work-mode no-opt
+```
+
+which snapshots the inputs and then runs four whole-closure legs: a reference emission by the
+node-hosted compiler; a build of the compiler ITSELF with `PURVASM_PROFILE_APPLY=1`; that
+instrumented compiler compiling the same pinned closure (`Purvasm.CLI.Native`) under a pinned heap;
+and finally the STATIC census over that same snapshot.
+
+The fourth leg is what makes the two rankings comparable, and it is not optional. Both harnesses
+snapshotting `output/` is NOT the same as both measuring one corpus: they snapshot at different
+times, and `output/` holds the compiler's own CoreFn, so any `spago build` in between changes the
+program being measured — two such snapshots taken during this work differed in 85 files. The census
+is therefore run from `$COREFN`, the very bytes the profiled compiler was built from, and in
+`--build-mode`, because the sites that exist in the running binary are the sites of the compiler as
+it was BUILT, not of the workload it compiles.
+
+Pinning the CoreFn is only half of it: **the classifier is an input too.** A census that rebuilds
+itself (`spago build`) and re-snapshots `output/` would derive its compiler from whatever the tree
+holds at that moment — and this harness spends hours in its earlier legs, so "that moment" can be
+long after the profiled binary was built. `apply-census.sh` therefore grew a `--toolchain` mode:
+the caller hands it an already-pinned `{output, cli, census, ulib}` and nothing is built or copied
+again. `apply-profile.sh` builds the toolchain ONCE up front, snapshots it, and every leg —
+including the census — runs from that one copy. The census is invoked rather than reimplemented, so
+the site numbers still arrive carrying its six-column and reason-axis gates.
+
+Two mode axes are involved and they are not the same axis. `--build-mode` decides which call sites
+exist in the running binary — the CORPUS, which must match the census's `--opt` for the
+site-vs-execution comparison to be about weights rather than about two different programs.
+`--work-mode` decides the execution weights; it is `--no-opt` because a native whole-closure `--opt`
+compile is the profile still under the ADR-0104 §2 waiver. The mode moves the ranking a long way, so
+the numbers below are always reported with both.
+
+Behaviour-neutrality is asserted for this workload the same way it is for the fixtures, except that
+here the program's output IS the emitted `.ll` set: the instrumented compiler must emit exactly what
+the uninstrumented reference emitted. Both identities hold exactly at this scale:
+
+```
+emitted .ll set == the uninstrumented reference's                    (304 objects)
+Σ generic-apply + structural = 626,997,553 + 2,268,285 = 629,265,838 == pv_apply_entries
+Σ generic-tail                                         = 123,275,311 == pv_tailcall_writes
+```
+
+**752.5 M dispatches in one self-host build**, attributed (the 750.3 M with a `MissReason`; the
+remaining 2.3 M are `structural-apply`, which has none):
+
+Sites and executions below come from ONE snapshot — the census leg above — so the two columns
+describe the same 19,110 classified call sites, and `exec/site` is a ratio of shares, not a
+comparison of two corpora:
+
+| reason | sites | share | executions | **share** | `exec/site` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `callee-not-var` | 3,655 | 19.1 % | 433,865,148 | **57.8 %** | **3.02×** |
+| `local-unknown-fn` | 9,229 | 48.3 % | 195,562,878 | 26.1 % | 0.54× |
+| `dep-no-direct-fact` | 2,179 | 11.4 % | 59,090,843 | 7.9 % | 0.69× |
+| `own-object-not-fn` | 2,770 | 14.5 % | 55,255,483 | 7.4 % | 0.51× |
+| `arity-cross-module` | 861 | 4.5 % | 4,216,740 | 0.6 % | 0.12× |
+| `arity-local` | 119 | 0.6 % | 1,855,134 | 0.2 % | 0.40× |
+| `arity-own-module` | 297 | 1.6 % | 426,638 | 0.1 % | 0.04× |
+| `unknown-key` | 0 | 0 % | 0 | 0 % | — |
+
+(The per-form split of the executions: `callee-not-var` 424,601,573 apply + 9,263,575 tail;
+`local-unknown-fn` 119,094,012 + 76,468,866; `dep-no-direct-fact` 47,778,582 + 11,312,261;
+`own-object-not-fn` 29,124,383 + 26,131,100; the three arity reasons 6,399,003 + 99,509.)
+
+**The two rankings disagree, and that is the finding.** The class that dominates the *code*
+(`local-unknown-fn`, 48.3 % of sites) is not the class that dominates the *run*: `callee-not-var`
+executes at 3.02× its share of the code, `local-unknown-fn` at 0.54× of its own. Ranking by sites
+would have pointed the optimisation work at the second-largest consumer of dispatches — precisely
+the failure mode step 3 was ordered to prevent, and the reason §3 pinned the static numbers as
+"static" when they were the only ones available.
+
+`arity-*` is worth a separate note: 6.7 % of sites, 0.9 % of executions — every one of its three
+reasons is colder than its site count suggests (0.40×, 0.12×, 0.04×). A caller/callee arity
+disagreement is real and fixable, but on this workload it is nearly cold.
+
+This says nothing yet about what to DO. `MissCalleeNotVar` is the callee atom being `AtomLit` or
+`AtomForeign` (ANF has no third non-variable atom), and a literal cannot be applied in well-typed
+code — so the class is, on its face, the foreign-application path, on which the emitter already
+carries an arity fact it does not consult (`Ctx.foreignArity`). That is a hypothesis with an obvious
+lever, not a result: **step 4's drill must split the constructor and attribute by site/function
+before any of it is believed.** The step order exists for this reason — a plausible lever named
+from an aggregate is exactly what the ADR-0107 close-out is the standing evidence against.
+
+`heap_apply_activations` (676.1 M) exceeds `pv_apply_entries` (629.3 M) on the same run, as §1
+predicted: the excess is internal `Heap::apply` re-entry, which is not an ABI dispatch and is
+deliberately outside both identities.
+
+**Scope of this ranking.** It describes ONE workload — the compiler built `--opt` compiling
+`Purvasm.CLI.Native` in `--no-opt` — and the harness prints both axes with every run for that
+reason. The fixture leg, run for comparison, shows how far a ranking moves with the workload: the
+same four fixtures rank `callee-not-var` at 77.1 % in `--opt` and `dep-no-direct-fact` first at
+49 % in `--no-opt`. So a percentage from one corpus is not a fact about the compiler, and the ADR's
+numbers come from `--selfhost` alone. What generalises is the METHOD, not the shares: sites and
+executions are different measurements, and this one is checked against the runtime's own counters.
+
+**Step 3 CLOSED 2026-08-12.** What it establishes, and only this: on one named workload — the
+compiler built `--opt`, compiling `Purvasm.CLI.Native` in `--no-opt` — 752.5 M dispatches attribute
+to the reasons above, checked against the runtime's own counters by two EXACT identities, with sites
+and executions taken from one CoreFn snapshot and one pinned classifier. `callee-not-var` runs at
+3.02× its share of the code and is the dominant consumer of dispatches; `local-unknown-fn`, which
+dominates the code, runs at 0.54×.
+
+What it does NOT establish: that any of this is cheap to fix, or what the 57.8 % consists of.
+`MissCalleeNotVar` is still a two-constructor class (`AtomLit | AtomForeign`) measured as one, and
+the "it is the foreign-application path, and `Ctx.foreignArity` is right there" reading remains a
+hypothesis with no measurement behind it. Step 4 exists to decompose that number to a granularity
+at which a design decision is possible — it is NOT the step that optimises anything.
+
+Reusable by later steps: the instrumented build profile, the `(form × reason)` slot space and its
+two identities, `--toolchain` pinning, and the rule that a ranking names its workload.
+
+**Step 4 slice 1+2 measured 2026-08-13** (`tools/apply-profile.sh --selfhost --build-mode opt
+--work-mode no-opt`; the drill is `pv_applyprofile_key`, reported on a third schema line
+`purvasm-applyprofile-keys:v1`).
+
+*The split.* `callee-literal` is **0** — on both axes, measured rather than assumed. So the class is
+the foreign-application path entire, and the earlier reading was right for the right reason only
+after being checked.
+
+*The gates that carry this result* (both hardened in review, before the numbers were accepted). The
+drill reconciliation is UNCONDITIONAL: an empty key file is Σ = 0 and is compared against the slot
+total anyway, because skipping it would make the gate vacuous in exactly the case it exists for —
+key emission or the third schema line regressing away entirely, while the slots still count hundreds
+of millions of dispatches. `tools/apply-profile.sh --self-test` injects that fault and four others
+and asserts the verdict, so the gate's load-bearing property is itself pinned. And the census's
+reason gate now fail-closes on `callee-literal` as well as `unknown-key`, matching the contract this
+ADR states for both: verified by injection, where the class/reason sums still balance and the gate
+fires regardless.
+
+*The cross-mechanism identity holds exactly*: `Σ drill keys == 434,445,743 == the two
+callee-foreign slots`. The whole-program identities of §3 are unchanged
+(`630,148,432 == pv_apply_entries`, `123,434,822 == pv_tailcall_writes`), the uninstrumented
+emission is byte-identical (303/303, same-CoreFn), and the instrumented compiler emitted an `.ll`
+set identical to the reference (304 objects).
+
+*The answer.* **100.00 % of foreign dispatches are `known-match`** — 434,445,743 of 434,445,743, at
+an arity the emitter already holds and that matches the call. There is no `known-mismatch` mass and
+no `arity-unknown` at all. And the population is tiny: **28 distinct keys**, 24 distinct symbols.
+
+| foreign symbol | executions | share |
+| --- | ---: | ---: |
+| `Purvasm.String.byteAt` | 198,072,908 | 45.6 % |
+| `Purvasm.String.unsafeSetByte` | 153,300,082 | 35.3 % |
+| `Purvasm.String.compareBytes` | 25,987,303 | 6.0 % |
+| `Purvasm.String.appendBulk` | 18,687,915 | 4.3 % |
+| `Purvasm.String.byteIndexOf` | 8,835,999 | 2.0 % |
+| `Purvasm.String.unsafeNew` | 7,694,809 | 1.8 % |
+| `Purvasm.String.byteLength` | 6,707,455 | 1.5 % |
+| (17 more, each < 1 %) | 15,159,272 | 3.5 % |
+
+Four symbols are 91.2 %; every one of the top seven is an ADR-0103 string-substrate leaf. By form:
+425.2 M apply, 9.3 M tail. Caller-function subdivision was NOT needed — §4 said to add it only if
+the symbol alone could not decide, and a distribution this concentrated decides.
+
+**A property of self-measurement, stated rather than smoothed over.** The corpus IS the compiler, so
+adding the drill changed it: `callee-foreign` sites went 3,655 → 3,659 and the class total
+433,865,148 → 434,445,743 (+0.13 %). The §4 completion condition "sums exactly to 433,865,148" is
+therefore unsatisfiable in that literal form — the drill cannot measure a compiler that predates the
+drill. What IS exact, and was checked instead:
+
+- on the STEP-3 pinned corpus, censused by the split classifier: `callee-foreign 3,655 +
+  callee-literal 0 == 3,655`, the step-3 `callee-not-var` site count, to the unit;
+- on THIS corpus, the two mechanisms agree to the unit (434,445,743), and both §3 identities hold.
+
+The +4 sites are the drill's own code being compiled: the same classifier over the step-3 CoreFn
+gives 3,655 and over this one 3,659, so the delta is corpus growth, not classification drift.
+
+**What this licenses, and what it does not.** It says the dominant reason is one narrow, fully
+arity-known population, which is the shape a `Ctx.foreignArity` direct lowering could capture, and
+that four symbols carry most of it. It does NOT say what that lowering should be, what it costs in
+the calling convention, or that dispatch removal converts to run time at any particular rate — the
+ADR-0107 close-out is the standing evidence that a dispatch count is not a time measurement. That
+design is a separate checkpoint, per §4's pinned condition 6, and is not begun here.
 
 ## Consequences
 
