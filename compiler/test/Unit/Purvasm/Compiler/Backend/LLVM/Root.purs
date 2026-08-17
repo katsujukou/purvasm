@@ -9,6 +9,8 @@ module Test.Unit.Purvasm.Compiler.Backend.LLVM.Root where
 
 import Prelude
 
+import Purvasm.Compiler.Backend.LLVM.ForeignRef (ForeignCallMode(..), ForeignClosureMode(..))
+
 import Data.Map as Map
 import Data.Maybe (Maybe(..))
 import Data.Set as Set
@@ -25,7 +27,7 @@ import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
 
 runWith :: forall a. Boolean -> Codegen a -> Tuple a Ctx
-runWith inlineAbi = runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi, defined: Set.empty, profileApply: false, byNeed: true })
+runWith inlineAbi = runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi, defined: Set.empty, profileApply: false, byNeed: true, foreignCall: DirectApplyAndTail, foreignClosure: Hoisted })
 
 -- Render the function-buffer text produced by an emitter run from a fresh release-mode context.
 emittedWith :: forall a. Boolean -> Codegen a -> String

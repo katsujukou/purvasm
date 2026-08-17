@@ -6,6 +6,8 @@ module Test.Unit.Purvasm.Compiler.Backend.LLVM.Prim where
 
 import Prelude
 
+import Purvasm.Compiler.Backend.LLVM.ForeignRef (ForeignCallMode(..), ForeignClosureMode(..))
+
 import Data.Maybe (Maybe(..))
 import Data.Tuple (Tuple(..))
 import Data.Map as Map
@@ -21,7 +23,7 @@ import Test.Spec.Assertions (shouldEqual)
 run :: forall a. Codegen a -> Tuple a String
 run m =
   let
-    Tuple a ctx = runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true, defined: Set.empty, profileApply: false, byNeed: true }) m
+    Tuple a ctx = runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true, defined: Set.empty, profileApply: false, byNeed: true, foreignCall: DirectApplyAndTail, foreignClosure: Hoisted }) m
   in
     Tuple a (renderBuffer ctx.fn)
 

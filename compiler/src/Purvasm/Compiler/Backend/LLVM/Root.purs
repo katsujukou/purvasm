@@ -37,6 +37,8 @@ module Purvasm.Compiler.Backend.LLVM.Root
   , tailcallWith
   , entryTeardown
   , emitGfunInit
+  , emitForeignCloInit
+  , foreignCloInitSym
   , emitInitFnFramed
   , emitGcafInitEngine
   ) where
@@ -48,9 +50,11 @@ import Data.Maybe (Maybe(..))
 import Data.Tuple (Tuple(..))
 import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.Compiler.Backend.LLVM.Abi (headerField, offRootsCap, offRootsLen)
+import Purvasm.Compiler.Backend.LLVM.CallClass (AllocSite(..))
+import Purvasm.Compiler.Backend.LLVM.ForeignRef (ForeignRef, refArity, refCell, refSym)
 import Purvasm.Compiler.Backend.LLVM.Mangle (immUnit, mangle)
 import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, beginFn, emit, emitDefine, emitGuestRet, emitGuestStore, emitRetResolved, forA, forA_, fresh, freshLabel, mintFrameOwner, resolveGuest, snapshotVal, takeFn, touchVal, unsafeEmitChainLabel)
-import Purvasm.Compiler.Backend.LLVM.Safepoint (RtArg(..), RtOp(..), emitPreparedMusttail, machineryHandleCall, prepareMusttail, rtCall, rtCallVoid)
+import Purvasm.Compiler.Backend.LLVM.Safepoint (RtArg(..), RtOp(..), emitPreparedMusttail, machineryHandleCall, noteAllocSite, prepareMusttail, rtCall, rtCallVoid)
 import Purvasm.Compiler.Backend.LLVM.Value (FrameOwner, RootSrc(..), RootedVal, Val, mkRootedLocal, rootedFromVal, rootedSrc, sameOwner, vImm)
 
 -- | Witness of THIS activation's open shadow-stack frame, carrying the frame's mark operand
@@ -171,6 +175,37 @@ emitGfunInit key arity = do
   storePermanentRoots [ Tuple key clo ]
   finishInitFn key
 
+-- | The per-object HOISTED LEAF-CLOSURE init (ADR-0109 §2.2c) — a FIXED SHAPE, no body callback,
+-- | for the same reason [`emitGfunInit`] has none: `Root` owns the phase order, so a caller cannot
+-- | get "allocate, then plant" wrong.
+-- |
+-- | Per reference: build the leaf's no-capture closure, then IMMEDIATELY plant its permanent root
+-- | into the object's own cell. The order is load-bearing — each `pv_make_closure` is a safepoint,
+-- | so a closure built but not yet rooted would be stale by the next reference's allocation.
+-- | Nothing is transient here (no frame), exactly as in the frameless `Gfun` init.
+-- |
+-- | One function, in the ENTRY object ([`foreignCloInitSym`]), called first from `pv_init_all`.
+-- | The refs are the leaves the REACHABLE program can execute (ADR-0109 §2.2-amended): a cell's
+-- | initialiser is the only live reference to `@pvf_<key>`, so initialising a leaf that only
+-- | dead code mentions would demand a provider the tree has never needed.
+emitForeignCloInit :: Array ForeignRef -> Codegen Unit
+emitForeignCloInit refs = do
+  beginFn
+  forA_ refs \r -> do
+    noteAllocSite SiteForeignCloInit
+    addr <- fresh
+    emit ("  " <> addr <> " = ptrtoint ptr @" <> refSym r <> " to i64")
+    clo <- rtCall RtMakeClosure [ I64 addr, I32 (show (refArity r)), V (vImm immUnit) ]
+    storePermanentRootsInto [ Tuple ("@" <> refCell r) clo ]
+  emit "  ret void"
+  text <- takeFn
+  emitDefine ("define void @" <> foreignCloInitSym <> "(ptr %ctx) {\nentry:\n") text
+
+-- | The hoisted-closure init's symbol (ADR-0109 §2.2c): ONE function, in the ENTRY object, called
+-- | first from `pv_init_all`. One derivation, shared by the definition and the call.
+foreignCloInitSym :: String
+foreignCloInitSym = "pv_fclo_init"
+
 -- | Emit a framed `define void @<mangle name>$init(ptr %ctx)` (the `Grec` shape — `Gcaf`
 -- | goes through the plan-driven [`emitGcafInitEngine`] since ADR-0106 slice 2): the
 -- | wrapper owns the WHOLE phase order — open the transient frame, run the body (which roots
@@ -228,8 +263,14 @@ emitGcafInitEngine c = do
 -- | the init wrappers above (`Gfun` fixed shape, the `Grec` framed wrapper, the `Gcaf`
 -- | engine — in each, after any transient frame is popped, so the handle survives).
 storePermanentRoots :: Array (Tuple String Val) -> Codegen Unit
-storePermanentRoots pairs =
-  forA_ pairs \(Tuple key v) -> case rootedSrc v of
+storePermanentRoots pairs = storePermanentRootsInto (map (\(Tuple key v) -> Tuple ("@" <> mangle key <> "$root") v) pairs)
+
+-- | [`storePermanentRoots`] over an explicit TARGET SYMBOL rather than a gdef key — the hoisted
+-- | leaf-closure cells (ADR-0109 §2.2a) are permanent roots too, but their cell is named after the
+-- | leaf's own symbol, not after a global key. One store implementation, two naming schemes.
+storePermanentRootsInto :: Array (Tuple String Val) -> Codegen Unit
+storePermanentRootsInto pairs =
+  forA_ pairs \(Tuple target v) -> case rootedSrc v of
     -- ADR-0106 GlobalSlot→reuse, applied to the permanent tier (slice-1 round 2): the
     -- candidate IS another global's value, already held by a permanent slot whose index is
     -- stable — the new `$root` aliases that slot by copying the INDEX. ABI soundness: a
@@ -239,10 +280,10 @@ storePermanentRoots pairs =
     Just (GlobalSlot sym) -> do
       h <- fresh
       emit ("  " <> h <> " = load i64, ptr " <> sym)
-      emit ("  store i64 " <> h <> ", ptr @" <> mangle key <> "$root")
+      emit ("  store i64 " <> h <> ", ptr " <> target)
     _ -> do
       h <- emitRoot v
-      emit ("  store i64 " <> h <> ", ptr @" <> mangle key <> "$root")
+      emit ("  store i64 " <> h <> ", ptr " <> target)
 
 finishInitFn :: String -> Codegen Unit
 finishInitFn name = do

@@ -15,6 +15,7 @@
 module Purvasm.Compiler.Backend.LLVM.Monad
   ( Ctx
   , Codegen
+  , foreignRef
   , MakeCxOptions
   , makeCx
   , runCodegen
@@ -88,6 +89,7 @@ import Data.String as String
 import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.Compiler.Backend.LLVM.ByNeed (FactMap, noFacts)
 import Purvasm.Compiler.Backend.LLVM.CallClass (CallEvent)
+import Purvasm.Compiler.Backend.LLVM.ForeignRef (ForeignCallMode, ForeignClosureMode, ForeignRef, refKey, unsafeForeignRef)
 import Purvasm.Compiler.Backend.LLVM.Mangle (escapeStringBytes)
 import Purvasm.Compiler.Backend.LLVM.Value (FrameOwner, RootSrc(..), Val, mintAt, ownerActId, rootSrcKey, rootedSrc, unsafeMkFrameOwner, verifyAt)
 import Data.Tuple (Tuple(..))
@@ -111,7 +113,7 @@ type Ctx =
   , gkeys :: Set String -- ^ top-level qualified keys (referenced as `@<mangle>$root`)
   , foreignArity :: Map String Int -- ^ native-leaf key → closure arity (ADR-0073/0080, from FSR)
   , externs :: Set String -- ^ referenced globals not defined here
-  , foreigns :: Set String -- ^ referenced native foreign keys
+  , foreigns :: Map String ForeignRef -- ^ ADR-0109 §1.1: the native leaves this OBJECT references, key → the one minted reference. Minted (and registered) only by [`foreignRef`]; it drives the `declare`s and the `$fclo` cell decls in EVERY object, and additionally the cell DEFINITIONS and their init in the entry object (§2.2-amended), so a leaf cannot be referenced without being declared
   , gfns :: Map String FnInfo -- ^ this module's own top-level function bindings
   , xfns :: Map String FnInfo -- ^ the program's cross-module export surface (ADR-0077 §2)
   , xdecls :: Map String Int -- ^ referenced cross-module direct entries (`$d` symbol → arity)
@@ -126,6 +128,8 @@ type Ctx =
   , defined :: Set String -- ^ ADR-0108 §1: the keys THIS OBJECT defines — the ownership input `directTarget` needs to tell an own-object non-function from a dependency with no published fact. The entry object defines nothing, so it passes the empty set
   , callEvents :: List CallEvent -- ^ ADR-0108 §1: one event per accounted guest-call occurrence (NOT every emitted `call` — runtime machinery is out of scope), in emission order (reversed), written by the arm that emits it. Per OBJECT — [`beginFn`] must not reset it
   , profileApply :: Boolean -- ^ ADR-0108 §3: whether this object is instrumented
+  , foreignCall :: ForeignCallMode -- ^ ADR-0109 slice B + §5.2: whether a saturated leaf call is emitted directly or through the generic dispatch. Read ONLY by the `CApp` decision — it changes which call is emitted, never how the call site was classified
+  , foreignClosure :: ForeignClosureMode -- ^ ADR-0109 slice A + §5.2: how a foreign reference obtains its leaf closure. The SAME value reaches the activation plan (`ActivationConfig`), so the counterfactual leg's emitter and plan switch together
   , byNeedOn :: Boolean -- ^ ADR-0107: whether the lattice is enabled for this module (the measurement counterfactual switches it off; `byNeed` below then stays empty)
   , crossing :: Set String -- ^ ADR-0105: the activation plan's crossing set (consulted only when `rootAll = false`)
   , byNeed :: FactMap -- ^ ADR-0107 §2: the activation plan's by-need decision set — the SAME value the plan classified force sites with. Empty (⇒ every force emitted) outside a planned activation, so an un-planned body is conservative by construction
@@ -146,6 +150,8 @@ type MakeCxOptions =
   , inlineAbi :: Boolean
   , defined :: Set String -- ^ ADR-0108 §1: the object's own defined keys (`entryLl` passes the empty set)
   , profileApply :: Boolean -- ^ ADR-0108 §3: emit the measurement instrumentation (counter bumps + the start-up registration). An OPT-IN build only — the shipped emission must be byte-identical with this off
+  , foreignCall :: ForeignCallMode -- ^ ADR-0109 slice B: `Direct` is the shipped path; `ViaApply` is the §5.2 counterfactual
+  , foreignClosure :: ForeignClosureMode -- ^ ADR-0109: `Hoisted` is the shipped path; `PerUse` is the §5.2 MEASUREMENT counterfactual (the pre-slice-A lowering), and it switches the plan with the emitter
   , byNeed :: Boolean -- ^ ADR-0107: the by-need lattice. `false` is the MEASUREMENT counterfactual (`PURVASM_BYNEED_OFF=1`) — the plan and the emitter switch together, so no elision and no plan change
   }
 
@@ -164,7 +170,7 @@ makeCx opts =
   , gkeys: opts.gkeys
   , foreignArity: opts.foreignArity
   , externs: Set.empty
-  , foreigns: Set.empty
+  , foreigns: Map.empty
   , gfns: Map.empty
   , xfns: opts.xfns
   , xdecls: Map.empty
@@ -174,6 +180,8 @@ makeCx opts =
   , defined: opts.defined
   , callEvents: Nil
   , profileApply: opts.profileApply
+  , foreignCall: opts.foreignCall
+  , foreignClosure: opts.foreignClosure
   , byNeedOn: opts.byNeed
   , spEpoch: 0
   , reloadCache: Map.empty
@@ -328,6 +336,30 @@ beginFn = modify_ \c ->
 -- | epoch, so an object's `.ll` is byte-identical with the log ignored.
 recordCall :: CallEvent -> Codegen Unit
 recordCall ev = modify_ \c -> c { callEvents = ev : c.callEvents }
+
+-- | Mint and REGISTER a reference to native leaf `key` (ADR-0109 §1.1) — the one safe producer of a
+-- | [`ForeignRef`], and the only caller of `unsafeForeignRef`.
+-- |
+-- | Obtaining a reference IS declaring it: the returned value goes into `Ctx.foreigns`, which drives
+-- | the object's `declare i64 @pvf_…`, its hoisted-closure cell and that cell's init. So a lowering
+-- | cannot emit a reference the object never declares, and every consumer reads the SAME derived
+-- | spellings instead of re-deriving them from the key.
+-- |
+-- | A missing arity fact CRASHES here — the single home for the ADR-0090 wiring-bug crash (the shape
+-- | is the source of truth; defaulting would link and then under/over-apply at run time). Registering
+-- | is idempotent: a second reference to the same key is the same value by construction.
+foreignRef :: String -> Codegen ForeignRef
+foreignRef key = do
+  c <- get
+  case Map.lookup key c.foreigns of
+    Just r -> pure r
+    Nothing -> case Map.lookup key c.foreignArity of
+      Nothing -> unsafeCrashWith
+        ("Backend.LLVM.Monad.foreignRef: missing native foreign arity for " <> key <> " (FSR must provide every native leaf's shape, ADR-0090)")
+      Just arity -> do
+        let r = unsafeForeignRef key arity
+        modify_ \c' -> c' { foreigns = Map.insert (refKey r) r c'.foreigns }
+        pure r
 
 -- | A rendered function body whose every line went through the guarded emitters — the
 -- | constructor is private, so call-carrying body text can only re-enter the module buffer via

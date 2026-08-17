@@ -18,6 +18,7 @@ import Test.Unit.Purvasm.Compiler.Backend.LLVM.CallClass as Backend.LLVM.CallCla
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Driver as Backend.LLVM.Driver
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Emit as Backend.LLVM.Emit
 import Test.Unit.Purvasm.Compiler.MiddleEnd.ANF.FreeVars as MiddleEnd.ANF.FreeVars
+import Test.Unit.Purvasm.Compiler.Backend.LLVM.ForeignRef as Backend.LLVM.ForeignRef
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Interface as Backend.LLVM.Interface
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Liveness as Backend.LLVM.Liveness
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Mangle as Backend.LLVM.Mangle
@@ -33,6 +34,7 @@ import Test.Unit.Purvasm.Compiler.Compile as Compile
 import Test.Unit.Purvasm.Compiler.Ffi as Ffi
 import Test.Unit.Purvasm.Compiler.ForeignSig as ForeignSig
 import Test.Unit.Purvasm.Compiler.Link as Link
+import Test.Unit.Purvasm.Compiler.MiddleEnd.ANF as MiddleEnd.ANF
 import Test.Unit.Purvasm.Compiler.MiddleEnd.ANF.Pretty as MiddleEnd.ANF.Pretty
 import Test.Unit.Purvasm.Compiler.MiddleEnd.MatchCompile as MiddleEnd.MatchCompile
 import Test.Unit.Purvasm.Compiler.MiddleEnd.Normalize as MiddleEnd.Normalize
@@ -58,6 +60,7 @@ main = runSpecAndExitProcess [ consoleReporter ] do
   MiddleEnd.Optimizer.Quarantine.spec
   MiddleEnd.Optimizer.Specialize.spec
   MiddleEnd.Optimizer.spec
+  MiddleEnd.ANF.spec
   MiddleEnd.ANF.Pretty.spec
   CESK.Translate.spec
   Bytecode.Lower.spec
@@ -70,6 +73,7 @@ main = runSpecAndExitProcess [ consoleReporter ] do
   Backend.LLVM.Prim.spec
   Backend.LLVM.Program.spec
   MiddleEnd.ANF.FreeVars.spec
+  Backend.LLVM.ForeignRef.spec
   Backend.LLVM.Interface.spec
   Backend.LLVM.Emit.spec
   Backend.LLVM.ByNeed.spec

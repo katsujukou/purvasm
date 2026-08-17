@@ -66,8 +66,9 @@ import Data.Set (Set)
 import Data.Set as Set
 import Data.Tuple (Tuple(..), snd)
 import Purvasm.Compiler.Backend.LLVM.ByNeed (FactMap, activationFacts, elidesForce, elidesForcedValue, noFacts)
+import Purvasm.Compiler.Backend.LLVM.ForeignRef (ForeignClosureMode(..))
 import Purvasm.Compiler.Backend.LLVM.Mangle (sortRecordFields)
-import Purvasm.Compiler.Backend.LLVM.Safepoint (RtOp(..), guestCallSafepoint, rtSafepoint)
+import Purvasm.Compiler.Backend.LLVM.Safepoint (RtOp(..), guestCallSafepoint, rootedReadSafepoint, rtSafepoint)
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr(..), Expr(..), Rhs(..))
@@ -80,6 +81,10 @@ type ActivationConfig =
   { params :: Array String
   , captures :: Array String
   , selfName :: Maybe String
+  -- | ADR-0109 §5.2: the SAME mode the emitter lowers under. A foreign reference allocates in
+  -- | `PerUse` and does not in `Hoisted`, so this is not a cosmetic option — a plan that disagreed
+  -- | with the lowering would under-root the operands around a foreign materialisation.
+  , foreignClosure :: ForeignClosureMode
   }
 
 -- | The walk context: the activation config PLUS the activation's by-need decision set
@@ -92,6 +97,7 @@ type Ctx =
   , captures :: Array String
   , selfName :: Maybe String
   , facts :: FactMap
+  , foreignClosure :: ForeignClosureMode
   }
 
 -- | The activation tier of the ADR-0105 §2 `RootPlan`, plus the lowering-local tier's
@@ -128,10 +134,16 @@ needsFrame p = not (Set.isEmpty p.crossing) || p.loweringMayRoot
 -- | and a foreign reference builds its leaf closure (`pv_make_closure`); a var is a plain
 -- | slot/global reload and scalar literals are immediates. Each allocating arm reads its seam
 -- | row — the row the `Emit.atom` recipe renders that exact call from.
-atomCanSafepoint :: Atom -> Boolean
-atomCanSafepoint = case _ of
-  AtomVar _ -> false
-  AtomForeign _ -> rtSafepoint RtMakeClosure
+atomCanSafepoint :: ForeignClosureMode -> Atom -> Boolean
+atomCanSafepoint mode = case _ of
+  AtomVar _ -> rootedReadSafepoint
+  -- ADR-0109: which row this arm reads is the MODE's to decide, because the mode decides what the
+  -- recipe emits — a hoisted reference is a rooted read (not a safepoint), a per-use one builds the
+  -- closure (`RtMakeClosure`, a safepoint). Both arms name the seam row of the operation actually
+  -- rendered, so a change to either row moves the plan with the lowering.
+  AtomForeign _ -> case mode of
+    Hoisted -> rootedReadSafepoint
+    PerUse -> rtSafepoint RtMakeClosure
   AtomLit (LInt _) -> false
   AtomLit (LBool _) -> false
   AtomLit (LNumber _) -> rtSafepoint RtNewNumber
@@ -141,15 +153,16 @@ atomCanSafepoint = case _ of
 -- | any non-immediate forced operand is a potential safepoint on top of its materialisation —
 -- | UNLESS the activation's decision set proves the operand is never a by-need cell (ADR-0107),
 -- | in which case the emitter emits no chain here and only the atom's own materialisation remains.
-forcedAtomCanSafepoint :: FactMap -> Atom -> Boolean
-forcedAtomCanSafepoint facts a
-  | elidesForce facts a = atomCanSafepoint a
+forcedAtomCanSafepoint :: ForeignClosureMode -> FactMap -> Atom -> Boolean
+forcedAtomCanSafepoint mode facts a
+  | elidesForce facts a = atomCanSafepoint mode a
   | otherwise = case a of
       AtomLit (LInt _) -> false
       AtomLit (LBool _) -> false
       -- every non-immediate: the force slow path alone may run a thunk (a var may hold a by-need
-      -- cell), and boxed literals / foreigns additionally allocate at materialisation.
-      _ -> rtSafepoint RtForceIfByneed || atomCanSafepoint a
+      -- cell), and boxed literals (and, in `PerUse`, foreigns) additionally allocate at
+      -- materialisation.
+      _ -> rtSafepoint RtForceIfByneed || atomCanSafepoint mode a
 
 -- | The §1 classification of the primop's OWN runtime operation (operand forcing is accounted
 -- | separately by `cexprCanSafepoint` — `CPrim` forces its operands): the seam's `RtPrim` row,
@@ -160,16 +173,16 @@ primOpSafepoint op = rtSafepoint (RtPrim op)
 -- | Whether a node's whole lowering sequence can emit ≥ 1 safepoint operation (the §1
 -- | `maySafepoint` transfer). Sub-`Expr`s (branches, guard bodies) are NOT included — the
 -- | backward pass recurses into them itself; this summarises only the node's own operations.
-cexprCanSafepoint :: FactMap -> CExpr -> Boolean
-cexprCanSafepoint facts = case _ of
-  CAtom a -> atomCanSafepoint a
+cexprCanSafepoint :: ForeignClosureMode -> FactMap -> CExpr -> Boolean
+cexprCanSafepoint mode facts = case _ of
+  CAtom a -> atomCanSafepoint mode a
   -- calls run guest code (force + call + settle)
   CApp _ _ -> guestCallSafepoint
   CPerform _ -> guestCallSafepoint
   -- closure construction allocates
   CLam _ _ -> rtSafepoint RtMakeClosure
   -- CPrim forces every operand, then runs the op
-  CPrim op args -> Array.any (forcedAtomCanSafepoint facts) args || primOpSafepoint op
+  CPrim op args -> Array.any (forcedAtomCanSafepoint mode facts) args || primOpSafepoint op
   -- saturated non-nullary ctor allocates; nullary is an immediate tag; unsaturated builds a
   -- builder closure (and `pv_apply`s it when partially applied)
   CCtor _ arity args
@@ -180,25 +193,25 @@ cexprCanSafepoint facts = case _ of
   -- even the empty record allocates
   CRecord _ -> rtSafepoint RtNewRecord
   -- the projection forces a by-need record first; the read itself is read-only
-  CAccessor a _ -> forcedAtomCanSafepoint facts a || rtSafepoint RtRecordGet
+  CAccessor a _ -> forcedAtomCanSafepoint mode facts a || rtSafepoint RtRecordGet
   -- the base force + each `record_set` allocation
-  CUpdate a _ -> forcedAtomCanSafepoint facts a || rtSafepoint RtRecordSet
+  CUpdate a _ -> forcedAtomCanSafepoint mode facts a || rtSafepoint RtRecordSet
   -- the condition force; branch bodies recursed separately
-  CIf a _ _ -> forcedAtomCanSafepoint facts a
+  CIf a _ _ -> forcedAtomCanSafepoint mode facts a
   -- scrutinee forces + dtree machinery (conservative: the dtree is lowering-tier fallback)
   CCase _ _ -> true
 
 -- | Whether `evalAtoms`-style operand evaluation roots intermediates for THIS operand list: an
 -- | operand is rooted iff it is non-immediate and some LATER operand can safepoint (the
 -- | suffix-scan `Emit.evalAtoms` implements; `force` mirrors its force flag).
-operandsMayRoot :: FactMap -> Boolean -> Array Atom -> Boolean
-operandsMayRoot facts force atoms =
+operandsMayRoot :: ForeignClosureMode -> FactMap -> Boolean -> Array Atom -> Boolean
+operandsMayRoot mode facts force atoms =
   -- ONE reverse fold (the same shape as `Emit.evalAtoms`' precomputed suffix scan): at each
   -- element, `later` is "some LATER operand can safepoint" — a per-index `Array.drop`/`any`
   -- re-scan would be quadratic in the operand count (§2a).
   (Array.foldr step { later: false, out: false } atoms).out
   where
-  canSp = if force then forcedAtomCanSafepoint facts else atomCanSafepoint
+  canSp = if force then forcedAtomCanSafepoint mode facts else atomCanSafepoint mode
 
   isImm = case _ of
     AtomLit (LInt _) -> true
@@ -214,24 +227,24 @@ operandsMayRoot facts force atoms =
 -- | root temporaries internally? Derived from the `Emit` recipes; the recipe-consistency tests
 -- | assert the ⇒ direction (roots emitted beyond the prologue ⇒ declared here). Sub-`Expr`s are
 -- | not included (the pass ORs over the whole body itself).
-cexprMayRootLocally :: FactMap -> CExpr -> Boolean
-cexprMayRootLocally facts = case _ of
+cexprMayRootLocally :: ForeignClosureMode -> FactMap -> CExpr -> Boolean
+cexprMayRootLocally mode facts = case _ of
   CAtom _ -> false
   -- args may be rooted by evalAtoms; an SForceCell/SClosureEnv target roots its callee/operands
   CApp _ _ -> true
   CPerform _ -> true
   -- makeClosure evaluates captures (evalAtoms-shaped); conservative when any exist
   CLam _ _ -> true
-  CPrim _ args -> operandsMayRoot facts true args
+  CPrim _ args -> operandsMayRoot mode facts true args
   CCtor _ arity args
     -- unsaturated with supplied fields roots the builder across their evaluation
     | Array.length args < arity && not (Array.null args) -> true
-    | otherwise -> operandsMayRoot facts false args
-  CArray elems -> operandsMayRoot facts false elems
+    | otherwise -> operandsMayRoot mode facts false args
+  CArray elems -> operandsMayRoot mode facts false elems
   -- the emitter sorts fields by unsigned label id BEFORE evalAtoms (ADR-0069 §1), so the
   -- rooting suffix-scan must run over the SAME canonical order — source order can invert which
   -- operand precedes a later allocating one.
-  CRecord fields -> operandsMayRoot facts false (map snd (sortRecordFields (map (\f -> Tuple f.prop f.val) fields)))
+  CRecord fields -> operandsMayRoot mode facts false (map snd (sortRecordFields (map (\f -> Tuple f.prop f.val) fields)))
   CAccessor _ _ -> false
   -- the accumulator is rooted across every step
   CUpdate _ _ -> true
@@ -269,7 +282,7 @@ activationPlanWith opts cfg body =
   let
     facts = if opts.byNeed then activationFacts cfg.params body else noFacts
 
-    ctx = { params: cfg.params, captures: cfg.captures, selfName: cfg.selfName, facts }
+    ctx = { params: cfg.params, captures: cfg.captures, selfName: cfg.selfName, facts, foreignClosure: cfg.foreignClosure }
 
     r = goExpr ctx body Set.empty
 
@@ -377,7 +390,7 @@ prefixHazards :: Ctx -> Boolean -> Array Atom -> Set String
 prefixHazards cfg force atoms =
   (Array.foldl step { sp: false, out: Set.empty } atoms).out
   where
-  canSp = if force then forcedAtomCanSafepoint cfg.facts else atomCanSafepoint
+  canSp = if force then forcedAtomCanSafepoint cfg.foreignClosure cfg.facts else atomCanSafepoint cfg.foreignClosure
 
   step st a =
     { sp: st.sp || canSp a
@@ -396,7 +409,7 @@ preReadHazards cfg = case _ of
     prefixHazards cfg false (Array.cons f args)
       <> case f of
         AtomVar x
-          | cfg.selfName == Just x, Array.any atomCanSafepoint args -> Set.singleton envPseudo
+          | cfg.selfName == Just x, Array.any (atomCanSafepoint cfg.foreignClosure) args -> Set.singleton envPseudo
         _ -> Set.empty
   CPerform t -> preReadHazards cfg (CApp t [ AtomLit (LInt 0) ])
   CPrim _ args -> prefixHazards cfg true args
@@ -428,7 +441,7 @@ goC cfg c k = case c of
       rt = goExpr cfg t k
       re = goExpr cfg e k
       branchLive = rt.live <> re.live
-      condSp = forcedAtomCanSafepoint cfg.facts a
+      condSp = forcedAtomCanSafepoint cfg.foreignClosure cfg.facts a
     in
       { live: atomUses cfg a <> branchLive
       -- the condition force precedes both branches: everything live at a branch entry is live
@@ -464,12 +477,12 @@ goC cfg c k = case c of
       -- biggest recovered class, resting on the §6.1 buffer-handover contract.
       { live: k <> captures
       , crossing: k
-      , mayRoot: cexprMayRootLocally cfg.facts c
+      , mayRoot: cexprMayRootLocally cfg.foreignClosure cfg.facts c
       , anySafepoint: true
       }
   _ ->
     let
-      sp = cexprCanSafepoint cfg.facts c
+      sp = cexprCanSafepoint cfg.foreignClosure cfg.facts c
     in
       -- 2b-1 (§6.3): crossingContribution(N) = liveAfter(N) ∪ preReadHazardOperands(N) —
       -- the liveAfter term is 2a's unchanged; the operand term is refined from ALL operand
@@ -477,7 +490,7 @@ goC cfg c k = case c of
       -- forward prefix), resting on the §6.1 handover contract for the handed-over leg.
       { live: k <> cexprUses cfg c
       , crossing: if sp then k <> preReadHazards cfg c else Set.empty
-      , mayRoot: cexprMayRootLocally cfg.facts c
+      , mayRoot: cexprMayRootLocally cfg.foreignClosure cfg.facts c
       , anySafepoint: sp
       }
 

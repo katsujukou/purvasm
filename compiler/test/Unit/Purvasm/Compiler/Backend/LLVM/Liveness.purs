@@ -11,6 +11,8 @@ module Test.Unit.Purvasm.Compiler.Backend.LLVM.Liveness where
 
 import Prelude
 
+import Purvasm.Compiler.Backend.LLVM.ForeignRef (ForeignClosureMode(..))
+
 import Data.Array as Array
 import Data.Maybe (Maybe(..))
 import Data.Set as Set
@@ -35,7 +37,7 @@ str :: String -> Atom
 str = AtomLit <<< LString
 
 cfg0 :: ActivationConfig
-cfg0 = { params: [], captures: [], selfName: Nothing }
+cfg0 = { params: [], captures: [], selfName: Nothing, foreignClosure: Hoisted }
 
 crossingOf :: ActivationConfig -> Expr -> Array String
 crossingOf cfg body = Set.toUnfoldable (activationPlan cfg body).crossing
@@ -62,6 +64,27 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
               (Ret (CPrim AddInt [ var "x", var "y" ]))
           )
       crossingOf cfg0 body `shouldEqual` [ "x", "y" ]
+
+    -- ADR-0109 slice A / §4: a foreign REFERENCE is a rooted read, not an allocation. Before the
+    -- slice it built the leaf closure (`pv_make_closure`, a safepoint), so an earlier operand had to
+    -- be rooted across it; now nothing between the two operands can move a value.
+    --
+    -- This is the seam counterfactual in test form: the arm reads `rootedReadSafepoint`, so flipping
+    -- that row moves the plan, and the CONTRAST below shows the fixture is discriminating — the same
+    -- shape with a still-allocating atom (a boxed string literal) DOES cross.
+    it "a foreign reference no longer hazards an earlier operand; a boxed literal still does" do
+      -- the §6.3 order: an ALLOCATING EARLIER operand hazards a later var.
+      crossingOf (cfg0 { params = [ "x" ] }) (Ret (CApp (var "f") [ AtomForeign "M.leaf", var "x" ])) `shouldEqual` []
+      crossingOf (cfg0 { params = [ "x" ] }) (Ret (CApp (var "f") [ str "s", var "x" ])) `shouldEqual` [ "x" ]
+
+    -- …and under the §5.2 counterfactual the plan moves BACK, because the emitter does: `PerUse`
+    -- builds the closure at the reference, so the same list roots `x` again. This is the
+    -- plan-and-emitter co-switch in one assertion — a mode that reached only the emitter would
+    -- leave this leg under-rooted, which is a GC bug, not a slower measurement.
+    it "PerUse restores the hazard, because the reference allocates again (§5.2 co-switch)" do
+      let perUse = cfg0 { params = [ "x" ], foreignClosure = PerUse }
+      crossingOf perUse (Ret (CApp (var "f") [ AtomForeign "M.leaf", var "x" ])) `shouldEqual` [ "x" ]
+      crossingOf perUse (Ret (CApp (var "f") [ var "x", AtomForeign "M.leaf" ])) `shouldEqual` []
 
     it "consumed-at-call is direct; a later use crosses via liveAfter (2b-1)" do
       let
@@ -144,7 +167,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
               (Ret (CApp (var "loop") [ var "m" ]))
               (Ret (CAtom (var "n")))
           )
-        plan = activationPlan { params: [ "c", "m", "n" ], captures: [], selfName: Just "loop" } body
+        plan = activationPlan { params: [ "c", "m", "n" ], captures: [], selfName: Just "loop", foreignClosure: Hoisted } body
       Set.member envPseudo plan.crossing `shouldEqual` true
 
     it "%env crosses a self-call only when an argument's materialisation precedes its read (2b-1)" do
@@ -153,14 +176,14 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
       -- argument materialises (§6.3's SSelf row).
       let
         body = Ret (CApp (var "loop") [ var "m" ])
-        plan = activationPlan { params: [ "m" ], captures: [], selfName: Just "loop" } body
+        plan = activationPlan { params: [ "m" ], captures: [], selfName: Just "loop", foreignClosure: Hoisted } body
       -- §6.3: a var argument cannot materialise, so the post-argument %env read has no
       -- pre-read hazard — recovered under 2b-1…
       Set.member envPseudo plan.crossing `shouldEqual` false
       -- …but an argument whose materialisation allocates (a string literal) hazards it.
       let
         body' = Ret (CApp (var "loop") [ str "s" ])
-        plan' = activationPlan { params: [], captures: [], selfName: Just "loop" } body'
+        plan' = activationPlan { params: [], captures: [], selfName: Just "loop", foreignClosure: Hoisted } body'
       Set.member envPseudo plan'.crossing `shouldEqual` true
 
     it "guard clauses are sequential: a binder used only after a failing guard crosses its safepoints" do
@@ -384,25 +407,25 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
       case map fst (sortRecordFields [ Tuple "a" unit, Tuple "value" unit ]) of
         [ l1, l2 ] -> do
           let fields = [ { prop: l2, val: AtomLit (LString "s") }, { prop: l1, val: var "x" } ]
-          operandsMayRoot noFacts false (map _.val fields) `shouldEqual` false -- the naive source order
-          cexprMayRootLocally noFacts (CRecord fields) `shouldEqual` true -- the canonical order
+          operandsMayRoot Hoisted noFacts false (map _.val fields) `shouldEqual` false -- the naive source order
+          cexprMayRootLocally Hoisted noFacts (CRecord fields) `shouldEqual` true -- the canonical order
         other -> fail ("sortRecordFields returned " <> show (Array.length other) <> " labels")
 
     it "is linear: 20k non-immediate no-safepoint operands decide instantly" do
       -- unforced vars can never safepoint → false; the per-index suffix re-scan this pins
       -- against was O(n²) here (never exercised by all-immediate fixtures).
-      operandsMayRoot noFacts false (Array.replicate 20000 (var "x")) `shouldEqual` false
+      operandsMayRoot Hoisted noFacts false (Array.replicate 20000 (var "x")) `shouldEqual` false
 
     it "roots only when a later operand can safepoint" do
       -- [x, 1]: nothing after x can safepoint → no rooting; [x, y] forced: y forces → x rooted.
-      operandsMayRoot noFacts true [ var "x", int 1 ] `shouldEqual` false
-      operandsMayRoot noFacts true [ var "x", var "y" ] `shouldEqual` true
+      operandsMayRoot Hoisted noFacts true [ var "x", int 1 ] `shouldEqual` false
+      operandsMayRoot Hoisted noFacts true [ var "x", var "y" ] `shouldEqual` true
       -- unforced vars never safepoint as operands → no rooting even with two vars
-      operandsMayRoot noFacts false [ var "x", var "y" ] `shouldEqual` false
+      operandsMayRoot Hoisted noFacts false [ var "x", var "y" ] `shouldEqual` false
       -- a later boxed literal allocates even unforced
-      operandsMayRoot noFacts false [ var "x", AtomLit (LString "s") ] `shouldEqual` true
+      operandsMayRoot Hoisted noFacts false [ var "x", AtomLit (LString "s") ] `shouldEqual` true
       -- immediates are never rooted
-      operandsMayRoot noFacts true [ int 1, var "x" ] `shouldEqual` false
+      operandsMayRoot Hoisted noFacts true [ int 1, var "x" ] `shouldEqual` false
 
   describe "primOpSafepoint (the §1 table, prim rows)" do
     it "classifies the allocating vs non-allocating prim families" do
@@ -416,17 +439,17 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
       primOpSafepoint RecordGet `shouldEqual` false
       primOpSafepoint NumberToInt `shouldEqual` false
 
-  describe "cexprMayRootLocally noFacts (the lowering-tier declarations)" do
+  describe "cexprMayRootLocally Hoisted noFacts (the lowering-tier declarations)" do
     it "declares the recipes that root temporaries" do
-      cexprMayRootLocally noFacts (CUpdate (var "r") []) `shouldEqual` true
-      cexprMayRootLocally noFacts (CCase [ var "s" ] []) `shouldEqual` true
-      cexprMayRootLocally noFacts (CApp (var "f") []) `shouldEqual` true
-      cexprMayRootLocally noFacts (CAtom (var "x")) `shouldEqual` false
-      cexprMayRootLocally noFacts (CAccessor (var "d") "f") `shouldEqual` false
+      cexprMayRootLocally Hoisted noFacts (CUpdate (var "r") []) `shouldEqual` true
+      cexprMayRootLocally Hoisted noFacts (CCase [ var "s" ] []) `shouldEqual` true
+      cexprMayRootLocally Hoisted noFacts (CApp (var "f") []) `shouldEqual` true
+      cexprMayRootLocally Hoisted noFacts (CAtom (var "x")) `shouldEqual` false
+      cexprMayRootLocally Hoisted noFacts (CAccessor (var "d") "f") `shouldEqual` false
       -- ctor: saturated with no later-safepoint operands needs no operand roots
-      cexprMayRootLocally noFacts (CCtor "T" 2 [ var "a", int 1 ]) `shouldEqual` false
+      cexprMayRootLocally Hoisted noFacts (CCtor "T" 2 [ var "a", int 1 ]) `shouldEqual` false
       -- unsaturated with supplied fields roots the builder
-      cexprMayRootLocally noFacts (CCtor "T" 2 [ var "a" ]) `shouldEqual` true
+      cexprMayRootLocally Hoisted noFacts (CCtor "T" 2 [ var "a" ]) `shouldEqual` true
 
   describe "§2a scale (default stack)" do
     it "walks a 50k-binding Let spine on the default stack" do

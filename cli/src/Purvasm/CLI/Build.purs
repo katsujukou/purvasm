@@ -46,6 +46,7 @@ import Purvasm.CLI.NativeLink as NativeLink
 import Purvasm.CLI.Ulib (corefnPathFor, requireUlibDir)
 import Purvasm.Compiler (Backend, BuildError(..), CompilerAction, LoadResult(..), build)
 import Purvasm.Compiler.Backend.LLVM.Abi (defaultHeapWords)
+import Purvasm.Compiler.Backend.LLVM.ForeignRef (foreignCallEnvVar, foreignClosureEnvVar, parseForeignCallMode, parseForeignClosureMode)
 import Purvasm.Compiler.Backend.LLVM.Driver (LlvmContext, llvmBackend)
 import Purvasm.Compiler.Bytecode.Artifact (interfaceToString)
 import Purvasm.Compiler.CESK.Translate (nameKey)
@@ -299,11 +300,24 @@ cmd opts = do
     Nothing -> pure false
     Just "1" -> pure true
     Just other -> throw (Fmt.fmt @"PURVASM_PROFILE_APPLY: expected absent or \"1\", got {other}" { other: show other })
+  -- Measurement-only knob (ADR-0109 §5.2): `PURVASM_FOREIGN_CLOSURE=per-use` restores the
+  -- pre-slice-A lowering (a leaf closure built at every reference) for the paired A/B's off leg.
+  -- Parsed ONCE, here, into the closed `ForeignClosureMode`; the same value reaches the emitter and
+  -- the activation plan, so they cannot disagree. Fail-closed: an unrecognised value is an error,
+  -- never "the shipped mode", because a typo would silently report the two legs as one.
+  foreignClosure <- lookupEnv foreignClosureEnvVar >>= \raw -> case parseForeignClosureMode raw of
+    Right m -> pure m
+    Left msg -> throw msg
+  -- Measurement-only knob (ADR-0109 §5.2, slice B): `PURVASM_FOREIGN_CALL=via-apply` keeps a
+  -- saturated leaf call on the generic dispatch. Parsed once, fail-closed, same as its sibling.
+  foreignCall <- lookupEnv foreignCallEnvVar >>= \raw -> case parseForeignCallMode raw of
+    Right m -> pure m
+    Left msg -> throw msg
   let
     action = mkAction opts ulibDir buildDir fsEnv modIdx irBuf
 
     backend :: Backend LlvmContext String
-    backend = llvmBackend { isEffect: not opts.value, heapWords: defaultHeapWords, debug: debugAbi, profileApply, byNeed: not byNeedOff }
+    backend = llvmBackend { isEffect: not opts.value, heapWords: defaultHeapWords, debug: debugAbi, profileApply, byNeed: not byNeedOff, foreignClosure, foreignCall }
     buildOpts =
       { entryModule: opts.entryModule
       , entryName: opts.entryName

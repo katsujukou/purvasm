@@ -58,14 +58,15 @@ import Data.Tuple (Tuple(..), fst, snd)
 import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.Compiler.Backend.LLVM.Abi (abiSettle, forceValue)
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (fvExpr)
-import Purvasm.Compiler.Backend.LLVM.Mangle (ctorTag, imm, immBool, immInt, immUnit, labelId, mangle, mangleForeign, sortRecordFields)
-import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, PhiIncoming, beginFn, recordCall, emit, emitAnfLabel, emitDefine, snapshotReloads, emitGuestRet, emitGuestStore, emitGuestSwitch, emitPayloadAshr, emitPhi, emitLowBitAnd, closeHopArm, emitStringConstant, foldA, forA, forA_, fresh, freshFn, freshLabel, mintCloWord, mintEnvWord, mintLoad, mintParam, takeFn)
+import Purvasm.Compiler.Backend.LLVM.Mangle (ctorTag, imm, immBool, immInt, immUnit, labelId, mangle, sortRecordFields)
+import Purvasm.Compiler.Backend.LLVM.ForeignRef (ForeignClosureMode(..), ForeignRef, refArity, refCell, refKey, refSym)
+import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, foreignRef, PhiIncoming, beginFn, recordCall, emit, emitAnfLabel, emitDefine, snapshotReloads, emitGuestRet, emitGuestStore, emitGuestSwitch, emitPayloadAshr, emitPhi, emitLowBitAnd, closeHopArm, emitStringConstant, foldA, forA, forA_, fresh, freshFn, freshLabel, mintCloWord, mintEnvWord, mintLoad, mintParam, takeFn)
 import Purvasm.Compiler.Backend.LLVM.Prim (inlinePrim)
 import Purvasm.Compiler.Backend.LLVM.ByNeed (elidesForce, elidesForcedValue)
-import Purvasm.Compiler.Backend.LLVM.CallClass (CallEvent(..), MissReason(..), profileSlot)
+import Purvasm.Compiler.Backend.LLVM.CallClass (AllocSite(..), CallEvent(..), CallTarget(..), EmissionDecision(..), Form(..), MissReason(..), callForm, decide, eventOf, profileSlot)
 import Purvasm.Compiler.Backend.LLVM.Liveness (activationPlanWith, atomCanSafepoint, envPseudo, forcedAtomCanSafepoint, needsFrame)
 import Purvasm.Compiler.Backend.LLVM.Root (FrameToken, emitGcafInitEngine, ensureRooted, musttailWith, openFrame, retWith, tailcallWith)
-import Purvasm.Compiler.Backend.LLVM.Safepoint (RtArg(..), RtOp(..), guestDirect, rtCall, rtCallVoid)
+import Purvasm.Compiler.Backend.LLVM.Safepoint (RtArg(..), RtOp(..), foreignDirect, guestDirect, noteAllocSite, rtCall, rtCallVoid)
 import Purvasm.Compiler.Backend.LLVM.Types (BindingV(..), Env, EnvSrc(..), FnInfo, Lifted(..), LiftedBody(..), bindDirectFnVar, bindDirectVar, bindFnVar, bindVar, lookupEnv)
 import Purvasm.Compiler.Backend.LLVM.Value (Val, rootedVal, vImm, vRootedGlobal)
 import Purvasm.Compiler.Binder (Binder(..))
@@ -178,20 +179,29 @@ atom env = case _ of
     Tuple p len <- stringConstant s
     rtCall RtNewStr [ Ptr p, I64 (show len) ]
   AtomForeign k -> do
-    -- A native foreign leaf resolves by link-time symbol (ADR-0073 §3): reference its `AbiCodeFn`
-    -- `@pvf_<mangle key>` and wrap it in a no-capture closure of the leaf's **physical closure arity**.
-    -- That is `foreignArity` — which the driver derives from the FSR shape (`Driver.leafClosureArity`),
-    -- **not** the raw semantic `ForeignShape.arity`: a nullary `Effect` leaf is physical arity 1 (it *is*
-    -- the thunk), while its semantic arity is 0. ADR-0090 makes the shape the single source of truth, so a
-    -- missing entry is a wiring bug — crash at compile time rather than default to a wrong closure arity
-    -- (which would link but under/over-apply at runtime).
-    modify_ \c -> c { foreigns = Set.insert k c.foreigns }
-    arity <- gets (Map.lookup k <<< _.foreignArity) >>= case _ of
-      Just a -> pure a
-      Nothing -> unsafeCrashWith ("Backend.LLVM.Emit.atom: missing native foreign arity for " <> k <> " (FSR must provide every native leaf's shape, ADR-0090)")
-    addr <- fresh
-    emit ("  " <> addr <> " = ptrtoint ptr @" <> mangleForeign k <> " to i64")
-    rtCall RtMakeClosure [ I64 addr, I32 (show arity), V (vImm immUnit) ]
+    -- A native foreign leaf resolves by link-time symbol (ADR-0073 §3): its `AbiCodeFn`
+    -- `@pvf_<mangle key>` wrapped in a no-capture closure of the leaf's **physical closure arity**
+    -- (`foreignArity`, from the FSR shape — ADR-0090; see `Monad.foreignRef`).
+    --
+    -- ADR-0109 slice A: that closure is HOISTED. It is a constant — same code address, same arity,
+    -- unit env — so building one per execution allocated (and safepointed) once per foreign
+    -- reference, ~434 M times on the self-host workload. The object builds one per key at init
+    -- instead (`Root.emitForeignCloInit`), and a reference is now a read of its permanent-root cell:
+    -- the same lowering as any rooted global, and NOT a safepoint.
+    ref <- foreignRef k
+    -- ADR-0109 §5.1: this materialisation is the LEFT side of the allocation identity. It is counted
+    -- at the SITE rather than at the allocation, so the count is unchanged by the mode below — the
+    -- two legs must count the same occurrences for the `Kind::Closure` delta between them to be
+    -- attributable to the change.
+    noteAllocSite SiteForeignMaterialise
+    gets _.foreignClosure >>= case _ of
+      Hoisted -> pure (vRootedGlobal ("@" <> refCell ref))
+      -- The §5.2 counterfactual: exactly the pre-slice-A lowering — build the closure here, every
+      -- time. `Liveness` reads the same mode, so the plan roots around this allocation.
+      PerUse -> do
+        addr <- fresh
+        emit ("  " <> addr <> " = ptrtoint ptr @" <> refSym ref <> " to i64")
+        rtCall RtMakeClosure [ I64 addr, I32 (show (refArity ref)), V (vImm immUnit) ]
 
 -- | Materialise a string literal as a module-level `@.str.N` byte constant (boot's `string_constant`),
 -- | returning the `getelementptr`-to-first-byte pointer operand and the byte length. An empty string is
@@ -247,6 +257,7 @@ forceAtom env a = do
 evalAtoms :: Maybe FrameToken -> Boolean -> Env -> Array Atom -> Codegen (Array Val)
 evalAtoms frame force env atoms = do
   facts <- gets _.byNeed
+  mode <- gets _.foreignClosure
   -- Stack-safety (2026-07-16 bugfix): a sequenced `State` step is a live host frame on the JS
   -- backend — a `Regex.Core.Unicode`-scale array literal (1,290 operands) was ~0.5× the
   -- default stack — so the pass is a `tailRecM` loop with a precomputed suffix scan for the
@@ -258,7 +269,7 @@ evalAtoms frame force env atoms = do
     -- set the plan published (ADR-0107 §2) — a hardcoded arm here is exactly the
     -- analysis-vs-lowering drift class the seam exists to prevent, found live by the
     -- 2026-08-06 force counterfactual where flipping the row moved the plan but not this pass.
-    canSafepoint = if force then forcedAtomCanSafepoint facts else atomCanSafepoint
+    canSafepoint = if force then forcedAtomCanSafepoint mode facts else atomCanSafepoint mode
 
     -- `laterCan !! i` ⇔ the original `any canSafepoint rest` at element `i`.
     laterCan :: Array Boolean
@@ -317,7 +328,7 @@ finish frame tail v =
 -- | leaf simply names its outcome instead of collapsing to `Nothing`. Note the self-call shortcuts
 -- | are not leaves: a shortcut whose shape does not match FALLS THROUGH to the local/global
 -- | lookups and can still resolve directly, which is why there is no "self shape" reason.
-directTarget :: Env -> Atom -> Int -> Codegen (Either MissReason FnInfo)
+directTarget :: Env -> Atom -> Int -> Codegen CallTarget
 directTarget env f nargs = case f of
   AtomVar x -> case lookupEnv x env of
     Just entry -> do
@@ -327,11 +338,11 @@ directTarget env f nargs = case f of
           | s.name == x
           , Just h0 <- s.captureHandle
           , entry.key == h0
-          , s.fnInfo.arity == nargs -> pure (Right s.fnInfo)
+          , s.fnInfo.arity == nargs -> pure (GuestTarget s.fnInfo)
         _ -> pure case entry.knownFn of
-          Just info | info.arity == nargs -> Right info
-          Just _ -> Left MissArityLocal
-          Nothing -> Left MissLocalUnknownFn
+          Just info | info.arity == nargs -> GuestTarget info
+          Just _ -> GenericTarget MissArityLocal
+          Nothing -> GenericTarget MissLocalUnknownFn
     Nothing -> do
       gkeys <- gets _.gkeys
       if Set.member x gkeys then do
@@ -340,20 +351,20 @@ directTarget env f nargs = case f of
           Just s
             | s.name == x
             , Nothing <- s.captureHandle
-            , s.fnInfo.arity == nargs -> pure (Right s.fnInfo)
+            , s.fnInfo.arity == nargs -> pure (GuestTarget s.fnInfo)
           _ -> do
             gfns <- gets _.gfns
             case Map.lookup x gfns of
-              Just info | info.arity == nargs -> pure (Right info)
+              Just info | info.arity == nargs -> pure (GuestTarget info)
               -- own-module fact says unsaturated: never fall through to the surface.
-              Just _ -> pure (Left MissArityOwnModule)
+              Just _ -> pure (GenericTarget MissArityOwnModule)
               Nothing -> do
                 xfns <- gets _.xfns
                 case Map.lookup x xfns of
                   Just info | info.arity == nargs -> do
                     modify_ \c -> c { xdecls = Map.insert info.dsym info.arity c.xdecls }
-                    pure (Right info)
-                  Just _ -> pure (Left MissArityCrossModule)
+                    pure (GuestTarget info)
+                  Just _ -> pure (GenericTarget MissArityCrossModule)
                   -- Neither a direct fact of this object nor a published one. WHICH it is needs the
                   -- ownership input (ADR-0108 §1): a key this object defines is an own-object
                   -- non-function (a `Gcaf`); anything else is a dependency with no published
@@ -361,13 +372,18 @@ directTarget env f nargs = case f of
                   -- dependency arm.
                   Nothing -> do
                     defined <- gets _.defined
-                    pure (Left (if Set.member x defined then MissOwnObjectNotFn else MissDepNoDirectFact))
-      else pure (Left MissUnknownKey)
+                    pure (GenericTarget (if Set.member x defined then MissOwnObjectNotFn else MissDepNoDirectFact))
+      else pure (GenericTarget MissUnknownKey)
   -- ANF has exactly three atoms, so the non-variable callees are these two and the split is total
   -- (ADR-0108 §4 slice 1). They are kept apart because they mean opposite things: a foreign callee
   -- is a candidate lever, a literal callee is a bug candidate.
-  AtomForeign _ -> pure (Left MissCalleeForeign)
-  AtomLit _ -> pure (Left MissCalleeLiteral)
+  -- ADR-0109 §1.2: a saturated native leaf is a TERMINAL OUTCOME of this classifier, not something
+  -- the `CApp` arm re-derives. `foreignRef` is the one safe producer (and the one arity crash site);
+  -- an arity disagreement is the residue `MissCalleeForeign` now means, in BOTH legs of the A/B.
+  AtomForeign k -> do
+    ref <- foreignRef k
+    pure (if refArity ref == nargs then ForeignTarget ref else GenericTarget MissCalleeForeign)
+  AtomLit _ -> pure (GenericTarget MissCalleeLiteral)
 
 -- | Lower a computation. Slice-1a handles `CAtom`; the rest are later slices.
 cexpr :: Maybe FrameToken -> Env -> Boolean -> CExpr -> Codegen (Maybe Val)
@@ -423,8 +439,18 @@ cexpr frame env tail = case _ of
     l <- lift env ps body
     makeClosure env l >>= finish frame tail
   CApp f args -> do
-    directTarget env f (Array.length args) >>= case _ of
-      Right info -> do
+    -- ADR-0109 §1.2: the classifier answers ELIGIBILITY, the `tail`/`inDirect` branch supplies the
+    -- FORM, and `decide` closes the two over the §5.2 knob. Every arm below emits its decision's own
+    -- event (`eventOf`), so a decision and its record cannot disagree.
+    target <- directTarget env f (Array.length args)
+    inDir0 <- gets _.inDirect
+    callMode <- gets _.foreignCall
+    let
+      -- ONE derivation, target-aware, pure and unit-tested (`CallClass.callForm`), and it is the
+      -- DECISION's form that drives every recipe below — never the raw `tail` Boolean.
+      form = callForm { tail, inDirect: inDir0 } target
+    case decide callMode form target of
+      EmitGuestDirect info guestForm -> do
         -- Direct known-arity call (ADR-0076 §2/§3): the env word is derived per the callee's shape;
         -- a cell force is a safepoint (the suspension may run guest code), so operands are re-read
         -- from their roots after it.
@@ -456,8 +482,7 @@ cexpr frame env tail = case _ of
             forcedVal <- rtCall RtForceIfByneed [ V (rootedVal fh) ]
             e <- rtCall RtReadField [ V forcedVal, I64 "2" ]
             pure (Tuple e (map rootedVal argHs))
-        inDir <- gets _.inDirect
-        if tail && inDir then do
+        if guestForm == FTail then do
           -- musttail (ADR-0076 §3): the fused pop+musttail+ret — every operand (env word
           -- included) is computed before the pop; no safepoint in between.
           noteCall (DirectMusttail info)
@@ -473,32 +498,57 @@ cexpr frame env tail = case _ of
             emitRet frame r'
             pure Nothing
           else pure (Just r')
-      Left reason -> do
-        -- `f` and the args are mutually protected: a foreign callee or a `String` arg may allocate.
-        all <- evalAtoms frame false env (Array.cons f args)
-        case Array.uncons all of
-          Just { head: fv, tail: ops } ->
-            if tail then do
-              -- Trampoline tail call (ADR-0071 §4): stash the pending tail, pop this frame, return.
-              -- NOTE (ADR-0108 §2): this is a `pv_tailcall` STORE, not a `pv_apply` — the generic
-              -- tail class is invisible in `pv_apply` counts, which is why it has its own column.
-              --
-              -- `noteCall` sits AFTER operand materialisation, immediately before the dispatch:
-              -- the counter it emits (§3) counts DISPATCHES, and `evalAtoms`/`argBuffer` can force
-              -- a by-need cell or allocate. Announcing the dispatch before the work that might not
-              -- reach it would make the dynamic count a count of intentions.
-              Tuple p n <- argBuffer ops
-              noteCall (GenericTail reason)
-              noteForeignDrill f (Array.length args) "tail"
-              tailcallWith frame { fv, argp: p, nargs: n }
-              pure Nothing
-            else do
-              Tuple p n <- argBuffer ops
-              noteCall (GenericApply reason)
-              noteForeignDrill f (Array.length args) "apply"
-              t <- rtCall RtApply [ V fv, Ptr p, I64 (show n) ]
-              pure (Just t)
-          Nothing -> unsafeCrashWith "Backend.LLVM.Emit.cexpr: empty CApp operand list"
+      -- ADR-0109 §2/§3: a saturated native leaf, called through its own `AbiCodeFn` entry. The
+      -- argument buffer is unchanged (that is the leaf ABI); what goes away is the closure the old
+      -- path rebuilt per call (slice A already did) and the `pv_apply` boundary.
+      --
+      -- The TAIL form is a direct call, the frame pop, and `ret` — NOT a trampoline (§3): a leaf is
+      -- first-order host code that returns to its caller, so there is no chain to bound, and
+      -- `musttail` is not available anyway (`ccc` vs `tailcc`, different signature). No `pv_settle`
+      -- either: a `pvf_` entry never leaves a pending tail (§3 clause 1).
+      EmitForeignDirect ref fform -> do
+        clo <- atom env f
+        ops <- evalAtoms frame false env args
+        Tuple bp bn <- argBuffer ops
+        noteCall (eventOf (EmitForeignDirect ref fform))
+        noteForeignDrill f (Array.length args) (show fform)
+        r <- foreignDirect { fsym: refSym ref, clo, argp: bp, nargs: bn }
+        if tail then do
+          emitRet frame r
+          pure Nothing
+        else pure (Just r)
+      -- ELIGIBLE, but the §5.2 knob is off: lower exactly as the generic path does, and record it as
+      -- its OWN class so the residue counter does not change meaning between the legs.
+      EmitForeignDeferred ref fform -> genericCall fform (eventOf (EmitForeignDeferred ref fform))
+      EmitGeneric reason gform -> genericCall gform (eventOf (EmitGeneric reason gform))
+    where
+    genericCall gform ev = do
+      -- `f` and the args are mutually protected: a foreign callee or a `String` arg may allocate.
+      all <- evalAtoms frame false env (Array.cons f args)
+      case Array.uncons all of
+        Just { head: fv, tail: ops } ->
+          -- the DECISION's form, never the raw `tail`: the two must not be able to disagree.
+          if gform == FTail then do
+            -- Trampoline tail call (ADR-0071 §4): stash the pending tail, pop this frame, return.
+            -- NOTE (ADR-0108 §2): this is a `pv_tailcall` STORE, not a `pv_apply` — the generic
+            -- tail class is invisible in `pv_apply` counts, which is why it has its own column.
+            --
+            -- `noteCall` sits AFTER operand materialisation, immediately before the dispatch:
+            -- the counter it emits (§3) counts DISPATCHES, and `evalAtoms`/`argBuffer` can force
+            -- a by-need cell or allocate. Announcing the dispatch before the work that might not
+            -- reach it would make the dynamic count a count of intentions.
+            Tuple p n <- argBuffer ops
+            noteCall ev
+            noteForeignDrill f (Array.length args) (show FTail)
+            tailcallWith frame { fv, argp: p, nargs: n }
+            pure Nothing
+          else do
+            Tuple p n <- argBuffer ops
+            noteCall ev
+            noteForeignDrill f (Array.length args) (show FApply)
+            t <- rtCall RtApply [ V fv, Ptr p, I64 (show n) ]
+            pure (Just t)
+        Nothing -> unsafeCrashWith "Backend.LLVM.Emit.cexpr: empty CApp operand list"
   CCtor name arity args ->
     let
       nargs = Array.length args
@@ -798,8 +848,9 @@ cexpr frame env tail = case _ of
 emitGcafInit :: String -> Expr -> Codegen Unit
 emitGcafInit key e = do
   byNeedOn <- gets _.byNeedOn
+  mode <- gets _.foreignClosure
   let
-    plan = activationPlanWith { byNeed: byNeedOn } { params: [], captures: [], selfName: Nothing } e
+    plan = activationPlanWith { byNeed: byNeedOn } { params: [], captures: [], selfName: Nothing, foreignClosure: mode } e
   emitGcafInitEngine
     { key
     , framed: needsFrame plan
@@ -1045,7 +1096,11 @@ emitFunction (Lifted l) = do
   plan <- case l.body of
     LBody e -> do
       byNeedOn <- gets _.byNeedOn
-      let p = activationPlanWith { byNeed: byNeedOn } { params: l.params, captures: l.captures, selfName: l.selfName } e
+      -- the plan is handed the SAME foreign-closure mode the lowering below emits under
+      -- (ADR-0109 §5.2): the counterfactual leg allocates at every foreign reference, and a plan
+      -- that did not know it would under-root the operands around that allocation.
+      mode <- gets _.foreignClosure
+      let p = activationPlanWith { byNeed: byNeedOn } { params: l.params, captures: l.captures, selfName: l.selfName, foreignClosure: mode } e
       modify_ \c -> c { rootAll = false, crossing = p.crossing, byNeed = p.byNeed }
       pure (Just p)
     LClosure _ -> pure Nothing

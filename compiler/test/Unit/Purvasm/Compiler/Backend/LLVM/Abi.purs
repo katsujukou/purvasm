@@ -6,6 +6,8 @@ module Test.Unit.Purvasm.Compiler.Backend.LLVM.Abi where
 
 import Prelude
 
+import Purvasm.Compiler.Backend.LLVM.ForeignRef (ForeignCallMode(..), ForeignClosureMode(..))
+
 import Data.Array (length)
 import Data.Array as Array
 import Data.Map as Map
@@ -20,7 +22,7 @@ import Test.Spec.Assertions (shouldEqual)
 
 -- Render the function-buffer text produced by an emitter run from a fresh release-mode context.
 emitted :: forall a. Codegen a -> String
-emitted m = renderBuffer (snd (runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true, defined: Set.empty, profileApply: false, byNeed: true }) m)).fn
+emitted m = renderBuffer (snd (runCodegen (makeCx { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true, defined: Set.empty, profileApply: false, byNeed: true, foreignCall: DirectApplyAndTail, foreignClosure: Hoisted }) m)).fn
 
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.Backend.LLVM.Abi" do

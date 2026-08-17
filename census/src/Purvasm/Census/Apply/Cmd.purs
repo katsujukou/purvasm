@@ -36,6 +36,7 @@ import Purvasm.Census.Apply.Backend (applyCensusBackend)
 import Purvasm.Census.Apply.Report (header)
 import Purvasm.Compiler (build)
 import Purvasm.Compiler.Backend.LLVM.Abi (defaultHeapWords)
+import Purvasm.Compiler.Backend.LLVM.ForeignRef (ForeignCallMode(..), ForeignClosureMode(..))
 import Run (EFFECT, Run, liftEffect)
 import Run.Except (EXCEPT, throw)
 import Type.Row (type (+))
@@ -142,6 +143,10 @@ cmd opts = do
       , profileApply: false
       -- the ADR-0107 lattice stays ON: the census must describe the emission that ships.
       , byNeed: true
+      -- ADR-0109 §5.2: likewise the SHIPPED foreign-closure mode. The census describes the emission
+      -- that ships, so it never reads the counterfactual knob.
+      , foreignCall: DirectApplyAndTail
+      , foreignClosure: Hoisted
       }
   build (applyCensusBackend backendOpts) action buildOpts >>= case _ of
     Left err -> throw (Build.renderBuildError err)

@@ -14,6 +14,8 @@ module Test.Unit.Purvasm.Census.ByNeed where
 
 import Prelude
 
+import Purvasm.Compiler.Backend.LLVM.ForeignRef (ForeignCallMode(..), ForeignClosureMode(..))
+
 import Data.Array as Array
 import Data.Foldable (for_)
 import Data.Map as Map
@@ -52,7 +54,7 @@ emittedChains :: Boolean -> Array Gdef -> Int
 emittedChains byNeed gdefs =
   let
     keys = Set.fromFoldable (gdefs >>= gdefKeys)
-    ir = moduleLl { gkeys: keys, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true, defined: keys, profileApply: false, byNeed } keys gdefs
+    ir = moduleLl { gkeys: keys, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: true, defined: keys, profileApply: false, byNeed, foreignCall: DirectApplyAndTail, foreignClosure: Hoisted } keys gdefs
   in
     Array.length (String.split (Pattern "\nfchk") ir) - 1
 

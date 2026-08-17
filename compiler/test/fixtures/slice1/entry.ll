@@ -79,7 +79,13 @@ declare void @pv_g_Slice1_2eidentInt$init(ptr)
 
 define void @pv_init_all(ptr %ctx) {
 entry:
+  call void @pv_fclo_init(ptr %ctx)
   call void @pv_g_Slice1_2eidentInt$init(ptr %ctx)
+  ret void
+}
+
+define void @pv_fclo_init(ptr %ctx) {
+entry:
   ret void
 }
 

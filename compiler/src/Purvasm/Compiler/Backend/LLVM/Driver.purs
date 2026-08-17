@@ -33,6 +33,7 @@ import Data.Tuple (Tuple(..))
 import PureScript.CoreFn.Module (Module) as CF
 import Purvasm.Compiler (Backend, EntryInput, ForeignSigMap, LoweredModule)
 import Purvasm.Compiler.Backend.LLVM.Interface (interfaceOfAnf)
+import Purvasm.Compiler.Backend.LLVM.ForeignRef (ForeignCallMode, ForeignClosureMode)
 import Purvasm.Compiler.Backend.LLVM.Monad (MakeCxOptions)
 import Purvasm.Compiler.Backend.LLVM.CallClass (CallEvent)
 import Purvasm.Compiler.Backend.LLVM.Program (classifyDecl, classifyNonrec, entryLlWithEvents, gdefInitKey, gdefKeys, moduleLlWithEvents, surfaceFn)
@@ -88,6 +89,13 @@ type LlvmBackendOptions =
   -- | ADR-0107: the by-need lattice. `false` is the MEASUREMENT counterfactual — the plan and the
   -- | emitter switch together, so it changes what is emitted but never what it means.
   , byNeed :: Boolean
+  -- | ADR-0109 §5.2: how a foreign reference obtains its leaf closure. `Hoisted` is the shipped
+  -- | path; `PerUse` is the paired A/B's counterfactual leg (the pre-slice-A lowering), and it
+  -- | switches the activation plan with the emitter.
+  -- | ADR-0109 slice B §5.2: whether a saturated leaf call is emitted directly (shipped) or through
+  -- | the generic dispatch (the counterfactual leg).
+  , foreignCall :: ForeignCallMode
+  , foreignClosure :: ForeignClosureMode
   }
 
 -- | The LLVM backend's cross-module context (ADR-0087 §2 / ADR-0104 §5-1) — a merge-able bag of
@@ -236,7 +244,7 @@ type EntryProgram =
 llvmBackend :: LlvmBackendOptions -> Backend LlvmContext String
 llvmBackend opts =
   { emptyContext:
-      { cxOpts: { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: not opts.debug, defined: Set.empty, profileApply: false, byNeed: opts.byNeed }
+      { cxOpts: { gkeys: Set.empty, xfns: Map.empty, foreignArity: Map.empty, inlineAbi: not opts.debug, defined: Set.empty, profileApply: false, byNeed: opts.byNeed, foreignCall: opts.foreignCall, foreignClosure: opts.foreignClosure }
       , isEffect: opts.isEffect
       , heapWords: opts.heapWords
       }
@@ -254,6 +262,8 @@ llvmBackend opts =
           , defined: Set.empty
           , profileApply: opts.profileApply
           , byNeed: opts.byNeed
+          , foreignCall: opts.foreignCall
+          , foreignClosure: opts.foreignClosure
           }
       , isEffect: opts.isEffect
       , heapWords: opts.heapWords
@@ -272,7 +282,7 @@ llvmBackend opts =
       in
         -- `foreignArity` is a per-module base — `lowerModule`/`lowerEntry` override it with the module's
         -- own native-leaf arities (`nativeLeafArities lm.foreignSigs`), threaded from FSR (ADR-0090).
-        { cxOpts: { gkeys, xfns, foreignArity: Map.empty, inlineAbi: not opts.debug, defined: Set.empty, profileApply: false, byNeed: opts.byNeed }
+        { cxOpts: { gkeys, xfns, foreignArity: Map.empty, inlineAbi: not opts.debug, defined: Set.empty, profileApply: false, byNeed: opts.byNeed, foreignCall: opts.foreignCall, foreignClosure: opts.foreignClosure }
         , isEffect: opts.isEffect
         , heapWords: opts.heapWords
         }

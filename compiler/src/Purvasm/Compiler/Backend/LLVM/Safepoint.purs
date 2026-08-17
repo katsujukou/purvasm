@@ -31,20 +31,25 @@ module Purvasm.Compiler.Backend.LLVM.Safepoint
   , rtCallVoid
   , machineryHandleCall
   , guestDirect
+  , foreignDirect
   , PreparedCall
   , prepareMusttail
   , emitPreparedMusttail
   , guestCallSafepoint
+  , rootedReadSafepoint
+  , noteAllocSite
   ) where
 
 import Prelude
 
+import Control.Monad.State.Class (gets)
 import Data.Array as Array
 import Data.Foldable (foldMap)
 import Data.Generic.Rep (class Generic)
 import Data.String (joinWith)
 import Data.Tuple (Tuple(..))
 import Partial.Unsafe (unsafeCrashWith)
+import Purvasm.Compiler.Backend.LLVM.CallClass (AllocSite, allocSiteSlot)
 import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, bumpEpoch, currentEpoch, forA, fresh, unsafeEmitRawCall, unsafeMintFresh, unsafeUseVal)
 import Purvasm.Compiler.Backend.LLVM.Prim (primArity, primSym)
 import Purvasm.Compiler.Backend.LLVM.Value (Val)
@@ -191,6 +196,16 @@ rtDesc = case _ of
     in
       { sym, ctx, void: false, sp: primSafepoint op, schema: Vals (primArity op) }
 
+-- | Count one execution of an instrumented ALLOCATION SITE (ADR-0108 §5 / ADR-0109 §5.1) — a seam
+-- | emission like any other, and `sp = false` like the dispatch bump: the activation plan must not
+-- | move, or the instrumented build would stop measuring the shipped one. It lives here, beside the
+-- | row it renders, so both its emitters (the materialisation in `Emit`, the hoisted-closure init
+-- | in `Root`) reach the same one.
+noteAllocSite :: AllocSite -> Codegen Unit
+noteAllocSite site = do
+  profiling <- gets _.profileApply
+  when profiling (rtCallVoid RtApplyProfileBump [ I64 (show (allocSiteSlot site)) ])
+
 -- | The row's safepoint class — what `Liveness`'s transfer functions consult.
 rtSafepoint :: RtOp -> Boolean
 rtSafepoint = _.sp <<< rtDesc
@@ -199,6 +214,18 @@ rtSafepoint = _.sp <<< rtDesc
 -- | seam unit tests hold that).
 rtSym :: RtOp -> String
 rtSym = _.sym <<< rtDesc
+
+-- | The classification of a ROOTED READ — reading a value back through a permanent or transient
+-- | root slot (a `$root` global, an ADR-0109 `$fclo` cell, a rooted local). It is an ABSTRACT row:
+-- | the operation has TWO renderings, an inline indexed load under the release inline ABI
+-- | (ADR-0079) and a `pv_get` call under `--debug`, and naming either one alone would be wrong about
+-- | the other build. Neither allocates nor runs guest code, so it is not a safepoint.
+-- |
+-- | It exists so `Liveness`'s atom arms can keep naming the OPERATION their recipe renders
+-- | (ADR-0109 §4) instead of hardcoding `false`: after slice A a foreign reference IS a rooted read,
+-- | structurally the same as a variable read.
+rootedReadSafepoint :: Boolean
+rootedReadSafepoint = false
 
 -- | A direct/`musttail` guest call always runs guest code — the classification the `CApp`/
 -- | `CPerform` transfer arms consume for [`guestDirect`] and the [`prepareMusttail`]/
@@ -300,6 +327,24 @@ guestDirect c = do
   argSs <- forA c.args unsafeUseVal
   r <- fresh
   unsafeEmitRawCall ("  " <> r <> " = call tailcc i64 @" <> c.dsym <> "(ptr %ctx, i64 " <> envS <> foldMap (\o -> ", i64 " <> o) argSs <> ")")
+  bumpEpoch
+  unsafeMintFresh r
+
+-- | Emit a DIRECT call to a native leaf's `AbiCodeFn` entry (ADR-0109 §2/§4), returning its result
+-- | token. A leaf may allocate on the guest heap, so this is a safepoint like any guest call:
+-- | operands verify against the pre-call epoch, the epoch bumps once, the result is minted after.
+-- |
+-- | It is a RENDERER rather than an [`RtOp`] row because the symbol varies per leaf; the operand
+-- | roles are checked all the same — `clo` is a guest value and goes through the token check, while
+-- | the buffer pointer and count are raw metadata. The signature is the published one
+-- | (`purvasm.h`: `(ctx, closure, args, nargs)`), and `ccc` is implicit, so nothing here can drift
+-- | from the ABI without changing the `declare` too.
+foreignDirect :: { fsym :: String, clo :: Val, argp :: String, nargs :: Int } -> Codegen Val
+foreignDirect c = do
+  cloS <- unsafeUseVal c.clo
+  r <- fresh
+  unsafeEmitRawCall
+    ("  " <> r <> " = call i64 @" <> c.fsym <> "(ptr %ctx, i64 " <> cloS <> ", ptr " <> c.argp <> ", i64 " <> show c.nargs <> ")")
   bumpEpoch
   unsafeMintFresh r
 

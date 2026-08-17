@@ -26,6 +26,8 @@ module Test.Unit.Purvasm.Compiler.Backend.LLVM.Driver where
 
 import Prelude
 
+import Purvasm.Compiler.Backend.LLVM.ForeignRef (ForeignCallMode(..), ForeignClosureMode(..))
+
 import Data.Argonaut.Decode (printJsonDecodeError)
 import Data.Argonaut.Parser (jsonParser)
 import Data.Array as Array
@@ -68,7 +70,7 @@ buildIR fixture opts = do
   modBuf <- liftEffect (Ref.new [])
   entryBuf <- liftEffect (Ref.new Nothing)
   let
-    backend = llvmBackend { isEffect: opts.isEffect, heapWords: 1048576, debug: false, profileApply: false, byNeed: true }
+    backend = llvmBackend { isEffect: opts.isEffect, heapWords: 1048576, debug: false, profileApply: false, byNeed: true, foreignCall: DirectApplyAndTail, foreignClosure: Hoisted }
     action =
       { workdir: "."
       , maxOptimizeIter: 1
@@ -227,16 +229,22 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Driver" do
           out <- buildIR { name: "Test.Ffi", mod, foreignSigs: sigs }
             { entryModule: "Test.Ffi", entryName: "answer", isEffect: false, opt: false }
           let ir = fromMaybe "" (Array.head out.mods)
-          -- the leaf is referenced by its link-time `@pvf_` symbol …
-          unless (String.contains (Pattern "ptrtoint ptr @pvf_Test_2eFfi_2egetThing to i64") ir)
-            (fail ("expected the @pvf_ leaf reference; module IR:\n" <> ir))
-          -- … wrapped in exactly one no-capture closure (the sole `make_closure` here), at **arity 1**
-          -- (the trailing `i64 1` is the immediate-unit env sentinel). The revert emits `i32 0` here.
-          countOccurrences "call i64 @pv_make_closure(" ir `shouldEqual` 1
-          unless (String.contains (Pattern ", i32 1, i64 1)") ir)
-            (fail ("the nullary-Effect leaf closure must be arity 1; module IR:\n" <> ir))
-          when (String.contains (Pattern ", i32 0, i64 1)") ir)
-            (fail ("the nullary-Effect leaf closure must not be arity 0 (over-applies on run); module IR:\n" <> ir))
+          let entryIr = fromMaybe "" out.entry
+          -- ADR-0109 slice A moved the leaf CLOSURE to the entry object's hoisted-cell init, so the
+          -- arity assertion moves with it. The module side keeps its own half: it reads the cell.
+          unless (String.contains (Pattern "@pvf_Test_2eFfi_2egetThing$fclo") ir)
+            (fail ("expected the module to read the hoisted leaf cell; module IR:\n" <> ir))
+          countOccurrences "call i64 @pv_make_closure(" ir `shouldEqual` 0
+          -- the leaf is referenced by its link-time `@pvf_` symbol, ONCE, in the hoisted init …
+          unless (String.contains (Pattern "ptrtoint ptr @pvf_Test_2eFfi_2egetThing to i64") entryIr)
+            (fail ("expected the @pvf_ leaf reference; entry IR:\n" <> entryIr))
+          -- … wrapped in exactly one no-capture closure, at **arity 1** (the trailing `i64 1` is the
+          -- immediate-unit env sentinel). The `leafClosureArity` revert emits `i32 0` here.
+          countOccurrences "call i64 @pv_make_closure(" entryIr `shouldEqual` 1
+          unless (String.contains (Pattern ", i32 1, i64 1)") entryIr)
+            (fail ("the nullary-Effect leaf closure must be arity 1; entry IR:\n" <> entryIr))
+          when (String.contains (Pattern ", i32 0, i64 1)") entryIr)
+            (fail ("the nullary-Effect leaf closure must not be arity 0 (over-applies on run); entry IR:\n" <> entryIr))
 
 -- --- ADR-0105 §2 recipe consistency (may-root declarations vs emitted roots) ----------------------
 

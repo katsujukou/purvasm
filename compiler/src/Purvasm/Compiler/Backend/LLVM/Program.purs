@@ -39,14 +39,15 @@ import Data.Tuple (Tuple(..), fst, snd)
 import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.Compiler.Backend.LLVM.CallClass (CallEvent, profileSlotNames)
 import Purvasm.Compiler.Backend.LLVM.Abi (abiStamp, ctxHeaderVersion, declarations, forceValue, profileDeclarations)
+import Purvasm.Compiler.Backend.LLVM.ForeignRef (ForeignClosureMode(..), ForeignRef, refCell, refSym)
 import Purvasm.Compiler.Backend.LLVM.Emit (buildGrec, emitGcafInit, emitPending, expr, readVar)
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (fvExpr)
-import Purvasm.Compiler.Backend.LLVM.Mangle (immUnit, mangle, mangleForeign)
-import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, FnBody, MakeCxOptions, beginFn, emit, emitModule, emitStringConstant, forA, forA_, fresh, makeCx, renderChunks, renderFnBody, runCodegen, takeFn, unsafeEmitRawCall, unsafeEmitRawModule)
-import Purvasm.Compiler.Backend.LLVM.Root (emitGfunInit, emitInitFnFramed, entryTeardown, openFrame)
+import Purvasm.Compiler.Backend.LLVM.Mangle (immUnit, mangle)
+import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, foreignRef, FnBody, MakeCxOptions, beginFn, emit, emitModule, emitStringConstant, forA, forA_, fresh, makeCx, renderChunks, renderFnBody, runCodegen, takeFn, unsafeEmitRawCall, unsafeEmitRawModule)
+import Purvasm.Compiler.Backend.LLVM.Root (emitForeignCloInit, emitGfunInit, emitInitFnFramed, entryTeardown, foreignCloInitSym, openFrame)
 import Purvasm.Compiler.Backend.LLVM.Safepoint (RtArg(..), RtOp(..), rtCall, rtCallVoid)
 import Purvasm.Compiler.Backend.LLVM.Types (CallFact(..), EnvSrc(..), FnInfo, Gdef(..), Lifted(..), LiftedBody(..), SplitOutput)
-import Purvasm.Compiler.MiddleEnd.ANF (CExpr(..), Expr(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), foldAtoms)
 import Purvasm.Compiler.MiddleEnd.Module (Decl)
 
 -- | The root-handle-global keys a gdef defines.
@@ -192,12 +193,21 @@ emitGdefs gdefs = do
 -- | not recipe emission) — the one call-carrying chunk allowed through `unsafeEmitRawModule`,
 -- | pinned by file/shape/count in `tools/seam-audit.sh` ($init symbols are the program's own,
 -- | always-safepoint init tier; the entry's own `pv_init_all` call goes through `RtInitAll`).
-emitInitAll :: Array Gdef -> Codegen Unit
-emitInitAll gdefs =
+emitInitAll :: ForeignClosureMode -> Array Gdef -> Codegen Unit
+emitInitAll mode gdefs =
   let
+    -- `PerUse` (the §5.2 counterfactual) has no cells and no init to call: the leg is the
+    -- pre-slice-A program, down to `pv_init_all`'s first line.
+    fclo = case mode of
+      Hoisted -> "  call void @" <> foreignCloInitSym <> "(ptr %ctx)\n"
+      PerUse -> ""
+    -- ADR-0109 §2.2c: the hoisted leaf closures are built BEFORE every gdef init — a gdef init may
+    -- call a function that reads a cell, so any later ordering would leave that read on the `0`
+    -- sentinel. One call: the cells are program-wide and live in this object.
     calls = joinWith "\n" (map (\g -> "  call void @" <> mangle (gdefInitKey g) <> "$init(ptr %ctx)") gdefs)
   in
-    unsafeEmitRawModule ("define void @pv_init_all(ptr %ctx) {\nentry:\n" <> calls <> "\n  ret void\n}\n\n")
+    unsafeEmitRawModule
+      ("define void @pv_init_all(ptr %ctx) {\nentry:\n" <> fclo <> calls <> "\n  ret void\n}\n\n")
 
 -- | Emit the `@main` entry stub body: `pv_runtime_new` → `pv_abi_check` → `pv_init_all` → evaluate the
 -- | entry → print (pure) or run+drain (effect) → free → return. Returns the body text.
@@ -257,11 +267,57 @@ externGlobalDecls defined = do
     (map (\k -> "@" <> mangle k <> "$root = external global i64") (Array.fromFoldable (Set.difference externs defined)))
 
 -- | `declare` decls for the native foreign `AbiCodeFn` symbols this object references (ADR-0073 §3).
+-- | Read off the registered [`ForeignRef`]s (ADR-0109 §1.1) — the symbol is the one `foreignRef`
+-- | derived, never a second `mangleForeign` of the key.
 foreignDecls :: Codegen String
 foreignDecls = do
-  foreigns <- gets _.foreigns
+  refs <- foreignRefsOf
   pure $ joinWith "\n"
-    (map (\k -> "declare i64 @" <> mangleForeign k <> "(ptr, i64, ptr, i64)") (Array.fromFoldable foreigns))
+    (map (\r -> "declare i64 @" <> refSym r <> "(ptr, i64, ptr, i64)") refs)
+
+-- | This object's registered leaf references, in key order — the ONE derivation every consumer
+-- | (declares, cells, init, census) reads (ADR-0109 §2.2b). `Map` iteration is key-ordered, so the
+-- | emitted text is deterministic without a second sort.
+foreignRefsOf :: Codegen (Array ForeignRef)
+foreignRefsOf = gets (Array.fromFoldable <<< Map.values <<< _.foreigns)
+
+-- | The hoisted leaf-closure cells (ADR-0109 §2.2a): one root-handle global per leaf, program-wide,
+-- | DEFINED in the entry object (`0` is the pre-init sentinel, exactly as for a `$root` global) and
+-- | declared `external` everywhere else.
+-- |
+-- | The entry owns them for the reason that decided this shape in review round 3: a cell's
+-- | initialiser is the ONLY live reference to `@pvf_<key>`, so whoever emits it decides which leaves
+-- | the link requires a provider for. The entry is the one object that knows REACHABILITY, and
+-- | initialising exactly the reachable leaves keeps the pre-existing contract — a leaf referenced
+-- | only from code the linker dead-strips needs no provider (`-Wl,-dead_strip` removes the reference
+-- | with the code). A per-object init would have made every emitted reference a link requirement,
+-- | which is a strictly stronger contract than the one the tree satisfies today.
+emitForeignCellDefs :: Codegen Unit
+emitForeignCellDefs = do
+  refs <- foreignRefsOf
+  forA_ refs \r -> emitModule ("@" <> refCell r <> " = global i64 0\n")
+
+-- | `external` decls for the cells a MODULE object reads (it defines none — see above). A cell whose
+-- | reader is dead-stripped takes this decl with it, which is what preserves the contract.
+emitForeignCellExterns :: Codegen Unit
+emitForeignCellExterns = do
+  refs <- foreignRefsOf
+  forA_ refs \r -> emitModule ("@" <> refCell r <> " = external global i64\n")
+
+-- | The native-leaf keys a reachable gdef body (or the entry expression) references — the set the
+-- | entry object builds cells for. `foldAtoms` is `mapAtoms`' read-only sibling, so this sees an
+-- | occurrence exactly where the lowering would emit one.
+reachableLeafKeys :: Array Gdef -> Expr -> Set String
+reachableLeafKeys gdefs entry = foldl overExpr (overExpr Set.empty entry) (gdefs >>= gdefBodies)
+  where
+  gdefBodies = case _ of
+    Gfun _ _ b -> [ b ]
+    Gcaf _ b -> [ b ]
+    Grec ms -> map snd ms
+
+  overExpr = foldAtoms \acc -> case _ of
+    AtomForeign k -> Set.insert k acc
+    _ -> acc
 
 -- | `declare tailcc` decls for the cross-module direct entries this object calls (ADR-0077 §3).
 xfnDecls :: Codegen String
@@ -297,6 +353,9 @@ moduleLlWithEvents opts defined gdefs =
     Tuple parts ctx = runCodegen (makeCx (opts { gkeys = Set.union opts.gkeys defined, defined = defined })) do
       emitGdefs gdefs
       emitPending
+      -- After emission the reference set is complete, so the cell externs come from the SAME
+      -- `Ctx.foreigns` the leaf declares do (ADR-0109 §2.2b — one derivation, every consumer).
+      when (opts.foreignClosure == Hoisted) emitForeignCellExterns
       extern <- externGlobalDecls defined
       foreign_ <- foreignDecls
       xfn <- xfnDecls
@@ -339,9 +398,17 @@ entryLlWithEvents opts isEffect heapWords gdefs entry =
     opts' = opts { gkeys = gkeys', defined = Set.empty }
     reach = reachableGdefs gkeys' entry gdefs
     Tuple parts ctx = runCodegen (makeCx opts') do
-      emitInitAll reach
+      emitInitAll opts.foreignClosure reach
       entryBody <- emitEntryStub isEffect heapWords entry
       emitPending
+      when (opts.foreignClosure == Hoisted) do
+        -- Register a reference for every leaf the REACHABLE program can execute (the entry stub's
+        -- own are already registered by its emission, and are a subset). Registering is what
+        -- defines the cell, emits the `declare`, and puts the leaf in the init — one derivation,
+        -- per §2.2b.
+        forA_ (Array.fromFoldable (reachableLeafKeys reach entry)) foreignRef
+        emitForeignCellDefs
+        foreignRefsOf >>= emitForeignCloInit
       extern <- externGlobalDecls Set.empty
       foreign_ <- foreignDecls
       xfn <- xfnDecls
