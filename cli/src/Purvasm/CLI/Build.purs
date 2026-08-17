@@ -72,6 +72,10 @@ type Options =
   -- | FFI Rust — the crate is bundled with the runtime rlib into one staticlib and linked; C siblings are
   -- | not compiled, only scanned to enforce C-xor-Rust (a co-located `.c` is then an ambiguity error).
   , rustFfi :: Maybe FilePath
+  -- | `--host-foreign-api`: keep the whole foreign-author ABI in this executable and visible to a
+  -- | provider loaded at run time (ADR-0111 §1.1). Off by default — an ordinary program never hosts
+  -- | one, and retaining a surface it does not call would only cost it size.
+  , hostForeignApi :: Boolean
   }
 
 -- | The heuristic hard cap on optimiser fixpoint rounds (ADR-0087 §3.1) — the outer-round analogue of
@@ -125,6 +129,14 @@ options = fromRecord
         "Stop after emitting the `.ll` objects (no clang/link). Useful for `.ll`-level\n\
         \differentials (e.g. the stage fixpoint, ADR-0104 §2); a full build otherwise links\n\
         \a native executable."
+        # ArgParser.boolean
+  , hostForeignApi:
+      ArgParser.flag [ "--host-foreign-api" ]
+        "Retain and export the whole foreign-author ABI — the `pv_*` surface of purvasm.h plus every\n\
+        \`pvf_*` the runtime defines — so a provider loaded at run time with `dlopen` can resolve\n\
+        \against this executable (ADR-0111 §1.1). Without it the linker drops what this program does\n\
+        \not itself call, and a provider fails to load over a symbol that was never in the binary.\n\
+        \Needed by a program that hosts dynamically loaded native providers — the owned VM."
         # ArgParser.boolean
   , emitIr:
       ArgParser.argument [ "--emit-ir" ]
@@ -332,4 +344,5 @@ cmd opts = do
           , ulibDir
           , appModules: projectModules fsEnv
           , rustFfiDir: opts.rustFfi
+          , hostForeignApi: opts.hostForeignApi
           }

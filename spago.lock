@@ -220,7 +220,10 @@
           ]
         },
         "test": {
-          "dependencies": []
+          "dependencies": [
+            "spec",
+            "spec-node"
+          ]
         }
       },
       "cli-lib": {

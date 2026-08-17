@@ -6,6 +6,10 @@
 -- | (`--gc-sections` / `-dead_strip`). Over the CLI `PROC`/`FS` effects.
 module Purvasm.CLI.NativeLink
   ( LinkOptions
+  -- | Exported for its unit tests: it decides what a loaded provider may reach, so its parse is
+  -- | checked directly rather than only through a native build.
+  , foreignAuthorApi
+  , generatedBanner
   , link
   ) where
 
@@ -59,7 +63,91 @@ type LinkOptions =
   -- | app-C provider *compilation* (siblings are still scanned to enforce C-xor-Rust) and links the
   -- | crate as a `purvasm-bundle` staticlib folding the runtime rlib (ADR-0078 §5).
   , rustFfiDir :: Maybe FilePath
+  -- | `--host-foreign-api` (ADR-0111 §1.1): this executable will host providers loaded with `dlopen`,
+  -- | so the whole foreign-author ABI must survive the link and stay visible. Off, the linker keeps
+  -- | only what the program itself calls — which is right for every program that is not a VM.
+  , hostForeignApi :: Boolean
   }
+
+-- | The foreign-author API a provider may call, **read out of `purvasm.h` itself** (ADR-0073 §2).
+-- |
+-- | Deriving beats listing here, and the list this replaced showed why twice over: a hand-list only
+-- | catches drift in one direction (a name it has that the runtime lacks), and it had already
+-- | acquired `pv_abi_check`, which the header files under GENERATED-CODE ABI — emphatically *not* the
+-- | foreign surface. The header is the contract, so the header is what is parsed: everything before
+-- | its generated-code marker, declaration lines only.
+-- |
+-- | ADR-0111 §5's `pv_foreign_abi_v<N>` stamp joins the retained set when that lands; it is not in
+-- | the header yet, and retaining a symbol the runtime does not define would reach the linker as an
+-- | undefined `-u` and fail the build.
+-- |
+-- | `Left` when the header does not carry **exactly one** generated-code banner. The banner is what
+-- | separates a provider's API from codegen's, so losing it must not degrade to "parse the whole
+-- | file" — that would quietly put `pv_ctx_header` and the inline rooting entries into the export
+-- | allowlist, which is the opposite of what this list is for. A safety boundary fails closed.
+foreignAuthorApi :: String -> Either String (Array String)
+foreignAuthorApi header = case String.split (Pattern generatedBanner) header of
+  [ authorRegion, _ ] -> Right (Array.nub (Array.mapMaybe declaration (String.split (Pattern "\n") authorRegion)))
+  pieces -> Left
+    ( "purvasm.h must contain exactly one `"
+        <> generatedBanner
+        <> "` banner (found "
+        <> show (Array.length pieces - 1)
+        <> "); it is what separates the foreign-author API from the generated-code ABI"
+    )
+  where
+  declaration line =
+    let
+      t = String.trim line
+    in
+      if isComment t then Nothing else Array.head (Array.mapMaybe called (String.split (Pattern "pv_") t))
+
+  -- Prose mentions a `pv_*` name without a following `(`; a declaration always has one.
+  called fragment =
+    let
+      ident = SCU.takeWhile identChar fragment
+    in
+      if ident /= "" && String.take 1 (String.drop (String.length ident) fragment) == "(" then Just ("pv_" <> ident)
+      else Nothing
+
+  identChar c = let n = toCharCode c in n == 95 || (n >= 48 && n <= 57) || (n >= 65 && n <= 90) || (n >= 97 && n <= 122)
+
+  isComment t =
+    isJust (String.stripPrefix (Pattern "*") t)
+      || isJust (String.stripPrefix (Pattern "/*") t)
+      || isJust (String.stripPrefix (Pattern "//") t)
+      || isJust (String.stripPrefix (Pattern "#") t)
+
+-- | The banner separating the foreign-author API from the generated-code ABI in `purvasm.h`
+-- | (ADR-0079). Named here because both the parse and its tests depend on the exact text.
+generatedBanner :: String
+generatedBanner = "GENERATED-CODE ABI"
+
+-- | Ask the linker to keep a symbol even though nothing in the program references it: it pulls the
+-- | defining archive member in, and gives dead-strip a root. Mach-O prefixes symbol names with `_`.
+forceUndefined :: Boolean -> String -> String
+forceUndefined macos sym = "-Wl,-u," <> (if macos then "_" else "") <> sym
+
+-- | The dynamic symbol table a `dlopen`ed provider may resolve against — **exactly** the retained
+-- | set, never "everything global" (ADR-0111 §1.1).
+-- |
+-- | The difference is not tidiness. An executable that exports its whole global table also exports
+-- | the VM's *own* leaves, including `Purvasm.VM.Loader`'s: a guest program could then declare
+-- | `foreign import` on `Purvasm.VM.Loader.resolveImpl`, resolve it through the ordinary frontier,
+-- | and hold the trusted loader itself — the one thing §6 exists to keep out of guest reach. It also
+-- | exports every `pv_g_*` generated global and the Rust runtime's internals.
+exportAllowlist :: Boolean -> FilePath -> Array String -> { path :: FilePath, contents :: String, flag :: String }
+exportAllowlist macos path syms
+  | macos =
+      { path
+      , contents: String.joinWith "\n" (map ("_" <> _) syms) <> "\n"
+      , flag: "-Wl,-exported_symbols_list," <> path
+      }
+  | otherwise =
+      { path
+      , contents: "{ global:\n" <> foldMap (\s -> "  " <> s <> ";\n") syms <> "local: *;\n};\n"
+      , flag: "-Wl,--version-script," <> path
+      }
 
 -- | The default conventional runtime staticlib path (release profile — the inline-ABI objects this
 -- | backend emits pair with the release runtime, ADR-0079 §2).
@@ -151,7 +239,14 @@ pvfSymbolsIn ll =
 -- | bundle audit (ADR-0078 §5) can count definitions per key (0 = missing, 1 = ok, > 1 = two members define
 -- | it). `nmDefinedPvf` dedups this to a `Set` for the provider-membership checks.
 nmDefinedPvfList :: forall r. FilePath -> Run (PROC + EXCEPT String + r) (Array String)
-nmDefinedPvfList path = do
+nmDefinedPvfList =
+  map (Array.filter (isJust <<< String.stripPrefix (Pattern "pvf_"))) <<< nmDefinedList
+
+-- | Every symbol an object/archive **defines**, `_`-stripped and with duplicates kept. The shared
+-- | substrate: the ADR-0091 §4 provider audit filters it to `pvf_*`, and ADR-0111 §1.1's retention
+-- | needs the `pv_*` API too — one parser, so the two cannot disagree about what "defined" means.
+nmDefinedList :: forall r. FilePath -> Run (PROC + EXCEPT String + r) (Array String)
+nmDefinedList path = do
   -- Prefer `llvm-nm` (ADR-0078 §5): it reads Rust-produced archives cleanly, where Apple `nm` can warn
   -- and exit non-zero. Fall back to `nm`; a failure of *both* is an error, never an empty (masked) result.
   -- `execCaptureQuiet`: discard the lister's stderr — `llvm-nm` prints "no symbols" per empty archive
@@ -170,11 +265,7 @@ nmDefinedPvfList path = do
     in
       case Array.last toks, Array.index toks (Array.length toks - 2) of
         Just name, Just ty
-          | ty /= "U" && ty /= "u" ->
-              let
-                sym = fromMaybe name (String.stripPrefix (Pattern "_") name)
-              in
-                if isJust (String.stripPrefix (Pattern "pvf_") sym) then Just sym else Nothing
+          | ty /= "U" && ty /= "u" -> Just (fromMaybe name (String.stripPrefix (Pattern "_") name))
         _, _ -> Nothing
 
 -- | The set of `pvf_*` symbols an object/archive **defines** (`nm`, ADR-0091 §4's symbol audit): the
@@ -351,7 +442,51 @@ link opts = do
         "--runtime-lib is not used with --rust-ffi: the runtime is built from its crate. Set $PURVASM_RT_CRATE instead."
       bundle <- resolveAppRust appSyms ulibSyms crateDir
       pure (Tuple bundle [])
-  linkExe archive deadStrip objs (ulibObjs <> extraObjs)
+  -- ADR-0111 §1.1: a program that hosts `dlopen`ed providers must *contain* and *export* the ABI they
+  -- resolve against. Neither is the default — an archive member is pulled in only if something already
+  -- references it, and dead-strip then drops what survives unreferenced — and the VM calls almost none
+  -- of it. The `pvf_*` half is derived from the archive rather than listed, so a leaf added to the
+  -- runtime is retained without an edit here.
+  hostFlags <-
+    if not opts.hostForeignApi then pure []
+    else do
+      -- Under `--rust-ffi` the archive is the *bundle* — the runtime rlib folded together with the
+      -- app crate (ADR-0078 §5) — so its `pvf_*` cannot be told apart by origin, and every app leaf
+      -- would be retained and exported as though it were the runtime's, quietly joining
+      -- `host-runtime`'s provider set (ADR-0111 §4). Refuse the combination rather than guess.
+      when (isJust opts.rustFfiDir) $ throw
+        "--host-foreign-api cannot be combined with --rust-ffi: the bundle folds the app crate into \
+        \the runtime archive, so the runtime's own leaves cannot be told from the app's."
+      inc <- resolveInclude
+      headerPath <- FS.joinPath [ inc, "purvasm.h" ]
+      header <- FS.readText headerPath >>= case _ of
+        Just t -> pure t
+        Nothing -> throw ("--host-foreign-api: cannot read " <> headerPath)
+      api <- case foreignAuthorApi header of
+        Right names -> pure names
+        Left e -> throw ("--host-foreign-api: " <> e)
+      defined <- nmDefinedList archive
+      let
+        definedSet = Set.fromFoldable defined
+        -- A header entry the runtime does not define would otherwise reach the linker as `-u` and
+        -- fail as a raw undefined symbol; name it here instead.
+        missing = Array.filter (\s -> not (Set.member s definedSet)) api
+        runtimeLeaves = Array.filter (isJust <<< String.stripPrefix (Pattern "pvf_")) defined
+        retained = api <> runtimeLeaves
+      when (Array.null api) $ throw
+        ("--host-foreign-api: no `pv_*` declarations found in " <> headerPath)
+      unless (Array.null missing) $ throw
+        ( "--host-foreign-api: the runtime staticlib does not define "
+            <> String.joinWith ", " missing
+            <> " (purvasm.h and the runtime disagree)"
+        )
+      listPath <- FS.joinPath [ opts.buildDir, if macos then "exported_symbols.txt" else "export.map" ]
+      let allow = exportAllowlist macos listPath retained
+      FS.writeText allow.path allow.contents
+      Log.info $ Fmt.fmt @"  host-foreign-api: retaining {n} symbols, exporting exactly those"
+        { n: show (Array.length retained) }
+      pure (map (forceUndefined macos) retained <> [ allow.flag ])
+  linkExe archive ([ deadStrip ] <> hostFlags) objs (ulibObjs <> extraObjs)
   where
   inAppNamespace s =
     any (\m -> isJust (String.stripPrefix (Pattern ("pvf_" <> escapeIdent m.key <> "_2e")) s)) opts.appModules
@@ -478,10 +613,10 @@ link opts = do
   -- The last `.`-segment of a qualified key, for the `PVF_EXPORT(ident)` hint.
   identOf key = fromMaybe key (Array.last (String.split (Pattern ".") key))
 
-  linkExe rt deadStrip objs extraObjs = do
+  linkExe rt linkFlags objs extraObjs = do
     exe <- FS.joinPath [ opts.output, "app" ]
     -- `-lm` for libm calls a native foreign `.c` may emit; harmless with none.
-    runClang "link" ([ deadStrip ] <> objs <> extraObjs <> [ rt, "-lm", "-o", exe ])
+    runClang "link" (linkFlags <> objs <> extraObjs <> [ rt, "-lm", "-o", exe ])
     Log.info $ Fmt.fmt @"✓ Linked native executable → {exe}" { exe }
 
   runClang label args = Proc.exec "clang" args >>= case _ of

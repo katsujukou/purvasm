@@ -136,6 +136,34 @@ From that union the VM's link inputs follow:
 This is why §Alternatives keeps "ship the runtime as a shared library" on the table: it removes this
 whole class of link-retention work at the cost of a non-self-contained distribution.
 
+> **Correction (2026-08-17, as implemented):** three departures, one of them a defect this record's
+> own wording invited.
+>
+> - **The export allowlist is not optional, and "export dynamically" is not it.** An earlier
+>   implementation read this section's `--export-dynamic` as *make the symbols visible* and let the
+>   platform default stand on Mach-O. Measured, that exported **635** symbols — every `pv_g_*`
+>   generated global, the Rust runtime's internals, and, decisively, the VM's own
+>   `pvf_Purvasm_2eVM_2eLoader_2e*` leaves. A guest could then declare `foreign import` on
+>   `Purvasm.VM.Loader.resolveImpl`, resolve it through the ordinary frontier, and hold the trusted
+>   loader — exactly what §6 exists to prevent. The allowlist is therefore an explicit
+>   `-exported_symbols_list` (Mach-O) / version script (ELF) naming the retained set and nothing else.
+>   Measured after: **56** exported, 0 loader leaves, 0 `pv_g_*`, with runtime leaves still resolving.
+> - **The `pv_*` API is derived from `purvasm.h`, not hand-listed.** This section said hand-listed,
+>   with a fixture as the net. That is one-directional — it cannot see an API the header gained and
+>   the list did not — and the hand-list had already acquired `pv_abi_check`, which the header files
+>   under GENERATED-CODE ABI and a provider must never call. Parsing the header's author region is
+>   both simpler and exact (verified against an independent extraction: 28 names, identical).
+> - **No anchor object.** `-Wl,-u,<sym>` alone pulls the archive member in *and* roots it against
+>   dead-strip, which is what the anchor was for. Measured on Mach-O only; the same claim for
+>   ELF + `--gc-sections` is **owed a measurement** before it is relied on, and until then this is a
+>   Mach-O-verified mechanism, not a cross-platform one.
+>
+> Also implemented, and not in this record: `--host-foreign-api` is **refused together with
+> `--rust-ffi`**. That mode links the *bundle* (the runtime rlib folded with the app crate,
+> ADR-0078 §5), whose `pvf_*` cannot be told apart by origin — so every app leaf would be retained and
+> exported as though it were the runtime's, silently joining `host-runtime`'s provider set and
+> defeating §4's exactly-one check. Refusing beats guessing until provenance can be separated.
+
 ### 2. Resolution and firing: delegate to the runtime's `apply`, at the carrier only
 
 A `ForeignRef key arity` instruction ([0110](0110-owned-vm-purescript-native.md) §4) resolves to a
