@@ -425,7 +425,12 @@
           "dependencies": []
         },
         "test": {
-          "dependencies": []
+          "dependencies": [
+            "effect",
+            "prelude",
+            "spec",
+            "spec-node"
+          ]
         }
       },
       "purvasm-fs": {
@@ -551,6 +556,7 @@
           "dependencies": [
             "arrays",
             "effect",
+            "exceptions",
             "foldable-traversable",
             "integers",
             "lists",
@@ -558,8 +564,10 @@
             "numbers",
             "ordered-collections",
             "prelude",
+            "purvasm-base",
             "refs",
             "strings",
+            "tailrec",
             "tuples"
           ]
         },
