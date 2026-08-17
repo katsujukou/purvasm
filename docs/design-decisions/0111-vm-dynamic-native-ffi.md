@@ -363,7 +363,7 @@ value:
   see nor interpose on another's, and a per-handle `dlsym` becomes the honest basis for §4's
   exactly-one determination (each module is asked separately, rather than the loader observing
   whichever definition won a global merge).
-- `resolve : ModuleHandle -> String -> Int -> Effect (Maybe LeafValue)` — mangle the key
+- ~~`resolve : ModuleHandle -> String -> Int -> Effect (Maybe LeafValue)`~~ (see the Correction below) — mangle the key
   (`pvf_<escapeIdent(key)>`), `dlsym` it in *that* module, and, **without the address ever becoming a
   purvasm value**, wrap it with `pv_make_closure` at the given arity. The result is a carrier-held
   closure or `Nothing`; the address exists only inside the leaf.
@@ -391,7 +391,41 @@ The loader-owned table is also what gives "which providers exist" a single answe
 and for diagnostics (each entry carries its path, or the `host-runtime` name). This is the whole
 trusted surface: everything else in §1–§5 is ordinary purvasm code above it.
 
+> **Correction (2026-08-17, as implemented):** the surface is three operations, not two, and
+> `resolve` is **pure**:
+>
+> - `hostRuntime : Effect ModuleHandle` is its own effectful constructor rather than a table entry
+>   this record assumed into existence. Establishing provider zero can fail (`dlopen(NULL)`), and
+>   folded into `resolve` that failure would surface later wearing the one disguise a resolver must
+>   never wear — "that symbol is absent" (§4 rests on `Nothing` meaning exactly *this provider does
+>   not define it*).
+> - `resolve : ModuleHandle -> String -> Arity -> Maybe LeafValue` drops the `Effect`. Every failure
+>   that is not "the provider does not define this key" has moved into its arguments' constructors:
+>   the table exists *because* a `ModuleHandle` exists, and the arity is in range *because* an
+>   `Arity` exists. What is left is a question with a stable answer, so purity is honest and
+>   `Nothing` regains a single meaning.
+> - `Arity` is new, and is the reason the above holds: the number reaches `pv_make_closure` as a
+>   `uint32_t`, where a negative value becomes an enormous arity and the closure is then called with
+>   garbage. `Instruction` admits any `Int` (the stream is compiler-generated today, but that is a
+>   convention, not a guarantee), so the constraint belongs in a type — checked once, at the image
+>   reader and at the machine, not re-argued at the boundary.
+>
+> Two implementation obligations this record did not state, both live in `Loader.c`: a string that
+> names a file or a symbol is **never truncated** (a shortened path opens a *different* file; a
+> shortened symbol can resolve a *different* leaf, then call it at the wrong arity), and a path
+> containing an interior NUL is refused by name rather than silently shortened by `dlopen`. `dlsym`
+> failure is detected through `dlerror`, not a NULL address, since a symbol's value may legitimately
+> be NULL.
+
 ### 7. Staging and gates
+
+> **Progress (2026-08-17):** the VM now compiles and runs natively
+> ([0110](0110-owned-vm-purescript-native.md) §2's Progress note), which is what makes any of the
+> below reachable. It also fixes *where* the work happens: a natively compiled purvasm program cannot
+> spawn a subprocess yet (no `purvasm-process`), so both halves of this record's build side — invoking
+> `clang` for the program's own link (§1.1's retention/export flags) and compiling a provider to a
+> shared object (§1) — run under the **node-hosted Level-2 CLI** until that gap closes. The *loading*
+> side needs no subprocess and is unaffected.
 
 1. The trusted loader (§6) with its `host-runtime` entry, the §1.1 retention/export pins, and the §5
    version contract — with the API-coverage provider fixture, before anything calls a leaf.

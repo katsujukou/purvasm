@@ -1,6 +1,7 @@
 package:
   name: vm
   dependencies:
+    - abi
     - arrays
     - effect
     - exceptions
@@ -12,6 +13,7 @@ package:
     - ordered-collections
     - prelude
     - purvasm-base
+    - purvasm-stdio
     - refs
     - strings
     - tailrec

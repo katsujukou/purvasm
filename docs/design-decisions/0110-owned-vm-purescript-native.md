@@ -133,6 +133,21 @@ bytecode format, it does not produce it, and the compiler must not gain a depend
 naming during the transition (both `purvm`s exist) is an implementation detail, pinned when the
 first slice ships.
 
+> **Progress (2026-08-17):** §2's claim is measured, on **both** paths and with the same result
+> (`result: 55`, `instructions: 134`, from a tail-recursive guest loop run through `vm/src/Main.purs`):
+>
+> - via **boot** — `purvm native --backend llvm --corefn-dir output --ulib ./purvasm_lib -m Main`,
+>   a 929K executable;
+> - via **Level-2** — the maintainer built and ran the same entry through `cli/index.node.js`.
+>
+> One constraint the record did not anticipate, and that
+> [0111](0111-vm-dynamic-native-ffi.md) inherits: a natively compiled purvasm program **cannot spawn a
+> subprocess** yet (there is no `purvasm-process`), so the Level-2 native path stops at emitting `.ll`
+> and something else must invoke `clang` and the linker. Today that something is the **node-hosted**
+> Level-2 CLI. Nothing about the VM depends on this — the *loading* side of 0111 needs no
+> subprocess — but the *build* side (compiling a provider to a shared object) inherits the same
+> node-hosted step until `purvasm-process` exists.
+
 ### 3. Value representation: a VM-owned ADT, converted at the FFI boundary
 
 `Value` is an ordinary PureScript ADT owned by the VM — scalars, string, array, record, data tagged by
@@ -236,7 +251,8 @@ tag encoding baked into the shared format.
 The VM is a second implementation of purvasm's dynamic semantics, so it is gated against the ones
 that exist:
 
-- **differential against boot's VM** over the existing program corpus — same result value, same
+- ~~**differential against boot's VM** over the existing program corpus~~ **the fixture-owned
+  behavioural gate** over the existing program corpus — same result value, same
   observable output, on the same source compiled by the same Level-2 front half. **The observation
   contract is part of this gate, because a carrier is not printable.** A value that came from a leaf
   is opaque by construction (§3), and the VM has no introspection with which to render one — so the
@@ -268,8 +284,26 @@ that exist:
 - **the terminal-demand regression**: `main = Console.log "x"` writes its output and exits
   successfully, with the final `pv_apply` result discarded rather than inspected. It is listed
   separately because it is the case the first draft of the observation contract got wrong;
-- boot's VM stays the reference runner until the owned VM is green on both, and stays available as an
-  oracle afterwards (the freeze keeps it stable, which is exactly what makes it a good oracle).
+- ~~boot's VM stays the reference runner until the owned VM is green on both, and stays available as an
+  oracle afterwards (the freeze keeps it stable, which is exactly what makes it a good oracle).~~
+
+> **Correction (2026-08-17):** **boot is not an oracle for this VM, and identity with it is not a
+> guard.** The record framed §5 as a differential against boot, which reads back the retired
+> relationship: the LLVM backend has already passed the strict byte-identity gate against boot, and
+> purvasm has entered the stage where it develops *without* being tied to it
+> ([0104](0104-retire-boot-byte-identity-gate.md)). What must be guarded now is **semantic
+> correctness**, which is a moving target that boot — frozen — cannot define.
+>
+> So the anchor is the **fixture-owned expected trace**: each fixture states what its program must
+> print, and every runner is held to that. The owned VM joins
+> `tools/l2-native-behavioural.sh` as a leg on those terms (§6's Progress note). boot's VM remains a
+> leg of that gate for its own historical reasons; the owned VM is *not* compared to it, and a
+> disagreement between the two is a question about which is right, not a failure of the new one.
+>
+> Agreement with the **LLVM backend** is worth watching — two implementations of the same semantics
+> disagreeing is information — but it is a cross-check, not an authority: that backend is itself under
+> active development, so it is not a definition of correct either. Where the two disagree, the fixture
+> and the language's semantics decide.
 
 ### 6. Staging
 
@@ -282,6 +316,24 @@ that exist:
    as the oracle.
 
 Each slice ships with its gates; none of them requires boot to change.
+
+> **Progress (2026-08-17):** slice 1 is implemented — `Value`, the instruction loop, the primops, and
+> the array cell, with 47 unit tests over the invariants §5 names. Two staging corrections, found
+> while wiring the gate:
+>
+> - **The corpus differential cannot be part of slice 1.** It needs an image to run, so it cannot
+>   precede slice 2's reader; and the fixtures are `Effect`-shaped, so their output goes through host
+>   leaves, which is [0111](0111-vm-dynamic-native-ffi.md)'s `host-runtime` resolution. Slice 1's gate
+>   is therefore the unit tests alone, and the differential lands with **slice 2 + 0111's slices 1–2**.
+>   Nothing about the design changes; the order the record gave was wrong.
+> - **The differential is a *third leg*, not an image comparison.** `tools/l2-native-behavioural.sh`
+>   already holds boot's VM and the Level-2 native binaries to each fixture's **own** expected stdout
+>   ([0104](0104-retire-boot-byte-identity-gate.md) §2's 2026-07-18 amendment, whose point is that a
+>   bug the two legs *share* must still fail). The owned VM joins that gate the same way rather than
+>   being compared to boot directly — strictly stronger, and it removes a transition this record had
+>   worried about: the boot leg builds its own image with `purvm build` from CoreFn and never consumes
+>   Level-2's `.pvm`, so §4's format changes cost the gate nothing. There are no paired artifacts and
+>   no delinearizer; §Consequences' "one image per runner" note is thereby moot.
 
 ### 7. What this does not change
 
@@ -303,9 +355,13 @@ untouched until slice 2.
   is not the VM — another backend, an analysis, a disassembler — reads the tree instead of rebuilding
   it from relative offsets. Since a `.pvm` producer and consumer no longer share the linear-offset
   convention, the offset back-patcher in `Bytecode.Lower.Match` disappears for `case` dispatch.
-- boot's VM cannot read a `.pvm` carrying either §4 change, so from that point the differential in §5
+- ~~boot's VM cannot read a `.pvm` carrying either §4 change, so from that point the differential in §5
   runs on *paired* artifacts (one image per runner from the same source), not one shared image. The
-  version stamp is what makes the mismatch a loud failure rather than a misparse.
+  version stamp is what makes the mismatch a loud failure rather than a misparse.~~
+  > **Correction (2026-08-17):** the premise was wrong. boot's VM leg of the behavioural gate builds
+  > its **own** image (`purvm build` from CoreFn) and never reads Level-2's `.pvm`, so §4's changes
+  > cost it nothing and no paired artifacts arise — see §6's Progress note. The version stamp is still
+  > worth having, now purely so a stale *owned* image fails loudly rather than being misparsed.
 - The optimiser measurement field moves onto an artifact the project owns, so a measurement can be
   refined (new counters, allocation attribution, per-key profiles) instead of being limited to what
   frozen boot happens to count.

@@ -569,6 +569,7 @@
         "path": "vm",
         "core": {
           "dependencies": [
+            "abi",
             "arrays",
             "effect",
             "exceptions",
@@ -580,6 +581,7 @@
             "ordered-collections",
             "prelude",
             "purvasm-base",
+            "purvasm-stdio",
             "refs",
             "strings",
             "tailrec",
