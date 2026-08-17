@@ -377,6 +377,39 @@ Three corrections, all forced by that:
   `pv_ctx_abi_v<N>` protects generated code — the dynamic path is then not a special case but the
   same contract, enforced by a different linker.
 
+> **Progress (2026-08-17, as implemented):** the contract is live — `PV_FOREIGN_ABI_VERSION` and the
+> reference to `pv_foreign_abi_v<N>` are in `runtime/include/purvasm.h`, the symbol is defined by
+> `runtime/src/abi.rs`, and `tools/vm-loader-e2e.sh` holds the refusal to its terms. Four things the
+> record left open, decided here:
+>
+> - **The version is written once, and every other spelling is derived from it.** The header pastes
+>   the symbol name from the `#define` (so a bump renames the reference by editing one number), and
+>   the VM's link derives the symbol it must export by *reading that `#define`*
+>   (`Purvasm.CLI.NativeLink.foreignAbiStamp`) rather than naming it. A hand-written list would fail
+>   in the one direction that matters: a host still exporting `…_v1` while every provider references
+>   `…_v2` refuses every provider, and the two facts would have lived in different files. The
+>   `#[no_mangle]` name in Rust cannot be computed, so *that* paste is instead pinned by a
+>   `const _: () = assert!(…)` against the mirrored constant — a compile error rather than a
+>   `dlopen` failure at a user's machine. The version is handled as a **token**, never a number:
+>   the header pastes it, so `01` makes every provider reference `pv_foreign_abi_v01`, and a host
+>   that parsed-and-reprinted it would export `…_v1` and refuse them all. Only a canonical decimal
+>   is accepted (a sign cannot be part of an identifier at all), and it is pasted verbatim — which
+>   also stops an ABI version from being bounded by the host language's integer range.
+> - **Rust emits it per leaf, not once per crate.** `#[used]` keeps a static in its object file, but
+>   the linker may still drop an object nothing references, and a `cdylib` carrying no reference is
+>   exactly the module the loader must refuse. So `#[pv_foreign]` places the reference beside each
+>   exported wrapper, where the symbol that must survive already lives. Verified on a real `cdylib`:
+>   `pvf_…` defined, `pv_foreign_abi_v1` undefined, as with a C provider's object.
+> - **The loader names the failure.** The platform reports a stale module as an ordinary missing
+>   symbol, which reads as a host that forgot to export something; `Loader.c` recognises the shape
+>   and reports "built against a different foreign ABI — this VM provides
+>   `PV_FOREIGN_ABI_VERSION=<N>`" instead.
+> - **The statically linked half is weaker than the dynamic half, and is not claimed.** The
+>   reference protects a static link because the archive member must be found to resolve it; whether
+>   dead-strip could ever discard the referring datum *before* resolution is not something this
+>   change measured. The dynamic path — the one this record exists for — is measured, on Mach-O:
+>   the bumped module is refused, and its initialiser marker never fires.
+
 ### 6. The loader's own API: privileged, and never a raw address
 
 The VM is PureScript, so `dlopen`/`dlsym` reach it as leaves — and the obvious shape of those leaves
@@ -457,6 +490,14 @@ trusted surface: everything else in §1–§5 is ordinary purvasm code above it.
 
 1. The trusted loader (§6) with its `host-runtime` entry, the §1.1 retention/export pins, and the §5
    version contract — with the API-coverage provider fixture, before anything calls a leaf.
+   **Done (2026-08-17)**, on the terms of §5's and §1.1's Progress notes. `tools/vm-loader-e2e.sh` is
+   the gate: it builds the VM with `--host-foreign-api`, then loads a provider referencing every
+   `pv_*` the header declares, and a stale one. Two things the slice needed that this list did not
+   name — the VM takes `--ffi <path>` (explicit opt-in, §4: nothing is discovered), and the
+   API-coverage fixture is **exhaustive** rather than one-entry-per-group, since the retained set is
+   derived from the header and a listed-but-untested entry would be untested retention. Confirmed
+   able to fail: the same fixture against a VM built *without* `--host-foreign-api` fails to load,
+   naming the first symbol the link dropped.
 2. Resolution against `host-runtime` alone, and firing, and `toPv` for **scalars and strings** only:
    the corpus's runtime leaves (`show`, stdio, FS, `argv`) run on the VM with **no module loaded**,
    which is both the first useful milestone and the cheapest test of §1.1's retention. Arrays are a
@@ -473,14 +514,19 @@ Gates:
   source: linked into a native binary, and loaded by the VM. The same program must produce the same
   result both ways. This is what turns "write once, run on both backends" into a checked claim;
 - **the API-coverage load test** (§1.1): a provider calling at least one entry from each API group
-  loads and runs, so a retention/export list that forgot a symbol fails here;
+  loads and runs, so a retention/export list that forgot a symbol fails here — **landed** in
+  `tools/vm-loader-e2e.sh`, covering every entry rather than one per group, and asserting the load
+  only (a leaf cannot be *called* until slice 2, and `RTLD_NOW` already binds every reference);
 - **the runtime-leaf test** (§1.1 / §2): a guest program exercising a runtime leaf from each family —
   `show`, a line write, an FS read, `argv` — runs on the VM with no `--ffi` and no manifest. This is
   the gate for the `pvf_*` half of the retained set, which nothing in the VM's own code references;
 - **the runtime-shadow test** (§4): a loaded module exporting a key the runtime already defines fails
   with `provided by both host-runtime and <module>`, rather than one of them silently winning;
 - **the stale-module test** (§5): a module built against a bumped `PV_FOREIGN_ABI_VERSION` fails to
-  load, and a marker in its initialiser proves no module code ran;
+  load, and a marker in its initialiser proves no module code ran — **landed** in
+  `tools/vm-loader-e2e.sh`, with the marker's *positive* control alongside it (the same source built
+  against the shipped header loads and does print the marker, so its absence in the stale leg is
+  evidence rather than an assumption);
 - **the aliasing gate** (§3): shared arrays, a `Ref`, and a cyclic array observed through every alias
   after a leaf writes — plus an empty array and an array promoted while another promotion is in
   flight, the two cases the migration procedure's steps 1 and 3 exist for;
