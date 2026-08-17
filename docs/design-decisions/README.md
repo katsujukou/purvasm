@@ -157,5 +157,6 @@ language and are kept out of version control.)
 | [0109](0109-native-leaf-direct-lowering.md) | Native-leaf direct lowering: hoist the leaf closure, call the `pvf_` entry | Accepted |
 | [0110](0110-owned-vm-purescript-native.md) | The owned VM: a PureScript interpreter, natively compiled | Accepted |
 | [0111](0111-vm-dynamic-native-ffi.md) | VM dynamic native FFI: load the provider, apply through the runtime | Accepted |
+| [0112](0112-int-32-bit-invariant-and-division-layering.md) | `Int`'s 32-bit invariant is absolute: normalise every quotient, and let Prelude choose the division | Accepted |
 
 ## Scope

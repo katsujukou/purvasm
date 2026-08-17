@@ -23,20 +23,13 @@ module Purvasm.VM.Value
   , ForeignValue
   , Thunk(..)
   , Value(..)
-  , arity
-  , newLocalArray
-  , readArrayCell
   ) where
 
-import Prelude
-
-import Data.Array as Array
 import Data.List (List)
-import Data.List as List
 import Data.Map (Map)
+import Data.Unit (Unit)
 import Effect (Effect)
 import Effect.Ref (Ref)
-import Effect.Ref as Ref
 import Purvasm.VM.Instruction (CodeBlock)
 
 -- | A runtime value that crossed the FFI boundary, held exactly as the leaf produced it (ADR-0111 §3).
@@ -92,28 +85,9 @@ data Value
   -- genuinely self-forcing cycle reaches `Building` — a black hole.
   | VThunk (Ref Thunk)
 
+-- | Building a by-need cell runs guest code, so the suspension is an `Effect` action rather than a
+-- | pure one. `Building` is the black hole: a cell reached while it is being built.
 data Thunk
-  = Unbuilt (Unit -> Value)
+  = Unbuilt (Unit -> Effect Value)
   | Building
   | Built Value
-
--- | The number of further arguments a value needs before it fires: a closure's remaining parameters,
--- | a partial constructor's remaining fields. `Nothing` for a value that is not awaiting arguments —
--- | which includes a carrier, whose arity is the runtime's business, not the VM's.
-arity :: Value -> Int
-arity = case _ of
-  VClosure c -> Array.length c.params
-  VPap c collected -> Array.length c.params - List.length collected
-  VCtor _ n collected -> n - List.length collected
-  _ -> 0
-
--- | Build an array cell over VM-local storage. Every array starts here; only the FFI boundary moves
--- | one to `Promoted`.
-newLocalArray :: Array Value -> Effect ArrayCell
-newLocalArray = Ref.new <<< Local
-
--- | Read an array cell's current storage. Every array operation goes through this — the dereference
--- | is what buys the promotion invariant, and it is charged to every array whether or not it ever
--- | meets a leaf.
-readArrayCell :: ArrayCell -> Effect ArrayStorage
-readArrayCell = Ref.read

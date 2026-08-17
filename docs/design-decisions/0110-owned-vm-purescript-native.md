@@ -135,10 +135,10 @@ first slice ships.
 
 ### 3. Value representation: a VM-owned ADT, converted at the FFI boundary
 
-`Value` is an ordinary PureScript ADT owned by the VM — scalars, string, array, record, data with a
-**numeric** tag, closure (code block + captured environment), the partial forms (under-applied
-closure / constructor), and a by-need cell — plus one carrier described below. It is deliberately
-**not** the runtime's value representation.
+`Value` is an ordinary PureScript ADT owned by the VM — scalars, string, array, record, data tagged by
+its **constructor name** (§4), closure (code block + captured environment), the partial forms
+(under-applied closure / constructor), and a by-need cell — plus one carrier described below. It is
+deliberately **not** the runtime's value representation.
 
 This is a **principle, not a compromise**. The LLVM/native ABI
 ([0059](0059-native-abi-value-representation.md) / [0069](0069-v1-dynamic-record-operations.md)) is

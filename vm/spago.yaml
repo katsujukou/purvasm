@@ -3,6 +3,7 @@ package:
   dependencies:
     - arrays
     - effect
+    - exceptions
     - foldable-traversable
     - integers
     - lists
@@ -10,8 +11,10 @@ package:
     - numbers
     - ordered-collections
     - prelude
+    - purvasm-base
     - refs
     - strings
+    - tailrec
     - tuples
   test:
     main: Test.Unit.Purvasm.VM
