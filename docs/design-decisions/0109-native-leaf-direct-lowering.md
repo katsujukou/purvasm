@@ -82,8 +82,7 @@ with a **cheaper direct call**, not with no call.
 ### 1. Three slices, and ONE classifier with a closed result
 
 - **Slice A — hoist the leaf closure.** An `AtomForeign k` materialisation stops allocating: the
-  no-capture closure for `k` becomes a root-handle global built once per object at init, and `atom`
-  reads it. This changes *every* foreign reference (call position and value position alike), removes
+  no-capture closure for `k` becomes a root-handle global built once at init, and `atom` reads it. This changes *every* foreign reference (call position and value position alike), removes
   the allocation and the safepoint, and keeps `pv_apply` exactly where it is.
 - **Slice B — direct-call the saturated `apply` form.** A `CApp` whose callee classifies as a
   saturated native leaf emits a direct call to `@pvf_<mangle k>` instead of `pv_apply`, passing the
@@ -238,6 +237,15 @@ The current emission has **no per-object init**: there are per-gdef `@<key>$init
 foreign key is referenced by many objects, so a cell defined under external linkage in each of them
 would be a duplicate symbol. Four things are therefore pinned.
 
+> **AMENDED 2026-08-16, during implementation — (a), (c) and (d) below are SUPERSEDED by
+> §2.2-amended.** The per-object design links a program the previous tree links: a cell's
+> initialiser is the only LIVE reference to `@pvf_<key>`, so initialising every key an object
+> *mentions* turns "referenced anywhere" into "must have a provider". The self-host fixture closure
+> promptly failed to link on `Control.Extend.arrayExtend` — a leaf mentioned by a dead instance
+> dictionary, provided by nobody, and until now removed with its code by `-Wl,-dead_strip`. The
+> original text is kept below because the reasoning it rejects (a duplicate symbol per object) is
+> still what rules out the naive alternative; what changed is the OWNER.
+
 **(a) The cell is a root-handle global with INTERNAL linkage, one per (object × key).**
 
 ```llvm
@@ -317,6 +325,33 @@ reachability (shared middle-end machinery the optimiser also reads) so `reachabl
 prune the owner's init, and it introduces a cross-object init-order dependency instead of removing
 one. The per-object copies cost a bounded, one-off allocation each and are self-contained in the
 backend. Revisit if the object×key count ever stops being small.
+
+#### 2.2-amended (2026-08-16): the ENTRY object owns the cells, and initialises the REACHABLE leaves
+
+What the failure above establishes is that the cell's owner is not a linkage question but a
+**reachability** question — and exactly one object knows reachability. So:
+
+- **One cell per KEY, program-wide, DEFINED in the entry object** (`@pvf_<mangle key>$fclo = global
+  i64 0`) and declared `external global i64` by every module object that reads one. Still a
+  permanent root HANDLE, planted by the same tier (a); reads are unchanged. The duplicate-symbol
+  problem (a) solves by internal linkage is solved here by there being one definition site, and the
+  "does the owner object exist" objection to the rejected alternative does not arise — the entry
+  object always exists.
+- **One init, `@pv_fclo_init`, in the entry object**, called as the FIRST line of `pv_init_all`
+  (pinned by shape in `tools/seam-audit.sh`). The "all cells before all gdef inits" requirement of
+  (c) is then structural rather than a list to get right, and the whole per-object init tier — the
+  unconditional empty functions, the object-name list, `foreignCloInitSym`'s object argument — is
+  deleted.
+- **The initialised set is the leaves the reachable program can execute**: `foldAtoms` over the
+  bodies of `reachableGdefs` ∪ the entry expression. `foldAtoms` is added beside `mapAtoms` as its
+  read-only sibling, so "which atoms are in here" and "rewrite every atom" cannot disagree about
+  what an occurrence is. This is what preserves the pre-existing link contract: a leaf mentioned only
+  by code the linker strips is never referenced by a live section, so it still needs no provider.
+- **The dead-leaf property is a pinned test**, not a comment — `entryLl` over a reachable gdef that
+  calls one leaf and an unreachable gdef that calls another must emit the first symbol and never the
+  second. Its discrimination was demonstrated live: the superseded design fails the link.
+- (d)'s two layers survive unchanged in spirit: a one-sided inconsistency is a link error, and the
+  per-object identity `#cell externs == #leaf declares == |foreigns|` is the census gate.
 
 ### 3. Q2 — the TAIL form: a direct call and a return, not a trampoline
 
@@ -431,13 +466,22 @@ no-opt`) over one pinned CoreFn snapshot, legs taken pairwise between consecutiv
 
 ```text
 every ADR-0108 slot, pv_apply_entries, pv_tailcall_writes   ==  UNCHANGED, to the unit
+AtomForeign materialisation executions(before)              ==  the same, after   (leg invariance)
 Kind::Closure allocations(before) − Kind::Closure allocations(after)
   ==  AtomForeign materialisation executions(before)  −  hoisted fclo init executions(after)
-hoisted fclo init executions(after)  ==  Σ over objects of |foreigns|      (static, × 1 each)
+hoisted fclo init executions(after)  ==  |reachable leaf keys|             (static, × 1 each)
+                                     ==  #entry cell definitions
+                                     ==  #permanent-root stores in @pv_fclo_init
 ```
 
+(AMENDED with §2.2: the hoisted count is the ENTRY object's reachable-leaf set, not `Σ over objects
+of |foreigns|` — that was the superseded ownership, and leaving it here would make the completion
+test specify the rejected design. Leg invariance of the materialisation counter is checked rather
+than assumed: it is what makes the closure delta attributable to this change and not to the two legs
+having run different work. `tools/apply-profile.sh --alloc-identity BEFORE AFTER` is the verdict.)
+
 The three-way identity is the review's correction, and it matters twice over. First, **slice A does
-not remove all the closures**: it allocates one per (object × key) at init, so the reduction is the
+not remove all the closures**: it allocates one per reachable key at init, so the reduction is the
 old materialisation count MINUS those, not the old count. Second, **a `Kind` total cannot attribute
 the leaf closures**: `Kind::Closure` counts every closure the program builds, and the foreign
 materialisations include VALUE positions that no ADR-0108 dispatch slot ever counted. So both ends
@@ -610,6 +654,417 @@ disappearance.
 - It does not touch `local-unknown-fn` (26.1 % of executions, the higher-order call), which the
   ADR-0108 ranking puts second and which needs its own design.
 
+#### Progress (2026-08-16): slice 0 — the allocation census and the materialisation counter
+
+The §5.1 precondition, implemented and verified end to end before slice A touches a lowering.
+
+**Runtime.** `Heap::alloc` — the single mutator allocation site — bumps a per-`Kind` counter, and the
+census prints as `alloc/kind/*` rows on the `purvasm-applyprofile:v1` line (ADR-0108 §5's "all of it
+lives in the step-3 profile schema, never in the dispatch counts"). Two properties are tested rather
+than asserted in prose: `Kind::ALL` is pinned discriminant-indexed (a kind added to the enum but not
+the census would otherwise count under a neighbour's label), and **a collection is not an
+allocation** — the collector evacuates through `collect_core`, so a forced collection leaves the
+census unchanged while the survivor really moves. That is what makes this allocation VOLUME rather
+than a restatement of `gc_copied_words`.
+
+**Compiler.** `Emit.atom`'s `AtomForeign` arm bumps an `alloc/site/foreign-materialise` slot. The
+allocation sites share the apply profile's registration and bump ABI — one layout definition, one
+blob, one `pv_applyprofile_bump` — but are a separate family in `CallClass` (`AllocSite`), named
+under their own prefix and given the HIGH slot indices so no dispatch slot is renumbered by them.
+
+**Harness.** `slots_of`'s row pattern was too tight to read a three-segment name, which would have
+dropped every census row SILENTLY; it now parses any `/`-separated name and fails when a token on
+the line does not parse at all. The dispatch identities and the reason ranking take the
+`dispatch_rows` family only. Five new `--self-test` cases inject the two faults that matter (an
+unreadable row; an allocation row reaching a dispatch sum) and assert the verdict.
+
+**First numbers (fixture leg, `--opt`; the self-host leg is a slice-A/B measurement, not this one).**
+Both §3 identities still hold exactly and the instrumented output is unperturbed:
+
+```
+alloc/site/foreign-materialise   68,176      == the callee-foreign dispatch total, exactly
+alloc/kind/closure               94,296      → foreign materialisations are 72.3 % of ALL
+                                                Kind::Closure allocations on these fixtures
+```
+
+The first line is the Context's derivation ("one materialisation per counted dispatch") measured for
+the first time — on THESE fixtures it is an equality, which also says they contain no value-position
+foreign reference. The self-host corpus is not expected to be so clean, and the difference is now
+observable instead of assumed.
+
+#### Progress (2026-08-16): slice A — the hoisted leaf closure
+
+Implemented per §1.1 (the opaque `ForeignRef`), §2.2-amended (entry-owned cells) and §4 (the
+abstract rooted-read row). `Emit.atom`'s `AtomForeign` arm no longer allocates: it reads the cell,
+the same lowering as any rooted global.
+
+**The §5.1 identity holds EXACTLY on the fixture corpus**, and it is the first measured statement
+about what the foreign path allocates:
+
+| | before slice A | after |
+| --- | ---: | ---: |
+| `alloc/kind/closure` | 94,296 | **26,143** |
+| `alloc/site/foreign-materialise` | 68,176 | 68,176 |
+| `alloc/site/foreign-clo-init` | — | 23 |
+
+```
+ΔKind::Closure = 94,296 − 26,143 = 68,153
+materialisations(before) − hoisted inits(after) = 68,176 − 23 = 68,153      ✓ to the unit
+```
+
+**72.3 % of every closure these fixtures allocated was a leaf closure, and slice A removes all but
+23 of them.** The dispatch side is untouched, exactly as the slice-A endpoint requires: every
+ADR-0108 slot is unchanged (`callee-foreign` still 68,176), both §3 identities still hold exactly,
+and the instrumented run's output is unperturbed.
+
+**The rooting moved with it, through the shared table.** `Liveness.atomCanSafepoint`'s foreign arm
+now reads the new abstract `rootedReadSafepoint` row (§4) instead of `rtSafepoint RtMakeClosure`,
+so a foreign reference stops being a safepoint for the ANALYSIS at the same moment it stops being one
+in the LOWERING. The counterfactual is a pinned fixture rather than a claim: an operand list
+`[foreign, x]` no longer roots `x`, while `[boxed-string, x]` — the same shape with a still-allocating
+atom — still does, so the fixture is discriminating in both directions.
+
+**Gates green**: 571/571 compiler unit (4 new: the cell/extern split, the dead-leaf property, and
+the crossing counterfactual), 31/31 census, the e2e/json/regex/ulib-tools suites,
+`tools/seam-audit.sh` (self-test + the two new ADR-0109 cages), `tools/l2-native-behavioural.sh`
+7 fixtures × VM/no-opt/opt/stress×2 ≡ oracle **under forced GC** — the discriminator that matters
+after a rooting reduction — `tools/ffi-e2e.sh` (user C **and** Rust FFI still produce 42, so the ABI
+really is untouched), `tools/apply-profile.sh` fixtures + `--self-test`, `cargo fmt`/`purs-tidy`.
+
+**Hardened in review round 3** (three P1s, all of them about a measurement that could pass while
+saying nothing):
+
+- **the reachability walk is stack-safe and pinned.** `foldAtoms` was spine recursion and an
+  independently-written case tree — on generated ANF that overflows, and a field missed in one tree
+  and not the other would leave live module code reading a cell the entry never defined. It is now an
+  explicit work stack under `tailRec`, with a per-node **fidelity matrix** (every `CExpr`/`Rhs` form,
+  a distinct atom in every atom position, an exact expected list — it caught an ordering error in the
+  expectation on first run) and 100k-spine fixtures (bare, and nested under a guard clause). The doc
+  no longer claims "the same traversal as `mapAtoms`": they are two trees held in agreement by that
+  matrix, which is the honest statement;
+- **the allocation census can no longer disappear quietly.** The presence-only check accepted any
+  `alloc/*` row, so the compiler-owned site rows alone kept the leg green while the runtime's entire
+  kind family could vanish and print `Kind::Closure=0`. `check_alloc_schema` now requires every kind
+  row and every required site row exactly once, and refuses an unknown `alloc/*` row — against a
+  schema stated INDEPENDENTLY in the harness, because an expectation read off the measurement is not
+  a gate. Six self-test injections (family gone, one row gone, a site gone, a duplicate, an unknown
+  row) assert the verdict;
+- **the §5.1 identity is executable.** `tools/apply-profile.sh --alloc-identity BEFORE AFTER` parses
+  two captured runs, requires a complete census in both, checks **leg invariance of the
+  materialisation counter** (the property that makes the closure delta attributable to the change
+  rather than to two legs doing different work — the fault injection that first slipped through
+  proved the identity was blind without it), and exits non-zero on mismatch. Three more self-test
+  injections cover it.
+
+#### Progress (2026-08-16): the slice-A counterfactual knob
+
+§5.2 pins the leg pair as "same compiler sources, slice on/off via a build knob", and slice A first
+shipped without one — so the paired legs could not be built from one tree at all. The knob:
+
+- **a closed type, not a Boolean**: `ForeignClosureMode = PerUse | Hoisted`, parsed ONCE at the CLI
+  edge from `PURVASM_FOREIGN_CLOSURE` and handed as one value to the emitter and to
+  `ActivationConfig`. Fail-closed — an unrecognised value is an error, never "the shipped mode",
+  because a typo would make the counterfactual leg the shipped leg and report a real change as no
+  change (a unit matrix drives eight rejected spellings);
+- **the plan switches with the emitter**, which is the load-bearing part rather than the tidy one:
+  `PerUse` allocates at every foreign reference, so `Liveness.atomCanSafepoint`'s foreign arm reads
+  `RtMakeClosure` again under it. A mode that reached only the emitter would UNDER-ROOT that leg —
+  a GC bug, not a slower measurement. Pinned by a crossing fixture in both directions;
+- **`PerUse` is the pre-slice-A program, not an approximation**: a closure per reference, no cell, no
+  extern, no `@pv_fclo_init`, no call in `pv_init_all` — and the ordinary `@pvf_` declare kept.
+  Asserted per object, in both directions;
+- **harness-owned**: all nine `tools/*.sh` scrub an ambient value, `apply-profile.sh` grew
+  `--foreign-closure hoisted|per-use` and EXPORTS the leg it was told to build, so a leg is what the
+  flag says and never what the caller's shell held.
+
+**The paired mechanism works end to end** — two binaries from one tree, on `Gate.DictDispatch`:
+
+```
+ADR-0109 §5.1 identity: ΔKind::Closure 21,984 == materialisations 21,992 − hoisted-inits 8  OK
+pv_apply_entries       25,537 == 25,537          (dispatch untouched, both legs)
+generic-apply/callee-foreign 20,480 == 20,480    (classification leg-invariant)
+stdout                 identical
+```
+
+#### Progress (2026-08-16): slice A measured on the SELF-HOST corpus, paired
+
+`tools/apply-profile.sh --paired` runs both modes from ONE snapshot and ONE toolchain build — two
+separate invocations cannot give that (each snapshots at its own moment, and `output/` carries the
+compiler's own JS, so a `spago build` between them changes the program being measured; the default
+workdir also overwrites). Each leg is checked against a reference, then the pair is verdicted.
+
+**Which leg the knob applies to — corrected BY the first paired run failing.** The knob is a
+BUILD-mode axis in exactly ADR-0108 §3's sense: it decides how the measured binary is LOWERED, not
+what work it performs. Setting it for the workload compile too made the two legs emit different `.ll`
+for the workload, so the compilers did different work and every dispatch counter legitimately
+differed (`callee-foreign` 428,084,567 vs 427,910,970). That is a measurement of two different runs.
+Leg 2 (building the compiler) now carries the mode; legs 1 and 3 run in the shipped mode in both,
+and "the two legs did the same work" is a VERDICT — byte-identical workload artifacts — rather than
+an assumption.
+
+**Result (`--paired --build-mode opt --work-mode no-opt`, 305 objects, every verdict OK).**
+
+```
+ADR-0109 §5.1 identity: ΔKind::Closure 437,263,683
+                     == materialisations 437,263,715 − hoisted-inits 32          EXACT
+dispatch slot vector             IDENTICAL (17 slots)   — slice A moves no dispatch
+per-use hoisted-inits            0
+hoisted inits == cells == stores == leaf symbols          32   (four derivations, one integer)
+workload emission                BYTE-IDENTICAL (305 objects)
+per leg: Σ generic-apply + structural == pv_apply_entries == 635,226,491
+         Σ generic-tail             == pv_tailcall_writes == 124,592,053
+         Σ drill keys               == the callee-foreign slots == 437,263,707
+```
+
+**437.3 M guest-heap closure allocations removed from one self-host build**, leaving 32 — the
+Context's "≥ 434 M", now measured rather than derived. And the first measurement of the
+VALUE-position share the Context called unmeasured: materialisations 437,263,715 − dispatches
+437,263,707 = **8** foreign references that are not calls, on the whole corpus.
+
+**The IR delta, over the corpus that changed** (each leg's own compiler objects; the workload
+emission is byte-identical by the verdict above, so it is not the corpus here):
+
+Every measure is ANCHORED to its instruction form and to the two-space instruction indent, which is
+not pedantry: the corpus IS the compiler, so a module that emits LLVM carries emitted syntax as
+string constants — the ADR-0108 §2 trap, hit again here (see below the table).
+
+| measure (anchored needle) | per-use | hoisted | delta |
+| --- | ---: | ---: | ---: |
+| `.ll` lines | 3,381,958 | 3,311,757 | **−70,201 (−2.08 %)** |
+| `.ll` bytes | 113,869,012 | 111,549,178 | **−2,319,834 (−2.04 %)** |
+| root chains (`^rchk` label) | 84,665 | 81,273 | **−3,392 (−4.01 %)** |
+| `pv_root` (`^␣␣%t = call i64 @pv_root(`) | 84,665 | 81,273 | −3,392 |
+| `pv_make_closure` (same form) | 18,797 | 15,104 | −3,693 |
+| cell READS (`^␣␣%t = load i64, ptr @pvf_…$fclo`) | **0** | **3,725** | +3,725 |
+| `pv_apply` sites | 14,202 | 14,202 | 0 |
+| `pv_tailcall` sites | 5,109 | 5,109 | 0 |
+
+The rooting reduction is the §4 de-safepointing arriving in the IR: 3,392 fewer root chains because
+a foreign reference stopped being a safepoint. Reload and frame counts are deliberately ABSENT — in
+the release inline ABI both are bare load/store on the ctx header with no distinguishing text, so
+there is no honest grep for them; the root-chain count is the rooting proxy and it is exact.
+
+**Two counting faults, both caught by a second derivation rather than by reading the script.** The
+first: the `$fclo` needle was shell-escaped into a literal `\$fclo` and read 0 in BOTH legs, while
+the cells/stores/symbols verdict in the same run said 32. The second, after fixing that: the
+unanchored needle read **1 on the per-use leg — which builds no cells at all** — because
+`ForeignRef.purs`'s own `c"$fclo"` string constant is in the compiler's object. The anchored recount
+decomposes the old 4,108 exactly, which is what makes the 3,725 trustworthy:
+
+```
+3,725 read instructions + 318 extern decls + 32 cell definitions
+      + 32 permanent-root stores + 1 string constant  ==  4,108
+```
+
+**The gates this ADR names, re-run on the tree that carries the knob** — the earlier fixpoint pass
+does not carry, because the compiler's own CoreFn changed with the knob:
+
+- `tools/selfhost-fixpoint-diff.sh smoke` — **609/609 stage-3 ≡ stage-4 byte-identical** (and
+  C3-link ≡ stage-3, 609/609);
+- `examples/run-examples.sh` — **10/10** (fib, helloworld, effect-ref, record-meta,
+  recursion-scheme, recursive-value, transformer, rust-ffi, regex-demo, string-case-demo);
+- `tools/native-run-diff.sh` — **7/7**, boot ≡ Level-2 ≡ expected;
+- `tools/l2-native-behavioural.sh` — 7 fixtures × VM/no-opt/opt/stress×2 ≡ oracle under forced GC;
+- `tools/ffi-e2e.sh` — user C **and** Rust FFI both produce 42;
+- `tools/seam-audit.sh` + `tools/apply-profile.sh --self-test`, 585/585 compiler unit and the other
+  four suites, `cargo fmt` / `purs-tidy`.
+
+**SLICE A CLOSED 2026-08-16 — mechanical and correctness complete, run time OWED, and NO run-time
+claim is made.** §5.3 permits exactly this close: the mechanical endpoints are completion conditions,
+the run-time result is reported in both directions or not at all, and a slice may close on (a) plus
+the allocation/IR argument when the box is unavailable — explicitly labelled, as here.
+
+What slice A establishes: **437,263,683 guest-heap closure allocations removed from one self-host
+build** (32 remain), by two independent mechanisms — the runtime per-`Kind` census and the
+compiler-side site/init counters — agreeing to the unit, with the dispatch axis pinned unchanged and
+the two legs pinned to have done identical work. What it does NOT establish: that this is faster.
+
+**The one OWED measurement**, tracked as its own item and not folded into any later slice: the
+base→A A/A intervals on both endpoints and the A/B verdict, recorded even when INCONCLUSIVE. It needs
+the quiet Linux box §5.2 requires; everything else above is integer accounting and IR measurement,
+which this machine produces.
+
+**Re-baselined**: the `slice1` emission-shape golden (ADR-0104 §4), whose entry object now carries
+`@pv_fclo_init` and its call. The nullary-`Effect` leaf-arity test moved its subject from the module
+object to the entry's init and kept its discrimination (arity 1 vs the `leafClosureArity` revert's 0).
+
+#### Progress (2026-08-17): slice B — the saturated apply form calls the leaf directly
+
+Implemented per §1.2 (eligibility and emission are separate closed types), §2 (the direct call), §4
+(a classified-seam renderer) and §7 (the accounting column).
+
+**Three stages, not two — corrected in review before any measurement.** A two-state knob would have
+netted slices B and C together: slice B's mechanical endpoint IS that `pv_tailcall_writes` does not
+move, and that is unobservable in a build where the tail form changed too. The mode is therefore
+
+```text
+ForeignCallMode = ViaApply | DirectApplyOnly | DirectApplyAndTail
+```
+
+with `DirectApplyOnly` the default until slice C has its own checkpoint. Measured on a real build
+(`Gate.DictDispatch`, one tree, three legs, identical stdout):
+
+| stage | `@pvf_` sites | `pv_apply` sites | `pv_tailcall` sites |
+| --- | ---: | ---: | ---: |
+| `ViaApply` | 0 | 1,920 | 767 |
+| `DirectApplyOnly` (slice B) | 166 | 1,754 (−166) | **767 (unchanged)** |
+| `DirectApplyAndTail` (slice C) | 235 | 1,754 (unchanged) | 698 (−69) |
+
+**A defect the review caught, and what could honestly be pinned.** The form was derived once for
+every target from `tail && inDirect` and handed to `decide`, while the recipes branched on the raw
+`tail` — so a `tail && not inDirect` site would have emitted a TAIL recipe and recorded an APPLY
+event. The derivation is now the pure, exported `CallClass.callForm`, target-aware, and the
+DECISION's form drives every recipe (including the drill's key string).
+
+The regression fixture asked for could not be built, and saying so is part of the fix: a `Gcaf` body
+is NOT tail position (it must produce a value to root, so it is emitted non-tail — measured, after
+the first attempt at such a fixture reported `apply = 2`), and every tail context in the emitter today
+is a lifted body, which sets `inDirect`. The state is unreachable, so no fixture can reach it.
+`callForm` is pinned instead over its WHOLE input space (3 targets × tail × inDirect), which is where
+the wrong answer lived and stays checked if a future activation kind makes the state reachable.
+
+**The paired harness now takes an AXIS** — `--paired closure|apply|tail` — with every knob off the
+axis fixed at one value in both legs, and row-level verdicts rather than totals (a total could net a
+tail regression against an apply win). Verified at fixture scale before the self-host run:
+
+```
+moved:      foreign-deferred-apply 20,480 → 0    foreign-direct-apply 0 → 20,480
+INVARIANT:  foreign-deferred-tail 1,512 == 1,512     foreign-direct-tail 0 == 0
+            generic-*/callee-foreign 0 == 0          materialisations 21,992 == 21,992
+            alloc/kind/closure 5,590 == 5,590        pv_tailcall_writes 2,015 == 2,015   OK
+```
+
+That pre-flight also found two harness faults (an IR row label containing `$fclo` was expanded by the
+shell and aborted the run under `set -u`; the IR table header named the closure axis whatever axis
+ran) and one imprecision now fixed: a MISSING artifact set is reported as missing, not as "the legs
+did not do the same work".
+
+**Gates re-run after the B/C split** (the emission changed, so the earlier pass does not carry):
+592/592 compiler unit, the other four suites, `tools/seam-audit.sh` (renderer counts re-pinned),
+`tools/l2-native-behavioural.sh` under forced GC, `examples/run-examples.sh` 10/10,
+`tools/native-run-diff.sh` 7/7, `tools/ffi-e2e.sh`, `purs-tidy`.
+
+**The self-host measurement (`--paired apply --build-mode opt --work-mode no-opt`, 305 objects).**
+
+```
+TRANSFER (fail-closed, five conditions):
+  before: something to transfer      foreign-deferred-apply = 430,241,659 > 0        OK
+  before: no direct calls yet        foreign-direct-apply   = 0                      OK
+  after:  nothing left deferred      foreign-deferred-apply = 0                      OK
+  transfer is EXACT                  foreign-direct-apply   = 430,241,659            OK
+  runtime counter agrees             pv_apply_entries 638,915,068 − 208,673,409
+                                                            = 430,241,659            OK
+INVARIANT:
+  foreign-deferred-tail    9,417,058 == 9,417,058     foreign-direct-tail  0 == 0
+  generic-{apply,tail}/callee-foreign  0 == 0         alloc/site/foreign-clo-init 32 == 32
+  alloc/site/foreign-materialise 439,658,725 == same  alloc/kind/closure 102,076,450 == same
+  pv_tailcall_writes (runtime)  125,420,753 == 125,420,753
+  workload emission             BYTE-IDENTICAL (305 objects)
+```
+
+**430,241,659 generic dispatches became direct calls in one self-host build, and the trampoline
+counters did not move by one.** The transfer is exact in four places the compiler's classification
+owns and in a fifth the runtime wrote down its own path — `pv_apply_entries` fell by precisely the
+transferred count. The IR side carries the same signature on the changed corpus: `pv_apply` call
+SITES 14,245 → 11,020 (−3,225), `pv_tailcall` sites 5,123 unchanged, root chains / `pv_make_closure` /
+cell reads unchanged, `.ll` lines unchanged with +81,235 bytes (a direct call line is longer than a
+`pv_apply` line — same count, more text).
+
+**The first run reported FAIL, and it was a harness schema defect, not a failed measurement.**
+`reconcile()` — the §3 runtime identity — had never been extended to the ADR-0109 classes, so the
+via-apply leg summed 208,673,409 against `pv_apply_entries` 638,915,068 and reported a mismatch. The
+missing 430,241,659 were exactly the deferred applies: §7's identity was written into this ADR and
+into `apply-census.sh`, and not into the runtime reconciliation. **The identity was not relaxed to
+make the run pass** — `reconcile()` now includes the deferred rows (and deliberately excludes the
+direct ones, which are not dispatches), four self-test injections pin both directions, and the SAVED
+artifacts were re-reconciled rather than the four-hour build re-run:
+
+```
+via-apply : 208,673,409 + 430,241,659 = 638,915,068 == pv_apply_entries
+both legs : 116,003,695 +   9,417,058 = 125,420,753 == pv_tailcall_writes
+```
+
+**A second harness defect, found in review:** the transfer rows were PRINTED, not verdicted — an
+absent row read as 0, so a partial transfer, or both rows vanishing, would have passed. It is now
+`transfer_verdict`, fail-closed on all five conditions above, with a MISSING row a failure rather
+than a zero, and six self-test injections (complete transfer; one dispatch left deferred; direct
+short by one; rows correct but the runtime delta wrong; a missing row; a vacuous pair with nothing to
+transfer). Writing those found a third: a concatenated `case` guard with an empty alternative matches
+every string, so the guard had been failing every pair — caught by the "a COMPLETE transfer passes"
+row, which is why a passing case belongs in a fault-injection suite.
+
+**SLICE B CLOSED 2026-08-17 — mechanical and correctness complete, run time OWED, and NO run-time
+claim is made** (the §5.3 close, as for slice A). What it establishes: the eligible apply-form
+population transfers exactly, checked across two mechanisms, with the tail axis, the allocation axis
+and the workload emission pinned invariant. What it does not: that this is faster.
+
+**Owed for slice B**, tracked as its own item: the base→B A/A intervals on both endpoints and the A/B
+verdict, recorded even when INCONCLUSIVE, on the quiet Linux box §5.2 requires.
+
+#### Progress (2026-08-17): slice C — the tail form, and the default moves to it
+
+The tail lowering shipped with slice B's code but behind `DirectApplyAndTail`, so that slice B's
+endpoint (`pv_tailcall_writes` invariant) was observable. Slice C is that stage's own checkpoint.
+
+**The measurement (`--paired tail --build-mode opt --work-mode no-opt`, 305 objects, first run, every
+verdict OK).**
+
+```
+TRANSFER (fail-closed, five conditions):
+  before: something to transfer     foreign-deferred-tail = 9,417,058 > 0         OK
+  before: no direct calls yet       foreign-direct-tail   = 0                     OK
+  after:  nothing left deferred     foreign-deferred-tail = 0                     OK
+  transfer is EXACT                 foreign-direct-tail   = 9,417,058             OK
+  runtime counter agrees            pv_tailcall_writes 125,420,753 − 116,003,695
+                                                          = 9,417,058             OK
+INVARIANT (the MIRROR of slice B's, which is what makes the two separable):
+  foreign-deferred-apply  0 == 0          foreign-direct-apply 430,241,659 == same
+  generic-{apply,tail}/callee-foreign 0 == 0
+  alloc/site/foreign-materialise 439,658,725 == same   alloc/site/foreign-clo-init 32 == 32
+  alloc/kind/closure 102,076,450 == same
+  pv_apply_entries (runtime) 208,673,409 == 208,673,409
+  workload emission  BYTE-IDENTICAL (305 objects)
+```
+
+**9,417,058 trampoline dispatches became direct calls, and the apply axis did not move by one.** The
+IR is the mirror image of slice B's: `pv_tailcall` call sites 5,123 → 4,653 (−470), `pv_apply` sites
+unchanged, root chains / `pv_make_closure` / cell reads unchanged, `.ll` +6 lines and +15,001 bytes.
+Both legs' §3 identities also hold on their own, which is the extended `reconcile()` confirmed at
+scale rather than on injections alone.
+
+(The tail axis's invariant list gained `alloc/site/foreign-clo-init` in review before the run — the
+closure axis is pinned `hoisted` in both legs, so it is an invariant of this pair too, and it was
+checked on the apply axis already. Symmetry worth having BEFORE a four-hour measurement, not after.)
+
+**The default is now `DirectApplyAndTail`**, moved on that endpoint plus the correctness gates re-run
+on the tree that carries it — not before. A unit row pins the default itself, so a future change to it
+is a deliberate edit rather than a side effect of adding a constructor. All three stages remain
+selectable: `ViaApply` is still both slices' counterfactual, and `DirectApplyOnly` is still the
+`--paired tail` pair's BEFORE leg.
+
+**Gates on the new-default tree**: 595/595 compiler unit (3 new for the stage knob's parse) + the
+other four suites, `tools/seam-audit.sh`, `tools/l2-native-behavioural.sh` under forced GC,
+`examples/run-examples.sh` 10/10, `tools/native-run-diff.sh` 7/7, `tools/ffi-e2e.sh`,
+`tools/apply-profile.sh` fixtures (both identities exact, output unperturbed), `purs-tidy`,
+`tools/selfhost-fixpoint-diff.sh smoke` — **609/609 stage-3 ≡ stage-4 byte-identical** (and
+C3-link ≡ stage-3, 609/609).
+
+**SLICE C CLOSED 2026-08-17 — mechanical and correctness complete, run time OWED, and NO run-time
+claim is made**, the same §5.3 close as slices A and B.
+
+**What the three slices together establish**, all of it counted rather than argued, on one named
+workload (the compiler built `--opt`, compiling `Purvasm.CLI.Native` `--no-opt`):
+
+| | removed | checked against |
+| --- | ---: | --- |
+| slice A — guest-heap closure allocations | **437,263,683** | `Kind::Closure` census vs the site/init counters |
+| slice B — generic `pv_apply` dispatches | **430,241,659** | `pv_apply_entries`, to the unit |
+| slice C — generic `pv_tailcall` dispatches | **9,417,058** | `pv_tailcall_writes`, to the unit |
+
+**And what none of them establishes: that any of it is faster.** The wall-clock A/A + A/B for each
+slice remains OWED, per slice, on the quiet Linux box §5.2 requires — and until it runs, this ADR
+makes no run-time claim in either direction.
+
 ## Consequences
 
 - **Emission diverges intentionally**, in all three slices, and the divergence is declared under the
@@ -620,9 +1075,9 @@ disappearance.
 - **The `.ll` shrinks**, and by more than the removed lines: slice A removes a safepoint per foreign
   reference, so the ADR-0105 plan roots less around it. Reported per object, the ADR-0107 way, and
   not confused with a time claim.
-- **A new init tier exists** (§2.2c): one unconditional function per object, called from
-  `pv_init_all` before the gdef inits. It is emitted even when empty, which is the price of the
-  entry not needing to know each object's foreign set.
+- **A new init tier exists** (§2.2-amended): ONE function, `@pv_fclo_init`, in the entry object,
+  called from `pv_init_all` before the gdef inits. Its content is the reachable-leaf set, so the
+  link contract is exactly the one the tree satisfied before this ADR.
 - **Miri is unaffected**: the direct call exists only in emitted LLVM (the address path). The
   index-path runtime (`code_is_address() == false`) never sees it, so the island discipline and its
   Miri tests are untouched.
