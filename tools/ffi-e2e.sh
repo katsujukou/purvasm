@@ -22,7 +22,7 @@ ROOT="$(pwd)"
 # changes what the compiler emits, and in a DIFFERENTIAL it changes both sides equally — so the
 # comparison stays green while no longer being about the emission that ships. Any leg that wants one
 # of these must pass it to its own child process explicitly.
-unset PURVASM_BYNEED_OFF PURVASM_EMIT_DEBUG_ABI PURVASM_PROFILE_APPLY
+unset PURVASM_BYNEED_OFF PURVASM_EMIT_DEBUG_ABI PURVASM_PROFILE_APPLY PURVASM_FOREIGN_CLOSURE PURVASM_FOREIGN_CALL
 
 FIX="$ROOT/compiler/test/fixtures/ffi-e2e"
 : "${PURVASM_RT_A:=$ROOT/runtime/target/release/libpurvasm_rt.a}"

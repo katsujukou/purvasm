@@ -29,8 +29,10 @@ counts_for() {
     /^[[:space:]]*--/ { next }
     {
       if ($0 ~ /"[^"]*call (i64|void|ptr|tailcc)/) c["call"]++
-      split("unsafeEmitRawCall unsafeEmitRawModule popFrame openFrame bumpEpoch verifyAt mintAt keyOf unsafeUseVal unsafeMintFresh machineryHandleCall mkRootedLocal vRootedGlobal rootedSrc rootedFromVal mintFrameOwner unsafeMkFrameOwner unsafeEmitChainLabel emitGcafInitEngine", ids, " ")
-      for (i = 1; i <= 19; i++) if (index($0, ids[i]) > 0) c[ids[i]]++
+      n = split("unsafeEmitRawCall unsafeEmitRawModule popFrame openFrame bumpEpoch verifyAt mintAt keyOf unsafeUseVal unsafeMintFresh machineryHandleCall mkRootedLocal vRootedGlobal rootedSrc rootedFromVal mintFrameOwner unsafeMkFrameOwner unsafeEmitChainLabel emitGcafInitEngine mangleForeign unsafeForeignRef", ids, " ")
+      # bounded by the split RESULT, not a literal: a pinned identifier added to the list above and
+      # not to the bound would be counted nowhere, i.e. silently uncaged.
+      for (i = 1; i <= n; i++) if (index($0, ids[i]) > 0) c[ids[i]]++
       if (index($0, "unsafeTestVal") > 0 || index($0, "unsafeValText") > 0) c["testesc"]++
     }
     END { for (k in c) print k "=" c[k] }
@@ -64,18 +66,18 @@ audit_dir() {
 
     case "$base" in
       Safepoint.purs)
-        expect call 5 "call-renderer count drifted (rtCallWith/rtCallVoid/machineryHandleCall/guestDirect/emitPreparedMusttail)"
+        expect call 6 "call-renderer count drifted (rtCallWith/rtCallVoid/machineryHandleCall/guestDirect/foreignDirect/emitPreparedMusttail)"
         expect unsafeEmitChainLabel 0 "chain-label emitter outside Abi/Root"
-        expect unsafeEmitRawCall 6 "unsafeEmitRawCall count drifted"
+        expect unsafeEmitRawCall 7 "unsafeEmitRawCall count drifted"
         expect unsafeEmitRawModule 0 "unsafeEmitRawModule outside the allowlist"
         expect popFrame 0 "popFrame outside Root"
         expect openFrame 0 "openFrame outside its pinned minting sites"
-        expect bumpEpoch 5 "bumpEpoch count drifted"
+        expect bumpEpoch 6 "bumpEpoch count drifted"
         expect verifyAt 0 "verifyAt outside the Monad wrapper"
         expect mintAt 0 "mintAt outside the Monad wrapper"
         expect keyOf 0 "keyOf outside the bind-time key stamps"
-        expect unsafeUseVal 6 "unsafeUseVal count drifted"
-        expect unsafeMintFresh 4 "unsafeMintFresh count drifted"
+        expect unsafeUseVal 7 "unsafeUseVal count drifted"
+        expect unsafeMintFresh 5 "unsafeMintFresh count drifted"
         expect testesc 0 "test-only token escape used in src"
         expect machineryHandleCall 4 "machineryHandleCall count drifted"
         ;;
@@ -100,11 +102,19 @@ audit_dir() {
         expect machineryHandleCall 0 "machineryHandleCall outside Root"
         ;;
       Program.purs)
-        expect call 2 "raw call-construction count drifted"
+        expect call 3 "raw call-construction count drifted"
         [ "$(count_matches "$f" 'unsafeEmitRawCall ("  %ctx = call ptr @pv_runtime_new(i64 ' F)" -eq 1 ] \
           || { echo "seam-audit: $base: the ctx-birth construction drifted from its pinned shape" >&2; bad=1; }
         [ "$(count_matches "$f" '"  call void @" <> mangle (gdefInitKey g) <> "$init(ptr %ctx)"' F)" -eq 1 ] \
           || { echo "seam-audit: $base: the pv_init_all \$init-skeleton construction drifted from its pinned shape" >&2; bad=1; }
+        # ADR-0109 §2.2-amended: TWO pins — the hoisted-closure init call's own shape, and the
+        # skeleton placing it FIRST (a gdef init may call code that reads a cell, so a later
+        # position would read the 0 sentinel). The call is absent in the §5.2 \`PerUse\` leg, which is
+        # why the skeleton interpolates it rather than spelling it inline.
+        [ "$(count_matches "$f" '"  call void @" <> foreignCloInitSym <> "(ptr %ctx)\n"' F)" -eq 1 ] \
+          || { echo "seam-audit: $base: the pv_init_all hoisted-closure-init call drifted from its pinned shape" >&2; bad=1; }
+        [ "$(count_matches "$f" '"define void @pv_init_all(ptr %ctx) {\nentry:\n" <> fclo <> calls' F)" -eq 1 ] \
+          || { echo "seam-audit: $base: the pv_init_all skeleton no longer puts the hoisted-closure init first" >&2; bad=1; }
         expect unsafeEmitRawCall 2 "unsafeEmitRawCall count drifted"
         expect unsafeEmitRawModule 2 "unsafeEmitRawModule count drifted"
         expect popFrame 0 "popFrame outside Root"
@@ -245,9 +255,27 @@ audit_dir() {
     allow0106 rootedFromVal 3 0 2 0
     allow0106 mintFrameOwner 0 5 2 0
     allow0106 unsafeMkFrameOwner 3 2 0 0
-    allow0106 vRootedGlobal 3 0 0 2
+    allow0106 vRootedGlobal 3 0 0 3
     allow0106 rootedSrc 3 4 5 0
     allow0106 emitGcafInitEngine 0 0 3 2
+
+    # ADR-0109 §1.1 — ONE derivation per leaf reference. `mangleForeign` (the `pvf_` symbol) and
+    # `unsafeForeignRef` (the raw constructor) may appear ONLY in `ForeignRef.purs`, which derives
+    # every spelling, and `Monad.foreignRef`, its one safe producer. A second `mangleForeign` — the
+    # state this ADR removed, where the declare, the cell and the value-position read each derived
+    # their own — type-checks perfectly and drifts silently, so it is caged here rather than trusted.
+    allow0109() { # $1=id $2=ForeignRef $3=Monad
+      local want=0
+      case "$base" in
+        ForeignRef.purs) want="$2" ;;
+        Monad.purs) want="$3" ;;
+        Mangle.purs) want="${4:-99}" ;;
+      esac
+      [ "$want" = "99" ] && return 0
+      expect "$1" "$want" "ADR-0109 caged identifier outside its allowlist ($1)"
+    }
+    allow0109 mangleForeign 2 0
+    allow0109 unsafeForeignRef 3 2
   done
   return "$bad"
 }

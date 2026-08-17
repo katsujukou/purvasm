@@ -86,7 +86,7 @@ echo "   corefn closure: $COREFN_DIR → $SNAP_COREFN"
 export PURVASM_LIB="$SNAP_ULIB"
 # Measurement knobs are HARNESS-owned: an ambient export must not silently change what the two
 # legs mean (a stray `PURVASM_BYNEED_OFF` would make the "with the lattice" leg the counterfactual).
-unset PURVASM_BYNEED_OFF PURVASM_EMIT_DEBUG_ABI PURVASM_GC_STRESS PURVASM_STATS PURVASM_HEAP_WORDS PURVASM_PROFILE_APPLY
+unset PURVASM_BYNEED_OFF PURVASM_EMIT_DEBUG_ABI PURVASM_GC_STRESS PURVASM_STATS PURVASM_HEAP_WORDS PURVASM_PROFILE_APPLY PURVASM_FOREIGN_CLOSURE PURVASM_FOREIGN_CALL
 
 echo "== leg 1: native .ll emission ======================================"
 # `cli/index.node.js` is the Node-interpreted Level-2 compiler — the one built from this tree by

@@ -94,7 +94,7 @@ export PURVASM_RT_A="$WORK/libpurvasm_rt.a"
 # Every measurement knob is HARNESS-owned: the legs differ in `PURVASM_BYNEED_OFF` and in NOTHING
 # else, so an ambient `PURVASM_GC_STRESS=1` (or `PURVASM_STATS`, or a heap override) must not reach
 # either leg — it would change what is being timed while the summary still claimed defaults.
-unset PURVASM_BYNEED_OFF PURVASM_EMIT_DEBUG_ABI PURVASM_GC_STRESS PURVASM_STATS PURVASM_HEAP_WORDS PURVASM_PROFILE_APPLY
+unset PURVASM_BYNEED_OFF PURVASM_EMIT_DEBUG_ABI PURVASM_GC_STRESS PURVASM_STATS PURVASM_HEAP_WORDS PURVASM_PROFILE_APPLY PURVASM_FOREIGN_CLOSURE PURVASM_FOREIGN_CALL
 # The run wrapper: clean environment, the per-program heap size, and a REQUIRED exit status. The
 # heap is passed EXPLICITLY (and identically to both legs) rather than left to the built-in default:
 # the table carries a per-program size, and a column the harness silently ignores is a lie about

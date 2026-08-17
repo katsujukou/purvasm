@@ -12,6 +12,10 @@
 #                                                      a `pv_apply` that no MissReason explains)
 #   pv_tailcall == generic-tail                       (a generic TAIL call is a trampoline store,
 #                                                      invisible in any `pv_apply` count)
+#   pvf_ direct == foreign-direct-apply + foreign-direct-tail   (ADR-0109 §7: a saturated native
+#                                                                leaf called through its own entry;
+#                                                                without this column slice B's calls
+#                                                                would be accounted by nobody)
 #   musttail    == direct-musttail
 #   guestDirect == direct-nontail + wrapper-entry     (a lifted function's generic entry is a direct
 #                                                      call in the `.ll` but not a call SITE)
@@ -118,7 +122,7 @@ else
   echo "   corefn closure: $COREFN_DIR → $SNAP_COREFN"
 fi
 # measurement knobs are harness-owned
-unset PURVASM_BYNEED_OFF PURVASM_EMIT_DEBUG_ABI PURVASM_GC_STRESS PURVASM_STATS PURVASM_HEAP_WORDS PURVASM_PROFILE_APPLY
+unset PURVASM_BYNEED_OFF PURVASM_EMIT_DEBUG_ABI PURVASM_GC_STRESS PURVASM_STATS PURVASM_HEAP_WORDS PURVASM_PROFILE_APPLY PURVASM_FOREIGN_CLOSURE PURVASM_FOREIGN_CALL
 
 echo "== leg 1: native .ll emission ======================================"
 # shellcheck disable=SC2086
@@ -138,14 +142,17 @@ echo "== reconciliation: six columns, per object ========================="
 # Emitted call forms per object.
 : >"$WORK/emitted.tsv"
 emit_row() { # $1=object id  $2=path
-  local id="$1" f="$2" apply tailcall musttail direct
+  local id="$1" f="$2" apply tailcall musttail direct pvf
   # `^  ` anchors to the instruction indent — see caveat 3 in the header.
   apply=$(grep -cE '^  .*call i64 @pv_apply\(' "$f" || true)
   tailcall=$(grep -cE '^  call void @pv_tailcall\(' "$f" || true)
   musttail=$(grep -cE '^  .*musttail call' "$f" || true)
   direct=$(grep -cE '^  .*call tailcc i64 @' "$f" || true)
+  # ADR-0109 §7. Anchored to the instruction form: the leaf's own `declare` is at column 0, and the
+  # `ptrtoint` reference in the hoisted-closure init is not a call.
+  pvf=$(grep -cE '^  %[^ ]+ = call i64 @pvf_' "$f" || true)
   # a `musttail call tailcc i64 @…` line matches the direct needle too.
-  printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$apply" "$tailcall" "$musttail" "$((direct - musttail))" >>"$WORK/emitted.tsv"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$apply" "$tailcall" "$musttail" "$((direct - musttail))" "$pvf" >>"$WORK/emitted.tsv"
 }
 for ll in "$WORK"/build/_build/mod_*.ll; do
   id=$(basename "$ll" .ll); emit_row "${id#mod_}" "$ll"
@@ -162,16 +169,22 @@ awk -F'\t' '
     else if ($4 == "direct-musttail")  dm[$1] += $5
     else if ($4 == "direct-nontail")   dn[$1] += $5
     else if ($4 == "wrapper-entry")    we[$1] += $5
+    # ADR-0109: the deferred forms LOWER to the generic dispatch, so they land in those columns;
+    # only the direct forms are their own column.
+    else if ($4 == "foreign-deferred-apply") ga[$1] += $5
+    else if ($4 == "foreign-deferred-tail")  gt[$1] += $5
+    else if ($4 == "foreign-direct-apply")   fd[$1] += $5
+    else if ($4 == "foreign-direct-tail")    fd[$1] += $5
     seen[$1] = 1
   }
-  END { for (o in seen) printf "%s\t%d\t%d\t%d\t%d\n", o, ga[o] + sa[o], gt[o], dm[o], dn[o] + we[o] }
+  END { for (o in seen) printf "%s\t%d\t%d\t%d\t%d\t%d\n", o, ga[o] + sa[o], gt[o], dm[o], dn[o] + we[o], fd[o] }
 ' "$WORK/$OUT" | sort >"$WORK/recorded.tsv"
 sort -o "$WORK/emitted.tsv" "$WORK/emitted.tsv"
 
-join -t $'\t' -a1 -a2 -e MISSING -o 0,1.2,1.3,1.4,1.5,2.2,2.3,2.4,2.5 \
+join -t $'\t' -a1 -a2 -e MISSING -o 0,1.2,1.3,1.4,1.5,1.6,2.2,2.3,2.4,2.5,2.6 \
   "$WORK/recorded.tsv" "$WORK/emitted.tsv" >"$WORK/joined.tsv"
 
-mismatches=$(awk -F'\t' '$2 != $6 || $3 != $7 || $4 != $8 || $5 != $9' "$WORK/joined.tsv" \
+mismatches=$(awk -F'\t' '$2 != $7 || $3 != $8 || $4 != $9 || $5 != $10 || $6 != $11' "$WORK/joined.tsv" \
   | tee "$WORK/mismatches.tsv" | wc -l | tr -d ' ')
 objects=$(wc -l <"$WORK/joined.tsv" | tr -d ' ')
 
