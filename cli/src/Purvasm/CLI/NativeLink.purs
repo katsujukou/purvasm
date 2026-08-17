@@ -365,7 +365,7 @@ link opts = do
   compileObj sectionFlags tag = do
     ll <- FS.joinPath [ opts.buildDir, tag <> ".ll" ]
     obj <- FS.joinPath [ opts.buildDir, tag <> ".o" ]
-    runClang (tag <> " (clang -c)") ([ "-c", "-O2" ] <> sectionFlags <> [ ll, "-o", obj ])
+    runClang (tag <> " (clang -c)") ([ "-c", "-O2", "-Wno-unused-command-line-argument", "-Wno-override-module" ] <> sectionFlags <> [ ll, "-o", obj ])
     pure obj
 
   compileForeign sectionFlags inc (Tuple i (Tuple cPath keys)) = do
