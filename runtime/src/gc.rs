@@ -687,6 +687,13 @@ impl Heap {
                 self.cap
             );
         }
+        // ADR-0108 §5 allocation census: counted HERE, after the collection points above and before
+        // the bump, so it is one increment per MUTATOR allocation. The collector's evacuation runs
+        // through `collect_core`, never this function, so a copied object is not counted twice —
+        // the census measures allocation volume, which `gc_copied_words` (live-set volume) cannot.
+        if let Some(p) = self.apply_profile.as_mut() {
+            p.record_alloc(kind);
+        }
         let base = self.top;
         self.top += words;
         self.starts_bits[base >> 6] |= 1u64 << (base & 63);
@@ -2769,5 +2776,56 @@ mod tests {
         let f = h.record_get(r, 7);
         assert_eq!(h.str_read(unsafe { HeapPtr::from_word(f) }), "field-value");
         assert_eq!(h.record_get(r, 9).as_int(), 3);
+    }
+
+    // --- ADR-0108 §5 / ADR-0109 §5.1: the guest-heap allocation census -----------------------------
+
+    /// The census counts what the MUTATOR allocates, once per object, attributed to the right kind.
+    /// The formatter is unit-tested in `applyprofile`; what is tested here is the WIRING — that
+    /// `Heap::alloc` is the one place it hooks, so no constructor can allocate uncounted.
+    #[test]
+    fn alloc_census_counts_each_mutator_allocation_once_by_kind() {
+        let mut h = Heap::new(8192);
+        h.set_apply_profile(
+            crate::applyprofile::ApplyProfile::register("a", 1).expect("registers"),
+        );
+        // one array, one closure over it, two strings.
+        let e = h.new_array(&[TaggedWord::int(1)]).as_word();
+        // SAFETY: the index path interns code, so `0` is a valid code-table index only after an
+        // intern — this test never CALLS the closure, it only allocates one.
+        let _ = unsafe { h.new_closure_raw(0, 1, e) };
+        let _ = h.new_str(b"x");
+        let _ = h.new_str(b"yy");
+        let line = h.apply_profile().expect("registered").format();
+        assert!(line.contains(" alloc/kind/closure=1"), "{line}");
+        assert!(line.contains(" alloc/kind/array=1"), "{line}");
+        assert!(line.contains(" alloc/kind/str=2"), "{line}");
+        assert!(line.contains(" alloc/kind/adt=0"), "{line}");
+    }
+
+    /// A COPIED object is not an allocation. The collector evacuates through `collect_core`, never
+    /// `Heap::alloc`, and this is the property that makes the census allocation VOLUME rather than a
+    /// restatement of `gc_copied_words` — so a collection must move the census not at all.
+    #[test]
+    fn alloc_census_does_not_count_the_collectors_copies() {
+        let mut h = Heap::new(8192);
+        h.set_apply_profile(
+            crate::applyprofile::ApplyProfile::register("a", 1).expect("registers"),
+        );
+        let s = h.new_str(b"survivor").as_word();
+        let before = h.apply_profile().expect("registered").format();
+        assert!(before.contains(" alloc/kind/str=1"), "{before}");
+        let mut roots = [s];
+        h.collect(&mut roots);
+        let after = h.apply_profile().expect("registered").format();
+        assert_eq!(
+            before, after,
+            "a collection allocates nothing the census may count"
+        );
+        assert_eq!(
+            h.str_read(unsafe { HeapPtr::from_word(roots[0]) }),
+            "survivor",
+            "the survivor was really copied (so the unchanged count above excluded a real copy)"
+        );
     }
 }

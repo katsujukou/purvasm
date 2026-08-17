@@ -80,6 +80,41 @@ impl Kind {
             _ => None,
         }
     }
+
+    /// Every kind, in discriminant order — the allocation census's row order (ADR-0108 §5). A unit
+    /// test pins that each entry sits at its own discriminant, so a kind added to the enum without
+    /// being added here is caught rather than silently omitted from the census.
+    pub(crate) const ALL: [Kind; 11] = [
+        Kind::Adt,
+        Kind::Record,
+        Kind::Closure,
+        Kind::Pap,
+        Kind::Str,
+        Kind::NumberBox,
+        Kind::Ref,
+        Kind::ByNeed,
+        Kind::Array,
+        Kind::RawIds,
+        Kind::StrSlice,
+    ];
+
+    /// The census label. The RUNTIME owns these names because `Kind` is a runtime concept — unlike
+    /// the apply profile's call classes, which the compiler names and hands over (ADR-0108 §3).
+    pub(crate) const fn census_name(self) -> &'static str {
+        match self {
+            Kind::Adt => "adt",
+            Kind::Record => "record",
+            Kind::Closure => "closure",
+            Kind::Pap => "pap",
+            Kind::Str => "str",
+            Kind::NumberBox => "number",
+            Kind::Ref => "ref",
+            Kind::ByNeed => "byneed",
+            Kind::Array => "array",
+            Kind::RawIds => "rawids",
+            Kind::StrSlice => "strslice",
+        }
+    }
 }
 
 /// GC colour. **Reserved for v2** (mark-sweep of the shared heap, generational collection). The v1
@@ -275,6 +310,27 @@ mod tests {
     fn header_rejects_size_zero() {
         // `Header::new` now `assert!`s (release-on), so this holds regardless of build profile.
         let _ = Header::new(Kind::Adt, 0, Color::White);
+    }
+
+    /// The census (ADR-0108 §5) indexes its counters by `kind as usize`, so `ALL` must list every
+    /// kind exactly once AT its own discriminant — otherwise a row would count another kind's
+    /// allocations under its own label, which no downstream identity could detect.
+    #[test]
+    fn kind_all_is_indexed_by_its_own_discriminant() {
+        for (i, k) in Kind::ALL.iter().enumerate() {
+            assert_eq!(*k as usize, i, "{} is not at index {i}", k.census_name());
+            assert_eq!(Kind::from_u8(i as u8), Some(*k));
+        }
+        assert_eq!(
+            Kind::from_u8(Kind::ALL.len() as u8),
+            None,
+            "ALL must cover every decodable kind"
+        );
+        let mut names: Vec<&str> = Kind::ALL.iter().map(|k| k.census_name()).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(before, names.len(), "census labels must be distinct");
     }
 
     #[test]
