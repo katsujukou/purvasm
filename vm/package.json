@@ -13,6 +13,7 @@
   "scripts": {
     "compile": "cd .. && spago build -p vm",
     "test:unit": "cd .. && spago test -p vm",
+    "test:e2e": "cd .. && tools/vm-loader-e2e.sh",
     "test": "pnpm run test:unit",
     "format": "purs-tidy format-in-place src test",
     "check": "purs-tidy check src test"

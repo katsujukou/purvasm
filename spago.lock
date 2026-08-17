@@ -585,6 +585,7 @@
             "prelude",
             "purvasm-base",
             "purvasm-stdio",
+            "purvasm-system",
             "refs",
             "strings",
             "tailrec",

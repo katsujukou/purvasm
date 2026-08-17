@@ -84,7 +84,9 @@ hostRuntime = do
 -- | A failure is stuck rather than a `Maybe`: the caller asked for a specific file by name, and the
 -- | diagnostic (the platform's, via `dlerror`) says more than `Nothing` could. A path the boundary
 -- | cannot represent — one containing an interior NUL, which `dlopen` would read as a terminator and
--- | so open a *different* file — is refused the same way.
+-- | so open a *different* file — is refused the same way. A module built against another foreign ABI
+-- | fails here too, and by name (ADR-0111 §5): its unresolved `pv_foreign_abi_v<N>` is what `RTLD_NOW`
+-- | turns into a load failure, so no code of its own has run by the time this reports it.
 load :: String -> Effect ModuleHandle
 load path = do
   index <- loadImpl path

@@ -7,16 +7,26 @@
 -- | native executable and runs — because everything downstream (`dlopen`, `pv_make_closure`, the
 -- | link-time retention of the foreign API) is only reachable from a natively compiled VM. On node it
 -- | runs the same program through the same code, so the two targets can be compared by eye.
+-- |
+-- | It also takes `--ffi <path>` and loads that provider before running, which is what
+-- | `tools/vm-loader-e2e.sh` drives: loading with `RTLD_NOW` binds every reference a module makes, so
+-- | a module that loads is a module whose whole `pv_*` surface the host exported (ADR-0111 §1.1), and
+-- | a module built against another foreign ABI is refused before its initialisers run (§5). Neither
+-- | is observable without a natively compiled host, and neither needs a leaf to be *called*.
 module Main (main) where
 
 import Prelude
 
+import Data.Array as Array
+import Data.Foldable (for_)
 import Data.Map as Map
+import Data.Maybe (Maybe(..))
 import Data.Tuple.Nested ((/\))
 import Effect (Effect)
 import Effect.Ref as Ref
 import Purvasm.Stdio (writeLine)
-import Data.Maybe (Maybe(..))
+import Purvasm.System.Process as Process
+import Purvasm.VM.Error (stuck)
 import Purvasm.VM.Instruction (CodeBlock, Instruction(..), PrimOp(..))
 import Purvasm.VM.Loader as Loader
 import Purvasm.VM.Machine (newEnv, runBlock)
@@ -71,8 +81,27 @@ probe host key n = case Loader.arity n of
     Just _ -> "resolved"
     Nothing -> "absent"
 
+-- | The provider paths named by `--ffi <path>`, in order. Loading a shared object runs arbitrary
+-- | native code, so it is explicit and opt-in (ADR-0111 §4): nothing is discovered from the working
+-- | directory or the environment. A `--ffi` with no path is an error rather than a silent skip — the
+-- | caller meant to load something.
+ffiPaths :: Array String -> Effect (Array String)
+ffiPaths args = case Array.uncons args of
+  Nothing -> pure []
+  Just { head: "--ffi", tail } -> case Array.uncons tail of
+    Just path -> Array.cons path.head <$> ffiPaths path.tail
+    Nothing -> stuck "--ffi needs a provider path"
+  Just { tail } -> ffiPaths tail
+
 main :: Effect Unit
 main = do
+  -- Providers load *before* the program runs, so a module's own initialisers cannot be mistaken for
+  -- program output — which is what makes the ADR-0111 §5 stale-module gate observable.
+  args <- Process.argv
+  paths <- ffiPaths (Array.drop 1 args)
+  for_ paths \path -> do
+    handle <- Loader.load path
+    writeLine ("loaded: " <> Loader.describe handle)
   env <- newEnv Map.empty
   result <- runBlock env program Map.empty
   executed <- Ref.read env.executed

@@ -54,6 +54,22 @@ static void pvm_set_error(const char *what) {
   snprintf(pvm_error, sizeof pvm_error, "%s%s%s", what, detail ? ": " : "", detail ? detail : "");
 }
 
+/* A failed `dlopen`, read for the one shape worth naming (ADR-0111 §5): an unresolved
+ * `pv_foreign_abi_v<N>` means the provider was built against a different foreign ABI. Every platform
+ * reports that as an ordinary missing symbol — true, and misleading, since it reads as a host that
+ * forgot to export something. The path is *not* repeated here; `Loader.purs` names the module. */
+static void pvm_set_load_error(void) {
+  const char *detail = dlerror();
+  if (detail != NULL && strstr(detail, "pv_foreign_abi_v") != NULL) {
+    snprintf(pvm_error, sizeof pvm_error,
+             "built against a different foreign ABI — this VM provides PV_FOREIGN_ABI_VERSION=%d, so "
+             "rebuild the provider against this runtime's purvasm.h (loader: %s)",
+             PV_FOREIGN_ABI_VERSION, detail);
+  } else {
+    snprintf(pvm_error, sizeof pvm_error, "load failed%s%s", detail ? ": " : "", detail ? detail : "");
+  }
+}
+
 /* Copy a purvasm `String` out whole, NUL-terminated, on the C heap. Returns NULL and sets
  * `pvm_error` when the string cannot be represented as a C string — never a shortened copy. The
  * two-call read is the ABI's: it hands out no interior pointer into the moving heap. */
@@ -100,7 +116,7 @@ static int pvm_load(const char *path) {
   (void)dlerror(); /* clear any stale error before the call whose failure we report */
   void *handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
   if (handle == NULL) {
-    pvm_set_error("load failed");
+    pvm_set_load_error();
     return -1;
   }
   char *name = strdup(path);
