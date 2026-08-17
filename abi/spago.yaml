@@ -1,0 +1,7 @@
+package:
+  name: abi
+  dependencies:
+    - arrays
+    - integers
+    - prelude
+    - strings

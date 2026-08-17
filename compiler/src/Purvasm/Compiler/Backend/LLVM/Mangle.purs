@@ -4,6 +4,10 @@
 -- | — the ADR-0082 port. The encodings stay pinned by L2-owned goldens: mangling is link-time ABI
 -- | (`@pvf_` leaf symbols must match the runtime/ulib `.c` exports) and immediates are the value rep.
 -- |
+-- | `escapeIdent`/`mangle`/`mangleForeign` are re-exported from `Purvasm.Abi.Mangle`: the owned VM
+-- | resolves the very symbols this backend emits (ADR-0111 §2), so the two share one derivation
+-- | rather than a copy that could drift.
+-- |
 -- | The `fnv1a_64`-derived encodings (`labelId`, `ctorTag`, `sortRecordFields`) build on the pure 64-bit
 -- | hash in `Util.Fnv1a64`; `escapeStringBytes`/`utf8Bytes` back the `String`-literal constant.
 module Purvasm.Compiler.Backend.LLVM.Mangle
@@ -11,9 +15,7 @@ module Purvasm.Compiler.Backend.LLVM.Mangle
   , immInt
   , immBool
   , immUnit
-  , escapeIdent
-  , mangle
-  , mangleForeign
+  , module Purvasm.Abi.Mangle
   , utf8Bytes
   , escapeStringBytes
   , labelId
@@ -24,17 +26,18 @@ module Purvasm.Compiler.Backend.LLVM.Mangle
 import Prelude
 
 import Data.Array as Array
-import Data.Char (fromCharCode, toCharCode)
+import Data.Char (fromCharCode)
 import Data.Enum (fromEnum)
 import Data.Foldable (foldMap)
 import Data.Int (hexadecimal, toStringAs)
 import Data.Int.Bits (and, shl, shr, (.&.), (.|.))
 import Data.Maybe (maybe)
 import Data.String.CodePoints (toCodePointArray)
-import Data.String.CodeUnits (length, singleton, toCharArray)
+import Data.String.CodeUnits (length, singleton)
 import Data.String.Common (toUpper)
 import Data.Tuple (Tuple(..), fst, snd)
 import Purvasm.Compiler.Util.Fnv1a64 (fnv1a64Bytes, unsignedCompareI64)
+import Purvasm.Abi.Mangle (escapeIdent, mangle, mangleForeign)
 import Purvasm.Compiler.Util.Int64Decimal (int64BitsDecimal)
 
 -- | A scalar immediate (ADR-0064 §1): the payload as the i64 constant `(payload << 1) | 1`, rendered
@@ -57,36 +60,6 @@ immBool b = imm (if b then 1 else 0)
 -- | The `Unit` / sentinel immediate: `imm 0` (→ `"1"`).
 immUnit :: String
 immUnit = imm 0
-
--- | The injective identifier escape (ADR-0072 §2): alphanumerics pass through, every other byte
--- | (including `_` itself) becomes `_HH` (lowercase hex), so distinct keys never collide
--- | (`A.B` → `A_2eB`, `A_B` → `A_5fB`). Qualified keys are ASCII, so iterating code units matches
--- | boot's byte iteration.
-escapeIdent :: String -> String
-escapeIdent key = foldMap escapeChar (toCharArray key)
-  where
-  escapeChar c =
-    let
-      code = toCharCode c
-    in
-      if isAlphaNum code then singleton c
-      else "_" <> pad2 (toStringAs hexadecimal code)
-
-  isAlphaNum code =
-    (code >= 48 && code <= 57) -- 0-9
-
-      || (code >= 65 && code <= 90) -- A-Z
-      || (code >= 97 && code <= 122) -- a-z
-
-  pad2 s = if length s < 2 then "0" <> s else s
-
--- | A top-level binding's linker symbol base: `pv_g_<escape key>` (ADR-0072 §2).
-mangle :: String -> String
-mangle key = "pv_g_" <> escapeIdent key
-
--- | A native foreign leaf's `AbiCodeFn` linker symbol: `pvf_<escape key>` (ADR-0073 §3).
-mangleForeign :: String -> String
-mangleForeign key = "pvf_" <> escapeIdent key
 
 -- | The UTF-8 byte sequence of a string (ADR-0006: `String` is a UTF-8 byte sequence). boot's `String`
 -- | is already bytes; PureScript's is UTF-16, so re-encode each code point to its 1–4 UTF-8 bytes, so a
