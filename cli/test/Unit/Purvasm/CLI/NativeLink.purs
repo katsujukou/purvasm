@@ -1,5 +1,6 @@
--- | The native link step's parse of `purvasm.h`
--- | ([ADR-0111](../../../../../docs/design-decisions/0111-vm-dynamic-native-ffi.md) §1.1).
+-- | The native link step's parses of `purvasm.h`
+-- | ([ADR-0111](../../../../../docs/design-decisions/0111-vm-dynamic-native-ffi.md) §1.1's retained
+-- | API and §5's foreign-ABI version reference).
 -- |
 -- | This is a **safety boundary**, not a convenience: its result becomes the export allowlist of an
 -- | executable that hosts `dlopen`ed providers, so anything it wrongly includes is something a guest
@@ -14,7 +15,7 @@ import Prelude
 import Data.Array as Array
 import Data.Either (Either(..), isLeft)
 import Data.String as String
-import Purvasm.CLI.NativeLink (foreignAuthorApi, generatedBanner)
+import Purvasm.CLI.NativeLink (foreignAbiStamp, foreignAuthorApi, generatedBanner)
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
 
@@ -42,6 +43,10 @@ header banner =
     , ""
     , "#define PVF_EXPORT(ident) PVF_CAT(PVF_CAT(pvf_, PVF_MODULE), PVF_CAT(_2e, ident))"
     , ""
+    , "#define PV_FOREIGN_ABI_VERSION 1"
+    , "void PV_FOREIGN_ABI_SYM(PV_FOREIGN_ABI_VERSION)(void);"
+    , "static void (*const pv_foreign_abi_stamp)(void) PVF_USED = PV_FOREIGN_ABI_SYM(PV_FOREIGN_ABI_VERSION);"
+    , ""
     , banner
     , " * A `PVContext*` points to storage whose FIRST BYTES are a `pv_ctx_header`."
     , " */"
@@ -57,6 +62,12 @@ header banner =
 
 realBanner :: String
 realBanner = " * ==== " <> generatedBanner <> " (ADR-0079) — NOT part of the foreign-author API above."
+
+-- | The header with its version `#define` spelled as `token`.
+versioned :: String -> Either String String
+versioned token =
+  foreignAbiStamp
+    (String.replaceAll (String.Pattern "ABI_VERSION 1") (String.Replacement ("ABI_VERSION " <> token)) (header realBanner))
 
 spec :: Spec Unit
 spec = describe "Purvasm.CLI.NativeLink" do
@@ -96,3 +107,52 @@ spec = describe "Purvasm.CLI.NativeLink" do
       case foreignAuthorApi (header " * (banner removed)") of
         Left e -> String.contains (String.Pattern "found 0") e `shouldEqual` true
         Right _ -> shouldEqual "a rejection" "a parse"
+
+    it "leaves the version reference to `foreignAbiStamp`" do
+      -- The stamp is declared through a macro paste, so no reader of declaration lines can name it —
+      -- and the `pv_foreign_abi_stamp` *definition* line must not be mistaken for one either, or the
+      -- allowlist would export a per-object static that no provider can resolve against.
+      case foreignAuthorApi (header realBanner) of
+        Right names -> do
+          Array.elem "pv_foreign_abi_stamp" names `shouldEqual` false
+          Array.elem "pv_foreign_abi_v1" names `shouldEqual` false
+        Left e -> shouldEqual e "the parse to succeed"
+
+  describe "foreignAbiStamp" do
+    it "derives the version reference from the header's #define" do
+      foreignAbiStamp (header realBanner) `shouldEqual` Right "pv_foreign_abi_v1"
+
+    it "follows a bumped version" do
+      -- The whole point of deriving it: a host exporting `…_v1` while providers reference `…_v2`
+      -- would refuse every provider, and the two live in the same file precisely so they cannot drift.
+      versioned "7" `shouldEqual` Right "pv_foreign_abi_v7"
+
+    it "refuses a header that defines no version" do
+      isLeft (foreignAbiStamp (String.replaceAll (String.Pattern "#define PV_FOREIGN_ABI_VERSION 1") (String.Replacement "") (header realBanner)))
+        `shouldEqual` true
+
+    it "refuses a header that defines it twice" do
+      isLeft (foreignAbiStamp (header realBanner <> "\n#define PV_FOREIGN_ABI_VERSION 2\n")) `shouldEqual` true
+
+    it "refuses a non-integer version" do
+      isLeft (versioned "v1") `shouldEqual` true
+
+    it "carries a multi-digit version through unchanged" do
+      versioned "12" `shouldEqual` Right "pv_foreign_abi_v12"
+
+    -- The version is a token the header PASTES, not a number: normalising it (parse, then reprint)
+    -- silently renames the symbol, and the host would then export a name no provider references —
+    -- which fails as "symbol not found" at every `dlopen`, far from the header that caused it.
+    it "refuses a leading zero rather than normalising it" do
+      -- `01` makes providers reference `pv_foreign_abi_v01`; answering `pv_foreign_abi_v1` here is
+      -- the exact mismatch, and it is invisible until a provider fails to load.
+      isLeft (versioned "01") `shouldEqual` true
+
+    it "refuses a signed version, which cannot be part of an identifier at all" do
+      isLeft (versioned "+1") `shouldEqual` true
+      isLeft (versioned "-1") `shouldEqual` true
+
+    it "is not fooled by a macro whose name merely starts with it" do
+      -- `…_VERSION_MINOR 3` shares the whole prefix; taking it would export `pv_foreign_abi_v3`.
+      isLeft (foreignAbiStamp (String.replaceAll (String.Pattern "ABI_VERSION 1") (String.Replacement "ABI_VERSION_MINOR 3") (header realBanner)))
+        `shouldEqual` true

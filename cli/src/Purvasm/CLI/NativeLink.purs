@@ -6,8 +6,9 @@
 -- | (`--gc-sections` / `-dead_strip`). Over the CLI `PROC`/`FS` effects.
 module Purvasm.CLI.NativeLink
   ( LinkOptions
-  -- | Exported for its unit tests: it decides what a loaded provider may reach, so its parse is
+  -- | Exported for its unit tests: they decide what a loaded provider may reach, so their parses are
   -- | checked directly rather than only through a native build.
+  , foreignAbiStamp
   , foreignAuthorApi
   , generatedBanner
   , link
@@ -21,7 +22,7 @@ import Data.Array ((..))
 import Data.Array as Array
 import Data.Char (toCharCode)
 import Data.Either (Either(..))
-import Data.Foldable (any, foldMap)
+import Data.Foldable (all, any, foldMap)
 import Data.Int as Int
 import Data.Map (Map)
 import Data.Map as Map
@@ -77,9 +78,9 @@ type LinkOptions =
 -- | foreign surface. The header is the contract, so the header is what is parsed: everything before
 -- | its generated-code marker, declaration lines only.
 -- |
--- | ADR-0111 §5's `pv_foreign_abi_v<N>` stamp joins the retained set when that lands; it is not in
--- | the header yet, and retaining a symbol the runtime does not define would reach the linker as an
--- | undefined `-u` and fail the build.
+-- | ADR-0111 §5's `pv_foreign_abi_v<N>` reference is retained on the same footing but is not found
+-- | here: it is declared through a macro paste (`PV_FOREIGN_ABI_SYM(…)`), which no reader of
+-- | declaration lines can resolve. [foreignAbiStamp] derives it from the version the header defines.
 -- |
 -- | `Left` when the header does not carry **exactly one** generated-code banner. The banner is what
 -- | separates a provider's API from codegen's, so losing it must not degrade to "parse the whole
@@ -117,6 +118,62 @@ foreignAuthorApi header = case String.split (Pattern generatedBanner) header of
       || isJust (String.stripPrefix (Pattern "/*") t)
       || isJust (String.stripPrefix (Pattern "//") t)
       || isJust (String.stripPrefix (Pattern "#") t)
+
+-- | ADR-0111 §5's link-time version reference, `pv_foreign_abi_v<N>`, derived from the header's
+-- | `#define PV_FOREIGN_ABI_VERSION <N>`.
+-- |
+-- | Derived rather than named: every provider carries an undefined reference to this symbol, so the
+-- | host that must satisfy it and the header that emits it have to agree on `N` exactly. Reading the
+-- | version from the same file the provider compiled against is what makes a bump one edit — and a
+-- | host that failed to export the bumped symbol would not fail quietly, but by refusing to load
+-- | every provider built after it.
+-- |
+-- | `Left` when the header defines no version, defines it more than once, or spells it as anything
+-- | but a canonical decimal: this feeds the retained set of a program that hosts providers, and
+-- | guessing a version there would produce an executable that silently accepts modules built against
+-- | a different ABI.
+foreignAbiStamp :: String -> Either String String
+foreignAbiStamp header = case Array.mapMaybe versionOf (String.split (Pattern "\n") header) of
+  [ token ]
+    | isCanonicalDecimal token -> Right ("pv_foreign_abi_v" <> token)
+    | otherwise -> Left
+        ( "#define "
+            <> foreignAbiVersionMacro
+            <> " "
+            <> token
+            <> " is not a canonical decimal version; the token is pasted into a symbol name, so a "
+            <> "sign or a leading zero names something no provider references"
+        )
+  found -> Left
+    ( "purvasm.h must `#define "
+        <> foreignAbiVersionMacro
+        <> "` exactly once (found "
+        <> show (Array.length found)
+        <> "); it is the version every provider references, so it cannot be guessed"
+    )
+  where
+  versionOf line = do
+    rest <- String.stripPrefix (Pattern "#define") (String.trim line)
+    value <- String.stripPrefix (Pattern foreignAbiVersionMacro) (String.trim rest)
+    -- A macro whose name merely *starts* with this one (a hypothetical `…_VERSION_MINOR`) is not it:
+    -- a version must be separated from its name by whitespace, which `trim` then removes.
+    if String.trim value == value then Nothing else Just (String.trim value)
+
+  -- The version is a **token**, never a number: the header pastes it into the symbol name, so `01`
+  -- makes every provider reference `pv_foreign_abi_v01`, and a host that parsed-then-reprinted it
+  -- would export `…_v1` and refuse all of them. Parsing would also bound an ABI version by `Int`'s
+  -- range for no reason. So the token is returned verbatim, and only a canonical decimal is accepted
+  -- — a sign is refused because `-1`/`+1` cannot even be part of a valid identifier.
+  isCanonicalDecimal token = case SCU.uncons token of
+    Just { head, tail } -> head >= '1' && head <= '9' && all isDigit (SCU.toCharArray tail)
+    Nothing -> false
+
+  isDigit c = c >= '0' && c <= '9'
+
+-- | The header macro carrying ADR-0111 §5's foreign-ABI version. Named once: [foreignAbiStamp] and
+-- | its tests must agree on the exact spelling.
+foreignAbiVersionMacro :: String
+foreignAbiVersionMacro = "PV_FOREIGN_ABI_VERSION"
 
 -- | The banner separating the foreign-author API from the generated-code ABI in `purvasm.h`
 -- | (ADR-0079). Named here because both the parse and its tests depend on the exact text.
@@ -465,14 +522,21 @@ link opts = do
       api <- case foreignAuthorApi header of
         Right names -> pure names
         Left e -> throw ("--host-foreign-api: " <> e)
+      -- ADR-0111 §5: every provider references this, so a host that does not export it can load no
+      -- provider at all. Retained on the same footing as the API it versions.
+      stamp <- case foreignAbiStamp header of
+        Right sym -> pure sym
+        Left e -> throw ("--host-foreign-api: " <> e)
       defined <- nmDefinedList archive
       let
         definedSet = Set.fromFoldable defined
         -- A header entry the runtime does not define would otherwise reach the linker as `-u` and
-        -- fail as a raw undefined symbol; name it here instead.
-        missing = Array.filter (\s -> not (Set.member s definedSet)) api
+        -- fail as a raw undefined symbol; name it here instead. The version reference is checked the
+        -- same way, where the diagnostic can say the two disagree — a bumped header against an
+        -- unbuilt runtime is the likeliest way to arrive here.
+        missing = Array.filter (\s -> not (Set.member s definedSet)) (api <> [ stamp ])
         runtimeLeaves = Array.filter (isJust <<< String.stripPrefix (Pattern "pvf_")) defined
-        retained = api <> runtimeLeaves
+        retained = api <> [ stamp ] <> runtimeLeaves
       when (Array.null api) $ throw
         ("--host-foreign-api: no `pv_*` declarations found in " <> headerPath)
       unless (Array.null missing) $ throw
