@@ -108,7 +108,24 @@ extern "C" {
     pub fn pv_apply(ctx: *mut PVContext, f: PVWord, args: *const PVWord, nargs: usize) -> PVWord;
     /// Force a by-need cell to its value; passes any non-cell through unchanged (ADR-0070).
     pub fn pv_force_if_byneed(ctx: *mut PVContext, v: PVWord) -> PVWord;
+
+    /* ── Foreign-ABI version (ADR-0111 §5) ─────────────────────────────────────────────────── */
+
+    /// The link-time version reference every provider carries. Never called: `purvasm.h` emits an
+    /// undefined reference to it from every translation unit, and `purvasm-foreign` emits the same
+    /// reference for a Rust leaf (which never compiles the header, so a `cdylib` would otherwise
+    /// carry no version at all). Only the symbol for the runtime's own version exists, so a
+    /// provider built against a different one fails to resolve — at link when linked statically,
+    /// and at `dlopen` **before the module's initialisers run** when the VM loads it (RTLD_NOW).
+    ///
+    /// The name pastes the version, so bumping [`PV_FOREIGN_ABI_VERSION`] renames this.
+    pub fn pv_foreign_abi_v1();
 }
+
+/// `PV_FOREIGN_ABI_VERSION` in `purvasm.h` (ADR-0111 §5): the version of the foreign-author
+/// surface declared above. Distinct from [`PV_CTX_HEADER_VERSION`], which versions generated-code
+/// ABI — the two change for different reasons.
+pub const PV_FOREIGN_ABI_VERSION: u32 = 1;
 
 /* ══════════════════════════════════════════════════════════════════════════════════════════════
  * GENERATED-CODE ABI (ADR-0079) — mirrored for layout verification, NOT for foreign use.

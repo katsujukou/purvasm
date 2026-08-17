@@ -157,6 +157,47 @@ PVWord pv_apply(PVContext *ctx, PVWord f, const PVWord *args, size_t nargs);
 /** Force a by-need cell to its value; passes any non-cell through unchanged (ADR-0070). */
 PVWord pv_force_if_byneed(PVContext *ctx, PVWord v);
 
+/* ── Foreign-ABI version (ADR-0111 §5) ─────────────────────────────────────────────────────────────── */
+
+/**
+ * The version of the foreign-author surface above — the `pv_*` functions, their signatures and their
+ * contracts. Bumped when that surface changes incompatibly; an additive entry does not bump it.
+ *
+ * Deliberately NOT `PV_CTX_HEADER_VERSION`, which versions the generated-code `pv_ctx_header` layout
+ * below and is explicitly not the foreign surface: the two change for different reasons and a shared
+ * counter would make each one's bump a false alarm for the other.
+ */
+#define PV_FOREIGN_ABI_VERSION 1
+
+#if defined(__GNUC__) || defined(__clang__)
+#define PVF_USED __attribute__((used))
+#else
+#define PVF_USED
+#endif
+
+/*
+ * The version travels as an undefined **reference**, not as a stamp to be read back after loading.
+ * Every translation unit that includes this header carries a reference to `pv_foreign_abi_v<N>`, and
+ * the runtime defines that symbol for its own N only — so a provider built against a different header
+ * fails to *resolve*: at link when it is linked statically, and at `dlopen` when the VM loads it as a
+ * shared object (ADR-0111 §6 loads with RTLD_NOW, which binds every reference before the module's
+ * initialisers run).
+ *
+ * That ordering is the whole point. A version read *after* `dlopen` is too late: `dlopen` runs
+ * `init_array` / `+load` / a Rust `ctor` before it returns, so a stale module would already have
+ * called into a `pv_*` surface it disagrees with. Nothing here is ever called or read; the reference
+ * alone carries the version, and it costs one word of unreferenced data per object.
+ *
+ * The author writes nothing for this and no build flag selects it — the reference is unconditional,
+ * so a statically linked provider gets the same protection from the runtime staticlib's definition.
+ */
+#define PV_FOREIGN_ABI_SYM_(n) pv_foreign_abi_v##n
+#define PV_FOREIGN_ABI_SYM(n) PV_FOREIGN_ABI_SYM_(n)
+
+void PV_FOREIGN_ABI_SYM(PV_FOREIGN_ABI_VERSION)(void);
+
+static void (*const pv_foreign_abi_stamp)(void) PVF_USED = PV_FOREIGN_ABI_SYM(PV_FOREIGN_ABI_VERSION);
+
 /* ════════════════════════════════════════════════════════════════════════════════════════════════════
  * GENERATED-CODE ABI (ADR-0079) — NOT part of the foreign-author API above.
  *

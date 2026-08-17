@@ -7,6 +7,23 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use crate::ctx::{Ctx, PvValue};
 use purvasm_sys as sys;
 
+/// ADR-0111 §5's link-time foreign-ABI version reference, for the language that never compiles
+/// `purvasm.h`. A `#[pv_foreign]` expansion places a `#[used]` static holding this **beside its own
+/// exported wrapper**, so the reference lands in the same object file the `pvf_*` symbol does: a
+/// `#[used]` static here alone would be kept by the compiler but could still be dropped with an
+/// otherwise-unreferenced object of this crate, and a Rust `cdylib` would then carry no version at
+/// all — exactly the module `dlopen` must refuse.
+///
+/// Never called. The static's type is a plain fn pointer so the address is all that is taken.
+pub static PV_FOREIGN_ABI_STAMP: unsafe extern "C" fn() = sys::pv_foreign_abi_v1;
+
+// The name above pastes the version; this keeps the paste in step with the mirrored constant, so a
+// bump that forgets to rename fails to compile here rather than at a user's `dlopen`.
+const _: () = assert!(
+    sys::PV_FOREIGN_ABI_VERSION == 1,
+    "rename the `pv_foreign_abi_v1` reference to match the bumped PV_FOREIGN_ABI_VERSION"
+);
+
 /// A fatal foreign fault: report on stderr, then abort — the same observable class as a C leaf's
 /// runtime shape fault. Never unwinds into the runtime (ADR-0078 §4).
 fn fatal(key: &str, what: &str) -> ! {

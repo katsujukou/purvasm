@@ -80,6 +80,17 @@ fn sys_header_version_agrees_with_runtime() {
     unsafe { purvasm_sys::pv_abi_check(purvasm_sys::PV_CTX_HEADER_VERSION) }
 }
 
+/// The foreign-ABI version reference (ADR-0111 §5) resolves against the runtime this crate links,
+/// and names the version the sys mirror declares. Linking is the whole mechanism — a provider built
+/// against another version has no symbol to bind — so *reaching* this call is the assertion; the
+/// equality then pins the two spellings of the version together, which nothing else can (a
+/// `#[no_mangle]` name cannot be computed from a constant).
+#[test]
+fn foreign_abi_version_reference_resolves() {
+    unsafe { purvasm_sys::pv_foreign_abi_v1() }
+    assert_eq!(purvasm_sys::PV_FOREIGN_ABI_VERSION, 1);
+}
+
 #[test]
 fn pure_scalar_leaf_roundtrips() {
     with_rt(1 << 16, |ctx| unsafe {

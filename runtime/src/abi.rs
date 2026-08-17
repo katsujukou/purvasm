@@ -319,6 +319,36 @@ pub extern "C" fn pv_abi_check(version: u32) {
     }
 }
 
+// --- the foreign-ABI version (ADR-0111 §5) ----------------------------------------------------------
+
+/// The version of the **foreign-author** surface — the `pv_*` functions a native leaf may call
+/// (mirrors `PV_FOREIGN_ABI_VERSION` in `include/purvasm.h`). Distinct from
+/// [`PV_CTX_HEADER_VERSION`] on purpose: that one versions generated-code ABI, and a shared counter
+/// would make each side's bump a false alarm for the other.
+pub const PV_FOREIGN_ABI_VERSION: u32 = 1;
+
+/// The link-time version *reference* every provider carries (ADR-0111 §5): `purvasm.h` — and, for a
+/// Rust leaf, `purvasm-foreign` — emits an undefined reference to `pv_foreign_abi_v<N>`, and only
+/// the symbol for THIS runtime's N exists. A provider built against a different header therefore
+/// fails to resolve: at link when it is linked statically, and at `dlopen` when the VM loads it as a
+/// shared object — with `RTLD_NOW`, *before* the module's initialisers run, which a post-load
+/// version read cannot achieve.
+///
+/// Never called; only its address is referenced. Unlike [`pv_ctx_abi_v1`] this has no profile
+/// split — a foreign provider reaches the runtime only through real `pv_*` calls, so the debug/release
+/// difference in inline rooting (ADR-0079 §2) is not part of the contract it is built against.
+#[no_mangle]
+pub extern "C" fn pv_foreign_abi_v1() {}
+
+// The symbol name above pastes the version by hand (a `#[no_mangle]` name cannot be computed), so
+// this is the net that keeps the two in step: bumping the constant without renaming the symbol —
+// which would leave every provider referencing a version the runtime no longer implements — stops
+// the build here rather than at a user's `dlopen`.
+const _: () = assert!(
+    PV_FOREIGN_ABI_VERSION == 1,
+    "rename `pv_foreign_abi_v1` (and purvasm.h's / purvasm-sys's mirrors) to match the bumped version"
+);
+
 // --- ADR-0108 §3 apply profile (instrumented builds only) -------------------------------------------
 
 /// Register the apply profile's slot layout, called once from an INSTRUMENTED entry stub before
