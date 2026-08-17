@@ -1,0 +1,143 @@
+name: VM-Loader-CI
+
+# The ADR-0111 §1.1 / §5 loader gate on LINUX — the cross-platform half the record explicitly owes:
+# its Correction note records the retention/export mechanism as "a Mach-O-verified mechanism, not a
+# cross-platform one", because `-Wl,-u` + `-dead_strip` was measured on Mach-O only.
+#
+# Two jobs, deliberately separated by cost and by what a failure would mean:
+#
+#   `elf-probe`  — a two-file linker experiment (seconds, no purvasm build) that varies ONLY how the
+#                  host's symbols are made visible, so `--gc-sections` retention and each export mode
+#                  get an independent verdict. When the full gate below fails, this says whether the
+#                  cause is the link recipe or something above it.
+#   `loader`     — the real thing: the VM built with `--host-foreign-api`, then handed an
+#                  API-coverage provider and a stale one (tools/vm-loader-e2e.sh), exactly as it runs
+#                  on macOS today.
+#
+# Same gate topology as the sibling workflows (ADR-0057): the workflow always triggers so the
+# required `vm-loader-ci-gate` status is always produced, and the heavy job is gated on whether any
+# crossed surface changed. `workflow_dispatch` is here because the first purpose of this workflow is
+# a MEASUREMENT that must be runnable on demand, not only when a path changes.
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'runtime/**'
+              - 'crates/**'
+              - 'cli/**'
+              - 'cli-lib/**'
+              - 'compiler/**'
+              - 'vm/**'
+              - 'packages/**'
+              - 'ulib/**'
+              - 'ulib-tools/**'
+              - 'tools/vm-loader-e2e.sh'
+              - 'tools/elf-export-probe.sh'
+              - 'spago.yaml'
+              - 'spago.lock'
+              - 'flake.nix'
+              - 'flake.lock'
+              - '.github/workflows/vm-loader-ci.yaml'
+
+  # Cheap and always run: it needs no runtime, no ulib and no compiler, and its answer is the one the
+  # heavy job cannot give on its own.
+  elf-probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
+      - uses: cachix/cachix-action@v17
+        with:
+          name: katsujukou-github
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+      - uses: nicknovitski/nix-develop@v1
+
+      # The toolchain must be the flake's, not ubuntu's: what is being measured is how THIS clang and
+      # THIS linker treat `-Wl,-u` / `--gc-sections` / the export flags, and the native build uses
+      # exactly these.
+      - name: Record the toolchain being measured
+        run: |
+          clang --version | head -2
+          ld.lld --version 2>/dev/null || true
+          ld --version 2>/dev/null | head -1 || true
+
+      - name: ELF retention / export probe
+        run: ./tools/elf-export-probe.sh
+
+  loader:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
+      - uses: cachix/cachix-action@v17
+        with:
+          name: katsujukou-github
+          authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
+      - uses: nicknovitski/nix-develop@v1
+
+      # RELEASE only: the native pipeline emits the ADR-0079 inline ctx-header fast paths, which pair
+      # with the release staticlib. The VM is an ordinary program of that pipeline.
+      - name: Build runtime staticlib (release)
+        run: cargo build --release
+        working-directory: runtime
+
+      # One workspace build yields the VM's CoreFn (the harness's `$COREFN_DIR`) and the Level-2
+      # compiler's JS — which is what invokes clang and the linker, since a natively compiled purvasm
+      # program cannot spawn a subprocess yet (ADR-0110 §2).
+      - name: Build spago workspace
+        run: spago build
+
+      - name: Stage ulib
+        run: node ulib-tools/index.js build --prepare-release
+
+      # This runs the ELF measurement the ADR owes AND asserts it. In particular its `export-set` leg
+      # compares the generated allowlist against the executable's actual `.dynsym` exactly, in both
+      # directions, and fails on a re-exported `pvf_Purvasm_2eVM_2eLoader_2e*` or `pv_g_*` — the
+      # regression that would hand a guest the trusted loader (§6). Every number the ADR wants
+      # recorded is printed by the harness itself, so there is no separate report step that could
+      # print a violation and still pass.
+      - name: Run the VM loader gate
+        run: ./tools/vm-loader-e2e.sh
+        env:
+          PURVASM_LIB: dist/ulib
+
+  # The single required status check; point branch protection at `vm-loader-ci-gate`.
+  vm-loader-ci-gate:
+    needs: [elf-probe, loader]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate on the job results
+        run: |
+          for r in '${{ needs.elf-probe.result }}' '${{ needs.loader.result }}'; do
+            if [ "$r" = "failure" ] || [ "$r" = "cancelled" ]; then
+              echo "::error::VM loader CI did not pass (elf-probe: ${{ needs.elf-probe.result }}, loader: ${{ needs.loader.result }})"
+              exit 1
+            fi
+          done
+          echo "VM loader CI gate green (elf-probe: ${{ needs.elf-probe.result }}, loader: ${{ needs.loader.result }})"
