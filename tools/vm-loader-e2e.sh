@@ -2,14 +2,17 @@
 # The ADR-0111 slice-1 loader gate: build the owned VM (ADR-0110) as a native executable that hosts
 # `dlopen`ed providers (`--host-foreign-api`), then load providers into it.
 #
-# Two claims are checked, and NEITHER is observable from a unit test — both live in the link and in
-# `dlopen`, so they need a natively compiled host:
+# Three claims are checked, and NONE is observable from a unit test — they live in the link, in
+# `dlopen`, and in a real runtime leaf, so they need a natively compiled host:
 #
 #   - **API coverage / retention** (§1.1). The VM links the runtime as a *static archive* and
 #     dead-strips, and it calls almost none of the foreign-author API itself, so the default link
 #     drops it. `ApiCoverage.c` references every `pv_*` in `purvasm.h`; loading with `RTLD_NOW` binds
 #     every one of those references, so if the retention/export list missed a symbol the load fails
 #     and names it. A build that dropped, say, `pv_new_record` passes every other test in the repo.
+#   - **runtime leaves** (§1.1/§2). The corpus's own providers — `show`, stdio, FS, `argv` — live in
+#     the runtime staticlib this executable already links, so they resolve through `host-runtime`
+#     with no module loaded at all. The VM's guest program prints 42 through two of them.
 #   - **the foreign-ABI version contract** (§5). `Marker.c` is built twice from ONE source — against
 #     the real `purvasm.h`, and against a copy with `PV_FOREIGN_ABI_VERSION` bumped — and announces
 #     itself from a module initialiser. The current-version build must load *and print the marker*
@@ -135,8 +138,10 @@ else
     printf '  %-24s -> allowlisted but NOT exported: %s FAIL\n' export-set "$(echo "$missing" | tr '\n' ' ')"; rc=1
   fi
   # Named separately from the generic extra check even though it is a subset of it: this is the
-  # failure with a security meaning, and it must say so rather than appear as one line of a diff.
-  leaked_trusted="$(printf '%s\n' "$extra" | grep -E 'pvf_Purvasm_2eVM_2eLoader|^pv_g_' || true)"
+  # failure with a security meaning, and it must say so rather than appear as one line of a diff. The
+  # pattern covers the whole `Purvasm.VM.*` namespace, not just the loader: `Purvasm.VM.Foreign`'s
+  # `applyImpl` calls an arbitrary runtime closure, so exporting it would hand a guest the same reach.
+  leaked_trusted="$(printf '%s\n' "$extra" | grep -E 'pvf_Purvasm_2eVM_2e|^pv_g_' || true)"
   if [ -n "$leaked_trusted" ]; then
     printf '  %-24s -> TRUSTED SURFACE EXPORTED: %s FAIL\n' export-set "$(echo "$leaked_trusted" | tr '\n' ' ')"; rc=1
   fi
@@ -178,6 +183,55 @@ else
   rc=1
 fi
 
+echo "== runtime leaves: the corpus's own providers, with NO module loaded (§1.1/§2) =="
+# The slice-2 milestone, and the cheapest possible test of §1.1's retention: the runtime staticlib
+# linked into this executable is itself a provider class, so `show` and stdio resolve through
+# `host-runtime` with no `--ffi` and no manifest. The VM's built-in guest program applies `showIntImpl`
+# to 42, hands the resulting CARRIER straight to `writeLineImpl` without decoding it (§3), and runs the
+# effect thunk it gets back. So a printed 42 means resolution, firing, argument conversion, the carrier
+# pass-through and the effect run all worked — and none of it is reachable from a unit test.
+if out="$("$VM" 2>"$WORK/leaves.err")"; then
+  # One assertion per boundary arm a leaf actually READS, because "it ran" is not the claim — the
+  # claim is that a VM scalar already is a runtime value of the right representation, and only a leaf
+  # reading it can say so. `floatBitsHi 1.0` is the sharpest of the three: 1072693248 is 0x3FF00000,
+  # the high half of IEEE-754 1.0, which a wrong `Number` representation could not produce by chance.
+  arms_ok=yes
+  for expected in "boundary: a VM string" "42" "1072693248"; do
+    printf '%s' "$out" | grep -qxF "$expected" || {
+      printf '  %-24s -> a leaf never read: %s FAIL\n' runtime-leaves "$expected"; rc=1; arms_ok=no
+    }
+  done
+  if [ "$arms_ok" = yes ]; then
+    printf '  %-24s -> string/int/number read by real leaves OK\n' runtime-leaves
+  else
+    printf '%s\n' "$out" | sed 's/^/      /' >&2
+  fi
+  # The result of a leaf stays opaque: decoding it would break the invariant promotion exists to
+  # protect, so the entry reports `<value>` rather than the string it holds (§3's "coming out").
+  if printf '%s' "$out" | grep -qF "leaf result: <value>"; then
+    printf '  %-24s -> the leaf result stayed a carrier OK\n' runtime-leaves
+  else
+    printf '  %-24s -> the leaf result was decoded, or absent FAIL\n' runtime-leaves; rc=1
+  fi
+else
+  printf '  %-24s -> the VM could not run its own leaves FAIL\n' runtime-leaves; rc=1
+  sed 's/^/      /' "$WORK/leaves.err" >&2
+fi
+
+# A resolution cache that answered without re-checking the arity would reuse the arity-1 closure for
+# a later mention at arity 3, and a leaf indexes its argument vector by the arity its closure was
+# built with — so this is the difference between a refused image and a native read past the end of
+# the arguments. It runs as a SEPARATE process because a stuck run cannot be caught in-process:
+# purvasm's `Effect.Exception` is a throw-only shadow (ADR-0074), so the refusal IS the exit.
+if "$VM" --self-test arity-mismatch >"$WORK/mismatch.out" 2>"$WORK/mismatch.err"; then
+  printf '  %-24s -> an arity disagreement was NOT refused FAIL\n' arity-mismatch; rc=1
+  sed 's/^/      /' "$WORK/mismatch.out" >&2
+elif grep -qF "but was resolved at arity" "$WORK/mismatch.err"; then
+  printf '  %-24s -> refused, naming both arities OK\n' arity-mismatch
+else
+  printf '  %-24s -> refused for the wrong reason FAIL\n' arity-mismatch; rc=1
+  sed 's/^/      /' "$WORK/mismatch.err" >&2
+fi
 echo "== foreign-ABI version: the marker fires when it loads, and not when it is refused (§5) =="
 # The bumped header is the real mechanism, not a fixture flag: a copy of the shipped `purvasm.h` with
 # its version `#define` rewritten is exactly "a module built against a different foreign ABI".
