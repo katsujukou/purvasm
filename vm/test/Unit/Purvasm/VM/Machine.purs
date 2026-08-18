@@ -49,7 +49,7 @@ render = case _ of
   VPap _ _ -> pure "pap"
   VArray _ -> pure "array"
   VRecord _ -> pure "record"
-  VCarrier _ -> pure "carrier"
+  VCarrier origin _ -> pure ("carrier from " <> origin)
   VThunk _ -> pure "thunk"
 
 -- | `\x y -> x + y`, as a block that leaves the closure on the stack.
@@ -381,6 +381,18 @@ spec = describe "Purvasm.VM.Machine" do
         , Return
         ]
       result `shouldEqual` "true"
+
+  describe "ForeignRef" do
+    it "refuses a negative arity before it can reach pv_make_closure" do
+      -- The number becomes a `uint32_t` at the ABI, where a negative one is an enormous arity and a
+      -- leaf then indexes its argument vector by it. The check runs before the host is opened, which
+      -- is also why this one refusal is observable without a natively compiled VM.
+      diagnostic <- runStuck [ ForeignRef "M.leafImpl" (-1), Return ]
+      diagnostic `shouldSatisfy` contains "negative arity"
+
+    it "names the key it refused" do
+      diagnostic <- runStuck [ ForeignRef "M.leafImpl" (-1), Return ]
+      diagnostic `shouldSatisfy` contains "M.leafImpl"
 
 contains :: String -> String -> Boolean
 contains needle haystack = String.contains (String.Pattern needle) haystack
