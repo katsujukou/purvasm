@@ -22,6 +22,7 @@
 -- | is the machine's own bookkeeping, not something a consumer should be able to hand-assemble.
 module Purvasm.VM.Machine
   ( Env
+  , executed
   , force
   , newEnv
   , runBlock
@@ -36,6 +37,7 @@ import Data.List (List(..), (:))
 import Data.List as List
 import Data.Map (Map)
 import Data.Map as Map
+import Data.String as String
 import Data.Maybe (Maybe(..))
 import Data.Traversable (traverse)
 import Data.Tuple.Nested (type (/\), (/\))
@@ -54,26 +56,51 @@ import Purvasm.VM.Value (Closure, Thunk(..), Value(..))
 -- | recursion for top-level functions — a function finds itself there), and the instruction counter,
 -- | the deterministic cost metric the optimiser is measured on (ADR-0026).
 -- |
--- | `host` and `foreign` are the foreign frontier's (ADR-0111 §2). Both are established **lazily**,
--- | on the first `ForeignRef` a run actually executes: opening the host is an effect that can fail,
--- | and a program with no native leaf — every unit test here, and any pure guest program — has no
--- | reason to perform it. Resolution is cached per key because a resolved leaf is a *value* the VM
--- | builds once (§2), and because `pv_make_closure` allocates: re-resolving on every reference would
--- | make each mention of `show` a fresh closure.
-type Env =
+-- | `host`, `providers` and `foreigns` are the foreign frontier's (ADR-0111 §2). The host handle is
+-- | established **lazily**, on the first `ForeignRef` a run actually executes: opening it is an
+-- | effect that can fail, and a program with no native leaf — every unit test here, and any pure
+-- | guest program — has no reason to perform it. Resolution is cached per key because a resolved leaf
+-- | is a *value* the VM builds once (§2), and because `pv_make_closure` allocates.
+-- |
+-- | **`providers` is fixed when the `Env` is built, and there is no way to extend it.** That is what
+-- | makes §4's exactly-one an invariant rather than a check: with a mutable provider set, resolving a
+-- | key against `host-runtime`, then adding a module that also defines it, then mentioning the key
+-- | again would answer from the cache and never see the collision — and the carrier already handed
+-- | out would keep working besides, so clearing the cache on registration would not close it either.
+-- | An immutable set makes that ordering unrepresentable. It also costs nothing: loading is explicit
+-- | (§4), so every provider is known before a program starts.
+-- | Opaque, and that is load-bearing rather than tidy. A record type synonym would still be a record
+-- | at every call site, so `env { providers = … }` would rebuild the provider set while SHARING the
+-- | resolution cache's `Ref` — reinstating exactly the ordering the immutable set exists to forbid,
+-- | from ordinary safe PureScript. Hiding the constructor is what makes "fixed at construction" true
+-- | of the value and not just of the constructor's signature.
+newtype Env = Env
   { globals :: Ref (Map String Value)
   , executed :: Ref Int
   , host :: Ref (Maybe Loader.ModuleHandle)
   , foreigns :: Ref (Map String { arity :: Int, value :: Value })
+  , providers :: Array Loader.ModuleHandle
   }
 
-newEnv :: Map String Value -> Effect Env
-newEnv globals =
-  { globals: _, executed: _, host: _, foreigns: _ }
+-- | Build a run environment over the globals and the providers this run may resolve against.
+-- |
+-- | The providers are taken here and never again: loading is explicit and opt-in (§4), so the caller
+-- | knows them all before the program starts, and fixing them is what keeps exactly-one from
+-- | depending on when a module was registered. Order carries no precedence — every provider is asked
+-- | and exactly one must answer — so "which `show` am I running?" cannot be decided by load order.
+newEnv :: Map String Value -> Array Loader.ModuleHandle -> Effect Env
+newEnv globals providers = map Env $
+  { globals: _, executed: _, host: _, foreigns: _, providers }
     <$> Ref.new globals
     <*> Ref.new 0
     <*> Ref.new Nothing
     <*> Ref.new Map.empty
+
+-- | How many instructions a run has executed — the deterministic cost metric the optimiser is
+-- | measured on (ADR-0026). An accessor rather than a field, so the counter can be read without the
+-- | provider set and the resolution cache coming with it.
+executed :: Env -> Effect Int
+executed (Env env) = Ref.read env.executed
 
 -- | A code frame: the running block, its instruction pointer, and the environment of locals.
 -- |
@@ -137,7 +164,7 @@ activationFrame block locals = do
 -- | Run a frame stack to completion on a fresh operand stack; the result is the lone value left.
 -- | Re-entrant: recursive-group construction runs each member through it again.
 run :: Env -> List Frame -> Effect Value
-run env frames0 = do
+run wrapped@(Env env) frames0 = do
   stack <- Ref.new (Nil :: List Value)
   frames <- Ref.new frames0
 
@@ -246,7 +273,7 @@ run env frames0 = do
 
     buildMember shared (name /\ block) = do
       ip <- Ref.new 0
-      v <- run env
+      v <- run wrapped
         (Code { block, ip, env: shared, share: true, activation: true } : Nil)
       pure (name /\ v)
 
@@ -261,10 +288,10 @@ run env frames0 = do
     -- Dispatch a switch: run the matching arm, else the default.
     enterArm fr arm = enterBlock fr.env fr.share arm
 
-    -- Resolve a native leaf once and cache it (ADR-0111 §2). Only `host-runtime` is searched in this
-    -- slice — the runtime staticlib linked into this executable, which is where `show`, stdio, FS and
-    -- `argv` live — so a program using only those needs no `--ffi` and no manifest. Loaded modules
-    -- join next, at which point the search becomes "ask each provider, require exactly one" (§4).
+    -- Resolve a native leaf once and cache it (ADR-0111 §2). The search spans both provider classes:
+    -- `host-runtime` — the runtime staticlib linked into this executable, where `show`, stdio, FS and
+    -- `argv` live, so a program using only those needs no `--ffi` and no manifest — and every module
+    -- the caller loaded.
     resolveForeign key physicalArity =
       -- The arity is validated on EVERY reference, before the cache is consulted, and the cache
       -- records the arity it was built with. Both halves matter, and neither is defensive
@@ -294,14 +321,31 @@ run env frames0 = do
                   h <- Loader.hostRuntime
                   Ref.write (Just h) env.host
                   pure h
-              case Loader.resolve host key checked of
-                Nothing -> stuck ("unbound native foreign: " <> key)
-                Just fv -> do
+              -- Ask each provider SEPARATELY and require exactly one to answer (ADR-0111 §4). This
+              -- is why `resolve` is per-handle rather than a global `dlsym`: a module that defines a
+              -- key the runtime already defines is then *detected* — the "runtime-shadow" failure —
+              -- instead of one of them winning by archive order or load order. There is no shadowing
+              -- rule anywhere, deliberately.
+              --
+              -- The candidate's value is KEPT rather than re-derived: `resolve` builds a closure with
+              -- `pv_make_closure`, so asking twice would allocate twice and throw the first one away,
+              -- against the "build once" the cache below exists to state.
+              let
+                found = Array.mapMaybe
+                  (\provider -> { provider, value: _ } <$> Loader.resolve provider key checked)
+                  ([ host ] <> env.providers)
+              case found of
+                [] -> stuck ("unbound native foreign: " <> key)
+                [ one ] -> do
                   -- The origin travels with the value so a later boundary error can name the leaf
                   -- that demanded the crossing (ADR-0111 §3).
-                  let v = VCarrier key fv
+                  let v = VCarrier key one.value
                   Ref.modify_ (Map.insert key { arity: physicalArity, value: v }) env.foreigns
                   pure v
+                many -> stuck
+                  ( key <> " provided by both "
+                      <> String.joinWith " and " (map (Loader.describe <<< _.provider) many)
+                  )
 
     step = Ref.read frames >>= case _ of
       Nil -> Done <$> (pop >>= force)
