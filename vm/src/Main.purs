@@ -18,18 +18,17 @@ module Main (main) where
 import Prelude
 
 import Data.Array as Array
-import Data.Foldable (for_)
 import Data.Map as Map
 import Data.Maybe (Maybe(..))
+import Data.Traversable (traverse)
 import Data.Tuple.Nested ((/\))
 import Effect (Effect)
-import Effect.Ref as Ref
 import Purvasm.Stdio (writeLine)
 import Purvasm.System.Process as Process
 import Purvasm.VM.Error (stuck)
 import Purvasm.VM.Instruction (CodeBlock, Instruction(..), PrimOp(..))
 import Purvasm.VM.Loader as Loader
-import Purvasm.VM.Machine (newEnv, runBlock)
+import Purvasm.VM.Machine (executed, newEnv, runBlock)
 import Purvasm.VM.Value (Value(..))
 
 -- | `let go n acc = if n == 0 then acc else go (n - 1) (acc + n) in go 10 0` — a tail-recursive
@@ -158,25 +157,153 @@ ffiPaths args = case Array.uncons args of
     Nothing -> stuck "--ffi needs a provider path"
   Just { tail } -> ffiPaths tail
 
--- | `--self-test <name>`: run one deliberately-stuck program and nothing else.
+loadProvider :: String -> Effect Loader.ModuleHandle
+loadProvider path = do
+  handle <- Loader.load path
+  writeLine ("loaded: " <> Loader.describe handle)
+  pure handle
+
+-- | A leaf that only a **loaded module** can provide, exercising the two things slice 2 could not:
+-- | resolution across both provider classes, and the `Boolean` boundary arm — no runtime leaf takes a
+-- | `Boolean` (nothing in `runtime/src/leaf.rs` reads `pv_bool_payload`), so this fixture is the first
+-- | thing that can read one.
+loadedProvider :: CodeBlock
+loadedProvider =
+  [ ForeignRef "Purvasm.Stdio.writeLineImpl" 1
+  , ForeignRef "Test.Loader.describeBoolImpl" 1
+  , PushBool true
+  , Call 1
+  , Call 1
+  , PushInt 0
+  , Call 1
+  , Return
+  ]
+
+-- | The aliasing gate (ADR-0111 §3): one array, bound twice AND stored inside a data value, handed to
+-- | a leaf that writes element 0 — then observed through every alias.
 -- |
--- | It is a mode rather than an in-process assertion because **a stuck run cannot be caught on this
+-- | This is the invariant that a passing unit test cannot establish, because it is about *identity*
+-- | rather than about any one value: an elementwise copy at the boundary would leave each of these
+-- | three reads seeing the old element, and every other test in the tree would still pass.
+-- |
+-- | `SetArray` here also runs AFTER promotion, so the VM's own write goes through `pv_write_field`
+-- | into the same object — checked by reading it back through the leaf.
+aliasing :: CodeBlock
+aliasing = build <> leafWrites <> observeAll <> vmWrites <> [ Return ]
+  where
+  -- Each call keeps its function ADJACENT to its arguments: a `Call n` pops n arguments and then the
+  -- function, so anything left on the stack by an earlier statement must sit *below* the function,
+  -- not between it and its arguments.
+  callLeaf key arity args = [ ForeignRef key arity ] <> args <> [ Call arity ]
+  runEffect thunk = thunk <> [ PushInt 0, Call 1 ]
+  writeLine value = runEffect (callLeaf "Purvasm.Stdio.writeLineImpl" 1 value)
+
+  -- one array, three aliases: two names, and a field of a data value
+  build =
+    [ PushString "before"
+    , Array 1
+    , Bind "a"
+    , Load "a"
+    , Bind "b"
+    , Load "a"
+    , Ctor "Box" 1 1
+    , Bind "boxed"
+    ]
+
+  -- the leaf writes element 0 of the array it was handed; this is what promotes it
+  leafWrites = runEffect
+    (callLeaf "Test.Loader.writeArrayImpl" 3 [ Load "a", PushInt 0, PushString "written by the leaf" ])
+
+  observeAll =
+    writeLine [ Load "a", ProjArray 0 ]
+      <> writeLine [ Load "b", ProjArray 0 ]
+      <> writeLine [ Load "boxed", Proj 0, ProjArray 0 ]
+
+  -- the reverse direction: the VM writes through its own `SetArray` to an array that has ALREADY
+  -- crossed, and a leaf reads it back off the same object
+  vmWrites =
+    [ Load "a", PushInt 0, PushString "written by the VM", Prim SetArray 3 ]
+      <> writeLine (callLeaf "Test.Loader.readArrayImpl" 2 [ Load "a", PushInt 0 ])
+
+-- | The two migration cases §3's steps 1 and 3 exist for: an EMPTY array (no blank-array constructor
+-- | to build, so `pv_empty_array` and stop) and a CYCLIC one (an array reachable from itself, which
+-- | terminates only because the cell is forwarded before any element is migrated).
+-- |
+-- | A cycle that did not terminate would hang rather than fail, so this program existing and exiting
+-- | IS the assertion.
+cyclicAndEmpty :: CodeBlock
+cyclicAndEmpty = emptyCrosses <> cyclicCrosses <> [ Return ]
+  where
+  callLeaf key arity args = [ ForeignRef key arity ] <> args <> [ Call arity ]
+  runEffect thunk = thunk <> [ PushInt 0, Call 1 ]
+  writeLine value = runEffect (callLeaf "Purvasm.Stdio.writeLineImpl" 1 value)
+
+  -- Step 1: an empty array has no slot, so every other array leaf here would be out of range — it can
+  -- only cross into something that just measures it. Promotion happens because it crosses AT ALL.
+  emptyCrosses =
+    [ Array 0, Bind "empty" ]
+      <> writeLine (callLeaf "Data.Show.showIntImpl" 1 (callLeaf "Test.Loader.lengthOfImpl" 1 [ Load "empty" ]))
+
+  -- Step 3: an array whose only element is itself. Crossing it terminates only because the cell is
+  -- forwarded BEFORE the elements are migrated — otherwise the migration recurs forever.
+  cyclicCrosses =
+    [ PushInt 0
+    , Array 1
+    , Bind "cyclic"
+    , Load "cyclic"
+    , PushInt 0
+    , Load "cyclic"
+    , Prim SetArray 3
+    ]
+      <> writeLine (callLeaf "Data.Show.showIntImpl" 1 (callLeaf "Test.Loader.lengthOfImpl" 1 [ Load "cyclic" ]))
+
+-- | `--self-test <name>`: run ONE named program and nothing else.
+-- |
+-- | A mode rather than an in-process assertion, because **a stuck run cannot be caught on this
 -- | target**: purvasm's `Effect.Exception` is a throw-only shadow (ADR-0074), so `try` around
 -- | `runBlock` does not come back — the process writes the diagnostic and exits. The harness
--- | therefore observes the refusal the only way it can, as a separate run's exit status and stderr.
+-- | therefore observes a refusal the only way it can, as a separate run's exit status and stderr.
+-- |
+-- | Each probe also names what it needs. `loaded-provider` demands a module defining
+-- | `Test.Loader.describeBoolImpl`, which is exactly why it cannot live in the ordinary run: that run
+-- | is handed whatever `--ffi` names, and every other gate here passes a module that defines
+-- | something else entirely.
 selfTest :: Array String -> Maybe String
 selfTest args = case Array.uncons args of
   Nothing -> Nothing
   Just { head: "--self-test", tail } -> Array.head tail
   Just { tail } -> selfTest tail
 
-runSelfTest :: String -> Effect Unit
-runSelfTest = case _ of
+runSelfTest :: Array String -> String -> Effect Unit
+runSelfTest args = case _ of
   "arity-mismatch" -> do
-    env <- newEnv Map.empty
+    env <- newEnv Map.empty []
     void (runBlock env arityMismatch Map.empty)
     writeLine "arity-mismatch: unexpectedly resolved"
+  -- A module exporting a key the runtime already defines: exactly-one must catch it rather than let
+  -- either win silently (ADR-0111 §4's runtime-shadow case).
+  "runtime-shadow" -> do
+    handles <- loadAll args
+    env <- newEnv Map.empty handles
+    void (runBlock env [ ForeignRef "Data.Show.showIntImpl" 1, Return ] Map.empty)
+    writeLine "runtime-shadow: unexpectedly resolved"
+  -- With a provider loaded, resolution spans both classes (ADR-0111 §4): this calls a leaf the
+  -- runtime does NOT define, so an answer can only have come from the loaded module.
+  "loaded-provider" -> runWithProviders args loadedProvider
+  "aliasing" -> runWithProviders args aliasing
+  "cyclic" -> runWithProviders args cyclicAndEmpty
   other -> stuck ("unknown --self-test: " <> other)
+
+-- | Load whatever `--ffi` names and run one block against exactly those providers.
+runWithProviders :: Array String -> CodeBlock -> Effect Unit
+runWithProviders args block = do
+  handles <- loadAll args
+  env <- newEnv Map.empty handles
+  void (runBlock env block Map.empty)
+
+-- | The providers named by `--ffi`, loaded in order.
+loadAll :: Array String -> Effect (Array Loader.ModuleHandle)
+loadAll args = ffiPaths args >>= traverse Loader.load
 
 main :: Effect Unit
 main = do
@@ -184,21 +311,19 @@ main = do
   -- program output — which is what makes the ADR-0111 §5 stale-module gate observable.
   args <- Process.argv
   case selfTest (Array.drop 1 args) of
-    Just name -> runSelfTest name
+    Just name -> runSelfTest (Array.drop 1 args) name
     Nothing -> ordinaryRun (Array.drop 1 args)
 
 -- | The ordinary run: load whatever `--ffi` names, then the guest programs.
 ordinaryRun :: Array String -> Effect Unit
 ordinaryRun args = do
   paths <- ffiPaths args
-  for_ paths \path -> do
-    handle <- Loader.load path
-    writeLine ("loaded: " <> Loader.describe handle)
-  env <- newEnv Map.empty
+  handles <- traverse loadProvider paths
+  env <- newEnv Map.empty handles
   result <- runBlock env program Map.empty
-  executed <- Ref.read env.executed
+  count <- executed env
   writeLine ("result: " <> describe result)
-  writeLine ("instructions: " <> show executed)
+  writeLine ("instructions: " <> show count)
   -- ADR-0111 slice 2 probe: can the host resolve a runtime leaf the VM itself never calls?
   host <- Loader.hostRuntime
   writeLine ("provider: " <> Loader.describe host)
@@ -208,7 +333,7 @@ ordinaryRun args = do
   -- ADR-0111 slice 2: resolve, fire, and run the effect — all through `host-runtime`. The line below
   -- this one is written by the guest program, not by `main`.
   writeLine "runtime leaves:"
-  leafEnv <- newEnv Map.empty
+  leafEnv <- newEnv Map.empty handles
   leafResult <- runBlock leafEnv runtimeLeaves Map.empty
   writeLine ("leaf result: " <> describe leafResult)
 
