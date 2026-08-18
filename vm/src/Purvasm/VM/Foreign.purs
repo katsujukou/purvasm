@@ -20,14 +20,21 @@
 -- | That is why this module has a `toPv` and no `ofPv`.
 module Purvasm.VM.Foreign
   ( applyForeign
+  , arrayLength
+  , promote
+  , readField
   , toPv
+  , writeField
   ) where
 
 import Prelude
 
+import Control.Monad.Rec.Class (Step(..), tailRecM)
 import Effect (Effect)
+import Effect.Ref as Ref
+import Purvasm.Array as PA
 import Purvasm.VM.Error (stuck)
-import Purvasm.VM.Value (ForeignValue, Value(..))
+import Purvasm.VM.Value (ArrayCell, ArrayStorage(..), ForeignValue, Value(..))
 import Unsafe.Coerce (unsafeCoerce)
 
 -- | Reinterpret a VM scalar's payload as the runtime word it already is (see the module note). Only
@@ -51,10 +58,13 @@ boundary key what = stuck ("foreign boundary: " <> what <> " crossed " <> key)
 -- | which would hide a missing force at the one boundary where an unforced value would be handed to
 -- | native code.
 -- |
+-- | **Arrays do not convert at all — they are promoted** (§3), which is why they are not on either
+-- | list below: an elementwise copy would be a correctness bug rather than a cost, since a leaf's
+-- | write would land on the copy and two VM bindings holding the same array would stop agreeing.
+-- | `promote` forwards the shared cell to a runtime object, once and permanently.
+-- |
 -- | The unsupported arms are the boundary's contract as much as the supported ones:
 -- |
--- |   * **arrays** are identity-bearing and must be *promoted*, not copied (§3) — slice 3. Refusing
--- |     them here is what keeps the identity invariant from being violated even transiently;
 -- |   * **records** cannot cross in either direction on either backend (§3, fact 4): label ids are
 -- |     minted only by codegen, and no supported call hands one to a provider;
 -- |   * **data values** need `pv_new_adt` with a tag derived from the constructor name — slice 5;
@@ -64,14 +74,17 @@ toPv :: String -> Value -> Effect ForeignValue
 toPv key = case _ of
   VInt n -> pure (unsafeAsForeign n)
   VNumber f -> pure (unsafeAsForeign f)
-  -- The one supported arm with no native coverage yet: no runtime leaf takes a `Boolean`, so nothing
-  -- reads this across the boundary until a loaded module can be called (slice 3).
+  -- Read across the boundary by a loaded module's leaf (`Test.Loader.describeBoolImpl`), since no
+  -- runtime leaf takes a `Boolean`.
   VBool b -> pure (unsafeAsForeign b)
   VString s -> pure (unsafeAsForeign s)
   -- A value that came from a leaf goes back unchanged: it never stopped being a runtime value, and
   -- decoding it was never possible (§3's opacity).
   VCarrier _ fv -> pure fv
-  VArray _ -> boundary key "an array (promotion is ADR-0111 §3)"
+  -- An array is PROMOTED, not converted (§3). An elementwise copy would be a correctness bug rather
+  -- than a cost: a leaf's write would land on the copy, and two VM bindings holding the same array
+  -- would stop agreeing.
+  VArray cell -> promote cell
   VRecord _ -> boundary key "a record (records do not cross on either backend, ADR-0111 §3)"
   VData tag _ -> boundary key ("a data value (" <> tag <> "; `pv_adt_tag` is ADR-0111 §3)")
   VCtor tag _ _ -> boundary key ("a partially applied constructor (" <> tag <> ")")
@@ -93,3 +106,73 @@ foreign import applyImpl :: ForeignValue -> Array ForeignValue -> Effect Foreign
 -- | the run marker like any other call, and the result comes back as a carrier.
 applyForeign :: ForeignValue -> Array ForeignValue -> Effect ForeignValue
 applyForeign = applyImpl
+
+-- | `blankArrayImpl 0` is the canonical empty array, so there is no separate nullary import for it —
+-- | and that is not tidiness. A `foreign import` of arity 0 does not reach the VM as a *value*: it
+-- | reaches it as a closure of arity 0 (`leafClosureArity` over a non-function type), which a leaf
+-- | then receives instead of the array. Measured, as `array_len on a non-Array object: Closure`.
+foreign import blankArrayImpl :: Int -> Effect ForeignValue
+foreign import arrayLengthImpl :: ForeignValue -> Int
+foreign import readFieldImpl :: ForeignValue -> Int -> Effect ForeignValue
+foreign import writeFieldImpl :: ForeignValue -> Int -> ForeignValue -> Effect Unit
+
+-- | A promoted array's length. Unchanging — only its slots are mutable — so this needs no `Effect`.
+arrayLength :: ForeignValue -> Int
+arrayLength = arrayLengthImpl
+
+-- | Read a promoted array's slot. Effectful because a leaf may have written it since the last read:
+-- | that is the entire point of promoting rather than copying.
+readField :: ForeignValue -> Int -> Effect ForeignValue
+readField = readFieldImpl
+
+-- | Write a promoted array's slot, converting the value at the boundary. The `key` is the origin
+-- | reported if the written value cannot cross.
+writeField :: String -> ForeignValue -> Int -> Value -> Effect Unit
+writeField key carrier i v = toPv key v >>= writeFieldImpl carrier i
+
+-- | Promote an array's cell in place, once and permanently (ADR-0111 §3).
+-- |
+-- | The step ORDER is the substance here, and it is the order a copying collector installs a
+-- | forwarding pointer in:
+-- |
+-- |   1. `n = 0` → the canonical empty array; write `Promoted` and stop. (Two VM empty arrays
+-- |      therefore promote to one object. Unobservable: an empty array has no slot to write, and
+-- |      purvasm has no value-identity primitive.)
+-- |   2. `n >= 1` → build the runtime array **blank**, because the ABI has no blank-array
+-- |      constructor to build it any other way.
+-- |   3. **Write `Promoted` into the cell NOW**, before any element is migrated. A cycle — an array
+-- |      reachable from itself, directly or through a data value — then terminates on finding the
+-- |      cell already promoted, instead of recurring forever.
+-- |   4. Migrate the elements by the same boundary rules, which promotes nested arrays recursively.
+-- |
+-- | Rooting needs no shadow-stack work: step 3 puts the carrier in an ordinary PureScript field, so
+-- | the GC traces AND updates it like any other value, and each element migration re-reads it from
+-- | the cell. The VM never holds a runtime word outside a traced field — a property of being a
+-- | purvasm program rather than a foreign leaf.
+promote :: ArrayCell -> Effect ForeignValue
+promote cell = Ref.read cell >>= case _ of
+  -- Already promoted: this is both the idempotence of promotion and the cycle's base case.
+  Promoted carrier -> pure carrier
+  Local values -> do
+    let n = PA.length values
+    -- Step 1 and step 2 are one call: `blankArrayImpl` answers the canonical empty array for `n = 0`
+    -- (the ABI's `pv_empty_array`) and a unit-filled array otherwise. Two VM empty arrays therefore
+    -- promote to ONE object, which is unobservable — an empty array has no slot to write, and
+    -- purvasm has no value-identity primitive.
+    carrier <- blankArrayImpl n
+    -- Step 3, and it happens BEFORE any element is migrated: a cycle terminates on finding the cell
+    -- already promoted, exactly as a copying collector's forwarding pointer works.
+    Ref.write (Promoted carrier) cell
+    if n == 0 then pure carrier
+    else do
+      -- `tailRecM`, not a plain recursion or a `traverse_`: an `Effect` bind is a host call, and an
+      -- array is as long as the guest made it. The migration must not be bounded by the host stack.
+      tailRecM
+        ( \i ->
+            if i >= n then pure (Done unit)
+            else do
+              writeField "a promoted array" carrier i (PA.unsafeIndex values i)
+              pure (Loop (i + 1))
+        )
+        0
+      pure carrier
