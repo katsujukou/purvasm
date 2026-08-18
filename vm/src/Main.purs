@@ -63,6 +63,71 @@ program =
     , Return
     ]
 
+-- | The ADR-0111 slice-2 milestone, as a guest program: the corpus's **runtime** leaves run on the VM
+-- | with no module loaded and no manifest, because the runtime staticlib linked into this executable
+-- | is itself a provider class (§1.1/§4's `host-runtime`).
+-- |
+-- | It is written as the compiler would lower it. `Purvasm.Stdio.writeLineImpl :: String -> Effect Unit`
+-- | has physical closure arity 1 (`leafClosureArity` folds `retVsat` in), so saturating it yields the
+-- | effect *thunk*, and running the effect is applying that thunk to the run marker — `CPerform t`
+-- | lowers to `t` applied to `LInt 0` on this backend and on LLVM alike, so the VM passes exactly what
+-- | a compiled program passes.
+-- |
+-- | `show` is the pure leaf in the same program: its result is a carrier, and handing that carrier
+-- | straight to `writeLine` is the point — a value that came from a leaf is never decoded (§3), it is
+-- | passed on.
+runtimeLeaves :: CodeBlock
+runtimeLeaves = stringArm <> intArm <> numberArm <> [ Return ]
+  where
+  -- A VM `String` handed straight to a leaf. This is the arm that would break silently if the
+  -- boundary's claim were wrong: nothing converts here, so what `writeLineImpl` reads is the very
+  -- word the VM was holding, and a mismatch in representation would print rubbish rather than fail.
+  stringArm =
+    [ ForeignRef "Purvasm.Stdio.writeLineImpl" 1
+    , PushString "boundary: a VM string"
+    , Call 1
+    , PushInt 0
+    , Call 1
+    ]
+
+  -- A VM `Int` in, and a carrier back out that is passed on WITHOUT being decoded (§3): `showIntImpl`
+  -- returns a runtime `String` which goes straight into `writeLineImpl`.
+  intArm =
+    [ ForeignRef "Purvasm.Stdio.writeLineImpl" 1
+    , ForeignRef "Data.Show.showIntImpl" 1
+    , PushInt 42
+    , Call 1
+    , Call 1
+    , PushInt 0
+    , Call 1
+    ]
+
+  -- A VM `Number` in, through a leaf that actually READS it: `floatBitsHi 1.0` must print
+  -- 1072693248 (0x3FF00000, the high half of IEEE-754 1.0). A wrong `Number` representation could
+  -- not produce that number by accident, so this is the arm's proof rather than a smoke test.
+  numberArm =
+    [ ForeignRef "Purvasm.Stdio.writeLineImpl" 1
+    , ForeignRef "Data.Show.showIntImpl" 1
+    , ForeignRef "Purvasm.Number.floatBitsHi" 1
+    , PushNumber 1.0
+    , Call 1
+    , Call 1
+    , Call 1
+    , PushInt 0
+    , Call 1
+    ]
+
+-- | A corrupt image, refused: the same key mentioned at two different arities. The compiler derives
+-- | one arity per key from the PureScript type (ADR-0110 §4(a)), so a disagreement is not a program
+-- | error to report at the call — it is an image that must not be run, because a leaf indexes its
+-- | argument vector by the arity the closure was built with.
+arityMismatch :: CodeBlock
+arityMismatch =
+  [ ForeignRef "Data.Show.showIntImpl" 1
+  , ForeignRef "Data.Show.showIntImpl" 2
+  , Return
+  ]
+
 -- | Render a result for the trace. Deliberately partial in spirit — this is a smoke entry, not the
 -- | runner's observation contract (§5), which arrives with the corpus gate.
 describe :: Value -> String
@@ -93,12 +158,39 @@ ffiPaths args = case Array.uncons args of
     Nothing -> stuck "--ffi needs a provider path"
   Just { tail } -> ffiPaths tail
 
+-- | `--self-test <name>`: run one deliberately-stuck program and nothing else.
+-- |
+-- | It is a mode rather than an in-process assertion because **a stuck run cannot be caught on this
+-- | target**: purvasm's `Effect.Exception` is a throw-only shadow (ADR-0074), so `try` around
+-- | `runBlock` does not come back — the process writes the diagnostic and exits. The harness
+-- | therefore observes the refusal the only way it can, as a separate run's exit status and stderr.
+selfTest :: Array String -> Maybe String
+selfTest args = case Array.uncons args of
+  Nothing -> Nothing
+  Just { head: "--self-test", tail } -> Array.head tail
+  Just { tail } -> selfTest tail
+
+runSelfTest :: String -> Effect Unit
+runSelfTest = case _ of
+  "arity-mismatch" -> do
+    env <- newEnv Map.empty
+    void (runBlock env arityMismatch Map.empty)
+    writeLine "arity-mismatch: unexpectedly resolved"
+  other -> stuck ("unknown --self-test: " <> other)
+
 main :: Effect Unit
 main = do
   -- Providers load *before* the program runs, so a module's own initialisers cannot be mistaken for
   -- program output — which is what makes the ADR-0111 §5 stale-module gate observable.
   args <- Process.argv
-  paths <- ffiPaths (Array.drop 1 args)
+  case selfTest (Array.drop 1 args) of
+    Just name -> runSelfTest name
+    Nothing -> ordinaryRun (Array.drop 1 args)
+
+-- | The ordinary run: load whatever `--ffi` names, then the guest programs.
+ordinaryRun :: Array String -> Effect Unit
+ordinaryRun args = do
+  paths <- ffiPaths args
   for_ paths \path -> do
     handle <- Loader.load path
     writeLine ("loaded: " <> Loader.describe handle)
@@ -113,3 +205,10 @@ main = do
   writeLine ("resolve Data.Show.showIntImpl: " <> probe host "Data.Show.showIntImpl" 1)
   writeLine ("resolve Purvasm.Stdio.writeLineImpl: " <> probe host "Purvasm.Stdio.writeLineImpl" 1)
   writeLine ("resolve Nope.nope: " <> probe host "Nope.nope" 1)
+  -- ADR-0111 slice 2: resolve, fire, and run the effect — all through `host-runtime`. The line below
+  -- this one is written by the guest program, not by `main`.
+  writeLine "runtime leaves:"
+  leafEnv <- newEnv Map.empty
+  leafResult <- runBlock leafEnv runtimeLeaves Map.empty
+  writeLine ("leaf result: " <> describe leafResult)
+
