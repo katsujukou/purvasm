@@ -202,6 +202,16 @@ whole class of link-retention work at the cost of a non-self-contained distribut
 >   §5.3 of [0109](0109-native-leaf-direct-lowering.md) applies to a noise floor: a negative result
 >   is only readable when the positive one holds.
 >
+> **The gate is green on both platforms (2026-08-18).** With the ELF branch on `--dynamic-list`, the
+> Linux run reports `allowlist 57, exported 57` and *exactly the allowlist, nothing else* — no
+> surplus at all, not even the linker-defined symbols an executable usually carries in `.dynsym`,
+> because `--dynamic-list` adds only the names it is given. macOS reports the same 57, for the same
+> reason: the set is one derivation (28 header entries + the stamp + 28 runtime leaves), and only
+> the file format differs. All six checks pass on each platform — the export set, API coverage, the
+> load, the version's positive and negative legs, and the spoofed path — so §1.1 is measured end to
+> end rather than on Mach-O alone. The `--export-dynamic` spelling this record's prose gives is a
+> mechanism that works (the probe says so) but is not the one that ships.
+>
 > Also implemented, and not in this record: `--host-foreign-api` is **refused together with
 > `--rust-ffi`**. That mode links the *bundle* (the runtime rlib folded with the app crate,
 > ADR-0078 §5), whose `pvf_*` cannot be told apart by origin — so every app leaf would be retained and
@@ -541,12 +551,65 @@ trusted surface: everything else in §1–§5 is ordinary purvasm code above it.
    API-coverage fixture is **exhaustive** rather than one-entry-per-group, since the retained set is
    derived from the header and a listed-but-untested entry would be untested retention. Confirmed
    able to fail: the same fixture against a VM built *without* `--host-foreign-api` fails to load,
-   naming the first symbol the link dropped.
+   naming the first symbol the link dropped. **Green on macOS and Linux (2026-08-18)**, the
+   latter having first exposed — and then settled — §1.1's ELF question; the gate runs in CI
+   (`vm-loader-ci.yaml`), so the platform difference cannot silently reappear.
 2. Resolution against `host-runtime` alone, and firing, and `toPv` for **scalars and strings** only:
    the corpus's runtime leaves (`show`, stdio, FS, `argv`) run on the VM with **no module loaded**,
    which is both the first useful milestone and the cheapest test of §1.1's retention. Arrays are a
    named boundary error at this point, so the identity invariant is never violated even transiently.
    Loaded modules join in the next slice, at which point exactly-one spans both classes.
+   **Done (2026-08-18)**: a guest program resolves `Data.Show.showIntImpl` and
+   `Purvasm.Stdio.writeLineImpl` through `host-runtime`, applies the first to `42`, hands the
+   resulting **carrier** straight to the second without decoding it, runs the effect thunk, and
+   prints `42` — with no `--ffi` and no manifest. `tools/vm-loader-e2e.sh`'s `runtime-leaves` leg is
+   that program, and it also asserts the entry still reports the leaf's result as a carrier rather
+   than a string, which is the observable form of §3's "coming out" rule.
+
+   Three things the record did not say, found while building it:
+
+   - **Going in is not a conversion for scalars and strings; it is a change of type.** The VM is a
+     purvasm program compiled by the same backend, so its `Int`/`Number`/`Boolean`/`String` already
+     *are* runtime values of the representation a leaf expects (fact 2's "one heap, one `pv_*`").
+     Rebuilding them through `pv_new_str` would copy a value into itself. So `Purvasm.VM.Foreign`
+     holds one unexported `unsafeAsForeign` and no C conversion code at all — the sibling `.c` exists
+     only for `pv_apply`.
+   - **There is no `Unit` arm, because purvasm's run marker is `LInt 0`.** §3 lists `Unit` among the
+     converted scalars, but no such value reaches the boundary: `CPerform t` lowers to `t` applied to
+     `AtomLit (LInt 0)` in the bytecode backend *and* in the LLVM backend
+     (`Backend.LLVM.Emit`), so running an effect passes an `Int` on both paths. The VM therefore
+     passes exactly what a compiled program passes, and `pv_unit()` is not involved on this path.
+   - **The VM's own leaves are trusted surface too.** `Purvasm.VM.Foreign.applyImpl` calls an
+     arbitrary runtime closure, so exporting it would hand a guest the same reach §6 withholds for
+     the loader. The export-set gate's trusted-surface check now covers the whole `Purvasm.VM.*`
+     namespace rather than the loader alone.
+
+   Three more, from review:
+
+   - **The resolution cache is keyed by name but validated by arity.** Caching on the key alone let a
+     second `ForeignRef` for the same key at a *different* arity reuse the first closure without a
+     check — and a leaf indexes its argument vector by the arity its closure was built with, so a
+     malformed image could reach a native read past the end of the arguments. The arity is now
+     validated on every reference, before the cache is consulted, and the cache records the arity it
+     was built with: a disagreement is refused as a corrupt image (the compiler derives one arity per
+     key from the PureScript type, §4(a)), never re-resolved.
+   - **A carrier remembers where it came from.** §3 promises errors naming the leaf that demanded a
+     crossing, but by the time a value reaches the boundary the resolving instruction is long gone,
+     so `VCarrier` gained a diagnostic `origin` (ADR-0110 §3's note). Nothing dispatches on it and it
+     does not make the value less opaque; a result inherits the origin of the call that produced it,
+     so an effect thunk returned by `writeLineImpl` and run later still names `writeLineImpl`.
+   - **`Boolean` is the one supported arm with no native coverage.** `String`, `Int`, `Number` and the
+     carrier pass-through are each read by a real leaf in the gate — `floatBitsHi 1.0` must print
+     1072693248, which a wrong `Number` representation could not produce by chance — but **no runtime
+     leaf takes a `Boolean`** (checked: nothing in `runtime/src/leaf.rs` calls `pv_bool_payload`), so
+     nothing reads that arm across the boundary yet. It is closed by a loaded-module fixture in slice
+     3, the first slice that can call one, and is flagged as untested where the code is.
+
+   One constraint the staging did not anticipate: **a stuck run cannot be caught in-process.**
+   purvasm's `Effect.Exception` is a throw-only shadow ([0074](0074-effect-exception-throw-only-ulib-shadow.md)),
+   so `try` around `runBlock` does not come back — the process writes the diagnostic and exits. Every
+   negative gate here is therefore a separate run observed by its exit status and stderr
+   (`--self-test <name>`), not an assertion inside the VM's own entry.
 3. Array promotion (§3) and the aliasing/cycle gate.
 4. Effect leaves and the carrier-aware elimination sites.
 5. `pv_adt_tag` and data-returning leaves.
@@ -563,7 +626,11 @@ Gates:
   only (a leaf cannot be *called* until slice 2, and `RTLD_NOW` already binds every reference);
 - **the runtime-leaf test** (§1.1 / §2): a guest program exercising a runtime leaf from each family —
   `show`, a line write, an FS read, `argv` — runs on the VM with no `--ffi` and no manifest. This is
-  the gate for the `pvf_*` half of the retained set, which nothing in the VM's own code references;
+  the gate for the `pvf_*` half of the retained set, which nothing in the VM's own code references —
+  **landed** in `tools/vm-loader-e2e.sh`'s `runtime-leaves` leg with `show` + stdio, the two that
+  together exercise a pure leaf, a carrier passed on undecoded, and an effect thunk run; FS and
+  `argv` join when the image reader makes a fixture program cheaper to write than a hand-assembled
+  block;
 - **the runtime-shadow test** (§4): a loaded module exporting a key the runtime already defines fails
   with `provided by both host-runtime and <module>`, rather than one of them silently winning;
 - **the stale-module test** (§5): a module built against a bumped `PV_FOREIGN_ABI_VERSION` fails to

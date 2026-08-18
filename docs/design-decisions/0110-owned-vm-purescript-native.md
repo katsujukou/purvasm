@@ -170,6 +170,12 @@ constructor exists only in the interpreter.
 
 Two invariants that follow, and that [0111](0111-vm-dynamic-native-ffi.md) builds on:
 
+> **Amendment (2026-08-18, as implemented):** the carrier variant carries a diagnostic **origin**
+> beside the runtime value — the foreign key it came from — because
+> [0111](0111-vm-dynamic-native-ffi.md) §3's boundary errors promise to name the leaf that demanded a
+> crossing, and by the time a value reaches the boundary the instruction that resolved it is gone.
+> Nothing dispatches on it, so the opacity below is unaffected: it is a label, not a decoding.
+
 - **A runtime value that crossed the boundary stays opaque.** `Value` carries a *foreign carrier*
   variant holding a runtime value as-is. It is not decoded on arrival — the ABI a native leaf is
   written against ([`runtime/include/purvasm.h`](../../runtime/include/purvasm.h)) exposes typed
