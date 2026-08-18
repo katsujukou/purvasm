@@ -79,7 +79,14 @@ data Value
   -- A value produced by a native leaf, carried rather than decoded. Also how a leaf's own closure and
   -- the effect thunks it returns are held: they are applied with the runtime's `apply`, not the VM's
   -- (ADR-0110 §1.1).
-  | VCarrier ForeignValue
+  --
+  -- The `String` is the carrier's **origin** — the foreign key it came from — and it is diagnostic
+  -- only: nothing dispatches on it, and it does not make the value less opaque. It is here because
+  -- the boundary's errors promise to name the leaf that demanded the crossing (ADR-0111 §3), and by
+  -- the time a value reaches the boundary the instruction that resolved it is long gone. A result
+  -- inherits the origin of the call that produced it, so "which `foreign import` is this?" survives
+  -- an effect thunk being returned and then run.
+  | VCarrier String ForeignValue
   -- A by-need cell (ADR-0024/0030): published before it is built so a cyclic instance-dictionary
   -- group can refer to its siblings; forcing an `Unbuilt` cell builds it once and memoises. A
   -- genuinely self-forcing cycle reaches `Building` — a black hole.

@@ -44,20 +44,36 @@ import Effect.Ref (Ref)
 import Effect.Ref as Ref
 import Purvasm.VM.Array as VMArray
 import Purvasm.VM.Error (stuck)
+import Purvasm.VM.Foreign (applyForeign, toPv)
 import Purvasm.VM.Instruction (CodeBlock, GuardClause, Instruction(..), Literal(..))
+import Purvasm.VM.Loader as Loader
 import Purvasm.VM.Prim as VMPrim
 import Purvasm.VM.Value (Closure, Thunk(..), Value(..))
 
 -- | What outlives a single run: the top-level table free names resolve through (which also closes
 -- | recursion for top-level functions — a function finds itself there), and the instruction counter,
 -- | the deterministic cost metric the optimiser is measured on (ADR-0026).
+-- |
+-- | `host` and `foreign` are the foreign frontier's (ADR-0111 §2). Both are established **lazily**,
+-- | on the first `ForeignRef` a run actually executes: opening the host is an effect that can fail,
+-- | and a program with no native leaf — every unit test here, and any pure guest program — has no
+-- | reason to perform it. Resolution is cached per key because a resolved leaf is a *value* the VM
+-- | builds once (§2), and because `pv_make_closure` allocates: re-resolving on every reference would
+-- | make each mention of `show` a fresh closure.
 type Env =
   { globals :: Ref (Map String Value)
   , executed :: Ref Int
+  , host :: Ref (Maybe Loader.ModuleHandle)
+  , foreigns :: Ref (Map String { arity :: Int, value :: Value })
   }
 
 newEnv :: Map String Value -> Effect Env
-newEnv globals = { globals: _, executed: _ } <$> Ref.new globals <*> Ref.new 0
+newEnv globals =
+  { globals: _, executed: _, host: _, foreigns: _ }
+    <$> Ref.new globals
+    <*> Ref.new 0
+    <*> Ref.new Nothing
+    <*> Ref.new Map.empty
 
 -- | A code frame: the running block, its instruction pointer, and the environment of locals.
 -- |
@@ -205,7 +221,16 @@ run env frames0 = do
         if na == arity then produce tail (VData tag (Array.fromFoldable all))
         else if na < arity then produce tail (VCtor tag arity all)
         else stuck ("constructor " <> tag <> " over-applied")
-      VCarrier _ -> stuck "application of a native value: the FFI boundary has not landed (ADR-0111)"
+      -- A carrier holds a *runtime* closure — a resolved leaf, or an effect thunk one returned — so
+      -- the runtime applies it (ADR-0111 §2). No arity is consulted here on purpose: over- and
+      -- under-application, and forcing within that carrier, are the runtime's paths, and they are the
+      -- ones a compiled program takes. The VM contributes the conversion and nothing else.
+      VCarrier origin fv -> do
+        converted <- traverse (\arg -> force arg >>= toPv origin) (Array.fromFoldable args)
+        result <- applyForeign fv converted
+        -- The result inherits the origin: an effect thunk returned by `writeLineImpl` is still
+        -- `writeLineImpl`'s as far as a later diagnostic is concerned.
+        produce tail (VCarrier origin result)
       _ -> stuck "application of a non-function"
 
     -- Knot-tying (ADR-0030): build each member in a `share` frame over one env ref (so the members'
@@ -235,6 +260,48 @@ run env frames0 = do
 
     -- Dispatch a switch: run the matching arm, else the default.
     enterArm fr arm = enterBlock fr.env fr.share arm
+
+    -- Resolve a native leaf once and cache it (ADR-0111 §2). Only `host-runtime` is searched in this
+    -- slice — the runtime staticlib linked into this executable, which is where `show`, stdio, FS and
+    -- `argv` live — so a program using only those needs no `--ffi` and no manifest. Loaded modules
+    -- join next, at which point the search becomes "ask each provider, require exactly one" (§4).
+    resolveForeign key physicalArity =
+      -- The arity is validated on EVERY reference, before the cache is consulted, and the cache
+      -- records the arity it was built with. Both halves matter, and neither is defensive
+      -- programming against the compiler: the arity reaches `pv_make_closure` as a `uint32_t` and a
+      -- leaf then indexes `args` by it, so a malformed image that resolved a key once at arity 1
+      -- and mentioned it again at 3 would otherwise reuse the first closure and hand native code an
+      -- argument vector it reads past. A key whose arity disagrees with its first occurrence is a
+      -- corrupt image, not a program error — the compiler derives one arity per key from the
+      -- PureScript type (ADR-0110 §4(a)) — so it is refused rather than re-resolved.
+      case Loader.arity physicalArity of
+        Nothing -> stuck ("native foreign " <> key <> " has a negative arity (" <> show physicalArity <> ")")
+        Just checked -> do
+          cached <- Ref.read env.foreigns
+          case Map.lookup key cached of
+            Just entry
+              | entry.arity == physicalArity -> pure entry.value
+              | otherwise -> stuck
+                  ( "native foreign " <> key <> " is referenced at arity " <> show physicalArity
+                      <> " but was resolved at arity "
+                      <> show entry.arity
+                      <> " (a corrupt image: the compiler derives one arity per key)"
+                  )
+            Nothing -> do
+              host <- Ref.read env.host >>= case _ of
+                Just h -> pure h
+                Nothing -> do
+                  h <- Loader.hostRuntime
+                  Ref.write (Just h) env.host
+                  pure h
+              case Loader.resolve host key checked of
+                Nothing -> stuck ("unbound native foreign: " <> key)
+                Just fv -> do
+                  -- The origin travels with the value so a later boundary error can name the leaf
+                  -- that demanded the crossing (ADR-0111 §3).
+                  let v = VCarrier key fv
+                  Ref.modify_ (Map.insert key { arity: physicalArity, value: v }) env.foreigns
+                  pure v
 
     step = Ref.read frames >>= case _ of
       Nil -> Done <$> (pop >>= force)
@@ -274,8 +341,7 @@ run env frames0 = do
       PushBool b -> push (VBool b)
       PushString s -> push (VString s)
       Load name -> lookupName fr.env name >>= push
-      ForeignRef key _ ->
-        stuck ("unbound native foreign: " <> key <> " (the foreign frontier is ADR-0111)")
+      ForeignRef key physicalArity -> resolveForeign key physicalArity >>= push
       Bind name -> do
         v <- pop
         Ref.modify_ (Map.insert name v) fr.env
