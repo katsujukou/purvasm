@@ -232,6 +232,89 @@ else
   printf '  %-24s -> refused for the wrong reason FAIL\n' arity-mismatch; rc=1
   sed 's/^/      /' "$WORK/mismatch.err" >&2
 fi
+echo "== loaded providers: both classes searched, exactly one may answer (§4) =="
+# Slice 3's first half. A key the runtime does NOT define can only come from the loaded module, so a
+# correct answer here is proof that resolution spans both provider classes — and `describeBoolImpl`
+# reads the boundary's `Boolean`, the one supported arm no runtime leaf can exercise (nothing in
+# runtime/src/leaf.rs reads `pv_bool_payload`).
+if build_provider "$WORK/provider.so" "$FIX/Provider.c" Test_2eLoader; then
+  if out="$("$VM" --self-test loaded-provider --ffi "$WORK/provider.so" 2>"$WORK/provider.err")"; then
+    if printf '%s' "$out" | grep -qxF "provider read Boolean true"; then
+      printf '  %-24s -> a loaded leaf ran, and read a Boolean OK\n' loaded-provider
+    else
+      printf '  %-24s -> the loaded leaf did not run FAIL\n' loaded-provider; rc=1
+      printf '%s\n' "$out" | sed 's/^/      /' >&2
+    fi
+  else
+    printf '  %-24s -> the VM refused a valid provider FAIL\n' loaded-provider; rc=1
+    sed 's/^/      /' "$WORK/provider.err" >&2
+  fi
+else
+  rc=1
+fi
+
+# The runtime-shadow collision (§4): a module exporting a key the runtime already defines. Neither may
+# win — not by archive order, not by load order — because "which `show` am I running?" is not a
+# question a user should have to ask. Built with -DPVF_MODULE=Data_2eShow so the symbol really is the
+# runtime's own, and run as its own process because the refusal is a stuck run (ADR-0074).
+if build_provider "$WORK/shadow.so" "$FIX/Shadow.c" Data_2eShow; then
+  if "$VM" --self-test runtime-shadow --ffi "$WORK/shadow.so" >"$WORK/shadow.out" 2>"$WORK/shadow.err"; then
+    printf '  %-24s -> a shadowed key resolved anyway FAIL\n' runtime-shadow; rc=1
+    sed 's/^/      /' "$WORK/shadow.out" >&2
+  elif grep -qF "provided by both host-runtime and" "$WORK/shadow.err"; then
+    printf '  %-24s -> refused, naming both providers OK\n' runtime-shadow
+  else
+    printf '  %-24s -> refused for the wrong reason FAIL\n' runtime-shadow; rc=1
+    sed 's/^/      /' "$WORK/shadow.err" >&2
+  fi
+else
+  rc=1
+fi
+
+echo "== array promotion: one object, every alias (§3) =="
+# The identity invariant, which is the reason arrays are promoted rather than converted. Every leg
+# below would still pass under an elementwise copy EXCEPT these: a copy would leave the leaf writing
+# to a corpse, and each alias reading the old element.
+if "$VM" --self-test aliasing --ffi "$WORK/provider.so" >"$WORK/alias.out" 2>"$WORK/alias.err"; then
+  written=$(grep -c "^written by the leaf$" "$WORK/alias.out" || true)
+  if [ "$written" -eq 3 ]; then
+    printf '  %-24s -> a leaf write is visible through all 3 aliases OK\n' aliasing
+  else
+    printf '  %-24s -> only %s of 3 aliases saw the write FAIL\n' aliasing "$written"; rc=1
+    sed 's/^/      /' "$WORK/alias.out" >&2
+  fi
+  # And the reverse: the VM's own SetArray, on an array that has already crossed, must reach the same
+  # object — otherwise promotion would be a one-way mirror.
+  if grep -qxF "written by the VM" "$WORK/alias.out"; then
+    printf '  %-24s -> a VM write is visible to the leaf OK\n' aliasing
+  else
+    printf '  %-24s -> the VM write never reached the leaf FAIL\n' aliasing; rc=1
+  fi
+else
+  printf '  %-24s -> the aliasing program did not run FAIL\n' aliasing; rc=1
+  sed 's/^/      /' "$WORK/alias.err" >&2
+fi
+
+# Steps 1 and 3 of the migration: an empty array (no blank-array constructor exists to build one) and
+# an array containing itself. A cycle that did not terminate would HANG rather than fail, so this
+# completing at all is the assertion; the timeout is the backstop that turns a hang into a failure.
+if timeout 60 "$VM" --self-test cyclic --ffi "$WORK/provider.so" >"$WORK/cyclic.out" 2>"$WORK/cyclic.err"; then
+  if grep -qxF "0" "$WORK/cyclic.out" && grep -qxF "1" "$WORK/cyclic.out"; then
+    printf '  %-24s -> empty and self-referential arrays both promoted OK\n' cyclic-empty
+  else
+    printf '  %-24s -> promoted, but the leaf measured the wrong lengths FAIL\n' cyclic-empty; rc=1
+    sed 's/^/      /' "$WORK/cyclic.out" >&2
+  fi
+else
+  status=$?
+  if [ "$status" -eq 124 ]; then
+    printf '  %-24s -> HUNG: the cycle did not terminate FAIL\n' cyclic-empty; rc=1
+  else
+    printf '  %-24s -> refused (exit %s) FAIL\n' cyclic-empty "$status"; rc=1
+    sed 's/^/      /' "$WORK/cyclic.err" >&2
+  fi
+fi
+
 echo "== foreign-ABI version: the marker fires when it loads, and not when it is refused (§5) =="
 # The bumped header is the real mechanism, not a fixture flag: a copy of the shipped `purvasm.h` with
 # its version `#define` rewritten is exactly "a module built against a different foreign ABI".

@@ -1,0 +1,78 @@
+/* A user-supplied provider, for the two things `host-runtime` alone cannot exercise
+ * (ADR-0111 §4, §7 slice 3):
+ *
+ *   - **resolution across both provider classes.** `describeBoolImpl` is a key the runtime does not
+ *     define, so a program that runs it can only have resolved it in this module — which is the
+ *     whole claim of "one authoring surface": the same `.c` a native build links statically is the
+ *     one the VM loads.
+ *   - **the `Boolean` boundary arm.** No runtime leaf takes a `Boolean` (nothing in
+ *     `runtime/src/leaf.rs` reads `pv_bool_payload`), so nothing else reads that arm across the
+ *     boundary. This is the fixture ADR-0111 §7's slice-2 note defers it to.
+ *
+ * Built with -DPVF_MODULE=Test_2eLoader, exactly as the app-C sibling of a module `Test.Loader`
+ * would be (ADR-0091 §2).
+ */
+#include "purvasm.h"
+
+/* `Test.Loader.describeBoolImpl :: Boolean -> String` — reads the boundary's `Boolean` and answers a
+ * string that could not be produced by the wrong branch, so the gate distinguishes "a Boolean
+ * crossed correctly" from "something crossed". */
+PVWord PVF_EXPORT(describeBoolImpl)(PVContext *ctx, PVWord clo, const PVWord *args, size_t nargs) {
+  (void)clo;
+  (void)nargs;
+  const char *answer = pv_bool_payload(ctx, args[0]) ? "provider read Boolean true" : "provider read Boolean false";
+  size_t len = 0;
+  while (answer[len] != '\0') len++;
+  return pv_new_str(ctx, (const uint8_t *)answer, len);
+}
+
+/* `Test.Loader.writeArrayImpl :: Array -> Int -> String -> Effect Unit` — a leaf that WRITES into an
+ * array the guest owns (ADR-0111 §3's aliasing gate).
+ *
+ * This is what makes promotion observable rather than merely implemented: the array reaching here is
+ * the runtime object the VM's cell was forwarded to, so a write lands on the object every VM alias
+ * shares. An elementwise copy at the boundary would make this leaf write to a corpse — the guest
+ * would see nothing, and the two VM bindings holding "the same" array would stop agreeing.
+ *
+ * Effectful, so it is the ADR-0067 pair: the outer leaf captures its three arguments into a thunk,
+ * and the thunk performs the write when the effect runs.
+ */
+static PVWord pvm_write_array_thunk(PVContext *ctx, PVWord clo, const PVWord *args, size_t nargs);
+
+PVWord PVF_EXPORT(writeArrayImpl)(PVContext *ctx, PVWord clo, const PVWord *args, size_t nargs) {
+  (void)clo;
+  (void)nargs;
+  PVWord env = pv_new_array(ctx, args, 3);
+  return pv_make_closure(ctx, (uint64_t)(uintptr_t)&pvm_write_array_thunk, 1, env);
+}
+
+static PVWord pvm_write_array_thunk(PVContext *ctx, PVWord clo, const PVWord *args, size_t nargs) {
+  (void)args;
+  (void)nargs;
+  PVWord env = pv_closure_env(ctx, clo);
+  PVWord array = pv_read_field(ctx, env, 0);
+  int32_t i = pv_int_payload(ctx, pv_read_field(ctx, env, 1));
+  PVWord value = pv_read_field(ctx, env, 2);
+  pv_write_field(ctx, array, (uint64_t)i, value);
+  return pv_unit();
+}
+
+/* `Test.Loader.readArrayImpl :: Array -> Int -> String` — read a slot back out, so the gate can also
+ * check the OTHER direction: a write the *guest* made through its own `SetArray` must be visible to
+ * a leaf, on the same object. */
+PVWord PVF_EXPORT(readArrayImpl)(PVContext *ctx, PVWord clo, const PVWord *args, size_t nargs) {
+  (void)clo;
+  (void)nargs;
+  int32_t i = pv_int_payload(ctx, args[1]);
+  return pv_read_field(ctx, args[0], (uint64_t)i);
+}
+
+/* `Test.Loader.lengthOfImpl :: Array -> Int` — the leaf an EMPTY array can be handed. Every other
+ * array leaf here indexes a slot, and an empty array has none, so without this §3's step 1 (the
+ * `pv_empty_array` case) could not be exercised at all: promotion only happens when something
+ * actually crosses. */
+PVWord PVF_EXPORT(lengthOfImpl)(PVContext *ctx, PVWord clo, const PVWord *args, size_t nargs) {
+  (void)clo;
+  (void)nargs;
+  return pv_int((int32_t)pv_array_len(ctx, args[0]));
+}

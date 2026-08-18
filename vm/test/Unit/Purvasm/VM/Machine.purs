@@ -27,13 +27,13 @@ import Test.Spec.Assertions (shouldEqual, shouldSatisfy)
 -- | meaningful structural equality.
 runPure :: CodeBlock -> Aff String
 runPure block = liftEffect do
-  env <- newEnv Map.empty
+  env <- newEnv Map.empty []
   render =<< runBlock env block Map.empty
 
 -- | Run a block that is expected to be stuck, and give back the diagnostic.
 runStuck :: CodeBlock -> Aff String
 runStuck block = liftEffect do
-  env <- newEnv Map.empty
+  env <- newEnv Map.empty []
   result <- try (runBlock env block Map.empty)
   either (pure <<< message) (\v -> ("unexpectedly produced " <> _) <$> render v) result
 
@@ -308,7 +308,7 @@ spec = describe "Purvasm.VM.Machine" do
       built <- liftEffect do
         counter <- Ref.new 0
         cell <- Ref.new (Unbuilt \_ -> Ref.modify_ (_ + 1) counter $> VInt 41)
-        env <- newEnv (Map.singleton "caf" (VThunk cell))
+        env <- newEnv (Map.singleton "caf" (VThunk cell)) []
         _ <- runBlock env [ Load "caf", PushInt 1, Prim AddInt 2, Return ] Map.empty
         _ <- runBlock env [ Load "caf", PushInt 1, Prim AddInt 2, Return ] Map.empty
         Ref.read counter
@@ -317,7 +317,7 @@ spec = describe "Purvasm.VM.Machine" do
     it "is stuck on a self-forcing cell (a black hole)" do
       diagnostic <- liftEffect do
         cell <- Ref.new Building
-        env <- newEnv (Map.singleton "caf" (VThunk cell))
+        env <- newEnv (Map.singleton "caf" (VThunk cell)) []
         result <- try (runBlock env [ Load "caf", Return ] Map.empty)
         pure (either message (const "unexpectedly produced a value") result)
       diagnostic `shouldSatisfy` contains "black hole"

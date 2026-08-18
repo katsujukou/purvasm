@@ -17,9 +17,13 @@
 -- |     produce by accident;
 -- |   * `VInt` — `showIntImpl 42`, and every `CPerform` run marker;
 -- |   * `VCarrier` — `showIntImpl`'s result is passed to `writeLineImpl` undecoded;
--- |   * `VBool` — **not covered**: no runtime leaf takes a `Boolean` (checked: nothing in
--- |     `runtime/src/leaf.rs` calls `pv_bool_payload`). It is closed by a loaded-module fixture in
--- |     slice 3, which is the first slice that can call one.
+-- |   * `VBool` — a loaded-module fixture reads one (`Test.Loader.describeBoolImpl`), since no
+-- |     runtime leaf takes a `Boolean` — the `loaded-provider` leg;
+-- |   * `VArray` — **promoted**, not converted, so it is not a conversion arm at all: the cell is
+-- |     forwarded to a runtime object every alias then shares (§3). Its gate is the aliasing leg of
+-- |     `tools/vm-loader-e2e.sh`, where a leaf writes an element and the VM observes the write —
+-- |     which is the only place the invariant is observable, since it is about identity rather than
+-- |     about any one value.
 module Test.Unit.Purvasm.VM.Foreign (spec) where
 
 import Prelude
@@ -34,7 +38,6 @@ import Effect.Aff (Aff)
 import Effect.Class (liftEffect)
 import Effect.Exception (message, try)
 import Effect.Ref as Ref
-import Purvasm.VM.Array as VMArray
 import Purvasm.VM.Foreign (toPv)
 import Purvasm.VM.Value (Thunk(..), Value(..))
 import Test.Spec (Spec, describe, it)
@@ -57,14 +60,6 @@ spec = describe "Purvasm.VM.Foreign" do
       -- the only thing that makes the error actionable.
       diagnostic <- refused (VRecord Map.empty)
       diagnostic `shouldSatisfy` contains "M.leafImpl"
-
-    it "refuses an array, because promotion is not a conversion" do
-      -- An elementwise copy would be a correctness bug rather than a cost (§3): a leaf's write would
-      -- land on the copy, and two VM bindings holding the same array would stop agreeing. Until
-      -- promotion lands, the identity invariant is kept by refusing the crossing outright.
-      cell <- liftEffect (VMArray.fromValues [ VInt 1 ])
-      diagnostic <- refused (VArray cell)
-      diagnostic `shouldSatisfy` contains "an array"
 
     it "refuses a record, in both directions and on both backends" do
       diagnostic <- refused (VRecord (Map.singleton "a" (VInt 1)))
@@ -97,13 +92,11 @@ spec = describe "Purvasm.VM.Foreign" do
 
     it "says `foreign boundary` in every refusal" do
       -- The shared prefix is what makes these greppable as one class, and it is boot's wording.
-      cell <- liftEffect (VMArray.fromValues [])
       envRef <- liftEffect (Ref.new Map.empty)
       diagnostics <- traverse refused
-        [ VArray cell
-        , VRecord Map.empty
+        [ VRecord Map.empty
         , VData "X" []
         , VCtor "Y" 2 List.Nil
         , VClosure { params: [], body: [], env: envRef }
         ]
-      Array.length (Array.filter (contains "foreign boundary") diagnostics) `shouldEqual` 5
+      Array.length (Array.filter (contains "foreign boundary") diagnostics) `shouldEqual` 4
