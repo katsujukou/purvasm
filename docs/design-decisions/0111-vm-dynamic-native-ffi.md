@@ -611,6 +611,41 @@ trusted surface: everything else in §1–§5 is ordinary purvasm code above it.
    negative gate here is therefore a separate run observed by its exit status and stderr
    (`--self-test <name>`), not an assertion inside the VM's own entry.
 3. Array promotion (§3) and the aliasing/cycle gate.
+   **Done (2026-08-18)**, together with the loaded-module half slice 2 deferred here. The gate now
+   runs 14 assertions, of which these are new: a leaf writes element 0 of an array the guest owns and
+   **all three aliases see it** (two bindings and a field of a data value); the VM's own `SetArray` on
+   an already-crossed array is **read back by a leaf** off the same object; an empty array and an
+   array containing *itself* both promote, the latter terminating only because the cell is forwarded
+   before any element migrates; a loaded module's leaf runs (which also closes slice 2's owed
+   `Boolean` arm — `Test.Loader.describeBoolImpl` reads one); and a module exporting
+   `pvf_Data_2eShow_2eshowIntImpl` is refused as `provided by both host-runtime and <path>` rather
+   than one definition winning by load order.
+
+   Three findings worth carrying forward — two surfaced by failing gates, the third by review:
+
+   - **A `foreign import` of arity 0 is not a value.** `emptyArrayImpl :: ForeignValue` reached the VM
+     as an arity-0 *closure* (`leafClosureArity` over a non-function type), so a leaf handed it got a
+     `Closure` where it expected an `Array`. The empty case is now `blankArrayImpl 0`, and the rule
+     is general: the VM's own privileged imports must take at least one argument.
+   - **The provider set is fixed when the run environment is built.** Registering providers one at a
+     time left exactly-one dependent on *when* a module joined: resolve `showIntImpl` against
+     `host-runtime`, then add a module that also defines it, then mention the key again, and the
+     answer comes from the cache with the collision never seen — and the carrier already handed out
+     keeps working, so clearing the cache on registration would not have closed it either. The
+     providers are now taken by `newEnv` and cannot be extended, which makes that ordering
+     **unrepresentable** rather than checked. It costs nothing: loading is explicit (§4), so every
+     provider is known before a program starts. `Env` is opaque for the same reason: as a record type
+     synonym it stayed a record at every call site, so `env { providers = … }` could rebuild the set
+     while SHARING the cache’s `Ref` — the same ordering, reachable from ordinary safe PureScript.
+     (Both halves came from review rather than from a failing gate: the harness never registers a
+     provider late, so no gate could have found either.)
+   - **Applying a carrier that is not a function aborts in the runtime, not in the VM.** §2 delegates
+     arity dispatch deliberately, so the VM hands `pv_apply` whatever the bytecode said was a
+     function; an ill-typed image therefore fails as a Rust panic (`expected a pointer value, got an
+     immediate`) instead of a VM `stuck`. That is the price of the delegation and it is the right
+     trade for well-typed input — but it means a *malformed* image gets a worse diagnostic than a
+     stuck guest does, which is worth knowing before the image reader admits images the VM did not
+     build itself.
 4. Effect leaves and the carrier-aware elimination sites.
 5. `pv_adt_tag` and data-returning leaves.
 6. Manifest emission from the build; the scoped eager diagnostics (§4).
@@ -632,7 +667,9 @@ Gates:
   `argv` join when the image reader makes a fixture program cheaper to write than a hand-assembled
   block;
 - **the runtime-shadow test** (§4): a loaded module exporting a key the runtime already defines fails
-  with `provided by both host-runtime and <module>`, rather than one of them silently winning;
+  with `provided by both host-runtime and <module>`, rather than one of them silently winning —
+  **landed** (`Shadow.c`, built with `-DPVF_MODULE=Data_2eShow` so the symbol really is the
+  runtime's own);
 - **the stale-module test** (§5): a module built against a bumped `PV_FOREIGN_ABI_VERSION` fails to
   load, and a marker in its initialiser proves no module code ran — **landed** in
   `tools/vm-loader-e2e.sh`, with the marker's *positive* control alongside it (the same source built
@@ -647,7 +684,11 @@ Gates:
   (`allowlist 57, exported 0`) rather than as a downstream load error;
 - **the aliasing gate** (§3): shared arrays, a `Ref`, and a cyclic array observed through every alias
   after a leaf writes — plus an empty array and an array promoted while another promotion is in
-  flight, the two cases the migration procedure's steps 1 and 3 exist for;
+  flight, the two cases the migration procedure's steps 1 and 3 exist for — **landed** in
+  `tools/vm-loader-e2e.sh`'s `aliasing` and `cyclic-empty` legs, covering three aliases (two bindings
+  and a data field), both directions of the write, the empty array and the self-referential one. A
+  `Ref` is not exercised separately: it *is* a one-element array, so the same cell and the same
+  `pv_write_field` path carry it — noted rather than silently skipped;
 - **the effect-termination regression** ([0110](0110-owned-vm-purescript-native.md) §5):
   `main = Console.log "x"` writes and exits 0, with the carrier `Unit` from the final `pv_apply`
   discarded rather than inspected;
