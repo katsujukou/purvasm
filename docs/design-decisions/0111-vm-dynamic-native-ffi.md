@@ -154,9 +154,53 @@ whole class of link-retention work at the cost of a non-self-contained distribut
 >   under GENERATED-CODE ABI and a provider must never call. Parsing the header's author region is
 >   both simpler and exact (verified against an independent extraction: 28 names, identical).
 > - **No anchor object.** `-Wl,-u,<sym>` alone pulls the archive member in *and* roots it against
->   dead-strip, which is what the anchor was for. Measured on Mach-O only; the same claim for
+>   dead-strip, which is what the anchor was for. ~~Measured on Mach-O only; the same claim for
 >   ELF + `--gc-sections` is **owed a measurement** before it is relied on, and until then this is a
->   Mach-O-verified mechanism, not a cross-platform one.
+>   Mach-O-verified mechanism, not a cross-platform one.~~ **Measured on ELF (2026-08-18) — see below.**
+
+> **Progress (2026-08-18): the ELF measurement, and what it changed.** `tools/elf-export-probe.sh`,
+> run in CI on clang/LLD 21.1.7 + GNU ld 2.44, varies only how the host exposes its symbols and
+> reports retention and export *separately* (an executable may legitimately contain a symbol it does
+> not export, so one column cannot answer both):
+>
+> | mode | retained | exported | leaked | dlopen |
+> | --- | --- | --- | --- | --- |
+> | none | yes | no | no | fail |
+> | version script | yes | no | no | fail |
+> | `--export-dynamic` + version script | yes | yes | no | ok |
+> | `--dynamic-list` | yes | yes | no | ok |
+>
+> - **Retention carries over; the owed claim is settled.** `RETAINED` is `yes` in the `none` row —
+>   `-Wl,-u` alone, no export flag anywhere, an archive member nothing references, under
+>   `--gc-sections`. The anchor object stays deleted, and this is now a cross-platform mechanism
+>   rather than a Mach-O-verified one.
+> - **Export did NOT carry over, and the implementation was wrong.** An ELF executable populates
+>   `.dynsym` with nothing by default, and a version script only *filters* what is exported. The VM
+>   linked that way exported **0** symbols and could load no provider at all — a failure invisible on
+>   Mach-O, where `-exported_symbols_list` does both jobs. The ELF branch is now `--dynamic-list`,
+>   which states the wanted thing directly (put exactly these in `.dynsym`) in one flag, with the
+>   leak check confirming it does not widen the set. This record's prose said
+>   "`--export-dynamic`/version script"; both work, and the one-flag form is what ships.
+>
+> Two defects surfaced only because the ELF host was broken, and both are fixed:
+>
+> - **The loader misdiagnosed the failure.** An unresolved `pv_foreign_abi_v<N>` has two causes — a
+>   provider built against another ABI (§5), and a host that does not export the symbol at all — and
+>   every platform reports both as a missing symbol. The VM blamed the *provider*, sending the reader
+>   to rebuild something that was already correct. The loader now decides in the order the evidence
+>   is trustworthy: **first** it asks whether this host exports its own stamp, through `dlsym` on the
+>   `host-runtime` handle — a fact about the binary rather than a reading of a message — and only
+>   then reads a version, and only out of the platform's undefined-symbol field (`undefined symbol:`
+>   / `flat namespace '…'`), validated as a canonical `pv_foreign_abi_v<N>` with nothing adjacent.
+>   Searching the whole `dlerror()` string was not enough: it contains the provider's **path**, so a
+>   file named `pv_foreign_abi_v99-bad.so` could forge either verdict for an unrelated missing
+>   symbol. `tools/vm-loader-e2e.sh`'s `spoofed-path` leg is that case, built under exactly that
+>   filename, and requires the plain refusal naming the symbol that is actually missing.
+> - **The stale-module gate passed vacuously.** With nothing loadable, the stale module is refused
+>   too, and the negative leg reported OK for a reason unrelated to the version. It now carries the
+>   positive control's verdict and reports `INCONCLUSIVE` (a failure) without it — the same rule
+>   §5.3 of [0109](0109-native-leaf-direct-lowering.md) applies to a noise floor: a negative result
+>   is only readable when the positive one holds.
 >
 > Also implemented, and not in this record: `--host-foreign-api` is **refused together with
 > `--rust-ffi`**. That mode links the *bundle* (the runtime rlib folded with the app crate,
@@ -526,7 +570,14 @@ Gates:
   load, and a marker in its initialiser proves no module code ran — **landed** in
   `tools/vm-loader-e2e.sh`, with the marker's *positive* control alongside it (the same source built
   against the shipped header loads and does print the marker, so its absence in the stale leg is
-  evidence rather than an assumption);
+  evidence rather than an assumption) and **gated on that control**: without it the leg reports
+  `INCONCLUSIVE`, since a host that can load nothing refuses the stale module for the wrong reason;
+- **the export-set test** (§1.1, the negative direction — added 2026-08-18): the generated allowlist
+  and the executable's actual dynamic export set must match exactly, in both directions, with a
+  re-exported `pvf_Purvasm_2eVM_2eLoader_2e*` or `pv_g_*` named as a trusted-surface failure. Every
+  other gate here is positive, so none of them can see the regression that hands a guest the loader
+  §6 exists to keep out of reach. It is also what caught the ELF export failure above, by number
+  (`allowlist 57, exported 0`) rather than as a downstream load error;
 - **the aliasing gate** (§3): shared arrays, a `Ref`, and a cyclic array observed through every alias
   after a leaf writes — plus an empty array and an array promoted while another promotion is in
   flight, the two cases the migration procedure's steps 1 and 3 exist for;

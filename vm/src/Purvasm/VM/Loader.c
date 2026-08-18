@@ -54,22 +54,6 @@ static void pvm_set_error(const char *what) {
   snprintf(pvm_error, sizeof pvm_error, "%s%s%s", what, detail ? ": " : "", detail ? detail : "");
 }
 
-/* A failed `dlopen`, read for the one shape worth naming (ADR-0111 §5): an unresolved
- * `pv_foreign_abi_v<N>` means the provider was built against a different foreign ABI. Every platform
- * reports that as an ordinary missing symbol — true, and misleading, since it reads as a host that
- * forgot to export something. The path is *not* repeated here; `Loader.purs` names the module. */
-static void pvm_set_load_error(void) {
-  const char *detail = dlerror();
-  if (detail != NULL && strstr(detail, "pv_foreign_abi_v") != NULL) {
-    snprintf(pvm_error, sizeof pvm_error,
-             "built against a different foreign ABI — this VM provides PV_FOREIGN_ABI_VERSION=%d, so "
-             "rebuild the provider against this runtime's purvasm.h (loader: %s)",
-             PV_FOREIGN_ABI_VERSION, detail);
-  } else {
-    snprintf(pvm_error, sizeof pvm_error, "load failed%s%s", detail ? ": " : "", detail ? detail : "");
-  }
-}
-
 /* Copy a purvasm `String` out whole, NUL-terminated, on the C heap. Returns NULL and sets
  * `pvm_error` when the string cannot be represented as a C string — never a shortened copy. The
  * two-call read is the ABI's: it hands out no interior pointer into the moving heap. */
@@ -104,6 +88,87 @@ static int pvm_ensure_host(void) {
   return 0;
 }
 
+/* The symbol name of THIS host's foreign-ABI version (ADR-0111 §5), built from the header's own
+ * paste so it cannot drift from what a provider references. */
+#define PVM_STR_(x) #x
+#define PVM_STR(x) PVM_STR_(x)
+#define PVM_ABI_SYMBOL PVM_STR(PV_FOREIGN_ABI_SYM(PV_FOREIGN_ABI_VERSION))
+
+/* Does this executable export its own version stamp? Asked of the host handle directly, because it
+ * is a FACT about this binary rather than a reading of a message: if the answer is no, no provider
+ * can load at all and every other explanation is noise. */
+static int pvm_host_exports_abi_stamp(void) {
+  if (pvm_ensure_host() != 0) return 0;
+  (void)dlerror();
+  (void)dlsym(pvm_modules[PVM_HOST_RUNTIME].handle, PVM_ABI_SYMBOL);
+  return dlerror() == NULL;
+}
+
+/* Return the last occurrence: a provider path precedes the loader's reason and may itself contain
+ * either marker. The actual undefined-symbol field is the later occurrence. */
+static const char *pvm_last_strstr(const char *haystack, const char *needle) {
+  const char *last = NULL;
+  const char *at = haystack;
+  while ((at = strstr(at, needle)) != NULL) {
+    last = at;
+    at++;
+  }
+  return last;
+}
+
+/* The symbol the loader named as undefined, taken from the platform's OWN field rather than from
+ * anywhere in the message. The message also contains the provider's PATH, and a file named
+ * `/tmp/pv_foreign_abi_v99-bad.so` would otherwise make an unrelated missing symbol read as a stale
+ * ABI — a diagnosis that sends the reader to rebuild a provider that is not the problem. */
+static const char *pvm_undefined_symbol(const char *detail) {
+  const char *linux_at = pvm_last_strstr(detail, "undefined symbol: ");
+  const char *darwin_at = pvm_last_strstr(detail, "flat namespace '");
+  /* glibc/musl: "<path>: undefined symbol: <name>"; dyld: "... flat namespace '_<name>'" */
+  if (linux_at != NULL && (darwin_at == NULL || linux_at > darwin_at))
+    return linux_at + (sizeof "undefined symbol: " - 1);
+  if (darwin_at != NULL) return darwin_at + (sizeof "flat namespace '" - 1);
+  return NULL;
+}
+
+/* Read `symbol` as `pv_foreign_abi_v<N>` exactly — the canonical spelling and nothing adjacent to
+ * it. `pv_foreign_abi_v1-bad` is a DIFFERENT symbol, not version 1, and `pv_foreign_abi_v01` is not
+ * a version this project ever emits (the header refuses it). Returns 0 when it is not the stamp. */
+static int pvm_abi_symbol_version(const char *symbol, long *version) {
+  if (symbol == NULL) return 0;
+  if (*symbol == '_') symbol++; /* Mach-O prefixes symbol names */
+  if (strncmp(symbol, "pv_foreign_abi_v", sizeof "pv_foreign_abi_v" - 1) != 0) return 0;
+  const char *digits = symbol + (sizeof "pv_foreign_abi_v" - 1);
+  if (*digits < '1' || *digits > '9') return 0; /* canonical decimal: no sign, no leading zero */
+  const char *end = digits;
+  while (*end >= '0' && *end <= '9') end++;
+  /* The name must END here; the delimiters are the ones the two message forms put after it. */
+  if (*end != '\0' && *end != '\'' && *end != ' ' && *end != '\n' && *end != ',' && *end != ')') return 0;
+  *version = strtol(digits, NULL, 10);
+  return 1;
+}
+
+/* A failed provider `dlopen`, after the host's own stamp was verified. The message is consulted only
+ * through the platform's undefined-symbol field. Deciding from the whole message was measured to
+ * misfire because any provider path containing the stamp's name could forge the verdict.
+ *
+ * The path is *not* repeated here; `Loader.purs` names the module. */
+static void pvm_set_load_error(void) {
+  const char *detail = dlerror();
+  if (detail == NULL) detail = "(no diagnostic)";
+
+  long referenced = 0;
+  if (pvm_abi_symbol_version(pvm_undefined_symbol(detail), &referenced) &&
+      referenced != PV_FOREIGN_ABI_VERSION) {
+    snprintf(pvm_error, sizeof pvm_error,
+             "built against foreign ABI v%ld — this VM provides PV_FOREIGN_ABI_VERSION=%d, so "
+             "rebuild the provider against this runtime's purvasm.h (loader: %s)",
+             referenced, PV_FOREIGN_ABI_VERSION, detail);
+    return;
+  }
+
+  snprintf(pvm_error, sizeof pvm_error, "load failed: %s", detail);
+}
+
 /* RTLD_NOW is what makes the ABI-version reference a *load* failure, before the module's
  * initialisers run (ADR-0111 §5); RTLD_LOCAL keeps providers from seeing or interposing on each
  * other, so a per-handle `dlsym` is an honest question about one module (§4/§6). */
@@ -111,6 +176,15 @@ static int pvm_load(const char *path) {
   if (pvm_ensure_host() != 0) return -1;
   if (pvm_count >= PVM_MAX_MODULES) {
     snprintf(pvm_error, sizeof pvm_error, "too many loaded modules (max %d)", PVM_MAX_MODULES);
+    return -1;
+  }
+  /* Check this before `dlopen`: besides naming the primary host defect directly, this avoids keeping
+   * a `dlerror()` pointer across another dynamic-loader call (which may overwrite its storage). */
+  if (!pvm_host_exports_abi_stamp()) {
+    snprintf(pvm_error, sizeof pvm_error,
+             "this VM does not export " PVM_ABI_SYMBOL ", so no provider can resolve against it — it "
+             "was linked without the host foreign API (ADR-0111 §1.1); relink the VM before provider "
+             "compatibility can be assessed");
     return -1;
   }
   (void)dlerror(); /* clear any stale error before the call whose failure we report */

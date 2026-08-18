@@ -193,6 +193,17 @@ forceUndefined macos sym = "-Wl,-u," <> (if macos then "_" else "") <> sym
 -- | `foreign import` on `Purvasm.VM.Loader.resolveImpl`, resolve it through the ordinary frontier,
 -- | and hold the trusted loader itself — the one thing §6 exists to keep out of guest reach. It also
 -- | exports every `pv_g_*` generated global and the Rust runtime's internals.
+-- |
+-- | The two platforms need different files *and* differently-shaped claims, which a measurement
+-- | settled (`tools/elf-export-probe.sh`, run in CI on clang/LLD 21.1.7 + GNU ld 2.44):
+-- |
+-- |   * **Mach-O** — `-exported_symbols_list` both adds to the export table and confines it, so one
+-- |     file does the whole job.
+-- |   * **ELF** — an executable populates `.dynsym` with *nothing* by default, and a version script
+-- |     only filters what is exported rather than deciding that anything is. Measured, a version
+-- |     script alone exported **0** symbols and no provider could load. `--dynamic-list` is the flag
+-- |     that means what is wanted here — put exactly these in `.dynsym` — in one file, with an
+-- |     unrelated host function verified absent from the result.
 exportAllowlist :: Boolean -> FilePath -> Array String -> { path :: FilePath, contents :: String, flag :: String }
 exportAllowlist macos path syms
   | macos =
@@ -202,8 +213,8 @@ exportAllowlist macos path syms
       }
   | otherwise =
       { path
-      , contents: "{ global:\n" <> foldMap (\s -> "  " <> s <> ";\n") syms <> "local: *;\n};\n"
-      , flag: "-Wl,--version-script," <> path
+      , contents: "{\n" <> foldMap (\s -> "  " <> s <> ";\n") syms <> "};\n"
+      , flag: "-Wl,--dynamic-list," <> path
       }
 
 -- | The default conventional runtime staticlib path (release profile — the inline-ABI objects this
@@ -544,7 +555,7 @@ link opts = do
             <> String.joinWith ", " missing
             <> " (purvasm.h and the runtime disagree)"
         )
-      listPath <- FS.joinPath [ opts.buildDir, if macos then "exported_symbols.txt" else "export.map" ]
+      listPath <- FS.joinPath [ opts.buildDir, if macos then "exported_symbols.txt" else "dynamic.list" ]
       let allow = exportAllowlist macos listPath retained
       FS.writeText allow.path allow.contents
       Log.info $ Fmt.fmt @"  host-foreign-api: retaining {n} symbols, exporting exactly those"

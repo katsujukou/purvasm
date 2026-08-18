@@ -112,8 +112,8 @@ echo "== export allowlist ≡ what the executable actually exports (§1.1) =="
 #
 # The comparison is EXACT in both directions, not a spot check: missing means providers break,
 # extra means the allowlist is not the boundary it claims to be.
-ALLOW="$WORK/vm/_build/exported_symbols.txt"
-[ -f "$ALLOW" ] || ALLOW="$WORK/vm/_build/export.map"
+ALLOW="$WORK/vm/_build/exported_symbols.txt"          # Mach-O: -exported_symbols_list
+[ -f "$ALLOW" ] || ALLOW="$WORK/vm/_build/dynamic.list" # ELF: --dynamic-list
 if [ ! -f "$ALLOW" ]; then
   printf '  %-24s -> no export allowlist at %s FAIL\n' export-set "$ALLOW"; rc=1
 else
@@ -189,10 +189,17 @@ if ! grep -qF "#define PV_FOREIGN_ABI_VERSION 99" "$WORK/stale-include/purvasm.h
   exit 2
 fi
 
+# The positive control, and the stale leg below is only interpretable while it holds: if NOTHING can
+# load — a host that exported nothing, a broken fixture — the stale module is refused too, and the
+# negative leg reports OK for a reason that has nothing to do with the version. (Measured: an ELF
+# host whose allowlist never reached `.dynsym` produced exactly that false pass.) So the control's
+# verdict is carried, and the stale leg refuses to conclude without it.
+positive_control=no
 if build_provider "$WORK/marker.so" "$FIX/Marker.c" Test_2eLoader; then
   if "$VM" --ffi "$WORK/marker.so" >"$WORK/marker.out" 2>"$WORK/marker.err"; then
     if grep -qF "MARKER: provider initialiser ran" "$WORK/marker.err"; then
       printf '  %-24s -> loaded, initialiser ran OK\n' current-version
+      positive_control=yes
     else
       printf '  %-24s -> loaded but the marker never fired (the negative below would prove nothing) FAIL\n' current-version; rc=1
     fi
@@ -205,15 +212,42 @@ else
 fi
 
 if build_provider "$WORK/stale.so" "$FIX/Marker.c" Test_2eLoader "$WORK/stale-include"; then
-  if "$VM" --ffi "$WORK/stale.so" >"$WORK/stale.out" 2>"$WORK/stale.err"; then
+  if [ "$positive_control" != yes ]; then
+    # Not "FAIL" for a defect of its own, and emphatically not OK: with nothing loadable, a refusal
+    # here carries no information about the version at all.
+    printf '  %-24s -> INCONCLUSIVE: the positive control above did not load FAIL\n' stale-version; rc=1
+  elif "$VM" --ffi "$WORK/stale.so" >"$WORK/stale.out" 2>"$WORK/stale.err"; then
     printf '  %-24s -> loaded (expected a refusal) FAIL\n' stale-version; rc=1
-  elif ! grep -qF "different foreign ABI" "$WORK/stale.err"; then
-    printf '  %-24s -> refused, but not by version FAIL\n' stale-version; rc=1
+  elif ! grep -qF "built against foreign ABI v99" "$WORK/stale.err"; then
+    # The version in the message, not just the words: the loader distinguishes "built against
+    # another ABI" from "this host exports no version symbol", and only the former is this gate.
+    printf '  %-24s -> refused, but not by the version it was built against FAIL\n' stale-version; rc=1
     sed 's/^/      /' "$WORK/stale.err" >&2
   elif grep -qF "MARKER: provider initialiser ran" "$WORK/stale.err"; then
     printf '  %-24s -> refused AFTER its initialiser ran FAIL\n' stale-version; rc=1
   else
     printf '  %-24s -> refused before any module code ran OK\n' stale-version
+  fi
+else
+  rc=1
+fi
+
+# A refusal must name the RIGHT cause. `dlerror()` reports the provider path beside the unresolved
+# symbol, so a loader that searched the whole message for the version stamp could be steered by a
+# filename: this provider is missing an ordinary host symbol, and is deliberately built as
+# `pv_foreign_abi_v99-bad.so`. Both version verdicts are therefore wrong answers here, and the plain
+# one — naming the symbol that is actually missing — is the only right one.
+if build_provider "$WORK/pv_foreign_abi_v99-bad.so" "$FIX/Unresolved.c" Test_2eLoader; then
+  if "$VM" --ffi "$WORK/pv_foreign_abi_v99-bad.so" >"$WORK/unresolved.out" 2>"$WORK/unresolved.err"; then
+    printf '  %-24s -> loaded (expected a refusal) FAIL\n' spoofed-path; rc=1
+  elif grep -qE "built against foreign ABI|does not export pv_foreign_abi_v" "$WORK/unresolved.err"; then
+    printf '  %-24s -> the path forged an ABI verdict FAIL\n' spoofed-path; rc=1
+    sed 's/^/      /' "$WORK/unresolved.err" >&2
+  elif ! grep -qF "pvm_no_such_host_symbol" "$WORK/unresolved.err"; then
+    printf '  %-24s -> refused without naming the missing symbol FAIL\n' spoofed-path; rc=1
+    sed 's/^/      /' "$WORK/unresolved.err" >&2
+  else
+    printf '  %-24s -> refused, naming the real missing symbol OK\n' spoofed-path
   fi
 else
   rc=1
