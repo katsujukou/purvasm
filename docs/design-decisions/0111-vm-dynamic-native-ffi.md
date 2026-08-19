@@ -690,6 +690,85 @@ trusted surface: everything else in §1–§5 is ordinary purvasm code above it.
      eliminator* — `show` over a decoded `Int`, an `IndexArray` over a leaf's array — which is what
      the gate asserts.
 5. `pv_adt_tag` and data-returning leaves.
+   **Done (2026-08-19).** `pv_adt_tag` is in the runtime, the header and `purvasm-sys`; `toPv` builds a
+   data value with `pv_new_adt`; `SwitchCtor` dispatches on a leaf's ADT by tag and `Proj` reads its
+   fields. A leaf can now return a `Maybe`, which §3 named as the thing its absence ruled out.
+
+   The tag derivation moved rather than being copied. `ctorTag` (with `fnv1a64` and `utf8Bytes`
+   beneath it) now lives in the `abi` package, which already existed for exactly this reason — the
+   LLVM backend mints the tag when it emits an ADT and the VM mints the same number at the boundary,
+   and `Purvasm.Abi.Mangle`'s own preamble warns that a copy "would drift, and the failure mode is
+   silent". The compiler keeps its old module names as re-exports, and its 568 tests (which pin these
+   encodings as goldens) pass unchanged.
+
+   Two facts about the representation that the record did not state, both found by a crash:
+
+   - **A nullary constructor has no heap object.** Codegen emits it as the immediate whose payload
+     *is* the tag (ADR-0064 §1), so `pv_new_adt` — which is `arity >= 1` — never applies to it, and
+     neither does a heap read. `pv_adt_tag` therefore answers for **both** representations, which
+     is not a weakening of §3's opacity but the same shape `pv_array_len` already has (an immediate
+     sentinel for the empty array, a heap object otherwise): one question, one answer, whichever form
+     the value takes. Without that arm a leaf could return `Just x` but not `Nothing` — not a coherent
+     surface, since the VM cannot ask which one it is holding and so cannot avoid the bad call.
+   - **An `Adt`'s payload is `[tag] ++ fields`.** Field `i` is payload word `i + 1`, so reading a data
+     value's field with the array accessor returns the raw TAG — a number that is not a value word at
+     all, which the runtime rejects downstream as `pointer is not a live object`. That is what the
+     first run of the gate produced. There is now an `adtField` accessor beside `readField`: one per
+     layout, rather than one accessor and a convention to remember.
+
+   `pv_adt_tag` is **additive**, so it does not bump `PV_FOREIGN_ABI_VERSION` (§5): a provider built
+   before it existed references nothing new, and one built after it fails against an older runtime by
+   the symbol's own absence.
+
+   Four more from review, two of them defects in the ABI rather than in the VM:
+
+   - **The foreign API could not build a nullary constructor at all.** `pv_new_adt` always allocated,
+     so a provider asking for `Nothing` got a zero-field heap object: the right tag, and a value that
+     misses every *native* `case Nothing`, because a generated `case` splits on representation before
+     comparing tags (`Emit.purs`). The owned VM would have accepted it — `pv_adt_tag` reads either
+     form — so this was "write once, run on both backends" failing on the backend the VM is not. The
+     fixture's hand-encoded `pv_int(tag)` is what had hidden the gap.
+
+     The fix is **`pv_new_nullary_adt`, a new symbol**, not a new meaning for `pv_new_adt`. Teaching
+     the existing entry to answer for `n == 0` would have changed what a v1 symbol does: a provider
+     built against the new header and loaded by an older runtime would have resolved it, been
+     accepted, and silently misbehaved — which is the failure §5's version contract exists to
+     prevent, and which a version stamp cannot catch if the stamp does not move. A new name is
+     refused by an older runtime as an undefined symbol, so the change stays **additive** and
+     `PV_FOREIGN_ABI_VERSION` does not move.
+
+     `pv_new_adt` therefore **keeps** its v1 behaviour for `n == 0` — a zero-field heap object,
+     non-canonical and documented as such — rather than being taught to refuse it. Refusing is itself
+     a behaviour change to a v1 symbol: a provider built before the nullary entry existed passes the
+     version check and then faults inside a call that used to return, which is the same class of
+     silent-contract break, just louder. The safe Rust layer's `Ctx::new_adt` picks the correct entry
+     for the author, so a leaf still writes `new_adt(tag, &[])` and never learns that the two differ.
+   - **The safe Rust layer could receive a data value and do nothing with it.** `pv_adt_tag` reached
+     `purvasm-sys` but not `Ctx`, whose raw context and word are private — so a `#[pv_foreign]` leaf
+     could be handed a `Maybe` and had no way to inspect it, leaving §Context's "one authoring
+     surface" true for C and false for the crate the DX layer exists to be. `Ctx` now has `adt_tag`
+     and `adt_field` (the latter carrying the `+ 1` so a leaf never encodes the layout), with a
+     round-trip test through the safe layer for both constructor shapes.
+   - **The safe layer's field accessor had the same two holes as the VM's.** `i + 1` wraps at
+     `u64::MAX` in a release profile (overflow checks off) and lands on slot 0 — the raw tag — and the
+     accessor read a field without checking the value was an ADT at all, so an `Array` would have
+     answered with its element `i + 1` instead of faulting, against `Ctx`'s stated contract that a
+     shape error is a runtime fault. Both are closed (`checked_add`, and `adt_tag` first as the shape
+     check), in the Rust layer and in the VM's own C accessor.
+   - **A negative `Proj` index reached the tag slot.** A VM-local data value is refused by
+     `Data.Array.index`, but a carrier had no such guard, and `adtField`'s `+ 1` turns `-1` into slot
+     0 — the raw tag, the one word the separate accessor exists to keep out of value positions. It is
+     refused on both sides now, and the gate asserts the two representations produce the *same*
+     diagnostic.
+   - **The outbound gate could not see a wrong tag.** The fixture answered "Just or else Nothing", so
+     a broken nullary tag would have been reported as a correct `Nothing`. It has three outcomes now,
+     and the third is a `WRONG` line the gate fails on.
+
+   One limit worth stating rather than discovering: **`pv_adt_tag`'s shape check reaches only the
+   pointer case.** A heap non-ADT aborts, but a nullary constructor is an immediate and therefore
+   indistinguishable from an `Int`, a `Boolean` or `Unit` — the representation genuinely does not
+   separate them. So this accessor, unlike the scalar ones, rests on the caller being a site whose
+   TYPE already established that the value is an ADT, which a compiler-emitted `SwitchCtor` is.
 6. Manifest emission from the build; the scoped eager diagnostics (§4).
 
 Gates:
@@ -746,9 +825,14 @@ Gates:
 
 - A purvasm program with user FFI runs on the VM, on the same provider the native build links. The
   two backends stop disagreeing about what a program may contain.
-- The runtime gains one accessor (`pv_adt_tag`); the foreign surface gains its own version constant
-  (`PV_FOREIGN_ABI_VERSION`) and the host-symbol reference that enforces it, emitted by both
-  `purvasm.h` and `purvasm-foreign`. All additive; no existing provider changes.
+- The runtime gains two entries — the `pv_adt_tag` accessor and the `pv_new_nullary_adt` constructor,
+  the latter because a nullary constructor is an immediate and the field-carrying entry could not
+  answer for it without changing what a v1 symbol does. The foreign surface also gains its own
+  version constant (`PV_FOREIGN_ABI_VERSION`) and the host-symbol reference that enforces it, emitted
+  by both `purvasm.h` and `purvasm-foreign`. All additive: no existing provider changes, and no
+  existing symbol changes meaning — `pv_new_adt` with no fields keeps its (wrong, non-canonical) v1
+  behaviour rather than becoming an error, since refusing it would be exactly the silent-then-loud
+  break the version contract exists to prevent.
 - The VM's own link acquires platform-specific retention and export rules (§1.1) over two sets: the
   hand-listed `pv_*` foreign API (plus the version symbol), and the runtime's `pvf_*` leaves, derived
   by `nm`. The first is a maintained artifact — adding a `pv_*` to the header without adding it there
