@@ -360,7 +360,9 @@ run wrapped@(Env env) frames0 = do
         doCall false v rest
         pure (Loop unit)
       Guard gf : _ -> do
-        decided <- pop >>= force
+        -- A guard is a Boolean-demanding site like `JumpUnless`, and a leaf can supply the Boolean:
+        -- without the demand a perfectly good guard reads as `non-boolean condition`.
+        decided <- pop >>= force >>= decodeBool
         popFrame
         case decided, Array.index gf.clauses gf.index of
           VBool true, Just clause -> do
