@@ -1,13 +1,22 @@
-/* A user-supplied provider, for the two things `host-runtime` alone cannot exercise
- * (ADR-0111 §4, §7 slice 3):
+/* A user-supplied provider: everything `host-runtime` alone cannot exercise (ADR-0111 §4, §7
+ * slices 3 and 4).
+ *
+ * The runtime's own leaves are a provider class, but a fixed one — it defines what it defines, and
+ * several claims need a leaf that it does *not* define, or one whose signature no runtime leaf has:
  *
  *   - **resolution across both provider classes.** `describeBoolImpl` is a key the runtime does not
  *     define, so a program that runs it can only have resolved it in this module — which is the
  *     whole claim of "one authoring surface": the same `.c` a native build links statically is the
  *     one the VM loads.
- *   - **the `Boolean` boundary arm.** No runtime leaf takes a `Boolean` (nothing in
- *     `runtime/src/leaf.rs` reads `pv_bool_payload`), so nothing else reads that arm across the
- *     boundary. This is the fixture ADR-0111 §7's slice-2 note defers it to.
+ *   - **the `Boolean` boundary arm, in both directions.** No runtime leaf takes OR returns a
+ *     `Boolean` (nothing in `runtime/src/leaf.rs` touches `pv_bool_payload`), so this file owns both
+ *     halves: `describeBoolImpl` READS one crossing outward, and `isPositiveImpl` PRODUCES one for
+ *     the Boolean-demanding elimination sites — `JumpUnless`, a `Guarded` condition, `SwitchLit`
+ *     over `LBool`. Their absence is what let `Guarded` ship undecoded.
+ *   - **arrays in both directions.** `writeArrayImpl`/`readArrayImpl` write and read an array the
+ *     GUEST owns (the promotion path, §3), and `makeArrayImpl` RETURNS one — a carrier from birth,
+ *     which never gets promoted and which `SetArray` must still reach. `lengthOfImpl` is the only
+ *     leaf an EMPTY array can be handed, since every other one indexes a slot.
  *
  * Built with -DPVF_MODULE=Test_2eLoader, exactly as the app-C sibling of a module `Test.Loader`
  * would be (ADR-0091 §2).
@@ -75,4 +84,35 @@ PVWord PVF_EXPORT(lengthOfImpl)(PVContext *ctx, PVWord clo, const PVWord *args, 
   (void)clo;
   (void)nargs;
   return pv_int((int32_t)pv_array_len(ctx, args[0]));
+}
+
+/* `Test.Loader.makeArrayImpl :: String -> Array` — a leaf that RETURNS an array.
+ *
+ * This is the other entrance to the identity invariant (ADR-0111 §3, and the review that named it):
+ * an array the guest built and handed over is a `VArray` whose cell gets promoted, but an array a
+ * leaf *returned* is a carrier from birth — it never had a VM cell at all. `IndexArray`,
+ * `LengthArray` and `SetArray` must reach it just the same, so the VM gives it a cell that forwards
+ * to this very object rather than copying it into one.
+ */
+PVWord PVF_EXPORT(makeArrayImpl)(PVContext *ctx, PVWord clo, const PVWord *args, size_t nargs) {
+  (void)clo;
+  (void)nargs;
+  PVWord elems[2];
+  elems[0] = args[0];
+  elems[1] = args[0];
+  return pv_new_array(ctx, elems, 2);
+}
+
+/* `Test.Loader.isPositiveImpl :: Int -> Boolean` — a leaf that RETURNS a Boolean.
+ *
+ * `describeBoolImpl` reads one across the boundary; this produces one, which is what the
+ * Boolean-demanding *elimination* sites need (ADR-0111 §3): `JumpUnless`, a `Guarded` clause's
+ * condition, and a `SwitchLit` over `LBool`. Without a leaf on this side of the arrow those sites
+ * can only be exercised with VM-built Booleans, which is exactly the coverage gap that let the
+ * `Guarded` site ship undecoded.
+ */
+PVWord PVF_EXPORT(isPositiveImpl)(PVContext *ctx, PVWord clo, const PVWord *args, size_t nargs) {
+  (void)clo;
+  (void)nargs;
+  return pv_bool(pv_int_payload(ctx, args[0]) > 0);
 }

@@ -315,6 +315,67 @@ else
   fi
 fi
 
+echo "== carrier elimination: leaf values consumed by ordinary bytecode (§3) =="
+# Slice 4. Nothing here is a new instruction — each site meets a carrier where it used to meet a VM
+# value and decodes it by demanding the shape it already required. The two array entrances are both
+# exercised: an array the LEAF returned is a carrier from birth, so `SetArray` reaches it without any
+# promotion having happened, which is a different path from the aliasing leg above.
+#
+# Note what is NOT claimed: the VM's own `describe` still prints a carrier as `<value>`, because it
+# has no type to demand with. Making a carrier printable at the terminal is ADR-0110 §5's typed
+# terminal demand, not this slice.
+if "$VM" --self-test carrier-elimination --ffi "$WORK/provider.so" >"$WORK/elim.out" 2>"$WORK/elim.err"; then
+  elim_ok=yes
+  # 1072693249 = 0x3FF00001: a carrier Int decoded, then 1 added to the payload by an ordinary AddInt.
+  # "2" is LengthArray over an array the leaf returned; "from the leaf" is IndexArray over the same.
+  for expected in "1072693249" "2" "from the leaf"; do
+    grep -qxF "$expected" "$WORK/elim.out" || {
+      printf '  %-24s -> a site never consumed the carrier: %s FAIL\n' carrier-elim "$expected"; rc=1; elim_ok=no
+    }
+  done
+  # Twice: once read back by the VM's own IndexArray, once by the LEAF off the same object. One
+  # occurrence would mean the write and the read disagreed about which array they were talking about.
+  if [ "$(grep -cxF "set on a leaf array" "$WORK/elim.out")" -ne 2 ]; then
+    printf '  %-24s -> a SetArray on a leaf-returned array did not reach one object FAIL\n' carrier-elim; rc=1; elim_ok=no
+  fi
+  if [ "$elim_ok" = yes ]; then
+    printf '  %-24s -> scalars, length, index and SetArray all decoded OK\n' carrier-elim
+  else
+    sed 's/^/      /' "$WORK/elim.out" >&2
+  fi
+else
+  printf '  %-24s -> the elimination program did not run FAIL\n' carrier-elim; rc=1
+  sed 's/^/      /' "$WORK/elim.err" >&2
+fi
+
+# The CONTROL sites, one arm each. A site that branches on a leaf's value is an elimination site
+# just as much as one that computes with it, and none of them was covered until a review found
+# `Guarded` reading a carrier as a non-boolean. Each expected line names its site, and each WRONG line
+# is a branch that must never be taken — so a site that silently stopped decoding shows up as either a
+# missing line or a wrong one, not as a pass.
+if "$VM" --self-test carrier-control --ffi "$WORK/provider.so" >"$WORK/control.out" 2>"$WORK/control.err"; then
+  control_ok=yes
+  for expected in \
+    "jumpUnless: took the true branch" \
+    "guarded: true clause fired" \
+    "guarded: false fell through" \
+    "switchLit: matched the leaf's Int" \
+    "switchLen: matched the leaf's array" \
+    "projArray: read from the leaf's array"; do
+    grep -qxF "$expected" "$WORK/control.out" || {
+      printf '  %-24s -> a control site did not decode: %s FAIL\n' carrier-control "$expected"; rc=1; control_ok=no
+    }
+  done
+  if grep -q "WRONG" "$WORK/control.out"; then
+    printf '  %-24s -> a branch that must never be taken fired FAIL\n' carrier-control; rc=1; control_ok=no
+  fi
+  [ "$control_ok" = yes ] && printf '  %-24s -> jumpUnless, guarded, switchLit, switchLen, projArray OK\n' carrier-control
+  [ "$control_ok" = yes ] || sed 's/^/      /' "$WORK/control.out" >&2
+else
+  printf '  %-24s -> the control program did not run FAIL\n' carrier-control; rc=1
+  sed 's/^/      /' "$WORK/control.err" >&2
+fi
+
 echo "== foreign-ABI version: the marker fires when it loads, and not when it is refused (§5) =="
 # The bumped header is the real mechanism, not a fixture flag: a copy of the shipped `purvasm.h` with
 # its version `#define` rewritten is exactly "a module built against a different foreign ABI".
