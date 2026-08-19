@@ -123,8 +123,27 @@ PVWord pv_empty_array(void);
 /** An `Array`'s element count (the empty array reads as 0) — pairs with `pv_read_field` for the
     FFI's array conversions (ADR-0078). */
 size_t pv_array_len(PVContext *ctx, PVWord array);
-/** An algebraic-data value: constructor `tag`, then `n` field words at `fields`. */
+/** A field-carrying algebraic-data value: constructor `tag`, then `n` field words at `fields`.
+    A NULLARY constructor is `pv_new_nullary_adt`, not this: the two representations differ.
+    `n == 0` is LEGACY and non-canonical: it allocates a zero-field heap object, which
+    carries the right tag and matches no native `case` at all. It is kept because refusing it would
+    change what an existing v1 symbol does — a provider built before the nullary entry existed would
+    pass the version check and then fault inside a call that used to return. */
 PVWord pv_new_adt(PVContext *ctx, uint32_t tag, const PVWord *fields, size_t n);
+/** The NULLARY constructor `tag` — an immediate, so no allocation and no ctx.
+    This is the only representation a nullary constructor has, and the one a generated `case` matches:
+    a `case` splits on representation before comparing tags, so a zero-field heap object would carry
+    the right tag and miss every `case Nothing`. Build `Nothing` with this, never by hand. */
+PVWord pv_new_nullary_adt(uint32_t tag);
+/** An algebraic-data value's constructor tag — the number `pv_new_adt` was given, which is
+    `fnv1a64(name).lo & 0x7fffffff` for the constructor NAME. Answers for a NULLARY constructor too:
+    that one has no heap object (it is an immediate whose payload is the tag), and a caller holding an
+    opaque word cannot tell the two apart, so the accessor does. A typed accessor, not introspection:
+    it answers what tag THIS ADT carries, never what kind a word is.
+    NOTE the shape check reaches only the pointer case: a heap non-ADT aborts, but a nullary
+    constructor is indistinguishable from an `Int`/`Boolean`/`Unit` — all immediates — so the caller
+    must be a site whose TYPE already established that this is an ADT. */
+uint32_t pv_adt_tag(PVContext *ctx, PVWord adt);
 /** A record from parallel `ids` (sorted FNV-1a-64 label ids) and `values`, length `n` (ADR-0069). */
 PVWord pv_new_record(PVContext *ctx, const PVWord *ids, const PVWord *values, size_t n);
 /** A mutable one-cell `Ref` initialised to `init`. */

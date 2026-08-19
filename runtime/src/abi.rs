@@ -529,8 +529,21 @@ pub unsafe extern "C" fn pv_write_raw(ctx: *mut Heap, obj: u64, i: u64, bits: u6
 
 // --- allocation / constructors (ADR-0071 §6) --------------------------------------------------------
 
-/// Allocate a field-carrying [`Adt`](crate::heap::Kind::Adt) `tag(fields…)` (ADR-0071 §6). A *nullary*
-/// constructor is an immediate (codegen emits it inline), so this is only for `arity >= 1`. Self-rooting.
+/// Allocate a field-carrying [`Adt`](crate::heap::Kind::Adt) `tag(fields…)` (ADR-0071 §6).
+/// Self-rooting.
+///
+/// **Use [`pv_new_nullary_adt`] for a nullary constructor.** `nfields == 0` here is *legacy and
+/// non-canonical*: it allocates a zero-field heap object, which carries the right tag and matches no
+/// native `case` at all, because a generated `case` splits on representation before comparing tags
+/// (`Emit.purs`). That is a wrong value, and it is nonetheless what this entry did in v1 of the
+/// foreign ABI — so it keeps doing it.
+///
+/// Refusing it instead would be a **behaviour change to an existing v1 symbol**, which is precisely
+/// what the version contract cannot express: a provider built before the nullary entry existed
+/// resolves this symbol, passes the version check, and would then abort inside a call that used to
+/// return. Either the old entry keeps its old behaviour and the new one is additive (this), or the
+/// old behaviour goes and `PV_FOREIGN_ABI_VERSION` moves (§5). There is no third option, and the
+/// second is not worth spending on a case the correct entry now covers.
 ///
 /// # Safety
 /// `ctx` live; `fields`/`nfields` a valid value-word buffer.
@@ -547,6 +560,26 @@ pub unsafe extern "C" fn pv_new_adt(
             .as_word()
             .to_bits()
     })
+}
+
+/// The **nullary** constructor `tag` — an immediate, allocating nothing (hence no `ctx`, like
+/// [`pv_int`] and [`pv_empty_array`]).
+///
+/// This is the only representation a nullary constructor has. Codegen emits one inline (`Emit.purs`'s
+/// `arity == 0` arm) and a generated `case` splits on representation BEFORE comparing tags —
+/// immediate/nullary down one path, pointer/field-carrying down the other — so a zero-field heap
+/// object would carry the right tag and fail every native `case Nothing`. Without this entry a
+/// provider had to know the encoding and build the immediate by hand, which is exactly the leak the
+/// foreign surface exists to prevent.
+///
+/// **A separate symbol rather than a meaning change** (ADR-0111 §5): teaching `pv_new_adt` to answer
+/// for `n == 0` would have altered what an existing v1 symbol does, so a provider built against the
+/// new header and loaded by an older runtime would have been accepted and then silently misbehaved.
+/// A new name is refused by an older runtime as an undefined symbol — the failure the version
+/// contract is for — and stays additive, so `PV_FOREIGN_ABI_VERSION` does not move.
+#[no_mangle]
+pub extern "C" fn pv_new_nullary_adt(tag: u32) -> u64 {
+    TaggedWord::nullary_ctor(tag).to_bits()
 }
 
 /// Box a `Number` (`f64`) (ADR-0071 §6). `bits` is the IEEE-754 bit pattern (codegen passes `f64` bits).
@@ -730,6 +763,51 @@ pub unsafe extern "C" fn pv_array_len(ctx: *mut Heap, a: u64) -> usize {
         let h = heap(ctx);
         let p = h.checked_ptr(w);
         h.array_len(p) as usize
+    })
+}
+
+/// An `Adt`'s constructor tag (ADR-0111 §3): the number `pv_new_adt` was given, which is
+/// `fnv1a64(name).lo & 0x7fffffff` for the constructor's NAME (`Purvasm.Abi.Mangle.ctorTag`).
+///
+/// Added for the owned VM's `SwitchCtor`: a data value a native leaf returned is opaque like any
+/// other carrier, and dispatching on it needs the tag — the one question the foreign API could not
+/// answer, which is why a leaf could not return a `Maybe` before this. It is a shape-checked typed
+/// accessor in the same family as [`pv_array_len`], not introspection: it answers "what tag does
+/// this ADT carry", never "what kind is this word" (ADR-0069's opacity is unchanged).
+///
+/// The shape check is **representation-dependent, and only the pointer half is checked**: a heap
+/// argument that is not an `Adt` aborts, but an immediate carries no kind, so this cannot tell a nullary
+/// constructor from an `Int`, a `Boolean` or `Unit` — all four are immediates, and reading a
+/// tag out of one answers with its payload. That is not a hole this accessor could close (the
+/// representation genuinely does not distinguish them); it is why the caller must be a site whose
+/// TYPE already said "this is an ADT", which is exactly how the owned VM uses it (a `SwitchCtor` the
+/// compiler emitted).
+///
+/// Additive, so it does not bump `PV_FOREIGN_ABI_VERSION` (ADR-0111 §5): a provider built before it
+/// existed references nothing new, and one built after it fails to link against an older runtime by
+/// the symbol's own absence.
+///
+/// # Safety
+/// `ctx` live; `adt` a value word denoting an ADT — either a field-carrying heap `Adt` or a nullary
+/// constructor's immediate, both of which this answers for.
+#[no_mangle]
+pub unsafe extern "C" fn pv_adt_tag(ctx: *mut Heap, adt: u64) -> u32 {
+    guard(|| {
+        let w = TaggedWord::from_bits(adt);
+        // A NULLARY constructor has no heap object: codegen emits it as the immediate whose payload
+        // *is* the tag (ADR-0064 §1). Answering for both representations is what makes this an
+        // accessor rather than introspection — one question, one answer, whichever shape the value
+        // has — and it is the same shape `pv_array_len` already has, where the empty array is an
+        // immediate sentinel and a non-empty one is a heap object.
+        //
+        // Without this arm a leaf could return `Just x` but not `Nothing`, which is not a coherent
+        // surface: the VM cannot ask which one it is holding, so it cannot avoid the bad call.
+        if w.is_immediate() {
+            return w.as_ctor_tag();
+        }
+        let h = heap(ctx);
+        let p = h.checked_ptr(w);
+        h.adt_tag(p)
     })
 }
 

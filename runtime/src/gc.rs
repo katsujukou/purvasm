@@ -960,6 +960,15 @@ impl Heap {
         hdr.size_words()
     }
 
+    /// An `Adt`'s constructor tag — payload slot 0, which `new_adt` writes raw. Shape-checked like
+    /// [`Self::array_len`]: reading a tag off anything else would answer with whatever word happened
+    /// to be first.
+    pub fn adt_tag(&self, a: HeapPtr) -> u32 {
+        let hdr = self.header(a); // checked: validates `a` is a live object header
+        assert_eq!(hdr.kind(), Kind::Adt, "adt_tag on a non-Adt object");
+        self.read_raw(a, 0) as u32
+    }
+
     /// Copy a string value's bytes out to an owned `String` (`Str` or `StrSlice`). Copies (never
     /// hands a borrow into the moving heap outward, ADR-0063 §2); valid UTF-8 by the `new_str`
     /// invariant plus the slice builders' boundary validation (ADR-0103 §1).

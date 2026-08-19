@@ -74,8 +74,25 @@ extern "C" {
     pub fn pv_empty_array() -> PVWord;
     /// An `Array`'s element count (the empty array reads as 0).
     pub fn pv_array_len(ctx: *mut PVContext, array: PVWord) -> usize;
-    /// An algebraic-data value: constructor `tag`, then `n` field words.
+    /// A field-carrying algebraic-data value: constructor `tag`, then `n` field words. A NULLARY
+    /// constructor is [`pv_new_nullary_adt`] — the representations differ.
+    ///
+    /// `n == 0` here is LEGACY and non-canonical: it allocates a zero-field heap object, which
+    /// carries the right tag and matches no native `case`. Kept because refusing it would change
+    /// what an existing v1 symbol does.
     pub fn pv_new_adt(ctx: *mut PVContext, tag: u32, fields: *const PVWord, n: usize) -> PVWord;
+    /// The NULLARY constructor `tag`: an immediate, allocating nothing. The only representation a
+    /// nullary constructor has, and the one a generated `case` matches.
+    pub fn pv_new_nullary_adt(tag: u32) -> PVWord;
+    /// An algebraic-data value's constructor tag — the number [`pv_new_adt`] or
+    /// [`pv_new_nullary_adt`] was given, which is `fnv1a64(name).lo & 0x7fffffff` for the
+    /// constructor NAME. Answers for both representations. NOT introspection: it asks what tag this
+    /// ADT carries, never what kind a word is.
+    ///
+    /// The shape check reaches only the pointer case: a heap non-ADT faults, but a nullary
+    /// constructor is an immediate and so is indistinguishable from an `Int`/`Boolean`/`Unit`. The
+    /// caller must therefore be a site whose TYPE already established that this is an ADT.
+    pub fn pv_adt_tag(ctx: *mut PVContext, adt: PVWord) -> u32;
     /// A record from parallel sorted FNV-1a-64 `ids` and `values` (ADR-0069).
     pub fn pv_new_record(
         ctx: *mut PVContext,
