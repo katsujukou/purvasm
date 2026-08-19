@@ -23,18 +23,99 @@ module Purvasm.VM.Prim
 
 import Prelude
 
+import Data.Array as Array
 import Data.Map as Map
 import Data.Maybe (Maybe(..))
+import Data.TraversableWithIndex (traverseWithIndex)
 import Effect (Effect)
 import Purvasm.Int as Int
 import Purvasm.VM.Array as VMArray
 import Purvasm.VM.Error (stuck)
+import Purvasm.VM.Foreign as Foreign
 import Purvasm.VM.Instruction (PrimOp(..))
 import Purvasm.VM.Value (Value(..))
 
 -- | Apply a primop to its (already forced) arguments.
+-- |
+-- | A value that came from a leaf arrives as an opaque carrier, and **this is one of the sites that
+-- | decodes it** (ADR-0111 §3): a primop knows exactly what it wants, so it demands that rather than
+-- | asking what it has. [demands] states the shape per operand and [decode] applies it; every arm
+-- | below then sees ordinary VM values and is unchanged by the FFI existing.
 eval :: PrimOp -> Array Value -> Effect Value
-eval op args = case op, args of
+eval op args = evalDecoded op =<< traverseWithIndex (decode op) args
+
+-- | What operand `i` of `op` must be for the arm to fire. `DAny` is not laxness — it is the operands
+-- | that are *stored* rather than inspected (`SetArray`'s element, `RecordSet`'s value), where a
+-- | carrier is a perfectly good value to keep carrying.
+data Demand
+  = DInt
+  | DNumber
+  | DBool
+  | DString
+  | DArray
+  | DAny
+
+demands :: PrimOp -> Array Demand
+demands = case _ of
+  AddInt -> [ DInt, DInt ]
+  SubInt -> [ DInt, DInt ]
+  MulInt -> [ DInt, DInt ]
+  DivInt -> [ DInt, DInt ]
+  ModInt -> [ DInt, DInt ]
+  AndInt -> [ DInt, DInt ]
+  OrInt -> [ DInt, DInt ]
+  XorInt -> [ DInt, DInt ]
+  ShlInt -> [ DInt, DInt ]
+  ShrInt -> [ DInt, DInt ]
+  ZshrInt -> [ DInt, DInt ]
+  ComplementInt -> [ DInt ]
+  AddNumber -> [ DNumber, DNumber ]
+  SubNumber -> [ DNumber, DNumber ]
+  MulNumber -> [ DNumber, DNumber ]
+  DivNumber -> [ DNumber, DNumber ]
+  IntToNumber -> [ DInt ]
+  NumberToInt -> [ DNumber ]
+  EqInt -> [ DInt, DInt ]
+  EqString -> [ DString, DString ]
+  EqNumber -> [ DNumber, DNumber ]
+  EqBool -> [ DBool, DBool ]
+  LtInt -> [ DInt, DInt ]
+  LtString -> [ DString, DString ]
+  LtNumber -> [ DNumber, DNumber ]
+  AndBool -> [ DBool, DBool ]
+  OrBool -> [ DBool, DBool ]
+  NotBool -> [ DBool ]
+  Append -> [ DString, DString ]
+  IndexArray -> [ DArray, DInt ]
+  LengthArray -> [ DArray ]
+  NewArray -> [ DInt ]
+  -- The written element is `DAny`: it is stored, not inspected, and `Purvasm.VM.Array.write` crosses
+  -- it at the boundary if the array turns out to be promoted.
+  SetArray -> [ DArray, DInt, DAny ]
+  RecordGet -> [ DString, DAny ]
+  RecordSet -> [ DString, DAny, DAny ]
+  RecordHas -> [ DString, DAny ]
+  RecordDelete -> [ DString, DAny ]
+  RecordUnion -> [ DAny, DAny ]
+
+-- | Decode operand `i` to the demanded shape. Only a carrier is ever touched: a VM value is already
+-- | the shape it is, and an ill-typed one falls through to the arms below, which refuse it by name.
+-- |
+-- | An array is not decoded into anything — `Purvasm.VM.Array.asCell` gives the carrier a cell that
+-- | forwards to it, so the array operations reach the leaf's own object rather than a copy.
+decode :: PrimOp -> Int -> Value -> Effect Value
+decode op i value = case value, Array.index (demands op) i of
+  VCarrier _ fv, Just DInt -> pure (VInt (Foreign.intOf fv))
+  VCarrier _ fv, Just DNumber -> pure (VNumber (Foreign.numberOf fv))
+  VCarrier _ fv, Just DBool -> pure (VBool (Foreign.booleanOf fv))
+  VCarrier _ fv, Just DString -> pure (VString (Foreign.stringOf fv))
+  VCarrier _ _, Just DArray -> VMArray.asCell value >>= case _ of
+    Just cell -> pure (VArray cell)
+    Nothing -> pure value
+  _, _ -> pure value
+
+evalDecoded :: PrimOp -> Array Value -> Effect Value
+evalDecoded op args = case op, args of
   AddInt, [ VInt a, VInt b ] -> pure (VInt (a + b))
   SubInt, [ VInt a, VInt b ] -> pure (VInt (a - b))
   MulInt, [ VInt a, VInt b ] -> pure (VInt (a * b))

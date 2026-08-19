@@ -165,3 +165,65 @@ static PVWord pvm_write_thunk(PVContext *ctx, PVWord clo, const PVWord *args, si
   pv_write_field(ctx, array, (uint64_t)i, value);
   return pv_unit();
 }
+
+/* ── Decoding at the use site (ADR-0111 §3) ─────────────────────────────────────────────────────────
+ *
+ * A carrier is opaque on arrival because the ABI answers no "what kind is this word?" question. It is
+ * decoded where the bytecode ELIMINATES it, because that site already knows the shape it demands —
+ * an `AddInt` wants two `Int`s, a `JumpUnless` wants a `Boolean`. Each accessor below therefore
+ * states a demand rather than asking a question, and the runtime's own shape check is what enforces
+ * it: handing `intOfImpl` a `String` aborts in the runtime, exactly as a wrong-shaped leaf argument
+ * would. Nothing here branches on representation, so ADR-0069's opacity is preserved.
+ *
+ * The value is returned unchanged rather than rebuilt: the accessor's job is the CHECK. A VM `Int`
+ * and a runtime `Int` are the same word (the VM is a purvasm program on the same heap), so a
+ * re-encode would copy a value into itself — the same reasoning as `toPv`'s, read backwards.
+ */
+
+PVWord PVF_EXPORT(intOfImpl)(PVContext *ctx, PVWord clo, const PVWord *args, size_t nargs) {
+  (void)clo;
+  (void)nargs;
+  (void)pv_int_payload(ctx, args[0]); /* shape check: aborts if this is not an Int */
+  return args[0];
+}
+
+PVWord PVF_EXPORT(numberOfImpl)(PVContext *ctx, PVWord clo, const PVWord *args, size_t nargs) {
+  (void)clo;
+  (void)nargs;
+  (void)pv_number_bits(ctx, args[0]);
+  return args[0];
+}
+
+PVWord PVF_EXPORT(booleanOfImpl)(PVContext *ctx, PVWord clo, const PVWord *args, size_t nargs) {
+  (void)clo;
+  (void)nargs;
+  (void)pv_bool_payload(ctx, args[0]);
+  return args[0];
+}
+
+PVWord PVF_EXPORT(stringOfImpl)(PVContext *ctx, PVWord clo, const PVWord *args, size_t nargs) {
+  (void)clo;
+  (void)nargs;
+  (void)pv_str_len(ctx, args[0]);
+  return args[0];
+}
+
+static PVWord pvm_force_thunk(PVContext *ctx, PVWord clo, const PVWord *args, size_t nargs);
+
+/* `forceCarrierImpl :: ForeignValue -> Effect ForeignValue` — `pv_force_if_byneed`, which passes a
+ * non-cell through unchanged (ADR-0070). Effectful because forcing a by-need cell RUNS its
+ * suspension: the VM's own `force` is the same shape for its own thunks, and this is that discipline
+ * extended to the values a leaf hands back. */
+PVWord PVF_EXPORT(forceCarrierImpl)(PVContext *ctx, PVWord clo, const PVWord *args, size_t nargs) {
+  (void)clo;
+  (void)nargs;
+  PVWord env = pv_new_array(ctx, args, 1);
+  return pv_make_closure(ctx, (uint64_t)(uintptr_t)&pvm_force_thunk, 1, env);
+}
+
+static PVWord pvm_force_thunk(PVContext *ctx, PVWord clo, const PVWord *args, size_t nargs) {
+  (void)args;
+  (void)nargs;
+  PVWord env = pv_closure_env(ctx, clo);
+  return pv_force_if_byneed(ctx, pv_read_field(ctx, env, 0));
+}

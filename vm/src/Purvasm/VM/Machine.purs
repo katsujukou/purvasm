@@ -47,6 +47,7 @@ import Effect.Ref as Ref
 import Purvasm.VM.Array as VMArray
 import Purvasm.VM.Error (stuck)
 import Purvasm.VM.Foreign (applyForeign, toPv)
+import Purvasm.VM.Foreign as Foreign
 import Purvasm.VM.Instruction (CodeBlock, GuardClause, Instruction(..), Literal(..))
 import Purvasm.VM.Loader as Loader
 import Purvasm.VM.Prim as VMPrim
@@ -147,6 +148,10 @@ force value = case value of
       Ref.write (Built v) cell
       force v
     Building -> stuck "black hole: a recursive value was forced while being built"
+  -- A carrier can hold a by-need cell of the runtime's own (ADR-0070), and the VM cannot tell by
+  -- looking. `pv_force_if_byneed` answers for it and passes a non-cell through unchanged, so this is
+  -- the same rule the VM applies to its own thunks, extended to what a leaf handed back (§3).
+  VCarrier origin fv -> VCarrier origin <$> Foreign.forceCarrier fv
   _ -> pure value
 
 -- | Run a block as a top-level activation (the program entry, or one CAF), on a fresh stack.
@@ -417,11 +422,13 @@ run wrapped@(Env env) frames0 = do
           Just v -> push v
           Nothing -> stuck ("projection: field " <> show i <> " out of range")
         _ -> stuck "projection: not a data value"
-      ProjArray i -> pop >>= force >>= case _ of
-        VArray cell -> VMArray.index cell i >>= case _ of
+      -- `asCell` is what makes an array a leaf RETURNED usable here: it never had a VM cell, so it is
+      -- given one that forwards to it rather than being copied into one (ADR-0111 §3).
+      ProjArray i -> pop >>= force >>= VMArray.asCell >>= case _ of
+        Just cell -> VMArray.index cell i >>= case _ of
           Just v -> push v
           Nothing -> stuck ("array projection: index " <> show i <> " out of range")
-        _ -> stuck "array projection: not an array"
+        Nothing -> stuck "array projection: not an array"
       Update labels -> do
         values <- popN (Array.length labels)
         pop >>= force >>= case _ of
@@ -440,7 +447,7 @@ run wrapped@(Env env) frames0 = do
         doCall true f args
       Return -> returnFromActivation
       Jump rel -> Ref.modify_ (_ + rel) fr.ip
-      JumpUnless rel -> pop >>= force >>= case _ of
+      JumpUnless rel -> pop >>= force >>= decodeBool >>= case _ of
         VBool false -> Ref.modify_ (_ + rel) fr.ip
         VBool true -> pure unit
         _ -> stuck "if: non-boolean condition"
@@ -448,22 +455,39 @@ run wrapped@(Env env) frames0 = do
         VData tag _ -> enterArm fr (lookupArm (\t -> t == tag) arms default)
         _ -> stuck "switch on a non-data value"
       SwitchLit arms default -> do
-        v <- pop >>= force
+        v <- pop >>= force >>= decodeLike (map (\(l /\ _) -> l) (Array.head arms))
         case Array.head arms of
           -- A discriminant of the wrong *kind* is type-impossible; a wrong value of the right kind is
           -- an ordinary non-match and takes the default (ADR-0031).
           Just (l /\ _) | not (litKindEq l v) -> stuck "literal switch on a wrong-kind value"
           _ -> enterArm fr (lookupArm (\l -> litEq l v) arms default)
-      SwitchLen arms default -> pop >>= force >>= case _ of
-        VArray cell -> do
+      SwitchLen arms default -> pop >>= force >>= VMArray.asCell >>= case _ of
+        Just cell -> do
           n <- VMArray.length cell
           enterArm fr (lookupArm (_ == n) arms default)
-        _ -> stuck "array-length switch on a non-array value"
+        Nothing -> stuck "array-length switch on a non-array value"
       Guarded clauses fallthrough ->
         enterGuard { clauses, index: 0, fallthrough, env: fr.env, share: fr.share }
       Fail message -> stuck message
 
   tailRecM (\_ -> step) unit
+
+-- | Decode a carrier the way a `Boolean`-demanding site must (ADR-0111 §3): the site knows what it
+-- | wants, so it demands it, and the runtime's shape check enforces the demand.
+decodeBool :: Value -> Effect Value
+decodeBool = case _ of
+  VCarrier _ fv -> pure (VBool (Foreign.booleanOf fv))
+  v -> pure v
+
+-- | Decode a carrier to the kind a literal switch is discriminating on. With no arms there is
+-- | nothing to demand, so the value is left alone and the default arm takes it.
+decodeLike :: Maybe Literal -> Value -> Effect Value
+decodeLike literal value = case value, literal of
+  VCarrier _ fv, Just (LInt _) -> pure (VInt (Foreign.intOf fv))
+  VCarrier _ fv, Just (LBool _) -> pure (VBool (Foreign.booleanOf fv))
+  VCarrier _ fv, Just (LString _) -> pure (VString (Foreign.stringOf fv))
+  VCarrier _ fv, Just (LNumber _) -> pure (VNumber (Foreign.numberOf fv))
+  _, _ -> pure value
 
 -- | The arm whose discriminant matches, else the default.
 lookupArm :: forall d. (d -> Boolean) -> Array (d /\ CodeBlock) -> CodeBlock -> CodeBlock

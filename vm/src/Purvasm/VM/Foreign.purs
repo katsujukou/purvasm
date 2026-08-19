@@ -21,8 +21,13 @@
 module Purvasm.VM.Foreign
   ( applyForeign
   , arrayLength
+  , booleanOf
+  , forceCarrier
+  , intOf
+  , numberOf
   , promote
   , readField
+  , stringOf
   , toPv
   , writeField
   ) where
@@ -176,3 +181,38 @@ promote cell = Ref.read cell >>= case _ of
         )
         0
       pure carrier
+
+foreign import intOfImpl :: ForeignValue -> Int
+foreign import numberOfImpl :: ForeignValue -> Number
+foreign import booleanOfImpl :: ForeignValue -> Boolean
+foreign import stringOfImpl :: ForeignValue -> String
+foreign import forceCarrierImpl :: ForeignValue -> Effect ForeignValue
+
+-- | Decode a carrier at a site that already knows the shape it demands (ADR-0111 §3).
+-- |
+-- | These are **demands, not questions**: the ABI answers no "what kind is this word?", so there is
+-- | nothing to ask. The bytecode is generated from a well-typed program, so an `AddInt` demanding an
+-- | `Int` is entitled to one, and the runtime's own shape check is what enforces the entitlement —
+-- | a mis-shaped carrier aborts there, exactly as a mis-shaped leaf argument does. Nothing here
+-- | branches on representation, so ADR-0069's opacity survives.
+-- |
+-- | Not `Effect`: reading a scalar mutates nothing and allocates nothing. A wrong shape is a fault,
+-- | not a value, so there is no failure to sequence.
+intOf :: ForeignValue -> Int
+intOf = intOfImpl
+
+numberOf :: ForeignValue -> Number
+numberOf = numberOfImpl
+
+booleanOf :: ForeignValue -> Boolean
+booleanOf = booleanOfImpl
+
+stringOf :: ForeignValue -> String
+stringOf = stringOfImpl
+
+-- | Force a carrier through the runtime's by-need discipline (`pv_force_if_byneed`, ADR-0070), which
+-- | passes a non-cell through unchanged. The VM forces its OWN thunks at every site that inspects a
+-- | value's shape; this is that same rule applied to what a leaf handed back, and it is effectful for
+-- | the same reason — forcing a cell runs its suspension.
+forceCarrier :: ForeignValue -> Effect ForeignValue
+forceCarrier = forceCarrierImpl

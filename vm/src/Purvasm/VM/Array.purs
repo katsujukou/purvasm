@@ -17,7 +17,8 @@
 -- | decoding it would break the very invariant promotion protects (§3's "coming out"). Its origin
 -- | says so, for a diagnostic that has to name something.
 module Purvasm.VM.Array
-  ( fromValues
+  ( asCell
+  , fromValues
   , index
   , length
   , new
@@ -36,6 +37,24 @@ import Purvasm.Array as PA
 import Purvasm.VM.Error (stuck)
 import Purvasm.VM.Foreign as Foreign
 import Purvasm.VM.Value (ArrayCell, ArrayStorage(..), Value(..))
+
+-- | The cell to operate an array value through, whichever way it reached the VM (ADR-0111 §3).
+-- |
+-- | There are two entrances and one path. A `VArray` is already a cell — possibly promoted, possibly
+-- | not. An array a **leaf returned** is a `VCarrier`: it never had a cell, because it was never
+-- | VM-local. Wrapping it in a cell that is `Promoted` from birth costs no object and copies nothing
+-- | — the cell forwards to the very array the leaf handed back — and it means `IndexArray`,
+-- | `LengthArray` and, crucially, **`SetArray`** all reach it through the same accessors that a
+-- | promoted VM array uses. The identity invariant is the same invariant either way: one object,
+-- | every alias, in both directions.
+-- |
+-- | `Nothing` for anything else. A carrier that is not an array is NOT rejected here — the runtime's
+-- | shape check catches it at the first accessor, which is where a demand belongs (§3).
+asCell :: Value -> Effect (Maybe ArrayCell)
+asCell = case _ of
+  VArray cell -> pure (Just cell)
+  VCarrier _ fv -> Just <$> Ref.new (Promoted fv)
+  _ -> pure Nothing
 
 -- | The cell for an already-built element vector (the `Array` instruction, a literal).
 fromValues :: Array Value -> Effect ArrayCell
