@@ -647,6 +647,48 @@ trusted surface: everything else in §1–§5 is ordinary purvasm code above it.
      stuck guest does, which is worth knowing before the image reader admits images the VM did not
      build itself.
 4. Effect leaves and the carrier-aware elimination sites.
+   **Done (2026-08-19).** Effect leaves needed nothing, as §3 predicted: an effect thunk is a carrier
+   and the VM runs it by applying it to the run marker, which slice 2 already did. The work was all
+   on the *consuming* side, and it is deliberately invisible in the instruction set — every site
+   below meets a carrier where it used to meet a VM value and **demands** the shape it already
+   required, rather than asking what it has (there is nothing to ask; §3's opacity):
+
+   - scalar primops (`Prim`), through a per-operand `Demand` table, so each arm's pattern is
+     unchanged and the FFI is not visible in the arithmetic;
+   - `JumpUnless`, a `Guarded` clause's condition, and `SwitchLit` — which demand a `Boolean`, a
+     `Boolean`, and the discriminating literal's kind;
+   - `IndexArray` / `LengthArray` / `SetArray` / `ProjArray` / `SwitchLen`, through one array
+     entrance (below);
+   - `force`, which now routes a carrier through `pv_force_if_byneed`: a leaf may hand back one of
+     the runtime's own by-need cells, and the VM cannot tell by looking. This is the same rule the VM
+     applies to its own thunks, extended to what crossed.
+
+   The accessors check rather than convert: a VM `Int` and a runtime `Int` are the same word, so
+   `intOf` calls `pv_int_payload` for its **shape check** and returns the value unchanged. A
+   mis-shaped carrier therefore aborts in the runtime, exactly where a mis-shaped leaf argument does.
+
+   Three corrections from review, each of which changed the work:
+
+   - **`SetArray` is an elimination site too, and by a different route.** An array a leaf *returned*
+     is a carrier from birth — it never had a VM cell, so no promotion ever happened to it — yet the
+     identity invariant is the same. All array operations now go through `Purvasm.VM.Array.asCell`,
+     which hands such a carrier a cell that is `Promoted` from creation: no copy, no new object, and
+     writes land on the leaf's own array. The gate exercises both entrances against each other (the
+     VM writes, the leaf reads it back).
+   - **A branching site is an elimination site too, and the gate has to say so.** `Guarded` shipped
+     undecoded: a guard whose condition a leaf supplied read as `guard: non-boolean condition`, a
+     correct program refused. It was missed because the first gate exercised only the *value* sites
+     (arithmetic, the array operations) — coverage that was incidental rather than structural. The
+     gate now drives every carrier-aware control site once, each printing a line that names it and
+     each wrong branch printing a `WRONG` line, and the whole arrangement was checked by reverting
+     the fix and confirming the gate fails.
+   - **This does not make a carrier printable.** An earlier note here implied the runtime-leaf gate's
+     `<value>` would become a real rendering; it does not, and cannot: the VM's `describe` has no type
+     to demand with, and a value that came from a leaf carries no tag to ask about. Rendering one at
+     the terminal is [0110](0110-owned-vm-purescript-native.md) §5's **typed terminal demand**, which
+     is a separate mechanism. What slice 4 makes observable is a carrier consumed by a *typed
+     eliminator* — `show` over a decoded `Int`, an `IndexArray` over a leaf's array — which is what
+     the gate asserts.
 5. `pv_adt_tag` and data-returning leaves.
 6. Manifest emission from the build; the scoped eager diagnostics (§4).
 
