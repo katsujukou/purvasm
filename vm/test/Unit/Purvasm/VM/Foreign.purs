@@ -23,7 +23,12 @@
 -- |     forwarded to a runtime object every alias then shares (§3). Its gate is the aliasing leg of
 -- |     `tools/vm-loader-e2e.sh`, where a leaf writes an element and the VM observes the write —
 -- |     which is the only place the invariant is observable, since it is about identity rather than
--- |     about any one value.
+-- |     about any one value;
+-- |   * `VData` — built with `pv_new_adt` under a tag derived from the constructor NAME, or, for a
+-- |     nullary constructor, as the immediate whose payload IS that tag (ADR-0064 §1). Both shapes,
+-- |     and the dispatch back the other way, are the `data-leaves` leg. A JS-hosted assertion could
+-- |     only observe that the tag arithmetic ran, which is what `Purvasm.Abi.Mangle`'s own tests are
+-- |     for.
 module Test.Unit.Purvasm.VM.Foreign (spec) where
 
 import Prelude
@@ -65,10 +70,6 @@ spec = describe "Purvasm.VM.Foreign" do
       diagnostic <- refused (VRecord (Map.singleton "a" (VInt 1)))
       diagnostic `shouldSatisfy` contains "a record"
 
-    it "refuses a data value until `pv_adt_tag` lands, naming the constructor" do
-      diagnostic <- refused (VData "Just" [ VInt 1 ])
-      diagnostic `shouldSatisfy` contains "Just"
-
     it "refuses a partially applied constructor" do
       diagnostic <- refused (VCtor "Tuple" 2 (List.singleton (VInt 1)))
       diagnostic `shouldSatisfy` contains "Tuple"
@@ -95,8 +96,7 @@ spec = describe "Purvasm.VM.Foreign" do
       envRef <- liftEffect (Ref.new Map.empty)
       diagnostics <- traverse refused
         [ VRecord Map.empty
-        , VData "X" []
         , VCtor "Y" 2 List.Nil
         , VClosure { params: [], body: [], env: envRef }
         ]
-      Array.length (Array.filter (contains "foreign boundary") diagnostics) `shouldEqual` 4
+      Array.length (Array.filter (contains "foreign boundary") diagnostics) `shouldEqual` 3
