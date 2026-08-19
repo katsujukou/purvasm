@@ -9,7 +9,8 @@
 -- | The encodings are link-time ABI (ADR-0072 §2 / ADR-0073 §3) and are pinned by the compiler's
 -- | goldens; this package is their home, below both consumers.
 module Purvasm.Abi.Mangle
-  ( escapeIdent
+  ( ctorTag
+  , escapeIdent
   , mangle
   , mangleForeign
   ) where
@@ -21,6 +22,9 @@ import Data.Foldable (foldMap)
 import Data.Int (hexadecimal, toStringAs)
 import Data.String (length)
 import Data.String.CodeUnits (singleton, toCharArray)
+import Data.Int.Bits ((.&.))
+import Purvasm.Abi.Fnv1a64 (fnv1a64Bytes)
+import Purvasm.Abi.Utf8 (utf8Bytes)
 
 -- | The injective identifier escape (ADR-0072 §2): alphanumerics pass through, every other byte
 -- | (including `_` itself) becomes `_HH` (lowercase hex), so distinct keys never collide
@@ -51,3 +55,14 @@ mangle key = "pv_g_" <> escapeIdent key
 -- | A native foreign leaf's `AbiCodeFn` linker symbol: `pvf_<escape key>` (ADR-0073 §3).
 mangleForeign :: String -> String
 mangleForeign key = "pvf_" <> escapeIdent key
+
+-- | A constructor's runtime tag: `fnv1a64(name).lo` masked to 31 bits (ADR-0069 §2's derivation,
+-- | shared with record label ids).
+-- |
+-- | **Two consumers, one derivation** — the reason this is here rather than in the backend. Codegen
+-- | mints it when it emits an ADT; the owned VM mints it when a data value crosses the FFI boundary
+-- | and when a `SwitchCtor` dispatches on one a leaf returned (ADR-0111 §3). The tag is a pure
+-- | function of the constructor NAME, which is what lets the bytecode keep carrying names and stay
+-- | free of any backend's encoding (ADR-0110 §4) — but only if both sides compute it identically.
+ctorTag :: String -> Int
+ctorTag name = (fnv1a64Bytes (utf8Bytes name)).lo .&. 0x7fffffff

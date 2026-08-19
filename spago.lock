@@ -6,7 +6,10 @@
         "core": {
           "dependencies": [
             "arrays",
+            "enums",
+            "foldable-traversable",
             "integers",
+            "numbers",
             "prelude",
             "strings"
           ]

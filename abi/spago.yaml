@@ -2,6 +2,9 @@ package:
   name: abi
   dependencies:
     - arrays
+    - enums
+    - foldable-traversable
     - integers
+    - numbers
     - prelude
     - strings

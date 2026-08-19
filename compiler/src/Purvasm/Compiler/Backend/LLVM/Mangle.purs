@@ -16,10 +16,9 @@ module Purvasm.Compiler.Backend.LLVM.Mangle
   , immBool
   , immUnit
   , module Purvasm.Abi.Mangle
-  , utf8Bytes
+  , module Purvasm.Abi.Utf8
   , escapeStringBytes
   , labelId
-  , ctorTag
   , sortRecordFields
   ) where
 
@@ -27,17 +26,16 @@ import Prelude
 
 import Data.Array as Array
 import Data.Char (fromCharCode)
-import Data.Enum (fromEnum)
 import Data.Foldable (foldMap)
 import Data.Int (hexadecimal, toStringAs)
-import Data.Int.Bits (and, shl, shr, (.&.), (.|.))
+import Data.Int.Bits (shl, shr, (.|.))
 import Data.Maybe (maybe)
-import Data.String.CodePoints (toCodePointArray)
 import Data.String.CodeUnits (length, singleton)
 import Data.String.Common (toUpper)
 import Data.Tuple (Tuple(..), fst, snd)
 import Purvasm.Compiler.Util.Fnv1a64 (fnv1a64Bytes, unsignedCompareI64)
-import Purvasm.Abi.Mangle (escapeIdent, mangle, mangleForeign)
+import Purvasm.Abi.Mangle (ctorTag, escapeIdent, mangle, mangleForeign)
+import Purvasm.Abi.Utf8 (utf8Bytes)
 import Purvasm.Compiler.Util.Int64Decimal (int64BitsDecimal)
 
 -- | A scalar immediate (ADR-0064 §1): the payload as the i64 constant `(payload << 1) | 1`, rendered
@@ -60,28 +58,6 @@ immBool b = imm (if b then 1 else 0)
 -- | The `Unit` / sentinel immediate: `imm 0` (→ `"1"`).
 immUnit :: String
 immUnit = imm 0
-
--- | The UTF-8 byte sequence of a string (ADR-0006: `String` is a UTF-8 byte sequence). boot's `String`
--- | is already bytes; PureScript's is UTF-16, so re-encode each code point to its 1–4 UTF-8 bytes, so a
--- | string constant's byte length and escaping match boot's `String.length`/byte iteration.
-utf8Bytes :: String -> Array Int
-utf8Bytes s = Array.concatMap enc (toCodePointArray s)
-  where
-  enc cp =
-    let
-      n = fromEnum cp
-    in
-      if n < 0x80 then [ n ]
-      else if n < 0x800 then
-        [ 0xC0 .|. (n `shr` 6), 0x80 .|. (n `and` 0x3F) ]
-      else if n < 0x10000 then
-        [ 0xE0 .|. (n `shr` 12), 0x80 .|. ((n `shr` 6) `and` 0x3F), 0x80 .|. (n `and` 0x3F) ]
-      else
-        [ 0xF0 .|. (n `shr` 18)
-        , 0x80 .|. ((n `shr` 12) `and` 0x3F)
-        , 0x80 .|. ((n `shr` 6) `and` 0x3F)
-        , 0x80 .|. (n `and` 0x3F)
-        ]
 
 -- | A string literal's LLVM `c"…"` byte body and its byte length (boot's `string_constant` escape loop):
 -- | a printable ASCII byte (`0x20`–`0x7e`, not `"`/`\`) passes through; every other byte becomes
@@ -109,9 +85,6 @@ labelId label = int64BitsDecimal (fnv1a64Bytes (utf8Bytes label))
 
 -- | A constructor's runtime tag (ADR-0064 §1/§2): FNV-1a-64 of the name, masked to 31 bits so a nullary
 -- | ctor's immediate `(tag << 1) | 1` stays inside the 63-bit payload. Only construct/match consistency
--- | matters — the tag is internal, never observed — so only the low 32 bits (`lo`) are needed.
-ctorTag :: String -> Int
-ctorTag name = (fnv1a64Bytes (utf8Bytes name)).lo .&. 0x7fffffff
 
 -- | Sort a record's `(label, value)` fields by *unsigned* FNV-1a-64 label id ascending — the order the
 -- | runtime `new_record` requires (ADR-0069 §1). The id is computed once per field.
