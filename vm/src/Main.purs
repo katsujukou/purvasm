@@ -342,6 +342,74 @@ carrierControl = jumpUnlessArm <> guardedArms <> switchLitArm <> arrayArms <> [ 
         ]
       <> writeLine [ Load "arr", ProjArray 0 ]
 
+-- | Data values across the boundary, both directions and both shapes (ADR-0111 §3, slice 5).
+-- |
+-- | This is what `pv_adt_tag` was added for. A data value a leaf returned is opaque like any carrier,
+-- | so `SwitchCtor` cannot compare names — it compares the value's TAG against each arm's
+-- | `ctorTag name`, the same derivation codegen uses, which is why the bytecode can keep carrying
+-- | names (ADR-0110 §4) and still dispatch on a native ADT.
+-- |
+-- | Both constructors are exercised deliberately, because they are represented differently and only
+-- | one of them is a heap object: `Just x` is an ADT, `Nothing` is the immediate whose payload is the
+-- | tag. Nothing in the VM can tell them apart, which is exactly why the accessor answers for both.
+dataLeaves :: CodeBlock
+dataLeaves = inboundJust <> inboundNothing <> outbound <> [ Return ]
+  where
+  callLeaf key arity args = [ ForeignRef key arity ] <> args <> [ Call arity ]
+  runEffect thunk = thunk <> [ PushInt 0, Call 1 ]
+  writeLine value = runEffect (callLeaf "Purvasm.Stdio.writeLineImpl" 1 value)
+  say text = writeLine [ PushString text ]
+
+  -- The occurrence is bound before the switch, exactly as `MatchCompile` lowers a `case`: the arm
+  -- needs the value again to project a field out of it.
+  dispatch n justArm =
+    callLeaf "Test.Loader.lookupImpl" 1 [ PushInt n ]
+      <>
+        [ Bind "m"
+        , Load "m"
+        , SwitchCtor
+            [ "Data.Maybe.Just" /\ justArm
+            , "Data.Maybe.Nothing" /\ say "dispatch: took Nothing"
+            ]
+            (say "dispatch: WRONG default")
+        ]
+
+  -- `Just`: a heap ADT the leaf built, dispatched on and then PROJECTED — the field comes back as a
+  -- carrier and goes straight out to `writeLine` without being decoded (§3's "coming out").
+  inboundJust = dispatch 1 (writeLine [ Load "m", Proj 0 ])
+
+  -- `Nothing`: no heap object at all, so this arm proves the accessor's immediate case.
+  inboundNothing = dispatch 0 (say "dispatch: WRONG Just")
+
+  -- Outbound: the VM builds both shapes and a leaf reads their tags back.
+  outbound =
+    writeLine (callLeaf "Test.Loader.describeMaybeImpl" 1 [ PushString "x", Ctor "Data.Maybe.Just" 1 1 ])
+      <> writeLine (callLeaf "Test.Loader.describeMaybeImpl" 1 [ Ctor "Data.Maybe.Nothing" 0 0 ])
+
+-- | `Proj` with a negative index, against a data value a LEAF returned.
+-- |
+-- | A local `VData` is refused by `Data.Array.index`; a carrier has no such guard of its own, and the
+-- | accessor's `+ 1` would turn `-1` into slot 0 — the raw tag, the one word the separate ADT accessor
+-- | exists to keep out of value positions. Both representations must therefore give the SAME stuck
+-- | diagnostic, which is what this and its local twin below assert.
+negativeProjCarrier :: CodeBlock
+negativeProjCarrier =
+  [ ForeignRef "Test.Loader.lookupImpl" 1
+  , PushInt 1
+  , Call 1
+  , Proj (-1)
+  , Return
+  ]
+
+-- | The same demand against a VM-built data value, so the two diagnostics can be compared.
+negativeProjLocal :: CodeBlock
+negativeProjLocal =
+  [ PushString "x"
+  , Ctor "Data.Maybe.Just" 1 1
+  , Proj (-1)
+  , Return
+  ]
+
 -- | `--self-test <name>`: run ONE named program and nothing else.
 -- |
 -- | A mode rather than an in-process assertion, because **a stuck run cannot be caught on this
@@ -378,6 +446,9 @@ runSelfTest args = case _ of
   "aliasing" -> runWithProviders args aliasing
   "carrier-elimination" -> runWithProviders args carrierElimination
   "carrier-control" -> runWithProviders args carrierControl
+  "data-leaves" -> runWithProviders args dataLeaves
+  "negative-proj-carrier" -> runWithProviders args negativeProjCarrier
+  "negative-proj-local" -> runWithProviders args negativeProjLocal
   "cyclic" -> runWithProviders args cyclicAndEmpty
   other -> stuck ("unknown --self-test: " <> other)
 

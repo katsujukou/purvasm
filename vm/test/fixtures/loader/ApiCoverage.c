@@ -47,7 +47,10 @@ PVWord PVF_EXPORT(apiCoverageImpl)(PVContext *ctx, PVWord clo, const PVWord *arg
   size_t n = pv_array_len(ctx, arr) + pv_array_len(ctx, pv_empty_array());
 
   PVWord adt = pv_new_adt(ctx, 7, elems, 2);
-  int32_t field = pv_int_payload(ctx, pv_read_field(ctx, adt, 0));
+  /* An Adt's payload is [tag] ++ fields, so field 0 is payload word 1 — reading word 0 would hand
+     back the raw tag, which is not a value word. */
+  int32_t field = pv_int_payload(ctx, pv_read_field(ctx, adt, 1));
+  uint32_t tag = pv_adt_tag(ctx, adt) + pv_adt_tag(ctx, pv_new_nullary_adt(9));
 
   PVWord ids[1] = {pv_int(0)};
   PVWord vals[1] = {pv_int(1)};
@@ -71,5 +74,5 @@ PVWord PVF_EXPORT(apiCoverageImpl)(PVContext *ctx, PVWord clo, const PVWord *arg
 
   pv_pop_frame(ctx, mark);
   return pv_int((int32_t)(len + copied + n + captures) + i + b + (int32_t)(bits >> 62) + field +
-                updated + stored + answer);
+                updated + stored + answer + (int32_t)tag);
 }

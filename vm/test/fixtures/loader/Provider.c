@@ -116,3 +116,68 @@ PVWord PVF_EXPORT(isPositiveImpl)(PVContext *ctx, PVWord clo, const PVWord *args
   (void)nargs;
   return pv_bool(pv_int_payload(ctx, args[0]) > 0);
 }
+
+/* `Test.Loader.lookupImpl :: Int -> Maybe String` — a leaf that RETURNS a data value, in both of its
+ * shapes (ADR-0111 §3, slice 5).
+ *
+ * This is the case `pv_adt_tag` exists for: before it, the VM could not dispatch on a constructor a
+ * leaf produced, so a leaf could not return a `Maybe` — too common a signature to leave out. Both
+ * arms matter and they are represented DIFFERENTLY:
+ *
+ *   - `Just x` is a heap ADT, built with `pv_new_adt`;
+ *   - `Nothing` is nullary: `pv_new_nullary_adt`, its OWN ABI entry, because the representation is an
+ *     immediate rather than a heap object (ADR-0064 §1). `pv_new_adt` with no fields is the legacy
+ *     spelling and builds the wrong thing — a zero-field heap object no native `case` matches — so a
+ *     provider uses neither that nor a hand-built immediate.
+ *
+ * A caller holding the result cannot tell those apart, which is why `pv_adt_tag` answers for both.
+ * The tags are `fnv1a64(name).lo & 0x7fffffff` over "Data.Maybe.Just" / "Data.Maybe.Nothing" — the
+ * fully qualified constructor names the bytecode carries — computed here the same way the VM and
+ * codegen compute them.
+ */
+static uint32_t pvm_ctor_tag(const char *name) {
+  /* FNV-1a-64 over the name's bytes, low 32 bits masked to 31 (ADR-0069 §2). 64-bit arithmetic is
+     native here, so this is the whole derivation rather than the limb-wise version PureScript needs. */
+  uint64_t h = 0xcbf29ce484222325ULL;
+  for (const char *p = name; *p != '\0'; p++) {
+    h ^= (uint64_t)(unsigned char)*p;
+    h *= 0x100000001b3ULL;
+  }
+  return (uint32_t)(h & 0xffffffffULL) & 0x7fffffffU;
+}
+
+PVWord PVF_EXPORT(lookupImpl)(PVContext *ctx, PVWord clo, const PVWord *args, size_t nargs) {
+  (void)clo;
+  (void)nargs;
+  if (pv_int_payload(ctx, args[0]) > 0) {
+    PVWord field = pv_new_str(ctx, (const uint8_t *)"found by the leaf", 17);
+    return pv_new_adt(ctx, pvm_ctor_tag("Data.Maybe.Just"), &field, 1);
+  }
+  /* Nullary, through its OWN public constructor. `pv_new_adt` with no fields would compile and build
+     the wrong thing (a zero-field heap object no native `case` matches), and `pv_int` would work here
+     while hiding that the API had no way to express this — which is what an earlier draft of this
+     fixture did, and what let the gap survive. */
+  return pv_new_nullary_adt(pvm_ctor_tag("Data.Maybe.Nothing"));
+}
+
+/* `Test.Loader.describeMaybeImpl :: Maybe String -> String` — a leaf that RECEIVES a data value.
+ *
+ * The other direction of the same boundary: `toPv` builds this from the VM's `VData`, deriving the
+ * tag from the constructor NAME the bytecode carries. Both shapes cross — `Just x` as a heap ADT and
+ * `Nothing` as a bare immediate — and this leaf tells them apart the only way anything can, by tag.
+ */
+PVWord PVF_EXPORT(describeMaybeImpl)(PVContext *ctx, PVWord clo, const PVWord *args, size_t nargs) {
+  (void)clo;
+  (void)nargs;
+  /* THREE outcomes, not two. An `else` branch meaning "Nothing" would report a tag the VM computed
+   * WRONGLY as a correct `Nothing`, so the outbound nullary path could break with the gate still
+   * green — the leaf must be able to say "neither of the tags I know". */
+  uint32_t tag = pv_adt_tag(ctx, args[0]);
+  if (tag == pvm_ctor_tag("Data.Maybe.Just")) {
+    return pv_new_str(ctx, (const uint8_t *)"leaf received Just", 18);
+  }
+  if (tag == pvm_ctor_tag("Data.Maybe.Nothing")) {
+    return pv_new_str(ctx, (const uint8_t *)"leaf received Nothing", 21);
+  }
+  return pv_new_str(ctx, (const uint8_t *)"WRONG tag reached the leaf", 26);
+}

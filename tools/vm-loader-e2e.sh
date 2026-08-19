@@ -376,6 +376,51 @@ else
   sed 's/^/      /' "$WORK/control.err" >&2
 fi
 
+echo "== data values: both directions, both constructor shapes (§3) =="
+# Slice 5, and the reason `pv_adt_tag` was added to the ABI: a data value a leaf returned is opaque,
+# so `SwitchCtor` compares the value's TAG against each arm's `ctorTag name` rather than comparing
+# names. Before this a leaf could not return a `Maybe` at all.
+#
+# `Just` and `Nothing` are represented differently — a heap ADT and a bare immediate — and nothing in
+# the VM can tell which it holds, so both arms have to be driven: a gate that only tried `Just` would
+# pass with the accessor's immediate case broken.
+if "$VM" --self-test data-leaves --ffi "$WORK/provider.so" >"$WORK/data.out" 2>"$WORK/data.err"; then
+  data_ok=yes
+  for expected in \
+    "found by the leaf" \
+    "dispatch: took Nothing" \
+    "leaf received Just" \
+    "leaf received Nothing"; do
+    grep -qxF "$expected" "$WORK/data.out" || {
+      printf '  %-24s -> a data path did not work: %s FAIL\n' data-leaves "$expected"; rc=1; data_ok=no
+    }
+  done
+  # "WRONG" covers both a dispatch that took an impossible branch AND the fixture's third outcome —
+  # a tag that is neither constructor, which is what an outbound nullary tag getting broken looks
+  # like. Without that third outcome the leaf would report any wrong tag as a correct `Nothing`.
+  if grep -q "WRONG" "$WORK/data.out"; then
+    printf '  %-24s -> a wrong branch or an unrecognised tag FAIL\n' data-leaves; rc=1; data_ok=no
+  fi
+  [ "$data_ok" = yes ] && printf '  %-24s -> SwitchCtor, Proj and toPv over Just and Nothing OK\n' data-leaves
+  [ "$data_ok" = yes ] || sed 's/^/      /' "$WORK/data.out" >&2
+else
+  printf '  %-24s -> the data program did not run FAIL\n' data-leaves; rc=1
+  sed 's/^/      /' "$WORK/data.err" >&2
+fi
+
+# A negative field index must be refused identically whichever representation the data value has.
+# The carrier path is the one with teeth: its accessor adds 1 to reach past the tag, so `-1` would
+# address the tag slot and hand back a word that is not a value at all. Both runs are separate
+# processes because a stuck run cannot be caught in-process (ADR-0074).
+carrier_diag=$("$VM" --self-test negative-proj-carrier --ffi "$WORK/provider.so" 2>&1 >/dev/null)
+local_diag=$("$VM" --self-test negative-proj-local --ffi "$WORK/provider.so" 2>&1 >/dev/null)
+if [ "$carrier_diag" = "$local_diag" ] && printf '%s' "$carrier_diag" | grep -qF "out of range"; then
+  printf '  %-24s -> refused identically for carrier and local OK\n' negative-proj
+else
+  printf '  %-24s -> the two representations disagree FAIL\n' negative-proj; rc=1
+  printf '      carrier: %s\n      local:   %s\n' "$carrier_diag" "$local_diag" >&2
+fi
+
 echo "== foreign-ABI version: the marker fires when it loads, and not when it is refused (§5) =="
 # The bumped header is the real mechanism, not a fixture flag: a copy of the shipped `purvasm.h` with
 # its version `#define` rewritten is exactly "a module built against a different foreign ABI".
