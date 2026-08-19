@@ -26,7 +26,7 @@ import Effect (Effect)
 import Purvasm.Stdio (writeLine)
 import Purvasm.System.Process as Process
 import Purvasm.VM.Error (stuck)
-import Purvasm.VM.Instruction (CodeBlock, Instruction(..), PrimOp(..))
+import Purvasm.VM.Instruction (CodeBlock, Instruction(..), Literal(..), PrimOp(..))
 import Purvasm.VM.Loader as Loader
 import Purvasm.VM.Machine (executed, newEnv, runBlock)
 import Purvasm.VM.Value (Value(..))
@@ -257,6 +257,91 @@ cyclicAndEmpty = emptyCrosses <> cyclicCrosses <> [ Return ]
     ]
       <> writeLine (callLeaf "Data.Show.showIntImpl" 1 (callLeaf "Test.Loader.lengthOfImpl" 1 [ Load "cyclic" ]))
 
+-- | The slice-4 milestone: values that came from a leaf are **consumed** by ordinary bytecode.
+-- |
+-- | Nothing here is a new instruction. Each site simply meets a carrier where it used to meet a VM
+-- | value, and decodes it by demanding the shape it already required (ADR-0111 §3) — so what this
+-- | program really checks is that the FFI stopped being visible above the boundary.
+-- |
+-- | Two array entrances are exercised deliberately, because they are different code paths that must
+-- | share one invariant: an array the GUEST built (promoted when it crossed) and one a LEAF returned
+-- | (a carrier from birth, given a forwarding cell). `SetArray` runs on the latter, which the review
+-- | pointed out is reachable without any promotion ever happening.
+carrierElimination :: CodeBlock
+carrierElimination = arithmetic <> leafArray <> [ Return ]
+  where
+  callLeaf key arity args = [ ForeignRef key arity ] <> args <> [ Call arity ]
+  runEffect thunk = thunk <> [ PushInt 0, Call 1 ]
+  writeLine value = runEffect (callLeaf "Purvasm.Stdio.writeLineImpl" 1 value)
+  showInt value = callLeaf "Data.Show.showIntImpl" 1 value
+
+  -- `floatBitsHi 1.0` gives a carrier `Int`; adding 1 to it is a scalar primop meeting a carrier.
+  -- 1072693249 is 0x3FF00001, so the arithmetic really happened on the decoded payload.
+  arithmetic =
+    writeLine
+      ( showInt
+          ( callLeaf "Purvasm.Number.floatBitsHi" 1 [ PushNumber 1.0 ]
+              <> [ PushInt 1, Prim AddInt 2 ]
+          )
+      )
+
+  -- An array the leaf returned: length it, index it, write to it, and read the write back — all
+  -- through instructions that never knew about the FFI.
+  leafArray =
+    callLeaf "Test.Loader.makeArrayImpl" 1 [ PushString "from the leaf" ]
+      <> [ Bind "arr" ]
+      <> writeLine (showInt [ Load "arr", Prim LengthArray 1 ])
+      <> writeLine [ Load "arr", PushInt 0, Prim IndexArray 2 ]
+      <> [ Load "arr", PushInt 1, PushString "set on a leaf array", Prim SetArray 3, Bind "same" ]
+      <> writeLine [ Load "same", PushInt 1, Prim IndexArray 2 ]
+      -- and the leaf sees the VM's write on the same object
+      <> writeLine (callLeaf "Test.Loader.readArrayImpl" 2 [ Load "arr", PushInt 1 ])
+
+-- | Every **control** site that had to learn about carriers, driven once each (ADR-0111 §3).
+-- |
+-- | `carrierElimination` covers the value sites — arithmetic and the array operations — but a site
+-- | that merely *branches* on a leaf's value is just as much an elimination site, and none of them
+-- | was exercised until a review pointed at `Guarded`, which turned out to be undecoded. So this
+-- | program exists to make the coverage structural rather than incidental: one arm per site, each
+-- | printing a distinct line, driven by Booleans and Ints a **leaf** produced.
+carrierControl :: CodeBlock
+carrierControl = jumpUnlessArm <> guardedArms <> switchLitArm <> arrayArms <> [ Return ]
+  where
+  callLeaf key arity args = [ ForeignRef key arity ] <> args <> [ Call arity ]
+  runEffect thunk = thunk <> [ PushInt 0, Call 1 ]
+  writeLine value = runEffect (callLeaf "Purvasm.Stdio.writeLineImpl" 1 value)
+  say text = writeLine [ PushString text ]
+  isPositive n = callLeaf "Test.Loader.isPositiveImpl" 1 [ PushInt n ]
+
+  -- `JumpUnless` over a Boolean the leaf returned. The `else` line must never appear.
+  jumpUnlessArm =
+    isPositive 1
+      <> [ JumpUnless (Array.length (say "jumpUnless: took the true branch")) ]
+      <> say "jumpUnless: took the true branch"
+
+  -- A guard chain whose condition is the leaf's Boolean — both outcomes, so neither a stuck guard nor
+  -- an always-true one passes. The false clause falls through to the chain's fall-through block.
+  guardedArms =
+    [ Guarded [ { guard: isPositive 1, rhs: say "guarded: true clause fired" } ] (say "guarded: WRONG fall-through")
+    , Guarded [ { guard: isPositive (-1), rhs: say "guarded: WRONG true clause" } ] (say "guarded: false fell through")
+    ]
+
+  -- `SwitchLit` discriminating on an Int the leaf produced (0x3FF00000 for 1.0).
+  switchLitArm =
+    callLeaf "Purvasm.Number.floatBitsHi" 1 [ PushNumber 1.0 ]
+      <> [ SwitchLit [ LInt 1072693248 /\ say "switchLit: matched the leaf's Int" ] (say "switchLit: WRONG default") ]
+
+  -- `SwitchLen` and `ProjArray` over an array the leaf returned — a carrier from birth, so neither
+  -- site ever sees a VM-built array here.
+  arrayArms =
+    callLeaf "Test.Loader.makeArrayImpl" 1 [ PushString "projArray: read from the leaf's array" ]
+      <>
+        [ Bind "arr"
+        , Load "arr"
+        , SwitchLen [ 2 /\ say "switchLen: matched the leaf's array" ] (say "switchLen: WRONG default")
+        ]
+      <> writeLine [ Load "arr", ProjArray 0 ]
+
 -- | `--self-test <name>`: run ONE named program and nothing else.
 -- |
 -- | A mode rather than an in-process assertion, because **a stuck run cannot be caught on this
@@ -291,6 +376,8 @@ runSelfTest args = case _ of
   -- runtime does NOT define, so an answer can only have come from the loaded module.
   "loaded-provider" -> runWithProviders args loadedProvider
   "aliasing" -> runWithProviders args aliasing
+  "carrier-elimination" -> runWithProviders args carrierElimination
+  "carrier-control" -> runWithProviders args carrierControl
   "cyclic" -> runWithProviders args cyclicAndEmpty
   other -> stuck ("unknown --self-test: " <> other)
 
