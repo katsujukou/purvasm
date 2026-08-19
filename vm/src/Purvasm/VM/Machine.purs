@@ -47,6 +47,7 @@ import Effect.Ref as Ref
 import Purvasm.VM.Array as VMArray
 import Purvasm.VM.Error (stuck)
 import Purvasm.VM.Foreign (applyForeign, toPv)
+import Purvasm.Abi.Mangle (ctorTag)
 import Purvasm.VM.Foreign as Foreign
 import Purvasm.VM.Instruction (CodeBlock, GuardClause, Instruction(..), Literal(..))
 import Purvasm.VM.Loader as Loader
@@ -423,6 +424,11 @@ run wrapped@(Env env) frames0 = do
         VData _ fields -> case Array.index fields i of
           Just v -> push v
           Nothing -> stuck ("projection: field " <> show i <> " out of range")
+        -- The field of a leaf's data value, read where the bytecode already knows the shape it
+        -- demands. It comes back as a carrier, like everything else that crossed (§3's "coming out").
+        VCarrier origin fv -> Foreign.adtField fv i >>= case _ of
+          Just field -> push (VCarrier origin field)
+          Nothing -> stuck ("projection: field " <> show i <> " out of range")
         _ -> stuck "projection: not a data value"
       -- `asCell` is what makes an array a leaf RETURNED usable here: it never had a VM cell, so it is
       -- given one that forwards to it rather than being copied into one (ADR-0111 §3).
@@ -455,6 +461,13 @@ run wrapped@(Env env) frames0 = do
         _ -> stuck "if: non-boolean condition"
       SwitchCtor arms default -> pop >>= force >>= case _ of
         VData tag _ -> enterArm fr (lookupArm (\t -> t == tag) arms default)
+        -- A data value a leaf returned is opaque, so the arm is chosen by TAG rather than by name:
+        -- `pv_adt_tag` reads the constructor's tag and each arm's name hashes to one through the same
+        -- `ctorTag` codegen uses (ADR-0111 §3). This is the accessor §3 had to add — without it a leaf
+        -- could not return a `Maybe` at all.
+        VCarrier _ fv -> do
+          let tag = Foreign.adtTag fv
+          enterArm fr (lookupArm (\name -> ctorTag name == tag) arms default)
         _ -> stuck "switch on a non-data value"
       SwitchLit arms default -> do
         v <- pop >>= force >>= decodeLike (map (\(l /\ _) -> l) (Array.head arms))

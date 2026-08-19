@@ -19,7 +19,9 @@
 -- | carrier and is decoded at the site that eliminates it, which already knows the shape it demands.
 -- | That is why this module has a `toPv` and no `ofPv`.
 module Purvasm.VM.Foreign
-  ( applyForeign
+  ( adtField
+  , adtTag
+  , applyForeign
   , arrayLength
   , booleanOf
   , forceCarrier
@@ -35,8 +37,12 @@ module Purvasm.VM.Foreign
 import Prelude
 
 import Control.Monad.Rec.Class (Step(..), tailRecM)
+import Data.Array as Array
+import Data.Maybe (Maybe(..))
+import Data.Traversable (traverse)
 import Effect (Effect)
 import Effect.Ref as Ref
+import Purvasm.Abi.Mangle (ctorTag)
 import Purvasm.Array as PA
 import Purvasm.VM.Error (stuck)
 import Purvasm.VM.Value (ArrayCell, ArrayStorage(..), ForeignValue, Value(..))
@@ -63,6 +69,10 @@ boundary key what = stuck ("foreign boundary: " <> what <> " crossed " <> key)
 -- | which would hide a missing force at the one boundary where an unforced value would be handed to
 -- | native code.
 -- |
+-- | **Data values DO cross**: built with `pv_new_adt` under a tag derived from the constructor name,
+-- | or — for a nullary constructor — as the immediate whose payload is that tag. They are not on
+-- | either list below for that reason.
+-- |
 -- | **Arrays do not convert at all — they are promoted** (§3), which is why they are not on either
 -- | list below: an elementwise copy would be a correctness bug rather than a cost, since a leaf's
 -- | write would land on the copy and two VM bindings holding the same array would stop agreeing.
@@ -72,7 +82,7 @@ boundary key what = stuck ("foreign boundary: " <> what <> " crossed " <> key)
 -- |
 -- |   * **records** cannot cross in either direction on either backend (§3, fact 4): label ids are
 -- |     minted only by codegen, and no supported call hands one to a provider;
--- |   * **data values** need `pv_new_adt` with a tag derived from the constructor name — slice 5;
+
 -- |   * **closures and partial constructors** are guest-level values the runtime cannot enter at all
 -- |     (ADR-0110 §1.1): a VM closure is a code block plus an environment, not a code address.
 toPv :: String -> Value -> Effect ForeignValue
@@ -91,7 +101,15 @@ toPv key = case _ of
   -- would stop agreeing.
   VArray cell -> promote cell
   VRecord _ -> boundary key "a record (records do not cross on either backend, ADR-0111 §3)"
-  VData tag _ -> boundary key ("a data value (" <> tag <> "; `pv_adt_tag` is ADR-0111 §3)")
+  -- A data value is built with the native backend's own tag derivation over the constructor NAME the
+  -- bytecode carries (§3). Nothing stores a tag anywhere: `ctorTag` is a pure function of the name,
+  -- shared with codegen from one definition, so the two sides agree by construction.
+  VData tag fields
+    -- A nullary constructor has NO heap object — it is an immediate — so it goes to its own ABI
+    -- entry. The VM does not encode that itself: `pv_new_nullary_adt` does, which is what keeps the
+    -- representation the runtime's (ADR-0069) rather than something the boundary reimplements.
+    | Array.null fields -> pure (newNullaryAdtImpl (ctorTag tag))
+    | otherwise -> traverse (toPv key) fields >>= newAdtImpl (ctorTag tag)
   VCtor tag _ _ -> boundary key ("a partially applied constructor (" <> tag <> ")")
   VClosure _ -> boundary key "a VM closure (guest closures are not runtime closures, ADR-0110 §1.1)"
   VPap _ _ -> boundary key "a partially applied VM closure"
@@ -216,3 +234,42 @@ stringOf = stringOfImpl
 -- | the same reason — forcing a cell runs its suspension.
 forceCarrier :: ForeignValue -> Effect ForeignValue
 forceCarrier = forceCarrierImpl
+
+foreign import newAdtImpl :: Int -> Array ForeignValue -> Effect ForeignValue
+foreign import newNullaryAdtImpl :: Int -> ForeignValue
+foreign import adtTagImpl :: ForeignValue -> Int
+
+-- | The constructor tag of a data value a leaf returned, for `SwitchCtor` to dispatch on (ADR-0111
+-- | §3). Compared against each arm's `ctorTag name` — the same derivation `toPv` uses going the other
+-- | way, which is why the bytecode can keep carrying names and still meet a native ADT.
+-- |
+-- | This is the one accessor the foreign API did not have, and without it a leaf could not RETURN a
+-- | data value at all: no `Maybe`, no `Either`. It answers for a nullary constructor as well, because
+-- | a caller holding an opaque word cannot tell a nullary one from a field-carrying one — and asking
+-- | is exactly what §3's opacity forbids.
+-- |
+-- | Its check is weaker than the scalar accessors', and the difference is worth stating: a heap value
+-- | that is not an ADT aborts, but a nullary constructor is an immediate and so is indistinguishable
+-- | from an `Int`, a `Boolean` or `Unit`. Nothing can close that — the representation does not
+-- | distinguish them — so this rests on the caller being a site whose type already established the
+-- | shape, which is what a compiler-emitted `SwitchCtor` is.
+adtTag :: ForeignValue -> Int
+adtTag = adtTagImpl
+
+foreign import adtFieldImpl :: ForeignValue -> Int -> Effect ForeignValue
+
+-- | Field `i` of a data value a leaf returned, or `Nothing` when `i` is negative — the same answer
+-- | `Data.Array.index` gives for a VM-local data value, so a caller can report one diagnostic for
+-- | both representations.
+-- |
+-- | Distinct from [readField] because an `Adt`'s payload carries its tag in word 0, so a field is one
+-- | slot further along — one accessor per layout rather than one accessor and a convention to
+-- | remember. That offset is also why the sign matters here and not merely as hygiene: `-1` would
+-- | address slot 0 and hand back the raw TAG, which is not a value word at all.
+-- |
+-- | An index past the last field is NOT caught here: the runtime's own bounds check answers that,
+-- | the same way it does for an array.
+adtField :: ForeignValue -> Int -> Effect (Maybe ForeignValue)
+adtField carrier i
+  | i < 0 = pure Nothing
+  | otherwise = Just <$> adtFieldImpl carrier i

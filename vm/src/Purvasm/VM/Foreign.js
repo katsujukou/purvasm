@@ -37,3 +37,11 @@ export const booleanOfImpl = (_v) => noCarrier("a Boolean decode");
 export const stringOfImpl = (_v) => noCarrier("a String decode");
 
 export const forceCarrierImpl = (_v) => () => noCarrier("a carrier force");
+
+export const newAdtImpl = (_tag) => (_fields) => unavailable("an ADT construction");
+
+export const adtTagImpl = (_v) => noCarrier("a constructor-tag read");
+
+export const adtFieldImpl = (_v) => (_i) => unavailable("an ADT field read");
+
+export const newNullaryAdtImpl = (_tag) => noCarrier("a nullary ADT construction");

@@ -16,6 +16,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/* A state this file's own callers rule out (a negative index, an allocation failure). Failing loudly
+ * beats returning a word that is not a value. */
+static void pvm_fatal(const char *what) {
+  fprintf(stderr, "purvasm vm foreign: %s\n", what);
+  abort();
+}
+
 static PVWord pvm_apply_thunk(PVContext *ctx, PVWord clo, const PVWord *args, size_t nargs);
 
 /* `applyImpl :: ForeignValue -> Array ForeignValue -> Effect ForeignValue` — the outer leaf, whose
@@ -226,4 +233,115 @@ static PVWord pvm_force_thunk(PVContext *ctx, PVWord clo, const PVWord *args, si
   (void)nargs;
   PVWord env = pv_closure_env(ctx, clo);
   return pv_force_if_byneed(ctx, pv_read_field(ctx, env, 0));
+}
+
+/* ── Data values (ADR-0111 §3, slice 5) ─────────────────────────────────────────────────────────────
+ *
+ * The tag is NOT stored anywhere: it is `fnv1a64(name).lo & 0x7fffffff` over the constructor's name,
+ * which the bytecode already carries (ADR-0110 §4 keeps names precisely so the format owes no backend
+ * its encoding). `Purvasm.Abi.Mangle.ctorTag` computes it on the VM side and codegen computes it on
+ * the other, from one shared definition — so the two agree by construction rather than by a table.
+ */
+
+static PVWord pvm_new_adt_thunk(PVContext *ctx, PVWord clo, const PVWord *args, size_t nargs);
+
+/* `newAdtImpl :: Int -> Array ForeignValue -> Effect ForeignValue` — build `tag(fields…)`.
+ *
+ * Effectful because it allocates, like every other constructor here. A NULLARY constructor never
+ * reaches this: it has no heap object at all, so it goes to `newNullaryAdtImpl` above and this
+ * function is only for `arity >= 1` — the same split `pv_new_adt` / `pv_new_nullary_adt` makes at the
+ * ABI, and for the same reason. */
+PVWord PVF_EXPORT(newAdtImpl)(PVContext *ctx, PVWord clo, const PVWord *args, size_t nargs) {
+  (void)clo;
+  (void)nargs;
+  PVWord env = pv_new_array(ctx, args, 2);
+  return pv_make_closure(ctx, (uint64_t)(uintptr_t)&pvm_new_adt_thunk, 1, env);
+}
+
+static PVWord pvm_new_adt_thunk(PVContext *ctx, PVWord clo, const PVWord *args, size_t nargs) {
+  (void)args;
+  (void)nargs;
+
+  PVWord mark = pv_frame(ctx);
+  PVWord env = pv_closure_env(ctx, clo);
+  int32_t tag = pv_int_payload(ctx, pv_read_field(ctx, env, 0));
+  PVWord vec = pv_root(ctx, pv_read_field(ctx, env, 1));
+
+  size_t n = pv_array_len(ctx, pv_get(ctx, vec));
+  PVWord *fields = NULL;
+  if (n > 0) {
+    fields = (PVWord *)malloc(n * sizeof(PVWord));
+    if (fields == NULL) {
+      fputs("purvasm vm foreign: out of memory building an ADT\n", stderr);
+      abort();
+    }
+    /* Same rooting argument as `pvm_apply_thunk`: the words are read out with no allocating call
+       between the read-out and the `pv_new_adt` that consumes them, so each is valid when handed
+       over. `pv_new_adt` self-roots its arguments across its own allocation (ADR-0066 §3). */
+    PVWord vector = pv_get(ctx, vec);
+    for (size_t i = 0; i < n; i++) fields[i] = pv_read_field(ctx, vector, i);
+  }
+
+  PVWord adt = pv_new_adt(ctx, (uint32_t)tag, fields, n);
+  free(fields);
+  pv_pop_frame(ctx, mark);
+  return adt;
+}
+
+/* `newNullaryAdtImpl :: Int -> ForeignValue` — the nullary constructor, which is an immediate and so
+ * allocates nothing (hence no thunk: there is no effect to defer). A separate ABI entry from
+ * `pv_new_adt` because the representations differ, and the VM must not be the place that knows so. */
+PVWord PVF_EXPORT(newNullaryAdtImpl)(PVContext *ctx, PVWord clo, const PVWord *args, size_t nargs) {
+  (void)ctx;
+  (void)clo;
+  (void)nargs;
+  return pv_new_nullary_adt((uint32_t)pv_int_payload(ctx, args[0]));
+}
+
+/* `adtTagImpl :: ForeignValue -> Int` — the constructor tag, for a `SwitchCtor` that met a data value
+ * a leaf returned. Pure: a tag never changes. Answers for a nullary constructor too (see the header),
+ * so the VM does not have to ask which representation it is holding — it could not. */
+PVWord PVF_EXPORT(adtTagImpl)(PVContext *ctx, PVWord clo, const PVWord *args, size_t nargs) {
+  (void)clo;
+  (void)nargs;
+  return pv_int((int32_t)pv_adt_tag(ctx, args[0]));
+}
+
+/* `adtFieldImpl :: ForeignValue -> Int -> Effect ForeignValue` — field `i` of a data value.
+ *
+ * The `+ 1` is the whole reason this exists rather than `readFieldImpl`. An `Adt`'s payload is
+ * `[tag] ++ fields` (`Heap::new_adt`), so payload word 0 is the TAG and field `i` lives at `i + 1`.
+ * Reading field 0 with the array accessor returns the tag — a raw number that is not a value word at
+ * all, which the runtime then rejects as "pointer is not a live object" when something tries to use
+ * it. Measured, exactly so.
+ *
+ * An `Array`'s payload has no such header word, which is why `readFieldImpl` is right for arrays and
+ * closure envs and wrong here: one accessor per layout, rather than one accessor and a convention to
+ * remember.
+ */
+static PVWord pvm_adt_field_thunk(PVContext *ctx, PVWord clo, const PVWord *args, size_t nargs);
+
+PVWord PVF_EXPORT(adtFieldImpl)(PVContext *ctx, PVWord clo, const PVWord *args, size_t nargs) {
+  (void)clo;
+  (void)nargs;
+  PVWord env = pv_new_array(ctx, args, 2);
+  return pv_make_closure(ctx, (uint64_t)(uintptr_t)&pvm_adt_field_thunk, 1, env);
+}
+
+static PVWord pvm_adt_field_thunk(PVContext *ctx, PVWord clo, const PVWord *args, size_t nargs) {
+  (void)args;
+  (void)nargs;
+  PVWord env = pv_closure_env(ctx, clo);
+  PVWord adt = pv_read_field(ctx, env, 0);
+  int32_t i = pv_int_payload(ctx, pv_read_field(ctx, env, 1));
+  /* A negative index would wrap through `(uint64_t)i + 1`: `-1` becomes slot 0, which is the raw TAG
+     — the exact word this accessor exists to keep out of value positions. The caller refuses it too
+     (`Foreign.purs`), so reaching here means the machine let one through, and failing loudly beats
+     handing back a non-value. */
+  if (i < 0) pvm_fatal("adtField: negative field index");
+  /* Shape FIRST: without this, an `Array` carrier would quietly answer with its element `i + 1`
+     instead of faulting, and a malformed image would read past a data value's fields into whatever
+     follows. `pv_adt_tag` is the only ADT-shaped question the ABI has, so it doubles as the check. */
+  (void)pv_adt_tag(ctx, adt);
+  return pv_read_field(ctx, adt, (uint64_t)i + 1);
 }
