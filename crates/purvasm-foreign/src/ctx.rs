@@ -135,7 +135,16 @@ impl<'f> Ctx<'f> {
     }
 
     /// An algebraic-data value.
+    ///
+    /// An empty `fields` is the NULLARY constructor, which the runtime represents as an immediate
+    /// rather than a heap object — the representation a generated `case` matches, since it splits on
+    /// representation before comparing tags. The two go to different ABI entries, and choosing
+    /// between them here is the point: a leaf writes `new_adt(tag, &[])` for `Nothing` and never
+    /// learns that the encoding differs.
     pub fn new_adt(&self, tag: u32, fields: &[PvValue<'f>]) -> PvValue<'f> {
+        if fields.is_empty() {
+            return self.root_word(unsafe { sys::pv_new_nullary_adt(tag) });
+        }
         let words: Vec<sys::PVWord> = fields.iter().map(|e| self.word_of(*e)).collect();
         self.root_word(unsafe { sys::pv_new_adt(self.raw, tag, words.as_ptr(), words.len()) })
     }
@@ -154,9 +163,45 @@ impl<'f> Ctx<'f> {
     }
 
     /// Read value-slot `i` of a heap object.
+    ///
+    /// For an **ADT use [`Self::adt_field`]**, not this: an `Adt`'s payload is `[tag] ++ fields`, so
+    /// slot 0 is the raw tag rather than a value — reading it here would hand back a word that is not
+    /// a value at all, and the layout would have leaked into the leaf besides.
     pub fn read_field(&self, obj: PvValue<'f>, i: u64) -> PvValue<'f> {
         let w = self.word_of(obj);
         self.root_word(unsafe { sys::pv_read_field(self.raw, w, i) })
+    }
+
+    /// An algebraic-data value's constructor tag — the number [`Self::new_adt`] was given, which is
+    /// `fnv1a64(name).lo & 0x7fffffff` over the constructor's fully qualified NAME.
+    ///
+    /// This is how a leaf inspects a `Maybe`/`Either` it was handed, and it answers for a nullary
+    /// constructor too (which has no heap object at all). Without it the safe layer could receive a
+    /// data value and do nothing with it, which would leave ADR-0111's "one authoring surface" true
+    /// only for C.
+    pub fn adt_tag(&self, adt: PvValue<'f>) -> u32 {
+        unsafe { sys::pv_adt_tag(self.raw, self.word_of(adt)) }
+    }
+
+    /// Field `i` of an algebraic-data value (0-based over the constructor's FIELDS).
+    ///
+    /// Distinct from [`Self::read_field`] because the tag occupies payload word 0, so field `i` is
+    /// slot `i + 1`. Keeping that offset here means a leaf never encodes the ADT layout itself — and
+    /// it is why both guards below exist rather than being hygiene:
+    ///
+    /// - `i + 1` would WRAP at `u64::MAX` in a release profile (overflow checks off), landing on slot
+    ///   0, which is the raw tag: a word that is not a value at all. `checked_add` refuses instead,
+    ///   in every profile.
+    /// - the shape is checked with [`Self::adt_tag`] FIRST, so handing this an `Array` faults in the
+    ///   runtime the way [`Ctx`]'s contract says a shape error does, rather than quietly returning
+    ///   that array's element `i + 1`.
+    pub fn adt_field(&self, adt: PvValue<'f>, i: u64) -> PvValue<'f> {
+        let slot = i
+            .checked_add(1)
+            .expect("adt_field: field index overflows (the tag occupies slot 0)");
+        let _ = self.adt_tag(adt); // shape check: faults unless this really is an ADT
+        let w = self.word_of(adt);
+        self.root_word(unsafe { sys::pv_read_field(self.raw, w, slot) })
     }
 
     /// Write value-slot `i` of a heap object.
@@ -177,5 +222,117 @@ impl<'f> Ctx<'f> {
     pub fn force_if_byneed(&self, v: PvValue<'f>) -> PvValue<'f> {
         let w = self.word_of(v);
         self.root_word(unsafe { sys::pv_force_if_byneed(self.raw, w) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use purvasm_rt::abi;
+
+    /// Run `body` against a live runtime, under an open shadow-stack frame.
+    ///
+    /// The frame is not decoration: `Ctx::new`'s safety contract requires one that outlives the
+    /// borrow, because every `PvValue` this hands out is a ROOT in that frame. `leaf_shim` opens it
+    /// in production; a test that skipped it would be rooting into a frame that does not exist.
+    ///
+    /// The unwind dance exists for the same reason. One of these tests panics on purpose, and a
+    /// panic must not skip `pv_pop_frame`/`pv_runtime_free` — so the panic is caught, the runtime is
+    /// torn down in order, and only then is the unwind resumed for `#[should_panic]` to observe.
+    ///
+    /// `Ctx::new` is `pub(crate)`, which is why these tests live here rather than in `tests/`: a
+    /// leaf-level test could only reach these paths through `leaf_shim`, whose panic guard turns
+    /// them into an abort.
+    fn with_ctx<R>(body: impl FnOnce(&Ctx<'_>) -> R) -> R {
+        let heap = abi::pv_runtime_new(1 << 16);
+        let raw = heap.cast::<sys::PVContext>();
+        let mark = unsafe { sys::pv_frame(raw) };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let cx = unsafe { Ctx::new(raw) };
+            body(&cx)
+        }));
+        unsafe { sys::pv_pop_frame(raw, mark) };
+        unsafe { abi::pv_runtime_free(heap) };
+        match outcome {
+            Ok(r) => r,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// The legacy entry still answers with a POINTER for `n == 0`, and the new one with an immediate
+    /// — both carrying the same tag.
+    ///
+    /// This contrast is the whole basis for calling the change additive (ADR-0111 §5). If the old
+    /// entry's answer ever changed shape, a provider built before the nullary entry existed would
+    /// start behaving differently against a runtime that still says it speaks version 1 — so the
+    /// wrong-but-unchanged behaviour is pinned here deliberately, beside the right one.
+    #[test]
+    fn the_legacy_entry_keeps_its_v1_representation() {
+        with_ctx(|cx| {
+            let tag = 4242;
+            let legacy = unsafe { sys::pv_new_adt(cx.raw(), tag, std::ptr::null(), 0) };
+            let canonical = unsafe { sys::pv_new_nullary_adt(tag) };
+
+            assert_eq!(
+                legacy & 1,
+                0,
+                "the v1 entry must still return a heap pointer"
+            );
+            assert_eq!(
+                canonical & 1,
+                1,
+                "the nullary entry must return an immediate"
+            );
+            assert_ne!(
+                legacy, canonical,
+                "the two representations must stay distinguishable"
+            );
+
+            // Both carry the tag, which is why the wrong one is wrong *silently* — and why the
+            // owned VM could accept it while a native `case` could not.
+            assert_eq!(unsafe { sys::pv_adt_tag(cx.raw(), legacy) }, tag);
+            assert_eq!(unsafe { sys::pv_adt_tag(cx.raw(), canonical) }, tag);
+        });
+    }
+
+    /// The field index is offset past the tag, so an index at the type's maximum WRAPS to slot 0 —
+    /// the raw tag — in any profile with overflow checks off, which is every ordinary release build.
+    /// `checked_add` is what makes the refusal profile-independent, and this pins it.
+    #[test]
+    #[should_panic(expected = "field index overflows")]
+    fn adt_field_refuses_an_index_that_would_wrap_onto_the_tag() {
+        with_ctx(|cx| {
+            let inner = cx.new_int(1);
+            let adt = cx.new_adt(7, &[inner]);
+            let _ = cx.adt_field(adt, u64::MAX);
+        });
+    }
+
+    /// A field read is only meaningful on an ADT. Without the shape check this answered with the
+    /// *array's* element `i + 1`, silently and with the wrong value — against `Ctx`'s contract that a
+    /// shape error is a runtime fault.
+    ///
+    /// The fault is an abort rather than a panic (the runtime's `guard` catches and aborts), so it
+    /// cannot be observed in-process: the test re-runs itself as a child and asserts the child died.
+    #[test]
+    fn adt_field_on_an_array_faults() {
+        const CHILD: &str = "PVF_ADT_FIELD_ARRAY_CHILD";
+        if std::env::var(CHILD).is_ok() {
+            with_ctx(|cx| {
+                let elem = cx.new_int(1);
+                let array = cx.new_array(&[elem, elem]);
+                let _ = cx.adt_field(array, 0);
+            });
+            return; // reaching here means no fault, and the parent's assertion fails
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "ctx::tests::adt_field_on_an_array_faults"])
+            .env(CHILD, "1")
+            .output()
+            .expect("re-running the test binary");
+        assert!(
+            !status.status.success(),
+            "adt_field on an Array must fault; the child exited successfully"
+        );
     }
 }

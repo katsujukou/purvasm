@@ -34,6 +34,35 @@ fn sandwich<'f>(cx: &Ctx<'f>, s: PvValue<'f>) -> PvValue<'f> {
     cx.new_array(&[left, s, right])
 }
 
+/// The ADT round trip through the SAFE layer (ADR-0111 §3, slice 5): read a `Maybe`'s constructor
+/// tag, project its field when it has one, and answer with a `Maybe` of our own.
+///
+/// This is the test that keeps "one authoring surface" honest for Rust. Without `Ctx::adt_tag` a
+/// `#[pv_foreign]` leaf could be *handed* a `Maybe` and have no way to look at it — the raw context
+/// and word are private — so the claim would hold for a C sibling and not for the crate the DX layer
+/// exists to provide.
+#[pv_foreign(module = "Test.Scratch", name = "remapImpl")]
+fn remap<'f>(cx: &Ctx<'f>, m: PvValue<'f>) -> PvValue<'f> {
+    if cx.adt_tag(m) == ctor_tag("Data.Maybe.Just") {
+        let inner = cx.adt_field(m, 0);
+        cx.new_adt(ctor_tag("Data.Maybe.Just"), &[inner])
+    } else {
+        // Nullary: no fields, and the runtime answers with the immediate a generated `case` matches.
+        cx.new_adt(ctor_tag("Data.Maybe.Nothing"), &[])
+    }
+}
+
+/// `fnv1a64(name).lo & 0x7fffffff` — the derivation codegen and the owned VM share
+/// (`Purvasm.Abi.Mangle.ctorTag`), written out here because a test fixture has no access to it.
+fn ctor_tag(name: &str) -> u32 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    (h as u32) & 0x7fff_ffff
+}
+
 #[pv_foreign(module = "Test.Scratch", name = "mulLaterImpl", effect)]
 fn mul_later(a: i32, b: i32) -> i32 {
     a * b
@@ -186,6 +215,54 @@ fn arity_zero_effect_leaf_is_the_thunk() {
 /// Repeated leaf calls on a small heap: each call's garbage (arguments, results, per-call roots)
 /// must become collectable once its frame pops, and live values must survive the collections the
 /// churn forces. A leaked root or a stale word turns this into an OOM abort or a wrong string.
+/// A field-carrying constructor survives the round trip: tag read, field projected, ADT rebuilt.
+#[test]
+fn adt_round_trips_through_the_safe_layer() {
+    with_rt(1 << 16, |ctx| unsafe {
+        let payload = abi::pv_new_str(heap(ctx), "x".as_ptr(), 1);
+        let just = abi::pv_new_adt(
+            heap(ctx),
+            ctor_tag("Data.Maybe.Just"),
+            [payload].as_ptr(),
+            1,
+        );
+        let out = __pvf_remap(ctx, abi::pv_unit(), [just].as_ptr(), 1);
+        assert_eq!(abi::pv_adt_tag(heap(ctx), out), ctor_tag("Data.Maybe.Just"));
+        assert_eq!(read_string(ctx, abi::pv_read_field(heap(ctx), out, 1)), "x");
+    });
+}
+
+/// The nullary constructor round trips too, and — the part that matters — it is the IMMEDIATE
+/// representation, not a zero-field heap object. A heap object would carry the right tag and still
+/// miss every native `case Nothing`, because a generated `case` splits on representation before it
+/// compares tags.
+///
+/// The leaf under test writes `cx.new_adt(tag, &[])` and never learns that this is a different ABI
+/// entry from the field-carrying one — which is the safe layer earning its keep.
+#[test]
+fn nullary_ctor_is_built_as_an_immediate_by_the_public_api() {
+    with_rt(1 << 16, |ctx| unsafe {
+        let nothing = abi::pv_new_nullary_adt(ctor_tag("Data.Maybe.Nothing"));
+        // Low bit set = immediate, in the value representation both backends share (ADR-0064 §1).
+        assert_eq!(nothing & 1, 1, "a nullary constructor must be an immediate");
+        assert_eq!(
+            abi::pv_adt_tag(heap(ctx), nothing),
+            ctor_tag("Data.Maybe.Nothing")
+        );
+
+        let out = __pvf_remap(ctx, abi::pv_unit(), [nothing].as_ptr(), 1);
+        assert_eq!(
+            out & 1,
+            1,
+            "the leaf's own Nothing must be an immediate too"
+        );
+        assert_eq!(
+            abi::pv_adt_tag(heap(ctx), out),
+            ctor_tag("Data.Maybe.Nothing")
+        );
+    });
+}
+
 #[test]
 fn gc_pressure_across_many_calls() {
     with_rt(1 << 12, |ctx| unsafe {
