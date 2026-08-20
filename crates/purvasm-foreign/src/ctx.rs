@@ -315,6 +315,14 @@ mod tests {
     /// The fault is an abort rather than a panic (the runtime's `guard` catches and aborts), so it
     /// cannot be observed in-process: the test re-runs itself as a child and asserts the child died.
     #[test]
+    // The child re-runs this test binary, which needs `current_exe` — an isolated operation Miri
+    // refuses, and one this test cannot avoid: the fault under test is a process ABORT (the
+    // runtime catches the panic and calls `abort`), so it is only observable from outside the
+    // process. Miri checks for UB, which is a different axis; the sibling tests still run there.
+    #[cfg_attr(
+        miri,
+        ignore = "re-runs the test binary; current_exe is isolated under Miri"
+    )]
     fn adt_field_on_an_array_faults() {
         const CHILD: &str = "PVF_ADT_FIELD_ARRAY_CHILD";
         if std::env::var(CHILD).is_ok() {
