@@ -587,6 +587,7 @@
             "ordered-collections",
             "prelude",
             "purvasm-base",
+            "purvasm-fs",
             "purvasm-stdio",
             "purvasm-system",
             "refs",

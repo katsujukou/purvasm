@@ -20,6 +20,7 @@ import Prelude
 import Data.Array as Array
 import Data.Map as Map
 import Data.Maybe (Maybe(..))
+import Data.String as String
 import Data.Traversable (traverse)
 import Data.Tuple.Nested ((/\))
 import Effect (Effect)
@@ -28,7 +29,8 @@ import Purvasm.System.Process as Process
 import Purvasm.VM.Error (stuck)
 import Purvasm.VM.Instruction (CodeBlock, Instruction(..), Literal(..), PrimOp(..))
 import Purvasm.VM.Loader as Loader
-import Purvasm.VM.Machine (executed, newEnv, runBlock)
+import Purvasm.FS as FS
+import Purvasm.VM.Machine (checkManifest, executed, newEnv, runBlock)
 import Purvasm.VM.Value (Value(..))
 
 -- | `let go n acc = if n == 0 then acc else go (n - 1) (acc + n) in go 10 0` — a tail-recursive
@@ -144,6 +146,49 @@ probe host key n = case Loader.arity n of
   Just a -> case Loader.resolve host key a of
     Just _ -> "resolved"
     Nothing -> "absent"
+
+-- | The manifest path named by `--manifest <path>`, if any.
+-- |
+-- | A flag rather than discovery-beside-the-image, for now: there is no image yet (ADR-0110's slice 2),
+-- | so there is nothing to sit beside. When the reader lands, the manifest is found next to the image
+-- | and this flag becomes the override.
+manifestPath :: Array String -> Effect (Maybe String)
+manifestPath args = case Array.uncons args of
+  Nothing -> pure Nothing
+  Just { head: "--manifest", tail } -> case Array.uncons tail of
+    Just path -> pure (Just path.head)
+    Nothing -> stuck "--manifest needs a path"
+  Just { tail } -> manifestPath tail
+
+-- | The workspace-provided keys a build-emitted manifest declares (ADR-0111 §4).
+-- |
+-- | The banner is checked rather than assumed: a VM meeting a manifest it does not understand must
+-- | say so, not silently check nothing — an eager gate that quietly becomes a no-op is worse than no
+-- | gate, because the build still reports having emitted one.
+readManifest :: String -> Effect (Array String)
+readManifest path = FS.readTextFile path >>= case _ of
+  Nothing -> stuck ("cannot read the foreign manifest at " <> path)
+  Just text -> case Array.uncons (String.split (String.Pattern "\n") text) of
+    Nothing -> stuck ("empty foreign manifest at " <> path)
+    Just { head: banner, tail: rest }
+      -- The FIRST physical line is the banner: skipping blank lines to find it would accept a file
+      -- whose shape the writer never produces, and this check is the only thing standing between a
+      -- misread manifest and a check that silently passes.
+      | banner /= manifestBanner -> stuck ("unrecognised foreign manifest format at " <> path <> ": " <> banner)
+      | otherwise -> case Array.unsnoc rest of
+          -- The writer ends every manifest with a newline, so exactly one trailing empty segment is
+          -- expected and no other empty line is. An empty key silently dropped is a key not checked.
+          Just { init: keys, last: "" }
+            | not (Array.any (_ == "") keys) -> pure keys
+          _ -> stuck
+            ( "malformed foreign manifest at " <> path
+                <> ": expected the banner, then one key per line, ending in a newline"
+            )
+
+-- | The manifest format this VM understands. Shared in spirit with the build's writer; a mismatch is
+-- | refused above rather than misread.
+manifestBanner :: String
+manifestBanner = "purvasm-foreign-manifest:v1"
 
 -- | The provider paths named by `--ffi <path>`, in order. Loading a shared object runs arbitrary
 -- | native code, so it is explicit and opt-in (ADR-0111 §4): nothing is discovered from the working
@@ -457,6 +502,9 @@ runWithProviders :: Array String -> CodeBlock -> Effect Unit
 runWithProviders args block = do
   handles <- loadAll args
   env <- newEnv Map.empty handles
+  manifestPath args >>= case _ of
+    Nothing -> pure unit
+    Just path -> readManifest path >>= checkManifest env
   void (runBlock env block Map.empty)
 
 -- | The providers named by `--ffi`, loaded in order.
@@ -478,6 +526,11 @@ ordinaryRun args = do
   paths <- ffiPaths args
   handles <- traverse loadProvider paths
   env <- newEnv Map.empty handles
+  -- Before the program runs: the keys the build says the workspace provides must each have exactly
+  -- one provider (ADR-0111 §4). Everything else stays lazy.
+  manifestPath args >>= case _ of
+    Nothing -> pure unit
+    Just path -> readManifest path >>= checkManifest env
   result <- runBlock env program Map.empty
   count <- executed env
   writeLine ("result: " <> describe result)
