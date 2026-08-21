@@ -18,6 +18,7 @@ module Purvasm.VM.Loader
   ( Arity
   , ModuleHandle
   , arity
+  , declares
   , describe
   , hostRuntime
   , load
@@ -51,6 +52,7 @@ foreign import hostRuntimeImpl :: Effect Int
 foreign import loadImpl :: String -> Effect Int
 foreign import loadErrorImpl :: Effect String
 foreign import describeImpl :: Int -> String
+foreign import declaresImpl :: Int -> String -> Boolean
 
 -- | `Just`/`Nothing` are passed *in* so the provider never builds a data value, and so this module
 -- | owes the C side no knowledge of any representation.
@@ -105,6 +107,19 @@ load path = do
 -- | exists. What remains is a question with a stable answer, so `Nothing` means one thing only.
 resolve :: ModuleHandle -> String -> Arity -> Maybe ForeignValue
 resolve (ModuleHandle index) key (Arity n) = resolveImpl Just Nothing index (mangleForeign key) n
+
+-- | Does this provider define `key`? A question about existence, answered without building anything.
+-- |
+-- | This is what the exactly-one invariant (ADR-0111 §4) actually needs, and what `resolve` is the
+-- | wrong tool for: resolution allocates a closure, so asking every provider that way would build one
+-- | per candidate to discard all but one. It is also what lets a build-emitted manifest be checked
+-- | eagerly *without* arities — existence does not need one, and the arity is a fact only the image
+-- | carries (ADR-0110 §4(a)).
+-- |
+-- | Pure for the same reason `resolve` is: a `ModuleHandle` exists only because the loader made one,
+-- | so the table is there, and the answer does not depend on when it is asked.
+declares :: ModuleHandle -> String -> Boolean
+declares (ModuleHandle index) key = declaresImpl index (mangleForeign key)
 
 -- | A provider's name for diagnostics: the path it was loaded from, or `host-runtime`.
 describe :: ModuleHandle -> String

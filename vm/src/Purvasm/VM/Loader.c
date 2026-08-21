@@ -253,6 +253,33 @@ PVWord PVF_EXPORT(describeImpl)(PVContext *ctx, PVWord clo, const PVWord *args, 
   return pv_new_str(ctx, (const uint8_t *)name, strlen(name));
 }
 
+/* `declaresImpl :: Int -> String -> Boolean` — does THIS provider define this symbol?
+ *
+ * Separate from `resolveImpl` because the two questions differ in what they cost and in what they
+ * mean. Resolution BUILDS a closure (`pv_make_closure` allocates), so asking every provider that way
+ * to find out which one answers would allocate a closure per candidate and throw all but one away.
+ * More importantly, the exactly-one check (ADR-0111 §4) and the manifest's eager check are asking
+ * about *existence*, not about a value — and existence needs no arity, which is why a manifest can
+ * name keys without carrying the arities only the image knows (ADR-0110 §4(a)).
+ *
+ * As in `resolveImpl`, failure is detected through `dlerror` rather than a NULL address, since a
+ * symbol's value may legitimately be NULL. */
+PVWord PVF_EXPORT(declaresImpl)(PVContext *ctx, PVWord clo, const PVWord *args, size_t nargs) {
+  (void)clo;
+  (void)nargs;
+  int index = pv_int_payload(ctx, args[0]);
+  if (index < 0 || index >= pvm_count) pvm_fatal("declares: module handle outside the loader table");
+
+  char *symbol = pvm_dup_str(ctx, args[1], "the symbol name");
+  if (symbol == NULL) pvm_fatal("declares: symbol name contains an interior NUL");
+
+  (void)dlerror();
+  (void)dlsym(pvm_modules[index].handle, symbol);
+  const char *failure = dlerror();
+  free(symbol);
+  return pv_bool(failure == NULL);
+}
+
 /* `resolveImpl :: (leaf -> r) -> r -> Int -> String -> Int -> r` — `Just`/`Nothing` are passed in
  * rather than built here, so this file needs no knowledge of any data type's representation.
  *

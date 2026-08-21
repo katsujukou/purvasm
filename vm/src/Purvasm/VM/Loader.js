@@ -18,3 +18,5 @@ export const loadErrorImpl = () => unavailable;
 export const describeImpl = (_index) => "<unloaded>";
 
 export const resolveImpl = (_just) => (nothing) => (_index) => (_symbol) => (_arity) => nothing;
+
+export const declaresImpl = (_index) => (_symbol) => false;

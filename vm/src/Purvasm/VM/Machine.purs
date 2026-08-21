@@ -22,6 +22,7 @@
 -- | is the machine's own bookkeeping, not something a consumer should be able to hand-assemble.
 module Purvasm.VM.Machine
   ( Env
+  , checkManifest
   , executed
   , force
   , newEnv
@@ -32,7 +33,7 @@ import Prelude
 
 import Control.Monad.Rec.Class (Step(..), tailRecM)
 import Data.Array as Array
-import Data.Foldable (foldl)
+import Data.Foldable (foldl, for_)
 import Data.List (List(..), (:))
 import Data.List as List
 import Data.Map (Map)
@@ -333,25 +334,21 @@ run wrapped@(Env env) frames0 = do
               -- instead of one of them winning by archive order or load order. There is no shadowing
               -- rule anywhere, deliberately.
               --
-              -- The candidate's value is KEPT rather than re-derived: `resolve` builds a closure with
-              -- `pv_make_closure`, so asking twice would allocate twice and throw the first one away,
-              -- against the "build once" the cache below exists to state.
-              let
-                found = Array.mapMaybe
-                  (\provider -> { provider, value: _ } <$> Loader.resolve provider key checked)
-                  ([ host ] <> env.providers)
-              case found of
+              -- Which providers answer is an EXISTENCE question, so it is asked with `declares`:
+              -- `resolve` builds a closure, and asking every provider that way would allocate one per
+              -- candidate to keep just the winner. Exactly one closure is built, after the answer is
+              -- known.
+              case Array.filter (\provider -> Loader.declares provider key) ([ host ] <> env.providers) of
                 [] -> stuck ("unbound native foreign: " <> key)
-                [ one ] -> do
-                  -- The origin travels with the value so a later boundary error can name the leaf
-                  -- that demanded the crossing (ADR-0111 §3).
-                  let v = VCarrier key one.value
-                  Ref.modify_ (Map.insert key { arity: physicalArity, value: v }) env.foreigns
-                  pure v
-                many -> stuck
-                  ( key <> " provided by both "
-                      <> String.joinWith " and " (map (Loader.describe <<< _.provider) many)
-                  )
+                [ one ] -> case Loader.resolve one key checked of
+                  Nothing -> stuck ("unbound native foreign: " <> key)
+                  Just fv -> do
+                    -- The origin travels with the value so a later boundary error can name the leaf
+                    -- that demanded the crossing (ADR-0111 §3).
+                    let v = VCarrier key fv
+                    Ref.modify_ (Map.insert key { arity: physicalArity, value: v }) env.foreigns
+                    pure v
+                many -> stuck (collision key many)
 
     step = Ref.read frames >>= case _ of
       Nil -> Done <$> (pop >>= force)
@@ -486,6 +483,42 @@ run wrapped@(Env env) frames0 = do
       Fail message -> stuck message
 
   tailRecM (\_ -> step) unit
+
+-- | Check the keys a build-emitted manifest declares as **workspace-provided**, before the program
+-- | runs (ADR-0111 §4).
+-- |
+-- | The scoping is the whole design, and it is [0091](0091-user-native-ffi-c-sibling-rust-dir.md) §1's
+-- | transplanted: the referenced-key set **over-approximates** what a run needs, because an image
+-- | reaches a `ForeignRef` inside a *reachable definition* whose branch may never execute, and the VM
+-- | has neither dead-strip nor a liveness result to tell the difference. Checking every key eagerly
+-- | would therefore reject programs that run fine. What the build DOES know is which keys the user
+-- | authored a provider for — there, a referenced key is genuinely meant to be provided, and a
+-- | missing `.so` is the likely error — so those are checked up front and everything else stays lazy.
+-- |
+-- | No arity is involved: this asks whether a provider *defines* the key, which `declares` answers
+-- | without building anything. That is why a manifest can carry keys alone.
+checkManifest :: Env -> Array String -> Effect Unit
+checkManifest (Env env) keys = do
+  host <- Ref.read env.host >>= case _ of
+    Just h -> pure h
+    Nothing -> do
+      h <- Loader.hostRuntime
+      Ref.write (Just h) env.host
+      pure h
+  for_ keys \key ->
+    case Array.filter (\provider -> Loader.declares provider key) ([ host ] <> env.providers) of
+      [ _ ] -> pure unit
+      [] -> stuck
+        ( "no native provider for " <> key
+            <> ": the build declared it as workspace-provided, so its module was expected to be loaded"
+        )
+      many -> stuck (collision key many)
+
+-- | The exactly-one failure, worded once: a key two providers answer for is never resolved by
+-- | precedence, because "which `show` am I running?" is not a question a user should have to ask.
+collision :: String -> Array Loader.ModuleHandle -> String
+collision key providers =
+  key <> " provided by both " <> String.joinWith " and " (map Loader.describe providers)
 
 -- | Decode a carrier the way a `Boolean`-demanding site must (ADR-0111 §3): the site knows what it
 -- | wants, so it demands it, and the runtime's shape check enforces the demand.
