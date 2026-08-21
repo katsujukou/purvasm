@@ -15,7 +15,7 @@ import Prelude
 import Data.Array as Array
 import Data.Either (Either(..), isLeft)
 import Data.String as String
-import Purvasm.CLI.NativeLink (foreignAbiStamp, foreignAuthorApi, generatedBanner)
+import Purvasm.CLI.NativeLink (foreignAbiStamp, foreignAuthorApi, foreignManifest, generatedBanner)
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
 
@@ -117,6 +117,27 @@ spec = describe "Purvasm.CLI.NativeLink" do
           Array.elem "pv_foreign_abi_stamp" names `shouldEqual` false
           Array.elem "pv_foreign_abi_v1" names `shouldEqual` false
         Left e -> shouldEqual e "the parse to succeed"
+
+  describe "foreignManifest" do
+    it "writes the banner, then one key per line, sorted, ending in a newline" do
+      foreignManifest [ "pvf_B_2eb", "pvf_A_2ea" ]
+        `shouldEqual` Right "purvasm-foreign-manifest:v1\nA.a\nB.b\n"
+
+    it "recovers a key EXACTLY, including escapes a diagnostic demangle would miss" do
+      -- `App.foo'` links as `pvf_App_2efoo_27`. Written as `App.foo_27` it would re-mangle to
+      -- `pvf_App_2efoo_5f27` in the reader, and the eager check would report a missing provider for
+      -- a key this very link had just resolved.
+      foreignManifest [ "pvf_App_2efoo_27" ]
+        `shouldEqual` Right "purvasm-foreign-manifest:v1\nApp.foo'\n"
+
+    it "is empty but well-formed when the workspace provides nothing" do
+      foreignManifest [] `shouldEqual` Right "purvasm-foreign-manifest:v1\n"
+
+    it "refuses a symbol whose key cannot be recovered, rather than writing an approximation" do
+      -- The manifest is re-mangled by its reader, so an inexact key is a wrong contract — unlike a
+      -- diagnostic, where an approximate name is better than none.
+      isLeft (foreignManifest [ "pvf_App_2efoo_2" ]) `shouldEqual` true
+      isLeft (foreignManifest [ "not_a_pvf_symbol" ]) `shouldEqual` true
 
   describe "foreignAbiStamp" do
     it "derives the version reference from the header's #define" do

@@ -10,6 +10,7 @@ module Purvasm.CLI.NativeLink
   -- | checked directly rather than only through a native build.
   , foreignAbiStamp
   , foreignAuthorApi
+  , foreignManifest
   , generatedBanner
   , link
   ) where
@@ -37,6 +38,7 @@ import Data.Tuple (Tuple(..))
 import Data.Tuple.Nested (type (/\), (/\))
 import Fmt as Fmt
 import Foreign.Object as Object
+import Purvasm.Abi.Mangle (unescapeIdent)
 import Purvasm.Compiler.Backend.LLVM.Mangle (escapeIdent, mangleForeign)
 import Purvasm.CLI.Effect.Env (ENV)
 import Purvasm.CLI.Effect.Env as Env
@@ -174,6 +176,40 @@ foreignAbiStamp header = case Array.mapMaybe versionOf (String.split (Pattern "\
 -- | its tests must agree on the exact spelling.
 foreignAbiVersionMacro :: String
 foreignAbiVersionMacro = "PV_FOREIGN_ABI_VERSION"
+
+-- | The build-emitted foreign manifest (ADR-0111 §4): the **workspace-provided** keys this program
+-- | references, one per line, for a VM to check eagerly before running the image.
+-- |
+-- | Only the workspace class is listed, and that scope is the point. The referenced-key set
+-- | over-approximates what a run needs — a `ForeignRef` can sit in a branch that never executes, and
+-- | a VM has no dead-strip to tell the difference — so a manifest naming *every* key would turn a
+-- | working program into a startup failure ([0091](0091-user-native-ffi-c-sibling-rust-dir.md) §1's
+-- | false positive, transplanted). For a key the user authored a provider for, though, a reference
+-- | means it is genuinely meant to be provided, and a missing `.so` is the likely error — so those,
+-- | and only those, are worth failing early on.
+-- |
+-- | Line-oriented rather than JSON: the consumer is the owned VM, which would otherwise need a JSON
+-- | parser to read four fields. The header line is the format's version, so a VM meeting a manifest
+-- | it does not understand says so instead of misreading it.
+-- | `Left` names a symbol whose key cannot be recovered exactly. The manifest is a CONTRACT the VM
+-- | re-mangles, so a lossy key there is worse than no manifest: it reports a missing provider for a
+-- | key the link had just checked. `demangleKey` is fine for a diagnostic and wrong here.
+foreignManifest :: Array String -> Either String String
+foreignManifest symbols = do
+  keys <- traverse recover (Array.sort symbols)
+  pure (String.joinWith "\n" ([ manifestBanner ] <> keys) <> "\n")
+  where
+  recover symbol = case String.stripPrefix (Pattern "pvf_") symbol >>= unescapeIdent of
+    Just key -> Right key
+    Nothing -> Left
+      ( "cannot recover the foreign key from " <> symbol
+          <> ": the manifest is re-mangled by its reader, so an inexact key would report a missing "
+          <> "provider for a key this link just resolved"
+      )
+
+-- | The manifest's first line, naming the format and its version.
+manifestBanner :: String
+manifestBanner = "purvasm-foreign-manifest:v1"
 
 -- | The banner separating the foreign-author API from the generated-code ABI in `purvasm.h`
 -- | (ADR-0079). Named here because both the parse and its tests depend on the exact text.
@@ -347,11 +383,16 @@ nmDefinedPvf = map Set.fromFoldable <<< nmDefinedPvfList
 -- | `pvf_<escape key>` symbol by undoing the two escapes that occur in practice (`_2e`→`.`, `_5f`→`_`).
 -- | Rarer byte escapes stay as `_<hex>` — this feeds an error message, not the link.
 demangleKey :: String -> String
-demangleKey sym =
-  String.replaceAll (Pattern "_5f") (Replacement "_")
-    ( String.replaceAll (Pattern "_2e") (Replacement ".")
-        (fromMaybe sym (String.stripPrefix (Pattern "pvf_") sym))
-    )
+demangleKey sym = case String.stripPrefix (Pattern "pvf_") sym >>= unescapeIdent of
+  Just key -> key
+  -- A diagnostic must print SOMETHING, so an unrecoverable symbol falls back to the two escapes that
+  -- occur in practice and then to the raw symbol. The manifest writer does not share this fallback:
+  -- there, an inexact key is a wrong contract rather than an imperfect message.
+  Nothing ->
+    String.replaceAll (Pattern "_5f") (Replacement "_")
+      ( String.replaceAll (Pattern "_2e") (Replacement ".")
+          (fromMaybe sym (String.stripPrefix (Pattern "pvf_") sym))
+      )
 
 -- | The `purvasm-rt` runtime **crate** dir (its `Cargo.toml`) the app-Rust bundle folds as an rlib
 -- | (ADR-0091 §Addendum / ADR-0078 §5): `$PURVASM_RT_CRATE`, else the conventional `runtime`. Distinct
@@ -561,6 +602,13 @@ link opts = do
       Log.info $ Fmt.fmt @"  host-foreign-api: retaining {n} symbols, exporting exactly those"
         { n: show (Array.length retained) }
       pure (map (forceUndefined macos) retained <> [ allow.flag ])
+  -- The provider map this link just enforced, written down for the VM (ADR-0111 §4). It is a
+  -- projection of what `enforceAppProviders` checked, not a second derivation, so the two cannot
+  -- disagree about which keys the workspace provides.
+  manifestPath <- FS.joinPath [ opts.output, "foreign-manifest" ]
+  case foreignManifest appSyms of
+    Right manifest -> FS.writeText manifestPath manifest
+    Left e -> throw ("foreign manifest: " <> e)
   linkExe archive ([ deadStrip ] <> hostFlags) objs (ulibObjs <> extraObjs)
   where
   inAppNamespace s =
