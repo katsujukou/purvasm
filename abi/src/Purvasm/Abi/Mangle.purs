@@ -11,15 +11,18 @@
 module Purvasm.Abi.Mangle
   ( ctorTag
   , escapeIdent
+  , unescapeIdent
   , mangle
   , mangleForeign
   ) where
 
 import Prelude
 
-import Data.Char (toCharCode)
+import Data.Array as Array
+import Data.Char (fromCharCode, toCharCode)
 import Data.Foldable (foldMap)
-import Data.Int (hexadecimal, toStringAs)
+import Data.Int (fromStringAs, hexadecimal, toStringAs)
+import Data.Maybe (Maybe(..))
 import Data.String (length)
 import Data.String.CodeUnits (singleton, toCharArray)
 import Data.Int.Bits ((.&.))
@@ -47,6 +50,50 @@ escapeIdent key = foldMap escapeChar (toCharArray key)
       || (code >= 97 && code <= 122) -- a-z
 
   pad2 s = if length s < 2 then "0" <> s else s
+
+-- | The **exact** inverse of [escapeIdent]: `Nothing` for anything that escaping could not have
+-- | produced.
+-- |
+-- | Exact rather than best-effort, because a caller uses it to recover a key that then gets mangled
+-- | again — a build writes a foreign manifest, a VM reads it and re-derives the symbol (ADR-0111 §4).
+-- | A partial inverse breaks that round trip on the first key it does not know: decoding only `_2e`
+-- | and `_5f` turns `pvf_App_2efoo_27` (`App.foo'`) into `App.foo_27`, which re-mangles to
+-- | `pvf_App_2efoo_5f27` — a symbol nothing defines, reported as a missing provider for a key the
+-- | link had already checked.
+-- |
+-- | An escape that decodes to an alphanumeric (`_61`) is REFUSED even though it is well-formed hex:
+-- | escaping never produces one, so accepting it would make two spellings denote the same key and
+-- | cost the encoding its injectivity — the property ADR-0072 §2 chose it for.
+unescapeIdent :: String -> Maybe String
+unescapeIdent = go "" <<< toCharArray
+  where
+  go acc chars = case Array.uncons chars of
+    Nothing -> Just acc
+    Just { head: c, tail: rest }
+      | c /= '_' -> if isAlphaNumChar c then go (acc <> singleton c) rest else Nothing
+      | otherwise -> case Array.take 2 rest of
+          [ hi, lo ] -> do
+            code <- fromStringAs hexadecimal (singleton hi <> singleton lo)
+            -- Reject an escape of something escaping would have passed through, and any digit the
+            -- lowercase-hex writer would not have emitted.
+            if isAlphaNum code || not (isLowerHex hi && isLowerHex lo) then Nothing
+            else do
+              ch <- fromCharCode code
+              go (acc <> singleton ch) (Array.drop 2 rest)
+          _ -> Nothing
+
+  isAlphaNumChar c = isAlphaNum (toCharCode c)
+
+  isAlphaNum code =
+    (code >= 48 && code <= 57)
+      || (code >= 65 && code <= 90)
+      || (code >= 97 && code <= 122)
+
+  isLowerHex c =
+    let
+      n = toCharCode c
+    in
+      (n >= 48 && n <= 57) || (n >= 97 && n <= 102)
 
 -- | A top-level binding's linker symbol base: `pv_g_<escape key>` (ADR-0072 §2).
 mangle :: String -> String
