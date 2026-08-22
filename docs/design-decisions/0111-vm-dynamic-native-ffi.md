@@ -770,6 +770,49 @@ trusted surface: everything else in §1–§5 is ordinary purvasm code above it.
    separate them. So this accessor, unlike the scalar ones, rests on the caller being a site whose
    TYPE already established that the value is an ADT, which a compiler-emitted `SwitchCtor` is.
 6. Manifest emission from the build; the scoped eager diagnostics (§4).
+   **Done (2026-08-20).** `purvasm build` writes `<outdir>/foreign-manifest` — the workspace-provided
+   keys, one per line under a version banner — as a *projection* of the provider map the link already
+   enforced, so the two cannot disagree about which keys the workspace provides. The VM takes
+   `--manifest <path>` and checks each declared key has exactly one provider **before the program
+   runs**; everything else stays lazy.
+
+   Five things worth recording, the last two found in review:
+
+   - **Existence is a different question from resolution, and the manifest needs only the first.**
+     `Loader.resolve` builds a closure (`pv_make_closure` allocates), so asking every provider that
+     way would allocate one per candidate and keep the winner. The new `Loader.declares` answers
+     "does this provider define this key" with `dlsym` alone — which is also **why a manifest can
+     carry keys without arities**, the arity being a fact only the image holds (ADR-0110 §4(a)). The
+     exactly-one check in the resolver now uses it too, so exactly one closure is built per key.
+   - **A manifest belongs to the image, not to the host.** The VM's own link emits one — its loader
+     and boundary modules are workspace modules with C siblings — and that manifest names the VM's
+     *trusted* leaves, which §6 deliberately does not export. Feeding it back to the VM would fail by
+     design. Nothing does that, but the shape of the mistake is worth naming before an image reader
+     makes manifests discoverable beside images.
+   - **An unrecognised manifest is refused, not treated as empty.** A gate that silently becomes a
+     no-op is worse than no gate, because the build still reports having emitted one.
+   - **The key must survive the round trip exactly, so the escape has an exact inverse now.** The
+     writer first reused `demangleKey`, a best-effort decoder for *diagnostics* that knows `_2e` and
+     `_5f`. A key like `App.foo'` links as `pvf_App_2efoo_27`, would have been written as
+     `App.foo_27`, and the reader would have re-mangled it to `pvf_App_2efoo_5f27` — a missing
+     provider reported for a key the link had just resolved, which is precisely the claim that the
+     manifest is a *projection* of the enforced provider map. `Purvasm.Abi.Mangle` now carries
+     `unescapeIdent`, an exact inverse that also refuses what escaping could not have produced (`_61`
+     for an alphanumeric), since accepting it would give one key two spellings and cost the encoding
+     the injectivity ADR-0072 §2 chose it for. The writer FAILS on a symbol it cannot recover rather
+     than approximating; only the diagnostic keeps a fallback.
+   - **The reader accepts only the shape the writer emits.** Filtering blank lines before finding the
+     banner would have accepted a leading one and silently dropped an empty key — and a key silently
+     dropped is a key not checked.
+
+   The format is line-oriented rather than JSON: the consumer is the VM, which would otherwise need a
+   JSON parser to read a banner and some keys. Writer and reader hold the banner independently, so
+   the gate feeds the VM the banner the *build* just wrote — a drift between them fails there rather
+   than in a user's project.
+
+   `--manifest` is a flag rather than discovery-beside-the-image because there is no image yet
+   ([0110](0110-owned-vm-purescript-native.md)'s slice 2). When the reader lands, the manifest is
+   found next to the image and the flag becomes the override.
 
 Gates:
 
