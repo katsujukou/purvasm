@@ -421,6 +421,92 @@ else
   printf '      carrier: %s\n      local:   %s\n' "$carrier_diag" "$local_diag" >&2
 fi
 
+echo "== the build-emitted manifest: eager where the build knows, lazy everywhere else (§4) =="
+# Slice 6. The manifest names the keys the BUILD resolved as workspace-provided, and those are checked
+# before the program runs. The scope is the whole design: a referenced key can sit in a branch that
+# never executes, and the VM has no dead-strip to tell the difference, so checking everything eagerly
+# would reject working programs (ADR-0091 §1's false positive). Both halves are asserted here.
+printf 'purvasm-foreign-manifest:v1\nTest.Loader.describeBoolImpl\n' >"$WORK/manifest-ok"
+printf 'purvasm-foreign-manifest:v1\nTest.Loader.neverBuiltImpl\n' >"$WORK/manifest-missing"
+printf 'not-a-manifest\n' >"$WORK/manifest-bogus"
+
+if "$VM" --self-test loaded-provider --ffi "$WORK/provider.so" --manifest "$WORK/manifest-ok" \
+     >"$WORK/manifest.out" 2>"$WORK/manifest.err"; then
+  printf '  %-24s -> a declared key with a provider runs OK\n' manifest
+else
+  printf '  %-24s -> a satisfiable manifest was refused FAIL\n' manifest; rc=1
+  sed 's/^/      /' "$WORK/manifest.err" >&2
+fi
+
+# A declared key with NO provider fails before the program runs — which is the point of declaring it.
+if "$VM" --self-test loaded-provider --ffi "$WORK/provider.so" --manifest "$WORK/manifest-missing" \
+     >"$WORK/missing.out" 2>"$WORK/missing.err"; then
+  printf '  %-24s -> a declared key with no provider was accepted FAIL\n' manifest; rc=1
+elif grep -qF "no native provider for Test.Loader.neverBuiltImpl" "$WORK/missing.err"; then
+  # And it must fail EARLY: the program's own output must never appear.
+  if grep -q "provider read Boolean" "$WORK/missing.out"; then
+    printf '  %-24s -> refused, but only after the program ran FAIL\n' manifest; rc=1
+  else
+    printf '  %-24s -> a declared key with no provider fails before the run OK\n' manifest
+  fi
+else
+  printf '  %-24s -> refused for the wrong reason FAIL\n' manifest; rc=1
+  sed 's/^/      /' "$WORK/missing.err" >&2
+fi
+
+# An UNDECLARED key on a branch that never executes must NOT fail. `carrier-control` references
+# several keys and takes only some branches; with no manifest naming them, none is checked eagerly.
+if "$VM" --self-test carrier-control --ffi "$WORK/provider.so" >/dev/null 2>"$WORK/lazy.err"; then
+  printf '  %-24s -> undeclared keys stay lazy OK\n' manifest
+else
+  printf '  %-24s -> a lazy key was checked eagerly FAIL\n' manifest; rc=1
+  sed 's/^/      /' "$WORK/lazy.err" >&2
+fi
+
+# The writer and the reader hold the format independently (the build's `foreignManifest` and the VM's
+# `manifestBanner`), so they can drift. This takes the banner the BUILD just wrote — the VM's own link
+# emits one, since `Purvasm.VM.Loader`/`Foreign` are workspace modules with C siblings — and feeds it
+# back as a manifest declaring nothing. It must be accepted, which is only true if the two agree.
+#
+# The build's manifest is not fed in whole on purpose: it names the VM's OWN trusted leaves, which are
+# deliberately not exported (§6), so a host checking it against itself would fail by design. A
+# manifest belongs to the image a VM runs, not to the VM.
+head -1 "$WORK/vm/foreign-manifest" >"$WORK/manifest-from-build"
+if "$VM" --self-test loaded-provider --ffi "$WORK/provider.so" --manifest "$WORK/manifest-from-build" \
+     >/dev/null 2>"$WORK/banner.err"; then
+  printf '  %-24s -> the VM accepts the format the build writes OK\n' manifest
+else
+  printf '  %-24s -> writer and reader disagree about the format FAIL\n' manifest; rc=1
+  printf '      build wrote: %s\n' "$(head -1 "$WORK/vm/foreign-manifest")" >&2
+  sed 's/^/      /' "$WORK/banner.err" >&2
+fi
+
+# Shapes the writer never produces must be refused, not repaired. A parse that skipped blank lines
+# would accept a leading one (finding the banner anyway) and would drop an empty key silently — and a
+# key silently dropped is a key not checked, which is the failure mode this whole gate exists for.
+printf '\npurvasm-foreign-manifest:v1\nTest.Loader.describeBoolImpl\n' >"$WORK/manifest-lead-blank"
+printf 'purvasm-foreign-manifest:v1\n\nTest.Loader.describeBoolImpl\n' >"$WORK/manifest-blank-key"
+malformed_ok=yes
+for bad in manifest-lead-blank manifest-blank-key; do
+  if "$VM" --self-test loaded-provider --ffi "$WORK/provider.so" --manifest "$WORK/$bad" \
+       >/dev/null 2>"$WORK/$bad.err"; then
+    printf '  %-24s -> a malformed manifest was accepted (%s) FAIL\n' manifest "$bad"; rc=1; malformed_ok=no
+  fi
+done
+[ "$malformed_ok" = yes ] && printf '  %-24s -> a blank line is refused, not repaired OK\n' manifest
+
+# A manifest the VM does not understand is refused, not silently treated as empty: a gate that
+# quietly becomes a no-op is worse than no gate, because the build still reports emitting one.
+if "$VM" --self-test loaded-provider --ffi "$WORK/provider.so" --manifest "$WORK/manifest-bogus" \
+     >/dev/null 2>"$WORK/bogus.err"; then
+  printf '  %-24s -> an unrecognised manifest was ignored FAIL\n' manifest; rc=1
+elif grep -qF "unrecognised foreign manifest" "$WORK/bogus.err"; then
+  printf '  %-24s -> an unrecognised manifest is refused OK\n' manifest
+else
+  printf '  %-24s -> refused for the wrong reason FAIL\n' manifest; rc=1
+  sed 's/^/      /' "$WORK/bogus.err" >&2
+fi
+
 echo "== foreign-ABI version: the marker fires when it loads, and not when it is refused (§5) =="
 # The bumped header is the real mechanism, not a fixture flag: a copy of the shipped `purvasm.h` with
 # its version `#define` rewritten is exactly "a module built against a different foreign ABI".
