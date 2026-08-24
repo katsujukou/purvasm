@@ -1063,7 +1063,146 @@ workload (the compiler built `--opt`, compiling `Purvasm.CLI.Native` `--no-opt`)
 
 **And what none of them establishes: that any of it is faster.** The wall-clock A/A + A/B for each
 slice remains OWED, per slice, on the quiet Linux box §5.2 requires — and until it runs, this ADR
-makes no run-time claim in either direction.
+makes no run-time claim in either direction. _(A provisional measurement was later taken on a
+machine that does not meet §5.2's platform clause; see the post-close section below. It does not
+discharge this item, and this paragraph stands as written.)_
+
+#### Post-close provisional measurement (2026-08-18): the run-time endpoints, on a box §5.2 does not sanction
+
+**What this section is.** A record of a measurement, not an amendment. §5.2's conditions and §5.3's
+decision rule are unchanged and nothing normative is relaxed here. What this run executed is §5.2's
+EXECUTABLE disciplines — snapshotted inputs, harness-owned knobs, the per-program heap passed
+explicitly, ≥ 20 order-alternated pairs, the median of paired ratios, the GC counters per leg — and
+§5.3's decision rule in full. **It does not satisfy §5.2 as a whole**: the platform clause, the
+`perf stat` leg and the corpus clause are all unmet, which is why the result is labelled PROVISIONAL
+and does not count as the owed one.
+
+**Why provisional — three reasons, each of them standing on its own:**
+
+1. **`perf stat` did not run.** Darwin has no equivalent at this granularity, so §5.2's
+   instructions / branches / branch-misses leg is absent. The harness prints the reason rather than
+   omitting the column.
+2. **The box is not a quiet dedicated Linux machine.** Apple Silicon additionally offers no CPU
+   pinning (P/E cores) and no governor control, so the machine state is neither fixed nor commanded.
+3. **§5.2's non-string-substrate case is UNSATISFIED.** The clause is kept, not waived — see below.
+
+**What the design does and does not buy, stated precisely.** §5.3's floor is an A/A envelope measured
+on the same machine in the same session, and the regime check below additionally requires the
+comparison to have run in the state that floor sampled. Together these SUPPRESS the false-positive
+risk; they do not eliminate it. A WIN here is a WIN *under a rule fixed in advance*, over finite
+samples, drawn from a non-stationary and autocorrelated process, with three axes judged. It is
+evidence, not proof, and it is not the §5.2 result.
+
+**The harness**: `tools/foreign-ab.sh`, built to §5.2/§5.3 and modelled on `tools/byneed-ab.sh`. Its
+stage lattice is `apply-profile.sh --paired`'s axes verbatim, so the two harnesses describe one
+lattice: `s0` per-use/via-apply → `s1` hoisted/via-apply → `s2` hoisted/direct-apply-only → `s3`
+hoisted/direct-apply-and-tail. It owns every knob, snapshots its inputs, pins the heap, requires each
+run's exit status, alternates pair order, refuses to start above `--max-load`, and prints a
+`NOT THE PROTOCOL` banner below 20 pairs. `--self-test` (17 rows) pins the statistics and the
+decision rule on injected data, including the row that fails if §5.3's envelope is ever computed as
+anything but the UNION of the two endpoints' intervals.
+
+##### The corpus, measured before anything was timed
+
+§5.2 refuses to time a program the change does not alter, and on this corpus that is not a
+formality. Measured s1 → s3 by `pv_apply_entries`:
+
+| program | before | after | moved |
+| --- | ---: | ---: | --- |
+| `quicksort` 50000 | 6,192,904 | 6,192,881 | 23 (0.0004 %) |
+| `map-fold-array` 500000 | 48 | 12 | the run performs no dispatch worth timing |
+| `fib` 20000 | 42 | 10 | likewise |
+| `json-parse` | 27,813 | 6,842 | 75 %, but its input scales with a fixture, so it has no size knob |
+
+This is the expected consequence of ADR-0108 §4's own drill — four symbols carry 91.2 % of the class,
+every one of the top seven is an ADR-0103 string-substrate leaf, `byteAt` alone 45.6 %. On this
+corpus the population this ADR lowers IS the string substrate.
+
+**§5.2's non-string-substrate clause is therefore recorded as OWED, and is NOT treated as satisfied
+by the table above.** That the existing `mixed` cases came out `NOT-A-PROBE` is a fact about the
+corpus; it is not a measurement in a non-string case, and the two must not be conflated. Closing the
+clause requires ADDING a case that exercises non-string native leaves heavily enough to be a probe,
+sized to §5.2's 3–10 s. Until such a case exists and runs, this leg of §5.2 is unmet.
+
+##### The case that is a probe
+
+`selfhost-fib` — the native compiler, built at each stage of the lattice, compiling
+`Bench.Fib.Main --no-opt --emit-llvm`. It reproduces this ADR's whole endpoint structure at roughly a
+fifth of the pinned CLI corpus's scale, with every off-axis counter pinned:
+
+| leg | the counter that moves | before | after | pinned INVARIANT |
+| --- | --- | ---: | ---: | --- |
+| A `s0→s1` | `gc_copied_words` | 11,607,269 | 5,036,929 | `pv_apply_entries`, `pv_tailcall_writes` |
+| B `s1→s2` | `pv_apply_entries` | 93,336,993 | 29,545,469 | `pv_tailcall_writes`, `gc_copied_words` |
+| C `s2→s3` | `pv_tailcall_writes` | 19,342,702 | 18,023,899 | `pv_apply_entries`, `gc_copied_words` |
+
+and — the precondition without which no timing between stages means anything — **all four stage
+binaries emit the workload byte-identically** (`diff -r`, verdicted per stage, not assumed). The knob
+is a BUILD-mode axis, so the four compilers must do identical work; this ADR's first paired run
+failed precisely because they did not.
+
+The case runs at 7.7–8.1 s, **inside** §5.2's 3–10 s window — and the report prints the wall times so
+that is checkable per run rather than assumed from the case table. The distinction is not academic:
+the same case measured ~17 s/run on a loaded machine, so the window is a property of the RUN and not
+only of the case. `gc_total_ns` is deliberately not a gate: two runs agreeing on `gc_copied_words` to
+the word read 0.71 s and 1.85 s.
+
+##### Results
+
+n = 20 paired reps per set, order alternated, ratio = t(after)/t(before); floor = the union of the
+two endpoints' A/A [p5, p95] by nearest rank. **All three axes passed the regime check** (the A/B
+set's wall median lay inside the span its A/A sets observed).
+
+| leg | A/B median | floor | verdict |
+| --- | ---: | --- | --- |
+| A — closure `s0→s1` | 0.9454 | `[0.9677, 1.0198]` | **PROVISIONAL WIN** |
+| B — apply `s1→s2` | 0.9700 | `[0.9769, 1.0145]` | **PROVISIONAL WIN** |
+| C — tail `s2→s3` | 0.9818 | `[0.9722, 1.0195]` | **INCONCLUSIVE** |
+
+**No arithmetic is performed across slices.** The three legs are not summed, not compounded, and one
+leg's result never offsets another's — which is why the knob has three call stages rather than two
+(§5.2), and the rule is the same one that would have made a slice B regression non-absorbable by
+slice A's win.
+
+**Slice C is INCONCLUSIVE, and that is the word it is reported in.** It is not "no regression", it is
+not "≈ 1.8 % faster", and its median's proximity to the floor's lower edge is not a partial result.
+§5.3 makes INCONCLUSIVE a distinct verdict precisely so it cannot be rounded toward either neighbour.
+
+**Slice B's earlier INCONCLUSIVE was a fact about the box, not about slice B** — and the two runs say
+so mechanically rather than by interpretation. The median barely moved (0.9718 → 0.9700); the floor
+moved from `[0.8399, 1.0548]` to `[0.9769, 1.0145]`. A floor ±16 % wide cannot resolve a ~3 % effect,
+so the first run's null was a statement about resolution. This is recorded because the opposite
+reading — "slice B did nothing, then did something" — is the available misreading.
+
+##### The withdrawn run, kept as harness evidence
+
+A first protocol run's tail axis produced a confident INCONCLUSIVE that was **withdrawn, not
+reported**. Its A/A sets were taken at ~7.6 s/run; then, from the eighth of the twenty A/B pairs
+onward, the machine changed state and every remaining pair ran at ~13.5 s (A/B wall range
+7.39–14.55 s against an A/A span
+of 7.41–8.66 s). The floor described a machine state the comparison never ran in.
+
+What makes it worth recording is that **nothing in the ratio statistics could have shown it**. Pairs
+are measured back-to-back, so a level shift between pairs cancels in the ratio — and it did, to a
+degree that is itself the evidence: the withdrawn run's tail median was **0.981783** and the clean
+re-run's was **0.981784**, from disjoint samples taken at half the wall-clock speed. The pairing
+discipline was working exactly as §5.2 intends.
+
+**The lesson pinned in the harness: paired-ratio validity and floor validity are separate contracts,
+and satisfying the first says nothing about the second.** `foreign-ab.sh` now requires the A/B set's
+wall median to lie inside the span its A/A sets observed — no constant, only observed data — and
+withholds the verdict as `NO-FLOOR` when it does not. The check is exercised by four `--self-test`
+rows, including the real drift's shape and a drift in the FASTER direction.
+
+##### Owed, as two separate items
+
+1. **The §5.2 run**: the A/A intervals on both endpoints and the A/B verdict, per slice, with
+   `perf stat`, on a quiet dedicated Linux box. The three verdicts above are the input that run
+   should expect to confirm or contradict; they do not stand in for it.
+2. **A non-string-substrate probe**: a case exercising non-string native leaves heavily enough to
+   pass the relevance gate, sized to 3–10 s, so §5.2's corpus clause can be closed by measurement.
+
+Neither item is discharged by the other, and neither is discharged by this section.
 
 ## Consequences
 
