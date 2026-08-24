@@ -8,9 +8,11 @@
 # The gate reconciles EVERY guest-call form, because the naive "generic == Σ MissReason" is false
 # against this emitter in both directions:
 #
-#   pv_apply    == generic-apply + structural-apply   (the unsaturated-CCtor builder application is
+#   pv_apply    == generic-apply + local-deferred-apply + foreign-deferred-apply + structural-apply
+#                                                    (the unsaturated-CCtor builder application is
 #                                                      a `pv_apply` that no MissReason explains)
-#   pv_tailcall == generic-tail                       (a generic TAIL call is a trampoline store,
+#   pv_tailcall == generic-tail + local-deferred-tail + foreign-deferred-tail
+#                                                     (a generic TAIL call is a trampoline store,
 #                                                      invisible in any `pv_apply` count)
 #   pvf_ direct == foreign-direct-apply + foreign-direct-tail   (ADR-0109 §7: a saturated native
 #                                                                leaf called through its own entry;
@@ -169,10 +171,14 @@ awk -F'\t' '
     else if ($4 == "direct-musttail")  dm[$1] += $5
     else if ($4 == "direct-nontail")   dn[$1] += $5
     else if ($4 == "wrapper-entry")    we[$1] += $5
-    # ADR-0109: the deferred forms LOWER to the generic dispatch, so they land in those columns;
-    # only the direct forms are their own column.
+    # ADR-0109/ADR-0113: EVERY deferred form LOWERS to the generic dispatch — byte for byte — so it
+    # lands in the generic column here; only the direct forms are their own. A deferred class left
+    # out of these sums is not a rounding error: its dispatches are in the `.ll` and would show up
+    # as a per-object shortfall against it.
     else if ($4 == "foreign-deferred-apply") ga[$1] += $5
     else if ($4 == "foreign-deferred-tail")  gt[$1] += $5
+    else if ($4 == "local-deferred-apply")   ga[$1] += $5
+    else if ($4 == "local-deferred-tail")    gt[$1] += $5
     else if ($4 == "foreign-direct-apply")   fd[$1] += $5
     else if ($4 == "foreign-direct-tail")    fd[$1] += $5
     seen[$1] = 1
@@ -208,11 +214,16 @@ awk -F'\t' '
   $3 == "class"  && $4 == "generic-apply" { ga[$1] = $5; seen[$1] = 1 }
   $3 == "class"  && $4 == "generic-tail"  { gt[$1] = $5; seen[$1] = 1 }
   $3 == "reason" {
-    split($4, p, "/")
-    if (p[1] == "generic-apply") ra[$1] += $5
-    else if (p[1] == "generic-tail") rt[$1] += $5
-    if (p[2] == "unknown-key") uk[$1] += $5
-    if (p[2] == "callee-literal") cl[$1] += $5
+    # the key is <class>/<reason> and a reason may itself contain "/" (local-unknown-fn/<origin>),
+    # so only the FIRST separator is a field boundary — splitting on every "/" would fold the seven
+    # origin rows into one and make this sum agree for the wrong reason.
+    slash = index($4, "/")
+    cls = substr($4, 1, slash - 1)
+    rsn = substr($4, slash + 1)
+    if (cls == "generic-apply") ra[$1] += $5
+    else if (cls == "generic-tail") rt[$1] += $5
+    if (rsn == "unknown-key") uk[$1] += $5
+    if (rsn == "callee-literal") cl[$1] += $5
     seen[$1] = 1
   }
   END {

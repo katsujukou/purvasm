@@ -14,3 +14,4 @@ main :: Effect Unit
 main = runSpecAndExitProcess [ consoleReporter ] do
   ByNeed.spec
   Apply.spec
+  Apply.identitySpec

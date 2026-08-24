@@ -33,7 +33,7 @@ import Purvasm.CLI.Effect.Process (PROC)
 import Purvasm.CLI.ForeignSigs as ForeignSigs
 import Purvasm.CLI.Ulib (requireUlibDir)
 import Purvasm.Census.Apply.Backend (applyCensusBackend)
-import Purvasm.Census.Apply.Report (header)
+import Purvasm.Census.Apply.Report (checkIdentities, header)
 import Purvasm.Compiler (build)
 import Purvasm.Compiler.Backend.LLVM.Abi (defaultHeapWords)
 import Purvasm.Compiler.Backend.LLVM.ForeignRef (ForeignCallMode(..), ForeignClosureMode(..))
@@ -85,6 +85,14 @@ options = fromRecord
         # ArgParser.boolean
   }
 
+-- | The object a rendered block belongs to: the first field of its first row. The renderer writes
+-- | one block per object, so this is exact rather than a heuristic — and taking it from the rows
+-- | themselves means the gate cannot be handed the wrong name by its caller.
+objectOf :: Array String -> String
+objectOf ls = case Array.head ls >>= (Array.head <<< String.split (Pattern "\t")) of
+  Just o -> o
+  Nothing -> ""
+
 cmd :: forall r. Options -> Run (ENV + LOG + FS + PROC + EXCEPT String + EFFECT + r) Unit
 cmd opts = do
   Log.info $ Fmt.fmt @"Apply census from entry {mod}.{name} ({mode})"
@@ -94,6 +102,7 @@ cmd opts = do
   modIdx <- liftEffect (Ref.new 0)
   irBuf <- liftEffect (Ref.new [])
   rows <- liftEffect (Ref.new [])
+  gateFailures <- liftEffect (Ref.new [])
   fsEnv <- ForeignSigs.loadEnv { ulibDir, corefnDir: opts.corefnDir }
   let
     buildOptions :: Build.Options
@@ -112,9 +121,13 @@ cmd opts = do
       , rustFfi: Nothing
       }
 
-    recordRows label ir = liftEffect $ Ref.modify_
-      (\rs -> rs <> map (\l -> label <> "\t" <> l) (Array.filter (_ /= "") (String.split (Pattern "\n") ir)))
-      rows
+    -- ADR-0113 §3: the identities are checked on the rows AS RENDERED, per object, before the
+    -- report's index column is prefixed — that column is the file's key, not the renderer's object,
+    -- and parsing the prefixed form would be a second spelling of the row layout.
+    recordRows label ir = do
+      let raw = Array.filter (_ /= "") (String.split (Pattern "\n") ir)
+      liftEffect $ Ref.modify_ (\fs -> fs <> map (\f -> label <> ": " <> f) (checkIdentities (objectOf raw) raw).failures) gateFailures
+      liftEffect $ Ref.modify_ (\rs -> rs <> map (\l -> label <> "\t" <> l) raw) rows
 
     -- Object indices follow the build's own emission order (`emitFile` is called once per object,
     -- in order), so report row `i` pairs with the build's `mod_<i>.ll`.
@@ -153,5 +166,12 @@ cmd opts = do
     Right products -> do
       out <- liftEffect (Ref.read rows)
       FS.writeText opts.outFile (joinWith "\n" (Array.cons ("#index\t" <> String.drop 1 header) out) <> "\n")
-      Log.info $ Fmt.fmt @"✓ censused {n} object(s) (+ entry) → {out}"
+      -- The identities run on the PRODUCTION path, per object, and a violation FAILS the command.
+      -- A gate that exists only in the unit suite describes a report nobody produced; this one
+      -- describes the report that was just written.
+      failures <- liftEffect (Ref.read gateFailures)
+      when (not (Array.null failures)) do
+        Log.error (joinWith "\n" (Array.cons "apply-census: the ADR-0113 §3 identities do not hold:" failures))
+        throw ("apply-census: " <> show (Array.length failures) <> " identity violation(s); see above")
+      Log.info $ Fmt.fmt @"✓ censused {n} object(s) (+ entry), identities hold per object → {out}"
         { n: show (Array.length products.modules), out: opts.outFile }

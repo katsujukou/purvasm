@@ -10,9 +10,11 @@
 # What makes the dynamic numbers trustworthy is that they are checked against counters the runtime
 # was already keeping for its own reasons, and the check is EXACT — not a tolerance:
 #
-#   Σ generic-apply/<reason> + structural-apply == pv_apply_entries    (every generic dispatch that
+#   Σ generic-apply/<reason> + Σ local-deferred-apply/<kind> + foreign-deferred-apply
+#     + structural-apply                          == pv_apply_entries    (every generic dispatch that
 #                                                                       actually entered pv_apply)
-#   Σ generic-tail/<reason>                     == pv_tailcall_writes  (every trampoline store)
+#   Σ generic-tail/<reason> + Σ local-deferred-tail/<kind> + foreign-deferred-tail
+#                                                 == pv_tailcall_writes  (every trampoline store)
 #
 # An off-by-anything means the instrumentation and the emitter disagree about what was emitted —
 # a mis-slotted event, a bump on a path with no call, or a call on a path with no bump. Two
@@ -285,8 +287,13 @@ reconcile() { # $1=slots tsv  $2=stderr file
   # Leaving them out is what made the first self-host `--paired apply` run report a false failure:
   # the via-apply leg summed 208,673,409 against `pv_apply_entries` 638,915,068, and the missing
   # 430,241,659 were exactly the deferred applies. The identity held; the harness could not see it.
-  sum_apply=$(awk -F'\t' 'index($1,"generic-apply/")==1 || $1=="structural-apply" || $1=="foreign-deferred-apply" { s += $2 } END { print s+0 }' "$1")
-  sum_tail=$(awk -F'\t' 'index($1,"generic-tail/")==1 || $1=="foreign-deferred-tail" { s += $2 } END { print s+0 }' "$1")
+  #
+  # ADR-0113 §3 adds the LOCAL-deferred pair for the same reason and with the same consequence: a
+  # candidate is lowered as today's generic dispatch byte for byte, so its executions are inside
+  # `pv_apply_entries`/`pv_tailcall_writes`. Omitting them would report a shortfall of exactly the
+  # candidate population — the ADR-0109 false failure above, repeated one class later.
+  sum_apply=$(awk -F'\t' 'index($1,"generic-apply/")==1 || $1=="structural-apply" || $1=="foreign-deferred-apply" || index($1,"local-deferred-apply/")==1 { s += $2 } END { print s+0 }' "$1")
+  sum_tail=$(awk -F'\t' 'index($1,"generic-tail/")==1 || $1=="foreign-deferred-tail" || index($1,"local-deferred-tail/")==1 { s += $2 } END { print s+0 }' "$1")
   rt_apply="$(field_of "$2" 'purvasm-stats:v1' pv_apply_entries)"
   rt_tail="$(field_of "$2" 'purvasm-stats:v1' pv_tailcall_writes)"
   if [ -z "$rt_apply" ] || [ -z "$rt_tail" ]; then
@@ -366,9 +373,22 @@ ranking() { # $1=slots tsv (aggregated: slot, count)
     END { for (s in n) if (n[s] > 0) printf "%-42s %14d %7.1f%%\n", s, n[s], 100 * n[s] / tot }' "$d" \
     | sort -k2 -rn
   echo
-  printf '%-24s %14s %8s\n' "reason (both forms)" "executions" "share"
-  awk -F'\t' '{ split($1, p, "/"); if (p[1] == "structural-apply") next; r[p[2]] += $2; tot += $2 }
-    END { for (k in r) printf "%-24s %14d %7.1f%%\n", k, r[k], 100 * r[k] / tot }' "$d" \
+  printf '%-30s %14s %8s\n' "population (both forms)" "executions" "share"
+  # The key is <class>/<tail>, and for a generic row the tail is a MissReason that may itself
+  # contain "/" (local-unknown-fn/<origin>), so only the FIRST separator is a field boundary —
+  # `split` on every "/" would fold the seven origins into one bucket named "local-unknown-fn".
+  # Candidate rows are keyed by CandidateKind, in a namespace of their own, because a kind is not a
+  # reason: merging the two would report one "capture" line that is the sum of a population the
+  # emitter CAN act on and one it cannot.
+  awk -F'\t' '{
+      if ($1 == "structural-apply") next
+      slash = index($1, "/")
+      if (slash == 0) next
+      cls = substr($1, 1, slash - 1); rest = substr($1, slash + 1)
+      if (index(cls, "local-deferred-") == 1) k = "candidate/" rest; else k = rest
+      r[k] += $2; tot += $2
+    }
+    END { for (k in r) printf "%-30s %14d %7.1f%%\n", k, r[k], 100 * r[k] / tot }' "$d" \
     | sort -k2 -rn
   alloc_census "$1"
 }
@@ -447,6 +467,40 @@ if [ "$SELF_TEST" = "1" ]; then
   n="$(dispatch_rows "$t/pslots.tsv" | grep -c 'alloc/' || true)"
   if [ "$n" = "0" ]; then printf '  ok    %-46s (%s)\n' "the dispatch family excludes every alloc row" "pass"
   else printf '  FAIL  %-46s (%s alloc rows leaked)\n' "the dispatch family excludes every alloc row" "$n"; st_rc=1; fi
+
+  # --- ADR-0113 §3: the LOCAL-deferred rows must be inside the identities -------------------------
+  # A gate that can be satisfied by the ABSENCE of its own input is not a gate, so each of the three
+  # candidate kinds is injected in each form and the identity asserted. If `reconcile` ever stops
+  # summing these rows, every one of these cases fails — which is what the ADR-0109 false failure
+  # cost when the same omission happened one class earlier.
+  echo
+  echo "== self-test: the ADR-0113 candidate rows are inside the identities ="
+  rcheck() { # $1=label  $2=expected pass|fail  $3=profile body  $4=stats body
+    printf 'purvasm-applyprofile:v1 %b\n' "$3" >"$t/prof.err"
+    printf 'purvasm-stats:v1 %b\n' "$4" >>"$t/prof.err"
+    slots_of "$t/prof.err" "$t/pslots.tsv" >/dev/null 2>&1
+    if reconcile "$t/pslots.tsv" "$t/prof.err" >/dev/null 2>&1; then got=pass; else got=fail; fi
+    if [ "$got" = "$2" ]; then printf '  ok    %-52s (%s)\n' "$1" "$got"
+    else printf '  FAIL  %-52s (expected %s, got %s)\n' "$1" "$2" "$got"; st_rc=1; fi
+  }
+  for kind in capture alias-local alias-global; do
+    rcheck "local-deferred-apply/$kind counts toward pv_apply_entries" pass \
+      "generic-apply/local-unknown-fn/param=3 local-deferred-apply/$kind=7" \
+      "pv_apply_entries=10 pv_tailcall_writes=0"
+    rcheck "local-deferred-tail/$kind counts toward pv_tailcall_writes" pass \
+      "generic-tail/local-unknown-fn/param=2 local-deferred-tail/$kind=5" \
+      "pv_apply_entries=0 pv_tailcall_writes=7"
+  done
+  # …and the mirror: if the runtime total does NOT include them, the identity must FAIL. This is the
+  # row that would have caught the ADR-0109 omission, so it is stated for this class too.
+  rcheck "a candidate row missing from the runtime total FAILS" fail \
+    "generic-apply/local-unknown-fn/param=3 local-deferred-apply/capture=7" \
+    "pv_apply_entries=3 pv_tailcall_writes=0"
+  rcheck "a candidate row counted in the WRONG form FAILS" fail \
+    "local-deferred-apply/capture=7" \
+    "pv_apply_entries=0 pv_tailcall_writes=7"
+  # a three-level generic key must survive the parse intact (local-unknown-fn/<origin>)
+  pcheck "a three-level generic reason row parses" pass "generic-apply/local-unknown-fn/match-binder=4"
 
   # --- the TRANSFER verdict (ADR-0109 §5.1's completion condition for a direct-lowering slice) ---
   # This is the gate the first self-host `--paired apply` run did NOT have: its predecessor only
@@ -986,28 +1040,64 @@ if [ "$SELFHOST" = "1" ]; then
   fi
 
   if [ -f "$WORK/census-work/sites.tsv" ]; then
-    # sites per reason (both forms), from the census's `reason` rows
-    awk -F'\t' '/^#/ { next } $3 == "reason" { split($4, p, "/"); s[p[2]] += $5 }
+    # BOTH sides derive their key by the SAME rule, and it is not `split(…, "/")`: a generic key is
+    # <class>/<reason> where the reason may ITSELF contain a slash (ADR-0113's
+    # `local-unknown-fn/<origin>`), so `p[2]` silently truncates seven origins to one bucket — and a
+    # candidate key is <class>/<kind>, a different namespace whose `p[2]` collides with a reason of
+    # the same spelling ("capture" is both an origin and a kind). Keying them apart is not cosmetic:
+    # merged, one line would be the sum of a population the emitter CAN act on and one it cannot.
+    #
+    # The rule, shared by the two producers below:
+    #   generic-<form>/<reason…>        -> <reason…>              (origin kept)
+    #   local-deferred-<form>/<kind>    -> candidate/<kind>
+    #   foreign-{direct,deferred}-<form>-> foreign/<that class>
+    #   structural-apply                -> dropped (no reason axis)
+    #
+    # sites per population (both forms), from the census's `reason` and `kind` rows
+    awk -F'\t' '/^#/ { next }
+        $3 == "reason" { slash = index($4, "/"); if (slash) s[substr($4, slash + 1)] += $5 }
+        $3 == "kind"   { slash = index($4, "/"); if (slash) s["candidate/" substr($4, slash + 1)] += $5 }
       END { for (k in s) printf "%s\t%d\n", k, s[k] }' "$WORK/census-work/sites.tsv" | sort >"$WORK/sites-by-reason.tsv"
-    # executions per reason (both forms), from this run's DISPATCH slots (an allocation row is a
-    # different measurement on the same line and has no reason axis).
+    # executions per population, from this run's DISPATCH slots (an allocation row is a different
+    # measurement on the same line and has no reason axis).
     dispatch_rows "$WORK/slots.tsv" \
-      | awk -F'\t' '{ split($1, p, "/"); if (p[1] == "structural-apply") next; e[p[2]] += $2 }
+      | awk -F'\t' '{
+            if ($1 == "structural-apply") next
+            slash = index($1, "/")
+            if (slash == 0) { cls = $1; rest = "" } else { cls = substr($1, 1, slash - 1); rest = substr($1, slash + 1) }
+            if (index(cls, "foreign-direct-") == 1) next
+            if (index(cls, "local-deferred-") == 1) k = "candidate/" rest
+            else if (index(cls, "foreign-") == 1) k = "foreign/" cls
+            else if (rest == "") next
+            else k = rest
+            e[k] += $2
+          }
           END { for (k in e) printf "%s\t%d\n", k, e[k] }' | sort >"$WORK/execs-by-reason.tsv"
+    # The DIRECT classes, counted separately. They are calls, not dispatches: no pv_apply entry, no
+    # trampoline write. Keeping them out of the denominator matters on THIS run, where ADR-0109 had
+    # just converted 442.5 M dispatches into direct calls — leaving them in made every dispatch
+    # share read about 2.3x smaller than it is.
+    direct_calls=$(dispatch_rows "$WORK/slots.tsv" | awk -F'\t' 'index($1,"foreign-direct-")==1 { d += $2 } END { print d+0 }')
 
     echo
     echo "== ONE corpus, two measurements ===================================="
-    printf '%-22s %10s %8s %16s %8s %8s\n' "reason" "sites" "share" "executions" "share" "exec/site"
+    printf '%-30s %10s %8s %16s %8s %8s\n' "population" "sites" "share" "executions" "share" "exec/site"
     join -t $'\t' -a1 -a2 -e 0 -o 0,1.2,2.2 "$WORK/sites-by-reason.tsv" "$WORK/execs-by-reason.tsv" \
       | awk -F'\t' '{ r[$1] = 1; s[$1] = $2; e[$1] = $3; ts += $2; te += $3 }
           END {
             for (k in r) {
               ss = ts ? 100 * s[k] / ts : 0; es = te ? 100 * e[k] / te : 0
-              printf "%-22s %10d %7.1f%% %16d %7.1f%% %7.2fx\n", k, s[k], ss, e[k], es, (ss ? es / ss : 0)
+              printf "%-30s %10d %7.1f%% %16d %7.1f%% %7.2fx\n", k, s[k], ss, e[k], es, (ss ? es / ss : 0)
             }
           }' | sort -k4 -rn
     echo
     echo "(exec/site > 1 = the class runs hotter than its share of the code; < 1 = colder.)"
+    echo "(the executions column counts DISPATCHES only, so its total is pv_apply_entries +"
+    echo " pv_tailcall_writes. A direct call is a different operation and is excluded:"
+    echo " $direct_calls foreign-direct calls in this run, the population ADR-0109 moved.)"
+    echo "(the executions column counts DISPATCHES only — its total is pv_apply_entries +"
+    echo " pv_tailcall_writes. Direct calls are a different operation and are excluded:"
+    echo " $(cat "$WORK/direct-calls.txt" 2>/dev/null || echo 0) foreign-direct calls in this run, ADR-0109's population.)"
   fi
 
   echo
