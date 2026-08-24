@@ -22,17 +22,15 @@ module Purvasm.VM.Image
 
 import Prelude
 
-import Data.Array as Array
 import Data.Either (Either(..), note)
 import Data.Int as Int
 import Data.Maybe (Maybe(..))
-import Data.String.Common (joinWith)
 import Data.Traversable (traverse)
 import Data.Tuple (Tuple)
 import Data.Tuple.Nested (type (/\), (/\))
 import Purvasm.Abi.Float64 as Float64
 import Purvasm.VM.Image.Json (Json(..), entry, parseJson)
-import Purvasm.VM.Instruction (CodeBlock, Instruction(..), Literal(..), PrimOp(..))
+import Purvasm.VM.Instruction (CodeBlock, GuardClause, Instruction(..), Literal(..), PrimOp(..))
 
 -- | A global's shape, as the linker wrote it: a function of known parameters, a by-need constant, or
 -- | a recursive group member (which is a constant whose construction may refer to the group).
@@ -49,65 +47,75 @@ type Image =
   , isEffect :: Boolean
   }
 
--- | The format versions this reader understands. Bumped in lockstep with the producer by §4's paired
--- | changes; anything else is refused rather than guessed, since a misparse of a *stale* image is the
--- | failure the stamp exists to make loud (ADR-0110 §Consequences).
+-- | The format version this reader understands: leaf arities on `ForeignRef` (§4(a)) and tree-shaped
+-- | `case` dispatch (§4(b)). Bumped in lockstep with the producer; anything else is refused rather
+-- | than guessed, since a misparse of a *stale* image is the failure the stamp exists to make loud
+-- | (ADR-0110 §Consequences).
 -- |
--- | Two are accepted while the migration runs. Version 4 is the one this VM is *for*: its
--- | `ForeignRef` carries the leaf's physical arity (§4(a)), without which the VM cannot build the
--- | leaf's closure. Version 3 is boot's format, still accepted because a foreign-free program is
--- | identical in both and the compiler emits it for boot anyway — but a version-3 `ForeignRef` is
--- | refused below rather than guessed at.
-supportedVersions :: Array Int
-supportedVersions = [ 3, foreignArityVersion ]
-
--- | The version whose `ForeignRef` carries an arity.
-foreignArityVersion :: Int
-foreignArityVersion = 4
+-- | **One** version, now that the migration is over. The two it replaced are named in the refusal
+-- | rather than read:
+-- |
+-- |   * **3** is boot's, and boot is the runner for it — this VM read foreign-free version-3 images
+-- |     only for as long as the two runners were being compared on the same compilation (§6 step C),
+-- |     which is done and recorded.
+-- |   * **4** was this format with linearised `case`s. It existed for that comparison alone, and
+-- |     nothing produces or keeps one.
+supportedVersion :: Int
+supportedVersion = 5
 
 decodeImage :: String -> Either String Image
 decodeImage text = do
   json <- parseJson text
   fields <- object "the image" json
   version <- field "version" fields >>= int "version"
-  when (not (Array.elem version supportedVersions)) $ Left
+  when (version /= supportedVersion) $ Left
     ( "unsupported image format version " <> show version
-        <> " (this VM reads versions "
-        <> joinWith ", " (map show supportedVersions)
+        <> " (this VM reads version "
+        <> show supportedVersion
+        <> reason version
         <> "); rebuild the image with a matching compiler"
     )
-  gdefs <- field "gdefs" fields >>= array "gdefs" >>= traverse (gdefEntry version)
-  main <- field "main" fields >>= chunk version "main"
+  gdefs <- field "gdefs" fields >>= array "gdefs" >>= traverse gdefEntry
+  main <- field "main" fields >>= chunk "main"
   isEffect <- field "effect" fields >>= boolean "effect"
   pure { gdefs, main, isEffect }
 
 -- | `version` is threaded down to every instruction rather than consulted once: an opcode's shape is
 -- | only meaningful under the version that declared it, and a reader that accepts a shape from the
 -- | wrong version is guessing at what the producer meant — the thing the stamp exists to prevent.
-gdefEntry :: Int -> Json -> Either String (String /\ Gdef)
-gdefEntry version j = case j of
-  JArray [ JString name, body ] -> (\g -> name /\ g) <$> gdef version name body
+-- | What to add to an unsupported-version refusal when the version is one this VM used to read. A
+-- | bare number tells the reader nothing about which runner it should have used.
+reason :: Int -> String
+reason = case _ of
+  3 -> "; version 3 is boot's format — run it with `purvm`"
+  4 -> "; version 4 was the linear-`case` form of the step-C comparison and is no longer produced"
+  _ -> ""
+
+gdefEntry :: Json -> Either String (String /\ Gdef)
+gdefEntry j = case j of
+  JArray [ JString name, body ] -> (\g -> name /\ g) <$> gdef name body
   _ -> Left "a gdef entry must be [name, definition]"
 
-gdef :: Int -> String -> Json -> Either String Gdef
-gdef version name j = case j of
-  JArray [ JString "fn", params, body ] -> Gfun <$> strings ("the parameters of " <> name) params <*> chunk version name body
-  JArray [ JString "caf", body ] -> Gcaf <$> chunk version name body
-  JArray [ JString "rec", body ] -> Grec <$> chunk version name body
+gdef :: String -> Json -> Either String Gdef
+gdef name j = case j of
+  JArray [ JString "fn", params, body ] -> Gfun <$> strings ("the parameters of " <> name) params <*> chunk name body
+  JArray [ JString "caf", body ] -> Gcaf <$> chunk name body
+  JArray [ JString "rec", body ] -> Grec <$> chunk name body
   _ -> Left ("unrecognised global definition for " <> name)
 
-chunk :: Int -> String -> Json -> Either String CodeBlock
-chunk version what j = array what j >>= traverse (instruction version what)
+chunk :: String -> Json -> Either String CodeBlock
+chunk what j = array what j >>= traverse (instruction what)
 
-instruction :: Int -> String -> Json -> Either String Instruction
-instruction version what j = case j of
+instruction :: String -> Json -> Either String Instruction
+instruction what j = case j of
   JArray [ JString "pi", n ] -> PushInt <$> int what n
   JArray [ JString "pb", b ] -> PushBool <$> boolean what b
   JArray [ JString "ps", s ] -> PushString <$> string what s
+  JArray [ JString "pn", n ] -> PushNumber <$> (string what n >>= number what)
   JArray [ JString "ld", s ] -> Load <$> string what s
   JArray [ JString "bd", s ] -> Bind <$> string what s
-  JArray [ JString "cl", ps, body ] -> Closure <$> strings what ps <*> chunk version what body
-  JArray [ JString "mr", ms ] -> MakeRec <$> (array what ms >>= traverse (recMember version what))
+  JArray [ JString "cl", ps, body ] -> Closure <$> strings what ps <*> chunk what body
+  JArray [ JString "mr", ms ] -> MakeRec <$> (array what ms >>= traverse (recMember what))
   JArray [ JString "ct", tag, arity, n ] -> Ctor <$> string what tag <*> int what arity <*> int what n
   JArray [ JString "rc", ls ] -> Record <$> strings what ls
   JArray [ JString "arr", n ] -> Array <$> int what n
@@ -121,14 +129,18 @@ instruction version what j = case j of
   JArray [ JString "rt" ] -> Right Return
   JArray [ JString "jp", r ] -> Jump <$> int what r
   JArray [ JString "ju", r ] -> JumpUnless <$> int what r
+  -- Tree-shaped dispatch (§4(b)): an arm carries its own block. The same tags the linear form used —
+  -- the version stamp says which shape they hold, so a stale image cannot parse as a fresh one.
   JArray [ JString "sc", cs, d ] ->
-    SwitchCtorRel <$> (array what cs >>= traverse (arm what (string what))) <*> int what d
+    SwitchCtor <$> (array what cs >>= traverse (arm what (string what))) <*> chunk what d
   JArray [ JString "sl", cs, d ] ->
-    SwitchLitRel <$> (array what cs >>= traverse (arm what (literal what))) <*> int what d
+    SwitchLit <$> (array what cs >>= traverse (arm what (literal what))) <*> chunk what d
   JArray [ JString "sn", cs, d ] ->
-    SwitchLenRel <$> (array what cs >>= traverse (arm what (int what))) <*> int what d
+    SwitchLen <$> (array what cs >>= traverse (arm what (int what))) <*> chunk what d
+  JArray [ JString "gd", cs, ft ] ->
+    Guarded <$> (array what cs >>= traverse (guardClause what)) <*> chunk what ft
   JArray [ JString "fl", m ] -> Fail <$> string what m
-  JArray [ JString "fr", k, n ] | version >= foreignArityVersion -> do
+  JArray [ JString "fr", k, n ] -> do
     key <- string what k
     arity <- int what n
     -- A leaf's physical closure arity is a count. The writer emits an impossible -1 only where its own
@@ -137,36 +149,33 @@ instruction version what j = case j of
     when (arity < 0) $ Left
       ("in " <> what <> ": the native leaf " <> key <> " has a negative arity (" <> show arity <> ")")
     pure (ForeignRef key arity)
-  -- A version-3 image spells the same leaf without its arity, and there is nothing in the image to
-  -- recover it from — boot's VM answers from a compiled-in registry this VM deliberately does not have.
+  -- The pre-§4(a) spelling, which carries nothing to recover the arity from — boot's VM answers it
+  -- from a compiled-in registry this VM deliberately does not have. Reachable only from an image the
+  -- version check should already have refused, so it names the format rather than the instruction.
   JArray [ JString "fr", _ ] -> Left
     ( "in " <> what
-        <> ": a foreign reference without an arity, which the VM needs before it can build the leaf's "
-        <> "closure (ADR-0110 §4(a)); rebuild the image at version "
-        <> show foreignArityVersion
+        <> ": a foreign reference without an arity — a pre-version-"
+        <> show supportedVersion
+        <> " image that the version stamp did not declare as one"
     )
-  -- Reached only below version 4: the shape is right but the stamp says the producer could not have
-  -- meant it. Refused rather than read, because a stamp that a reader overrides is not a stamp.
-  JArray [ JString "fr", _, _ ] -> Left
-    ( "in " <> what
-        <> ": an arity-carrying foreign reference is version-"
-        <> show foreignArityVersion
-        <> " syntax, but this image declares version "
-        <> show version
-    )
-  JArray [ JString "pn", n ] -> PushNumber <$> (string what n >>= number what)
   _ -> Left ("in " <> what <> ": unrecognised instruction")
 
-recMember :: Int -> String -> Json -> Either String (String /\ CodeBlock)
-recMember version what j = case j of
-  JArray [ JString name, body ] -> (\c -> name /\ c) <$> chunk version name body
+-- | One clause of a guard chain: its test and the body that runs when the test leaves `true`.
+guardClause :: String -> Json -> Either String GuardClause
+guardClause what j = case j of
+  JArray [ g, r ] -> { guard: _, rhs: _ } <$> chunk what g <*> chunk what r
+  _ -> Left ("in " <> what <> ": a guard clause must be [guard, body]")
+
+recMember :: String -> Json -> Either String (String /\ CodeBlock)
+recMember what j = case j of
+  JArray [ JString name, body ] -> (\c -> name /\ c) <$> chunk name body
   _ -> Left ("in " <> what <> ": a recursive-group member must be [name, chunk]")
 
--- | One switch arm: its discriminant, decoded by `discriminant`, and its relative offset.
-arm :: forall d. String -> (Json -> Either String d) -> Json -> Either String (d /\ Int)
+-- | One switch arm: its discriminant, decoded by `discriminant`, and the block it runs.
+arm :: forall d. String -> (Json -> Either String d) -> Json -> Either String (d /\ CodeBlock)
 arm what discriminant j = case j of
-  JArray [ d, off ] -> (\x o -> x /\ o) <$> discriminant d <*> int what off
-  _ -> Left ("in " <> what <> ": a switch arm must be [discriminant, offset]")
+  JArray [ d, body ] -> (\x b -> x /\ b) <$> discriminant d <*> chunk what body
+  _ -> Left ("in " <> what <> ": a switch arm must be [discriminant, block]")
 
 -- | A `Number` literal: the writer emits the *signed 64-bit decimal spelling of the IEEE-754 bit
 -- | pattern* rather than a decimal fraction, precisely so the value survives the round trip exactly

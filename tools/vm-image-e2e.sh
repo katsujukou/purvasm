@@ -107,18 +107,22 @@ echo "== a real image, produced by \`purvasm run\` (§6 slice 2, step A) =="
 # native leaf, and this is what that looks like end to end.
 if node "$ROOT/cli/index.node.js" run --corefn-dir "$COREFN_DIR" --outdir "$WORK/img" \
      --entry VMGate.Quiet >"$WORK/run.log" 2>&1; then
-  if "$VM" --image "$WORK/img/app.v4.pvm" >"$WORK/real.out" 2>"$WORK/real.err"; then
+  if "$VM" --image "$WORK/img/app.owned.pvm" >"$WORK/real.out" 2>"$WORK/real.err"; then
     printf '  %-24s -> the owned VM ran a linked image OK\n' real-image
   else
     printf '  %-24s -> the owned VM could not run it FAIL\n' real-image; rc=1
     sed 's/^/      /' "$WORK/real.err" >&2
   fi
-  # The legacy form of the SAME program still decodes here: the reader accepts both versions while
-  # the two runners coexist (§4(a)), and a change that quietly dropped version 3 would strand boot.
+  # boot's copy of the SAME program is refused, and refused by NAME. After §4(b) this reader takes
+  # one version; a bare "unsupported version 3" would leave someone holding boot's image with
+  # nothing to do about it. The image is still emitted — boot runs it, and the two runners are still
+  # held to the same output — so what is asserted here is the handoff, not the absence.
   if "$VM" --image "$WORK/img/app.pvm" >/dev/null 2>"$WORK/legacy.err"; then
-    printf '  %-24s -> the legacy version-3 image still decodes OK\n' legacy-image
+    printf '  %-24s -> the reader accepted a version-3 image FAIL\n' legacy-image; rc=1
+  elif grep -q boot "$WORK/legacy.err" && grep -q purvm "$WORK/legacy.err"; then
+    printf '  %-24s -> a version-3 image is refused, naming purvm as its runner OK\n' legacy-image
   else
-    printf '  %-24s -> the reader stopped accepting version 3 FAIL\n' legacy-image; rc=1
+    printf '  %-24s -> refused for the wrong reason FAIL\n' legacy-image; rc=1
     sed 's/^/      /' "$WORK/legacy.err" >&2
   fi
 else
@@ -132,8 +136,8 @@ echo "== the guest's own argv (ADR-0075 §4, step C) =="
 # nothing else here would notice: the corpus would simply run at its default size.
 if node "$ROOT/cli/index.node.js" run --corefn-dir "$COREFN_DIR" --outdir "$WORK/img2" \
      --entry VMGate.Argv >"$WORK/run2.log" 2>&1; then
-  got="$("$VM" --image "$WORK/img2/app.v4.pvm" -- alpha beta 2>"$WORK/argv.err")"
-  want="$WORK/img2/app.v4.pvm|alpha|beta"
+  got="$("$VM" --image "$WORK/img2/app.owned.pvm" -- alpha beta 2>"$WORK/argv.err")"
+  want="$WORK/img2/app.owned.pvm|alpha|beta"
   if [ "$got" = "$want" ]; then
     printf '  %-24s -> the guest sees [image] ++ its own arguments OK\n' guest-argv
   else
@@ -142,8 +146,8 @@ if node "$ROOT/cli/index.node.js" run --corefn-dir "$COREFN_DIR" --outdir "$WORK
   fi
   # The VM's own flags are the VM's. A guest that could see them would change behaviour when the VM
   # grew a flag, and the `--` separator is what makes that impossible rather than unlikely.
-  got_bare="$("$VM" --image "$WORK/img2/app.v4.pvm" --count 2>/dev/null)"
-  if [ "$got_bare" = "$WORK/img2/app.v4.pvm" ]; then
+  got_bare="$("$VM" --image "$WORK/img2/app.owned.pvm" --count 2>/dev/null)"
+  if [ "$got_bare" = "$WORK/img2/app.owned.pvm" ]; then
     printf '  %-24s -> the VM'"'"'s own flags never reach the guest OK\n' guest-argv-flags
   else
     printf '  %-24s -> saw %s FAIL\n' guest-argv-flags "$got_bare"; rc=1
@@ -177,7 +181,7 @@ if node "$ROOT/cli/index.node.js" run --corefn-dir "$COREFN_DIR" --outdir "$WORK
   if node -e '
       const fs = require("fs");
       const img = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-      if (img.version !== 4) { console.error("version " + img.version + ", expected 4"); process.exit(1); }
+      if (img.version !== 5) { console.error("version " + img.version + ", expected 5"); process.exit(1); }
       const keys = new Set();
       const walk = (x) => {
         if (!Array.isArray(x)) return;
@@ -193,14 +197,20 @@ if node "$ROOT/cli/index.node.js" run --corefn-dir "$COREFN_DIR" --outdir "$WORK
       const missing = want.filter((k) => !keys.has(k));
       if (missing.length) { console.error("expected leaves absent: " + missing.join(", ") + "; found " + [...keys].join(", ")); process.exit(1); }
       if (/"ld","Purvasm\./.test(fs.readFileSync(process.argv[1], "utf8"))) { console.error("a native key is still loaded as a global"); process.exit(1); }
-    ' "$WORK/leafimg/app.v4.pvm" 2>"$WORK/emit.err"; then
+      // §4(b): a switch arm is a block, never an offset. An integer where a block belongs means the
+      // producer regressed to the linear form — and a reader would take the offset for a block.
+      const flat = JSON.stringify(img);
+      if (/\\["sc",\\[\\["[^"]*",\\d+\\]/.test(flat) || /\\["sn",\\[\\[\\d+,\\d+\\]/.test(flat)) {
+        console.error("a switch arm carries an offset, not a block"); process.exit(1);
+      }
+    ' "$WORK/leafimg/app.owned.pvm" 2>"$WORK/emit.err"; then
     printf '  %-24s -> leaves emitted as ForeignRef key arity OK\n' leaf-emission
   else
     printf '  %-24s -> FAIL\n' leaf-emission; rc=1
     sed 's/^/      /' "$WORK/emit.err" >&2
   fi
 
-  if "$VM" --image "$WORK/leafimg/app.v4.pvm" >"$WORK/leaf.out" 2>"$WORK/leaf.err"; then
+  if "$VM" --image "$WORK/leafimg/app.owned.pvm" >"$WORK/leaf.out" 2>"$WORK/leaf.err"; then
     printf '  %-24s -> the owned VM ran a program with native leaves OK\n' leaf-run
     if [ -x "$BOOT_VM" ]; then
       if "$BOOT_VM" run "$WORK/leafimg/app.pvm" >"$WORK/leaf.boot" 2>/dev/null \

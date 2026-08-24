@@ -6,7 +6,7 @@ module Purvasm.Compiler.Bytecode.Image where
 
 import Prelude
 
-import Data.Array (filter, fromFoldable, null) as Array
+import Data.Array (concatMap, filter, fromFoldable, null) as Array
 import Data.Char (toCharCode)
 import Data.Foldable (foldl)
 import Data.Either (Either(..))
@@ -26,6 +26,7 @@ import Data.Tuple (Tuple(..))
 import Data.Tuple.Nested (type (/\), (/\))
 import Purvasm.Compiler.Bytecode.Codegen (Gdef(..))
 import Purvasm.Compiler.Bytecode.Instruction (CodeBlock, Instruction(..))
+import Purvasm.Compiler.Bytecode.Linearise (linearise)
 import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.Primitive (PrimOp(..))
 import Purvasm.Compiler.Util.Int64Decimal (int64BitsDecimal)
@@ -36,17 +37,19 @@ import Purvasm.Number (floatBitsHi, floatBitsLo)
 formatVersion :: Int
 formatVersion = 3
 
--- | The **linked image** format that carries each native leaf's physical arity on its `ForeignRef`
--- | ([ADR-0110](../../../../../docs/design-decisions/0110-owned-vm-purescript-native.md) §4(a)). Only
--- | the `app.pvm` version field moves: `.pmo`/`.pmi` stay at `formatVersion`, since boot reads those
--- | and the arity is a *link-time* fact the linker resolves from the whole closure's FSR shapes.
+-- | The **linked image** format the owned VM reads: each native leaf's `ForeignRef` carries its
+-- | physical arity (§4(a)) and each `case` keeps its tree shape (§4(b)).
 -- |
--- | boot's frozen VM cannot read it — its reader accepts `["fr", key]` and nothing else — which is the
--- | whole reason the two forms are emitted side by side during the migration: boot keeps running the
--- | legacy image while the owned VM runs this one, and the pair is what makes the changeover
--- | measurable (ADR-0110 §6, step C).
-foreignArityVersion :: Int
-foreignArityVersion = 4
+-- | Only the `app.pvm` version field moves. `.pmo`/`.pmi` stay at `formatVersion` and stay linear:
+-- | the arity is a *link-time* fact (the linker resolves it from the whole closure's FSR shapes), and
+-- | nothing reads a `.pmo` but this compiler.
+-- |
+-- | Version **4** was this format with linear `case`s. It existed for one purpose — letting boot and
+-- | the owned VM be compared on instruction counts over the same compilation (§6 step C) — and that
+-- | comparison is done and recorded, so it is no longer produced or read. Version **3** still is:
+-- | boot's frozen VM reads it, and the two runners are still held to the same *output*.
+treeVersion :: Int
+treeVersion = 5
 
 -- | How a `ForeignRef` is written. The legacy form drops the arity, because that is the only form
 -- | boot's reader accepts; `ArityFrom` writes it, looked up in the link-time leaf map.
@@ -206,9 +209,20 @@ instrToJsonWith fa i = case i of
   Return -> t "rt" []
   Jump r -> t "jp" [ JInt r ]
   JumpUnless r -> t "ju" [ JInt r ]
-  SwitchCtor cs d -> t "sc" [ JArr (map (\(tag /\ r) -> JArr [ JStr tag, JInt r ]) cs), JInt d ]
-  SwitchLit cs d -> t "sl" [ JArr (map (\(l /\ r) -> JArr [ litToJson l, JInt r ]) cs), JInt d ]
-  SwitchLen cs d -> t "sn" [ JArr (map (\(k /\ r) -> JArr [ JInt k, JInt r ]) cs), JInt d ]
+  -- The tree form (§4(b)) and the linearised one share their tags: a reader knows which it is looking
+  -- at from the image's version stamp, exactly as it does for `fr`'s arity. Giving the flattened form
+  -- its own tags would let a version-3 image carry a version-5 shape and still parse.
+  SwitchCtor cs d -> t "sc" [ JArr (map (\(tag /\ b) -> JArr [ JStr tag, chunkToJsonWith fa b ]) cs), chunkToJsonWith fa d ]
+  SwitchLit cs d -> t "sl" [ JArr (map (\(l /\ b) -> JArr [ litToJson l, chunkToJsonWith fa b ]) cs), chunkToJsonWith fa d ]
+  SwitchLen cs d -> t "sn" [ JArr (map (\(k /\ b) -> JArr [ JInt k, chunkToJsonWith fa b ]) cs), chunkToJsonWith fa d ]
+  Guarded cs ft ->
+    t "gd"
+      [ JArr (map (\c -> JArr [ chunkToJsonWith fa c.guard, chunkToJsonWith fa c.rhs ]) cs)
+      , chunkToJsonWith fa ft
+      ]
+  SwitchCtorRel cs d -> t "sc" [ JArr (map (\(tag /\ r) -> JArr [ JStr tag, JInt r ]) cs), JInt d ]
+  SwitchLitRel cs d -> t "sl" [ JArr (map (\(l /\ r) -> JArr [ litToJson l, JInt r ]) cs), JInt d ]
+  SwitchLenRel cs d -> t "sn" [ JArr (map (\(k /\ r) -> JArr [ JInt k, JInt r ]) cs), JInt d ]
   Fail m -> t "fl" [ JStr m ]
   where
   t tag rest = JArr ([ JStr tag ] <> rest)
@@ -247,14 +261,32 @@ imageToJson img = JObj
   , "effect" /\ JBool img.isEffect
   ]
 
+-- | boot's version-3 image: the `case`s flattened back to relative offsets on the way out
+-- | (`Linearise`), because that is the only shape its reader knows.
 imageToString :: Image -> String
-imageToString = stringify <<< imageToJson
+imageToString = stringify <<< imageToJson <<< lineariseImage
 
--- | The same program in the arity-carrying format (ADR-0110 §4(a)): every `ForeignRef` gains the
--- | leaf's **physical closure arity**, so a VM can build the leaf's closure without a compiled-in
--- | registry of its own — the fact boot's VM supplies from `Ffi.foreign_arity` and an owned VM has no
--- | way to know. `arities` is `NativeLeaf.nativeLeafArities` over the whole closure's FSR shapes, the
--- | same derivation the backends use to decide which keys are leaves at all.
+-- | Every chunk of an image through `Linearise.linearise`.
+lineariseImage :: Image -> Image
+lineariseImage img = img
+  { gdefs = map (\(n /\ g) -> n /\ lineariseGdef g) img.gdefs
+  , main = linearise img.main
+  }
+
+lineariseGdef :: Gdef -> Gdef
+lineariseGdef = case _ of
+  Gfun ps c -> Gfun ps (linearise c)
+  Gcaf c -> Gcaf (linearise c)
+  Grec c -> Grec (linearise c)
+
+-- | The same program in the owned VM's format: every `ForeignRef` gains the leaf's **physical
+-- | closure arity** (ADR-0110 §4(a)) and every `case` keeps its **tree shape** (§4(b)).
+-- |
+-- | The arity is the fact boot's VM supplies from `Ffi.foreign_arity` and an owned VM has no way to
+-- | know; `arities` is `NativeLeaf.nativeLeafArities` over the whole closure's FSR shapes, the same
+-- | derivation the backends use to decide which keys are leaves at all. The tree is simply not
+-- | flattened on the way out — unlike `imageToString`, which must, because boot's reader knows only
+-- | offsets.
 -- |
 -- | `Left` when the image references a leaf the map does not describe. That is a wiring fault rather
 -- | than a user error, but it is reported as data instead of a crash because it is genuinely
@@ -280,7 +312,7 @@ imageToJsonWith fa img = JObj
   where
   version = case fa of
     ArityErased -> formatVersion
-    ArityFrom _ -> foreignArityVersion
+    ArityFrom _ -> treeVersion
 
 -- | The `ForeignRef` keys the image references but `arities` does not describe, sorted. Collected
 -- | over the same tree the writer walks — gdef bodies and the `main` chunk, descending into nested
@@ -305,4 +337,10 @@ foreignRefKeys img =
     ForeignRef k -> Set.singleton k
     Closure _ body -> chunkKeys body
     MakeRec ms -> foldl (\acc (_ /\ c) -> Set.union acc (chunkKeys c)) Set.empty ms
+    SwitchCtor cs d -> arms (map (\(_ /\ b) -> b) cs) d
+    SwitchLit cs d -> arms (map (\(_ /\ b) -> b) cs) d
+    SwitchLen cs d -> arms (map (\(_ /\ b) -> b) cs) d
+    Guarded cs ft -> arms (Array.concatMap (\c -> [ c.guard, c.rhs ]) cs) ft
     _ -> Set.empty
+
+  arms blocks default = foldl (\acc b -> Set.union acc (chunkKeys b)) (chunkKeys default) blocks

@@ -128,11 +128,12 @@ if [ "$OPT_EFFECT" = "1" ]; then
   guest_out() { "$PURVM" run "$1" "$2" 2>/dev/null; }
 
   # The owned VM (ADR-0110), run alongside boot's on the SAME compilation: `l2_compile` writes both
-  # image forms, so `app.pvm` (version 3) goes to boot and `app.v4.pvm` (version 4, carrying each
-  # native leaf's arity) goes here. §4(a) adds metadata without touching the instruction sequence, so
-  # the two runners must agree on the COUNT, not merely on the output — and that equality is available
-  # exactly once, while both runners exist. Step D changes what a count means (a `case` stops being a
-  # linear region), and boot's leg comes out then.
+  # image forms, so `app.pvm` (version 3) goes to boot and `app.owned.pvm` goes here.
+  #
+  # What is compared is the **output**. The two runners were also held to equal instruction counts
+  # while §4(a) was the only difference (§6 step C — taken, 8/8, and recorded in the ADR); §4(b)'s
+  # tree dispatch then changed what a step is, so equal counts would no longer mean the same program
+  # ran. The owned VM's own counts are the measurement field's baseline from here on.
   #
   # Opt-in by path because building the owned VM is a native link of minutes; when it is absent the
   # legs below say SKIPPED rather than passing quietly.
@@ -177,12 +178,11 @@ if [ "$OPT_EFFECT" = "1" ]; then
   # that failed produces empty output — which any content-based diagnosis below would misread.
   owned_out() { "$OWNED_VM" ${OWNED_FFI:+--ffi "$OWNED_FFI"} --image "$1" -- "$2" 2>"$OUT/owned.err"; }
   # Whether the owned VM's guest reads the size at all: the same image run at two different sizes.
-  # An identical count means the argument never reached the program — which is the known gap (the VM
-  # does not virtualise argv, so the guest reads the VM's own command line) rather than a
-  # disagreement between the runners. Asked of the owned VM alone, so no assumption about how boot's
-  # own flag parsing would treat a mimicked command line can creep into the attribution.
+  # Identical output means the argument never reached the program — an argv-injection regression
+  # rather than the two runners disagreeing. Asked of the owned VM alone, so no assumption about how
+  # boot's flag parsing would treat a mimicked command line can creep into the attribution.
   owned_ignores_size() {
-    [ "$(owned_count "$1" "$2")" = "$(owned_count "$1" "$3")" ]
+    [ "$(owned_out "$1" "$2")" = "$(owned_out "$1" "$3")" ]
   }
   now() { perl -MTime::HiRes=time -e 'printf "%.3f", time'; }
   pmo_bytes() { cat "$1"/_build/*.pmo 2>/dev/null | wc -c | tr -d ' '; }
@@ -200,7 +200,8 @@ if [ "$OPT_EFFECT" = "1" ]; then
   else
     echo "owned VM: SKIPPED (set PURVASM_VM to the built owned VM to run the ADR-0110 step-C leg)" | tee "$optsum"
   fi
-  printf '%-16s %-10s %14s %14s %8s %7s %7s %7s %8s\n' bench n opt no-opt ratio 'red%' 'size×' 'time×' owned | tee -a "$optsum"
+  printf '%-16s %-10s %14s %14s %8s %7s %7s %7s %8s %14s %14s %8s\n' \
+    bench n opt no-opt ratio 'red%' 'size×' 'time×' owned 'own-opt' 'own-no-opt' 'own-r' | tee -a "$optsum"
   echo "$BENCH_TABLE" | while read -r name module start heap; do
     [ -n "$name" ] || continue
     if [ -n "$ONLY" ] && ! echo "$ONLY" | tr ' ' '\n' | grep -qx "$name"; then continue; fi
@@ -275,48 +276,43 @@ if [ "$OPT_EFFECT" = "1" ]; then
       owned="≡"
       for m in opt noopt; do
         [ "$m" = "opt" ] && d="$odir" || d="$ndir"
-        [ "$m" = "opt" ] && bi="$oi" || bi="$ni"
         [ "$m" = "opt" ] && bo="$oo" || bo="$no"
-        if [ ! -f "$d/app.v4.pvm" ]; then
-          owned="NO-V4-IMAGE($m)"; touch "$OUT/.opt-failed"; break
+        if [ ! -f "$d/app.owned.pvm" ]; then
+          owned="NO-IMAGE($m)"; touch "$OUT/.opt-failed"; break
         fi
-        if ! vo=$(owned_out "$d/app.v4.pvm" "$start"); then
+        if ! vo=$(owned_out "$d/app.owned.pvm" "$start"); then
           owned="REFUSED($m)"; touch "$OUT/.opt-failed"
           sed 's/^/    /' "$OUT/owned.err" >>"$optsum"
           break
         fi
         if [ "$vo" != "$bo" ]; then
-          # Name the cause when it is the known one. The corpus reads its input size from the guest's
-          # argv (ADR-0075 §4), and the owned VM does not yet give a guest an argv of its own: it
-          # resolves `argvImpl` through the runtime, which reports the VM's OWN command line. So the
-          # program runs at its default size no matter what is passed here, and the two legs measure
-          # different inputs. Distinguished from a real divergence by re-running with no size at all:
-          # identical output means the argument was never seen.
-          if [ "$vo" = "$(owned_out "$d/app.v4.pvm" '')" ]; then
+          # Name the cause when it is a known one rather than reporting a bare mismatch. The corpus
+          # reads its input size from the guest's argv (ADR-0075 §4); if the owned run is insensitive
+          # to a doubled size, the guest never received one and the argv injection has regressed —
+          # which is a different bug from the two runners disagreeing about the program.
+          if owned_ignores_size "$d/app.owned.pvm" "$start" "$((start * 2))"; then
             owned="ARGV($m)"
           else
             owned="OUT($m)"
           fi
           touch "$OUT/.opt-failed"; break
         fi
-        vi=$(owned_count "$d/app.v4.pvm" "$start")
-        if [ -z "$vi" ] || [ "$vi" != "$bi" ]; then
-          # The known cause first, established rather than assumed: the corpus reads its input size
-          # from argv, and the owned VM's guest reads the VM's OWN command line, so it parses
-          # "--image" where boot parses the size. Same program, different input — `Int.fromString`
-          # over a longer string is the whole difference, and the program then runs at its default
-          # size. Doubling the size we pass settles which it is: a count that does not move never saw
-          # the argument.
-          if owned_ignores_size "$d/app.v4.pvm" "$start" "$((start * 2))"; then
-            owned="ARGV($m)"
-          else
-            owned="COUNT($m:$vi/$bi)"
-          fi
-          touch "$OUT/.opt-failed"; break
-        fi
       done
+      # The owned VM's OWN counts: the measurement field's baseline from §4(b) on (ADR-0110 §6's
+      # pinned terms). Reported, not compared — boot's numbers describe a different instruction
+      # vocabulary now, and the ratio here is the one an optimiser change should move.
+      if [ "$owned" = "≡" ]; then
+        voi=$(owned_count "$odir/app.owned.pvm" "$start")
+        vni=$(owned_count "$ndir/app.owned.pvm" "$start")
+        oratio=$(awk -v n="$vni" -v o="$voi" 'BEGIN { if (o > 0) printf "%.3f", n / o; else printf "n/a" }')
+      else
+        voi="-"; vni="-"; oratio="-"
+      fi
+    else
+      voi="-"; vni="-"; oratio="-"
     fi
-    printf '%-16s %-10s %14s %14s %8s %7s %7s %7s %8s%s\n' "$name" "$start" "$oi" "$ni" "$ratio" "$red" "$sizer" "$timer" "$owned" "$gate" | tee -a "$optsum"
+    printf '%-16s %-10s %14s %14s %8s %7s %7s %7s %8s %14s %14s %8s%s\n' \
+      "$name" "$start" "$oi" "$ni" "$ratio" "$red" "$sizer" "$timer" "$owned" "$voi" "$vni" "$oratio" "$gate" | tee -a "$optsum"
   done
   # The self-compile size leg (ADR-0089 self-compile extension): the compiler's own closure is
   # the regression gate for the inliner blow-up class the five bench closures cannot see

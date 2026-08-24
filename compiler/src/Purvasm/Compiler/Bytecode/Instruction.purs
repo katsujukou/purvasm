@@ -46,20 +46,42 @@ data Instruction
   | Return
   | Jump Int
   | JumpUnless Int
-  -- Decision-tree dispatch (ADR-0031). Each pops the inspected occurrence value and
-  -- branches by its discriminant to a matching case (relative offset) or, failing
-  -- that, the default (relative). A value the wrong *kind* (e.g. a non-data value
-  -- under [Switch_ctor]) is stuck (type-impossible, as in the oracle's matcher); a
-  -- well-typed discriminant that no case names takes the default edge (a value-level
-  -- non-match). [Switch_lit] branches on a scalar literal, [Switch_len] on a
-  -- `Varray`'s length (ADR-0012: a different length is a value-level non-match).
-  | SwitchCtor (Array (String /\ Int)) Int
-  | SwitchLit (Array (Literal /\ Int)) Int
-  | SwitchLen (Array (Int /\ Int)) Int
+  -- Decision-tree dispatch (ADR-0031/0083), **tree-shaped** (ADR-0110 §4(b)): each pops the
+  -- inspected occurrence value and runs the arm whose discriminant matches, else the default. An arm
+  -- is a nested block that yields the `case`'s value, and control resumes in the enclosing block —
+  -- which is what the linear form's single end-join label was for.
+  --
+  -- This is the shape `MiddleEnd.MatchCompile` already produced and the lowering used to throw away:
+  -- a consumer of an image should read the decision tree, not rebuild it from offsets. The tree
+  -- cannot duplicate code — `DTree` is a pure tree, each node emitted once — so the two forms carry
+  -- the same instructions in the same order.
+  --
+  -- A value the wrong *kind* (e.g. a non-data value under `SwitchCtor`) is stuck (type-impossible,
+  -- as in the oracle's matcher); a well-typed discriminant that no arm names takes the default edge
+  -- (a value-level non-match). `SwitchLit` branches on a scalar literal, `SwitchLen` on a `Varray`'s
+  -- length (ADR-0012: a different length is a value-level non-match).
+  | SwitchCtor (Array (String /\ CodeBlock)) CodeBlock
+  | SwitchLit (Array (Literal /\ CodeBlock)) CodeBlock
+  | SwitchLen (Array (Int /\ CodeBlock)) CodeBlock
+  -- A fully-matched but guarded row (ADR-0013): try each clause in order; if every guard is false,
+  -- fall through to the block below — the remaining rows of the decision tree.
+  | Guarded (Array GuardClause) CodeBlock
   -- No alternative matched (or every guard fell through): a stuck program.
   | Fail String
+  -- ── The linearised `case` forms ────────────────────────────────────────────────────────────────
+  --
+  -- Produced by `Linearise.linearise` on the way out to a format that predates the tree shape: the
+  -- `.pmo` and boot's version-3 image, whose reader knows offsets and nothing else. Never produced by
+  -- the lowering, and never read back — the compiler's own IR is the tree above.
+  | SwitchCtorRel (Array (String /\ Int)) Int
+  | SwitchLitRel (Array (Literal /\ Int)) Int
+  | SwitchLenRel (Array (Int /\ Int)) Int
 
 type CodeBlock = Array Instruction
+
+-- | One clause of a guard chain (ADR-0013): run `guard`, and if it leaves `true`, run `rhs` as the
+-- | `case`'s result. Both are blocks, so the chain nests like everything else in the tree form.
+type GuardClause = { guard :: CodeBlock, rhs :: CodeBlock }
 
 derive instance Eq Instruction
 derive instance Generic Instruction _

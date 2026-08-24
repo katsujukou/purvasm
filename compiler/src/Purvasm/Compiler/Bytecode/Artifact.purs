@@ -18,7 +18,7 @@ import Data.Maybe (Maybe(..))
 import Data.String.Common (joinWith)
 import Data.Tuple.Nested (type (/\), (/\))
 import Purvasm.Compiler.Bytecode.Codegen (Gdef(..))
-import Purvasm.Compiler.Bytecode.Image (Json(..), formatVersion, gdefToJson, stringify, strs)
+import Purvasm.Compiler.Bytecode.Image (Json(..), formatVersion, gdefToJson, lineariseGdef, stringify, strs)
 import Purvasm.Compiler.Util.MD5 (md5Hex)
 
 -- | A linkable binding group: the keys it defines, the keys it references (deps, for
@@ -120,7 +120,11 @@ groupToJson g = JObj
   [ "keys" /\ strs g.keys
   , "deps" /\ strs g.deps
   , "recursive" /\ JBool g.recursive
-  , "members" /\ JArr (map (\(n /\ gd) -> JArr [ JStr n, gdefToJson gd ]) g.members)
+  -- `gdefToJson` writes whatever shape it is given; the `.pmo` is stamped `formatVersion`, so the
+  -- `case`s are flattened to offsets first (ADR-0110 §4(b)). Nothing but this compiler reads a
+  -- `.pmo`, but a version-3 stamp over a version-5 shape would be a lie in an artifact that outlives
+  -- the run, and the size gate (ADR-0089 §7) measures these bytes.
+  , "members" /\ JArr (map (\(n /\ gd) -> JArr [ JStr n, gdefToJson (lineariseGdef gd) ]) g.members)
   ]
 
 moduleToJson :: ModuleArtifact -> Json

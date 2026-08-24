@@ -544,6 +544,12 @@ Each slice ships with its gates; none of them requires boot to change.
 > the gate fires only when someone measures by hand. Tracked as its own question: which change took
 > the ratio past 4.0, answered by bisection rather than by raising the threshold.
 >
+> Two more readings on 2026-08-24, on a machine that had been running heavy jobs for hours:
+> `run-state-except` 4.291 then 4.558, and `effect-ref` 3.068 → 3.843 → **5.502**. So the two are not
+> the same finding: `run-state-except` is over the threshold repeatably and under direct measurement
+> (~6.0 s against ~1.5 s), while `effect-ref` swings by 1.8× between runs and is noise. The bisection
+> above is owed for the first one only, and it wants a quiet machine.
+>
 > A **speed** observation, recorded so it is not rediscovered as a surprise: the owned VM is far
 > slower than boot's, which is expected of an interpreter with no performance work done to it and is
 > irrelevant to what step C measures (counts, not time) — but it decides the leg's cost. On
@@ -561,6 +567,71 @@ Each slice ships with its gates; none of them requires boot to change.
 > positive and none would notice) and `host-control-reach`, which is what that absence is *for*: an
 > image whose `ForeignRef` names the trusted setter exactly must be refused as `unbound native
 > foreign`, since a guest able to reach it could rewrite the argv of the runner hosting it.
+
+> **Progress (2026-08-24): step D — `case` keeps its tree shape (§4(b)).** Implemented against the
+> terms pinned above, and this note discharges the last of them.
+>
+> - **The compiler keeps the tree and drops it on the way out.** `Lower.Match.compileTree` now emits a
+>   switch whose arms and default are nested blocks, and a guard chain as one `Guarded` carrying its
+>   clauses — no labels, no back-patching, no end-join. The offset form is produced by a new
+>   `Bytecode.Linearise` for the two readers that predate it: the `.pmo` and boot's version-3 image.
+>   The information now flows the way an interchange artifact should — the producer keeps the
+>   structure it built, and one consumer that cannot use it gets a flattened copy.
+>
+> - **The flattening is byte-checked, not assumed.** Twenty-four images (eight benchmarks and four
+>   other programs, each at `--opt` and `--no-opt`) were captured before the change and re-emitted
+>   after: **21 identical**. Getting there caught one real difference — a tail call ends an
+>   activation, so the old assembler emitted no fall-through jump after one, and neither may this.
+>
+>   The remaining **3 differ by construction, and only downward**: where an ANF-level `case` sat in
+>   the tail of another's arm, the old lowering gave each its own join and control walked a chain of
+>   `Jump 0`s between them. Inheriting the enclosing join collapses the chain. Output is identical on
+>   boot in all three; the counts drop (`Gate.DictDispatch` −4, `bench-json-parse` −500,
+>   `bench-run-state-except` −1,937). Reproducing the no-op chains would mean carrying a defect
+>   forward for a checksum, and count parity is retired here by the pinned terms anyway.
+>
+> - **Version 5** is the owned VM's format: arities (§4(a)) *and* tree `case`s (§4(b)). It does not
+>   redefine version 4, which is no longer produced — the calibration it existed for is taken and
+>   recorded. The owned image's filename is now `app.owned.pvm`: the stamp inside says which format it
+>   is, and a name repeating the number would need renaming at every bump.
+>
+> - **Answering the pinned question about dates.** The reader takes **version 5 only**, from this step.
+>   Both retired versions are refused by *name* rather than by number — a version-3 image says it is
+>   boot's and to run it with `purvm`; a version-4 one says what it was and that nothing produces it —
+>   because a reader who has the wrong image in hand needs to know which runner to use. The emitter
+>   stopped producing version 4 at this step, and still produces version 3, which is not scaffolding:
+>   boot runs it, and the two runners remain held to the same **output**.
+>
+> - **The VM lost its migration scaffolding.** `SwitchCtorRel`/`SwitchLitRel`/`SwitchLenRel` and their
+>   machine arms are gone, along with the version threading the reader needed while two shapes were
+>   admissible. The tree arms and `Guarded` were already there and already gated.
+>
+> - **The corpus, after D.** Output parity holds 8/8 in both modes, and the owned VM's counts are
+>   taken as the measurement field's new baseline (`--opt` / `--no-opt` / ratio):
+>
+>   | benchmark | owned `--opt` | owned `--no-opt` | ratio | boot's ratio |
+>   |---|---:|---:|---:|---:|
+>   | `fib` | 9,376,501 | 29,355,167 | 3.131 | 3.131 |
+>   | `count-state` | 192,323 | 346,388 | 1.801 | 1.797 |
+>   | `effect-ref` | 60,113 | 118,648 | 1.974 | 1.941 |
+>   | `run-state-except` | 3,361,298 | 4,193,598 | 1.248 | 1.238 |
+>   | `st-ref` | 60,104 | 91,562 | 1.523 | 1.498 |
+>   | `map-fold-array` | 317,262 | 599,302 | 1.889 | 1.889 |
+>   | `quicksort` | 4,188,747 | 7,861,518 | 1.877 | 1.869 |
+>   | `json-parse` | 2,166,044 | 4,345,904 | 2.006 | 1.982 |
+>
+>   The counts sit just below boot's — the arm jumps the tree form does not need — and the *ratios*
+>   move by under 2%, which is the reassuring part: the optimiser's measured effect did not change
+>   when the vocabulary did. Behavioural gate ★ over the same change (7 fixtures, both modes, GC
+>   stress, debug-ABI), which is an independent check of both halves: the tree form executes right and
+>   `Linearise` flattens right.
+>
+> - **Gates.** The image gate's hand-written fixtures are version 5, so the nested decode is exercised
+>   by a fixture and not only by a compiled program; the leaf-emission leg additionally refuses an
+>   image whose switch arm carries an integer where a block belongs — a regression to the linear form
+>   that would otherwise parse. `legacy-image` flipped from "still decodes" to "refused, naming
+>   `purvm`". The benchmark leg compares **output** and now *reports* the owned VM's own counts as the
+>   measurement field's new baseline.
 
 ### 7. What this does not change
 

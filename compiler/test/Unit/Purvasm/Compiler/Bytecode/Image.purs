@@ -71,14 +71,14 @@ spec = describe "Purvasm.Compiler.Bytecode.Image" do
           """{"version":3,"gdefs":[],"main":[["fr","Data.Show.showIntImpl"],["rt"]],"effect":false}"""
 
   describe "imageToStringWithArities" do
-    it "stamps version 4 and writes each leaf's physical arity" do
+    it "stamps the owned VM's version and writes each leaf's physical arity" do
       imageToStringWithArities (Map.fromFoldable [ "Data.Show.showIntImpl" /\ 1 ])
         { gdefs: []
         , main: [ ForeignRef "Data.Show.showIntImpl", Return ]
         , isEffect: false
         }
         `shouldEqual`
-          Right """{"version":4,"gdefs":[],"main":[["fr","Data.Show.showIntImpl",1],["rt"]],"effect":false}"""
+          Right """{"version":5,"gdefs":[],"main":[["fr","Data.Show.showIntImpl",1],["rt"]],"effect":false}"""
 
     it "finds a leaf nested inside a closure, not only one in the main chunk" do
       -- The check walks the same tree the writer does. A leaf reachable only from inside a closure or
@@ -120,4 +120,4 @@ spec = describe "Purvasm.Compiler.Bytecode.Image" do
       imageToStringWithArities (Map.fromFoldable [ "M.k" /\ 0 ])
         { gdefs: [], main: [ ForeignRef "M.k", Return ], isEffect: false }
         `shouldEqual`
-          Right """{"version":4,"gdefs":[],"main":[["fr","M.k",0],["rt"]],"effect":false}"""
+          Right """{"version":5,"gdefs":[],"main":[["fr","M.k",0],["rt"]],"effect":false}"""

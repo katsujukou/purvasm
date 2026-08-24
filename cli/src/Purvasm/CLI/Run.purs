@@ -177,15 +177,18 @@ cmd opts = do
         image = (link artifacts Ffi.resolver mainTerm) { isEffect = true }
       appPath <- FS.joinPath [ opts.outDir, "app.pvm" ]
       FS.writeText appPath (imageToString image)
-      -- Both forms, from ONE compilation, for as long as the two VMs coexist (ADR-0110 §6, step C):
-      -- boot's frozen VM reads `app.pvm` and cannot read an arity-carrying `ForeignRef`, while the owned
-      -- VM needs the arity and has no registry to recover it from. Emitting them side by side is what
-      -- makes the changeover measurable — the instruction sequences are identical, so the two runners'
-      -- counts must agree, and that equality is available only while both exist. Step D removes the
-      -- legacy leg once tree dispatch changes what an instruction count means.
+      -- Both forms, from ONE compilation, for as long as the two VMs coexist (ADR-0110 §6): boot's
+      -- frozen VM reads `app.pvm` and knows neither an arity-carrying `ForeignRef` (§4(a)) nor a
+      -- tree-shaped `case` (§4(b)), while the owned VM needs both. Their instruction counts no longer
+      -- have to agree — tree dispatch changed what a step is, and step C's calibration is taken and
+      -- recorded — but the two runners are still held to the same OUTPUT, and that needs one
+      -- compilation to produce something each of them can run.
+      --
+      -- The owned image is named for its role rather than its version: the stamp inside says which
+      -- format it is, and a filename repeating the number would need renaming at every bump.
       case imageToStringWithArities (nativeLeafArities products.foreignSigs) image of
         Left err -> throw err
         Right text -> do
-          v4Path <- FS.joinPath [ opts.outDir, "app.v4.pvm" ]
-          FS.writeText v4Path text
+          ownedPath <- FS.joinPath [ opts.outDir, "app.owned.pvm" ]
+          FS.writeText ownedPath text
       Log.info $ Fmt.fmt @"✓ Build finished → {app}" { app: appPath }

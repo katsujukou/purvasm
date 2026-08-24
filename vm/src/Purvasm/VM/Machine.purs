@@ -304,9 +304,6 @@ run wrapped@(Env env) frames0 = do
     -- Dispatch a switch: run the matching arm, else the default.
     enterArm fr arm = enterBlock fr.env fr.share arm
 
-    -- The pre-§4(b) dispatch: advance within the current block by a relative offset.
-    jumpRel fr rel = Ref.modify_ (_ + rel) fr.ip
-
     -- Resolve a native leaf once and cache it (ADR-0111 §2). The search spans both provider classes:
     -- `host-runtime` — the runtime staticlib linked into this executable, where `show`, stdio, FS and
     -- `argv` live, so a program using only those needs no `--ffi` and no manifest — and every module
@@ -489,26 +486,6 @@ run wrapped@(Env env) frames0 = do
         Just cell -> do
           n <- VMArray.length cell
           enterArm fr (lookupArm (_ == n) arms default)
-        Nothing -> stuck "array-length switch on a non-array value"
-      -- The pre-§4(b) forms: the arm is a relative jump within THIS block, not a nested one, so the
-      -- frame is untouched and the instruction pointer moves exactly as boot's VM moves it. That
-      -- correspondence is the point — while both runners execute the same corpus, a step has to mean
-      -- the same thing in each (ADR-0110's slice-2 staging note, step C).
-      SwitchCtorRel arms default -> pop >>= force >>= case _ of
-        VData tag _ -> jumpRel fr (lookupArm (\t -> t == tag) arms default)
-        VCarrier _ fv -> do
-          let tag = Foreign.adtTag fv
-          jumpRel fr (lookupArm (\name -> ctorTag name == tag) arms default)
-        _ -> stuck "switch on a non-data value"
-      SwitchLitRel arms default -> do
-        v <- pop >>= force >>= decodeLike (map (\(l /\ _) -> l) (Array.head arms))
-        case Array.head arms of
-          Just (l /\ _) | not (litKindEq l v) -> stuck "literal switch on a wrong-kind value"
-          _ -> jumpRel fr (lookupArm (\l -> litEq l v) arms default)
-      SwitchLenRel arms default -> pop >>= force >>= VMArray.asCell >>= case _ of
-        Just cell -> do
-          n <- VMArray.length cell
-          jumpRel fr (lookupArm (_ == n) arms default)
         Nothing -> stuck "array-length switch on a non-array value"
       Guarded clauses fallthrough ->
         enterGuard { clauses, index: 0, fallthrough, env: fr.env, share: fr.share }

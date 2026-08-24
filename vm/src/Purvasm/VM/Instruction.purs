@@ -16,6 +16,10 @@
 -- | `Jump`/`JumpUnless` are deliberately untouched (§4(b)'s scope discipline): they lower `if`, not
 -- | `case`, and structuring them is a separate question.
 -- |
+-- | The offset-carrying `case` forms this set briefly also had are gone: they let the VM read the
+-- | pre-§4(b) image while boot and the owned VM were being compared on one compilation (§6 step C),
+-- | that comparison is recorded, and the compiler no longer emits an image containing them.
+-- |
 -- | The vocabulary is duplicated from `Purvasm.Compiler.Bytecode.Instruction` rather than shared, for
 -- | now: the VM consumes the format and must not drag the compiler into its binary. Whether producer
 -- | and consumer should share one definition — extracted into a package both depend on — is decided
@@ -144,21 +148,6 @@ data Instruction
   | Guarded (Array GuardClause) CodeBlock
   -- No alternative matched (or every guard fell through): a stuck program.
   | Fail String
-  -- ── The linearised `case` forms, read from a pre-§4(b) image ──────────────────────────────────
-  --
-  -- Today's `.pvm` lowers a decision tree to switches over **relative offsets** into a flat block,
-  -- and the format change that replaces them (§4(b)) is the LAST step of ADR-0110's slice 2 — after
-  -- the owned VM has taken over the optimiser measurement field, since that changeover needs boot
-  -- and the owned VM to agree on instruction counts first. Until then the reader meets offsets, and
-  -- the alternative to executing them is delinearising on the way in: rebuilding the tree the
-  -- producer already had, which §4(b) calls the wrong direction and which would be thrown away at
-  -- the same moment these are.
-  --
-  -- They are therefore deliberately temporary, and deliberately dumb: an arm is a jump, exactly as
-  -- in boot's VM, so the two agree about what a step is while both are running the same corpus.
-  | SwitchCtorRel (Array (String /\ Int)) Int
-  | SwitchLitRel (Array (Literal /\ Int)) Int
-  | SwitchLenRel (Array (Int /\ Int)) Int
 
 derive instance eqInstruction :: Eq Instruction
 derive instance genericInstruction :: Generic Instruction _
