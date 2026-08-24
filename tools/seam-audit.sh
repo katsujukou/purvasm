@@ -207,7 +207,11 @@ audit_dir() {
         ;;
       Types.purs)
         expect call 0 "raw call text outside the seam"
-        expect keyOf 5 "keyOf count drifted (import + the four bind-time key stamps)"
+        # ADR-0113 reduced this from 5: \`bindFnVar\`/\`bindDirectFnVar\` now DELEGATE to the two
+        # base binders instead of stamping their own key, so the caged \`keyOf\` runs at exactly two
+        # sites plus the import. Fewer stamp sites is the point of the cage, but the count is pinned
+        # either way — a new one must be a deliberate edit here.
+        expect keyOf 3 "keyOf count drifted (import + the two bind-time key stamps)"
         expect verifyAt 0 "verifyAt outside the Monad wrapper"
         expect mintAt 0 "mintAt outside the Monad wrapper"
         expect testesc 0 "test-only token escape used in src"
@@ -297,6 +301,31 @@ audit_wide() {
   return "$bad"
 }
 
+# ADR-0113: the SLICE 3 vocabulary must not exist yet.
+#
+# Slices 1–2 are Accepted; slice 3 — lowering a recovered fact to a direct call — is an explicit
+# separate re-approval. The guarantee that no such lowering can happen is structural: the types that
+# would express it are absent, so no caller, public API included, can select one. An absence is
+# exactly the kind of property that decays silently, so it is PINNED here: these identifiers must
+# have ZERO occurrences anywhere under compiler/src.
+#
+# This is not a substitute for the behavioural fixtures (`Test.…LocalFacts` pins that every
+# candidate, in every kind × form, actually emits the generic dispatch). It closes the other half:
+# an audit alone could be passed by adding a differently-named direct path, and a fixture alone
+# could be passed by a path no fixture happens to exercise.
+SLICE3_IDENTS='LocalFactsMode|decideLocal|movesKind|EmitLocalDirect|EmitLocalArity|LocalDirectApply|LocalDirectTail|LocalArityApply|LocalArityTail'
+
+audit_slice3_absent() {
+  local srcdir="$1" bad=0 hits
+  hits=$(grep -rnE "$SLICE3_IDENTS" "$srcdir" --include='*.purs' | grep -vE ':[[:space:]]*--' | grep -vE '^\S+:[0-9]+:\s*--' || true)
+  if [ -n "$hits" ]; then
+    echo "seam-audit: ADR-0113 slice-3 vocabulary present in $srcdir, but only slices 1-2 are Accepted:" >&2
+    echo "$hits" >&2
+    bad=1
+  fi
+  return "$bad"
+}
+
 # ---- self-test: every violation class must be rejected on a scratch copy -----------------------
 selftest() {
   local scratch base ok=0
@@ -318,6 +347,31 @@ selftest() {
   inject "extra unsafeEmitRawCall in Program.purs" "Program.purs" 'evil = unsafeEmitRawCall "  whatever"'
   inject "unsafeEmitRawModule outside the allowlist" "Evil.purs" 'x = unsafeEmitRawModule "chunk"'
   inject "popFrame use outside Root" "Emit.purs" 'evil tok = popFrame tok'
+
+  # ADR-0113: every slice-3 identifier must be rejected ON ITS OWN, so a partial re-introduction
+  # cannot slip through behind a sibling's absence. The injections are GENERATED from the same
+  # token list the audit greps for, so the two cannot drift apart — a token added to
+  # $SLICE3_IDENTS without an injection was exactly the gap this loop closes.
+  # Each identifier is smuggled into a scratch copy on its own and must be REJECTED. The list is
+  # the audit's OWN token list, so a token added to $SLICE3_IDENTS is injected automatically and
+  # the two cannot drift apart. Collected as output rather than a variable: the loop runs in a
+  # subshell, where an assignment would be silently lost — which would make this self-test pass by
+  # construction.
+  slice3_missed=$(
+    ( IFS='|'; for ident in $SLICE3_IDENTS; do echo "$ident"; done ) | while read -r ident; do
+      [ -n "$ident" ] || continue
+      scratch=$(mktemp -d)
+      cp "$BACKEND"/*.purs "$scratch"/
+      printf 'x = %s\n' "$ident" >> "$scratch/Evil.purs"
+      audit_slice3_absent "$scratch" > /dev/null 2>&1 && echo "$ident"
+      rm -rf "$scratch"
+    done
+  )
+  if [ -n "$slice3_missed" ]; then
+    echo "seam-audit: SELF-TEST FAILED — slice-3 identifiers not rejected:" >&2
+    echo "$slice3_missed" >&2
+    ok=1
+  fi
   inject "openFrame outside its pinned minting sites" "Liveness.purs" 'evil = openFrame'
   inject "an extra openFrame in Program.purs" "Program.purs" 'evil = openFrame'
   inject "bumpEpoch outside the seam" "Emit.purs" 'evil = bumpEpoch'
@@ -371,5 +425,6 @@ selftest || { echo "seam-audit: self-test failed" >&2; exit 1; }
 status=0
 audit_dir "$BACKEND" || status=1
 audit_wide compiler/src "Purvasm/Compiler/Backend/LLVM" || status=1
+audit_slice3_absent compiler/src || status=1
 [ "$status" -eq 0 ] || exit 1
-echo "seam-audit: OK (self-test passed; call text, unsafe emitters, popFrame and openFrame all within the pinned allowlist)"
+echo "seam-audit: OK (self-test passed; call text, unsafe emitters, popFrame and openFrame all within the pinned allowlist; the ADR-0113 slice-3 vocabulary is absent)"

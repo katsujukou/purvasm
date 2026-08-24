@@ -67,7 +67,7 @@ import Purvasm.Compiler.Backend.LLVM.CallClass (AllocSite(..), CallEvent(..), Ca
 import Purvasm.Compiler.Backend.LLVM.Liveness (activationPlanWith, atomCanSafepoint, envPseudo, forcedAtomCanSafepoint, needsFrame)
 import Purvasm.Compiler.Backend.LLVM.Root (FrameToken, emitGcafInitEngine, ensureRooted, musttailWith, openFrame, retWith, tailcallWith)
 import Purvasm.Compiler.Backend.LLVM.Safepoint (RtArg(..), RtOp(..), foreignDirect, guestDirect, noteAllocSite, rtCall, rtCallVoid)
-import Purvasm.Compiler.Backend.LLVM.Types (BindingV(..), Env, EnvSrc(..), FnInfo, Lifted(..), LiftedBody(..), bindDirectFnVar, bindDirectVar, bindFnVar, bindVar, lookupEnv)
+import Purvasm.Compiler.Backend.LLVM.Types (BindOrigin(..), BindingV(..), CandidateKind(..), CapturableFact, Env, EnvSrc(..), FnInfo, Lifted(..), LiftedBody(..), LocalFact(..), bindDirectFnVar, bindDirectVar, bindFnVar, bindVar, candidateOf, capturableFact, lookupEnv, unFact)
 import Purvasm.Compiler.Backend.LLVM.Value (Val, rootedVal, vImm, vRootedGlobal)
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Literal (Literal(..))
@@ -328,6 +328,35 @@ finish frame tail v =
 -- | leaf simply names its outcome instead of collapsing to `Nothing`. Note the self-call shortcuts
 -- | are not leaves: a shortcut whose shape does not match FALLS THROUGH to the local/global
 -- | lookups and can still resolve directly, which is why there is no "self shape" reason.
+-- | The candidate fact an alias `Let x (CAtom (AtomVar y))` could carry (ADR-0113 §2). The lookup
+-- | order MIRRORS [`directTarget`]'s — local scope first, then this object's `gfns`, then the
+-- | published `xfns` — because that order is what guarantees a local rebinding never masquerades as
+-- | the global; deriving the candidate by any other order would recover a fact for a different
+-- | binding than the one the call site will resolve.
+-- |
+-- | Which table answered decides the [`CandidateKind`], so the local and global alias populations
+-- | stay separable in the census and the profile alike.
+aliasCandidate :: Env -> String -> Codegen LocalFact
+aliasCandidate env y = case lookupEnv y env of
+  Just entry -> pure case candidateOf entry of
+    Just f -> FCandidate { fact: f, kind: AliasLocal }
+    Nothing -> FNone
+  Nothing -> do
+    gkeys <- gets _.gkeys
+    if not (Set.member y gkeys) then pure FNone
+    else do
+      gfns <- gets _.gfns
+      xfns <- gets _.xfns
+      -- own-module facts win over the interface, mirroring `directTarget`'s order.
+      pure case (case Map.lookup y gfns of
+        Just i -> Just i
+        Nothing -> Map.lookup y xfns) of
+        -- a published/own-module fact is `SSentinel`/`SForceCell` by construction, so a refusal
+        -- here is a compiler bug and takes the same fail-closed path as every other KNOWN fact —
+        -- silently demoting it to `FNone` would move the binding into the opaque population.
+        Just info -> FCandidate { fact: requireCapturableFact "aliasCandidate/global" info, kind: AliasGlobal }
+        Nothing -> FNone
+
 directTarget :: Env -> Atom -> Int -> Codegen CallTarget
 directTarget env f nargs = case f of
   AtomVar x -> case lookupEnv x env of
@@ -339,10 +368,16 @@ directTarget env f nargs = case f of
           , Just h0 <- s.captureHandle
           , entry.key == h0
           , s.fnInfo.arity == nargs -> pure (GuestTarget s.fnInfo)
-        _ -> pure case entry.knownFn of
-          Just info | info.arity == nargs -> GuestTarget info
-          Just _ -> GenericTarget MissArityLocal
-          Nothing -> GenericTarget MissLocalUnknownFn
+        -- ADR-0113 §2: knob-blind and form-blind. An ACTIVE fact behaves exactly as before; a
+        -- CANDIDATE becomes its own eligibility outcome, carrying the fact and the derivation that
+        -- produced it. What is DONE with a candidate belongs to the emission decision, not here —
+        -- today that is `decide`, which always defers it.
+        _ -> pure case entry.fact of
+          FActive af
+            | (unFact af).arity == nargs -> GuestTarget (unFact af)
+            | otherwise -> GenericTarget MissArityLocal
+          FCandidate c -> LocalCandidateTarget { fact: c.fact, kind: c.kind }
+          FNone -> GenericTarget (MissLocalUnknownFn entry.origin)
     Nothing -> do
       gkeys <- gets _.gkeys
       if Set.member x gkeys then do
@@ -520,6 +555,9 @@ cexpr frame env tail = case _ of
       -- ELIGIBLE, but the §5.2 knob is off: lower exactly as the generic path does, and record it as
       -- its OWN class so the residue counter does not change meaning between the legs.
       EmitForeignDeferred ref fform -> genericCall fform (eventOf (EmitForeignDeferred ref fform))
+      -- ADR-0113: a candidate the knob left alone. Byte-for-byte the generic path — only the event
+      -- differs, which is what lets slices 1–2 name this population without moving emission.
+      EmitLocalDeferred k lform -> genericCall lform (eventOf (EmitLocalDeferred k lform))
       EmitGeneric reason gform -> genericCall gform (eventOf (EmitGeneric reason gform))
     where
     genericCall gform ev = do
@@ -669,7 +707,7 @@ cexpr frame env tail = case _ of
         h <- ensureRooted frame rawVal
         pure (Array.cons (Tuple subOcc h) oenv)
 
-      bindLeaf oenv binds = foldl (\e (Tuple v occ) -> bindVar e v (lookupOcc oenv occ)) env binds
+      bindLeaf oenv binds = foldl (\e (Tuple v occ) -> bindVar e OMatchBinder v (lookupOcc oenv occ) FNone) env binds
 
       -- A matched body's value reaches the phi through a fresh single-predecessor block (the CIf
       -- idiom), carrying the epoch at its arm's end for the per-arm phi verification (§6.2).
@@ -881,8 +919,8 @@ buildGrec frame named env binds = do
   gkeys <- gets _.gkeys
   let
     members = map fst binds
-    k = Array.length members
     memberSet = Set.fromFoldable members
+    k = Array.length members
     enclosingLocals = Set.fromFoldable (map fst env)
     readableGlobals = Set.difference gkeys enclosingLocals
     -- members excluded, and top-level globals not shadowed by an enclosing local (read via `$root`).
@@ -910,10 +948,25 @@ buildGrec frame named env binds = do
             lifted = Lifted
               { name
               , params: ps
-              , captures
+              -- ADR-0113 §2: a member's captures are of THREE kinds and each needs its own fact.
+              -- The member test comes FIRST and is not an optimisation: inside the group the name
+              -- IS the member's cell, so an enclosing binding of the same name is SHADOWED. Deriving
+              -- from `env` first and overwriting only the function members afterwards would leave a
+              -- VALUE member holding the outer binding's fact — a candidate the emitter could never
+              -- act on, counted in a census whose whole purpose is to size that population.
+              --   member + lambda RHS -> FActive, stamped by `withGroupInfos` (the infos do not
+              --                          exist yet at this point);
+              --   member, otherwise   -> FNone;
+              --   not a member        -> an ordinary outside capture, derived as `lift` derives it.
+              , captures: map
+                  ( \c ->
+                      { name: c
+                      , fact: if Set.member c memberSet then FNone else outsideCaptureFact env c
+                      }
+                  )
+                  captures
               , body: LBody b
               , selfName: Just m
-              , captureFns: []
               , exported: top && Map.member m xfns
               }
           pure (Just { m, lifted, info })
@@ -923,7 +976,23 @@ buildGrec frame named env binds = do
   -- Every member lambda may reach its siblings through its captures — give each the group's info.
   let
     groupInfos = map (\r -> Tuple r.m r.info) memberFns0
-    memberFns = map (\r -> case r.lifted of Lifted lm -> r { lifted = Lifted (lm { captureFns = groupInfos }) }) memberFns0
+    -- Each member lambda may reach its siblings through its captures: stamp the group's infos onto
+    -- the matching capture ELEMENTS (ADR-0113 §2 — there is no side-array to stamp them into any
+    -- more). A sibling's info is `SForceCell`, so `capturableFact` holds.
+    -- A sibling's info OVERRIDES whatever the outside derivation found for that name: inside the
+    -- group the name IS the member, and the member's own `SForceCell` info is the accurate fact.
+    withGroupInfos (Lifted lm) = Lifted
+      ( lm
+          { captures = map
+              ( \cp -> case Array.find (\(Tuple gk _) -> gk == cp.name) groupInfos of
+                  Just (Tuple _ info) ->
+                    cp { fact = FActive (requireCapturableFact "buildGrec/sibling" info) }
+                  Nothing -> cp
+              )
+              lm.captures
+          }
+      )
+    memberFns = map (\r -> r { lifted = withGroupInfos r.lifted }) memberFns0
   forA_ memberFns (\r -> pushPending r.lifted)
   -- One suspension per member over the shared env: a function member's suspension builds its
   -- pre-lifted closure; any other member's suspension evaluates its RHS.
@@ -936,7 +1005,23 @@ buildGrec frame named env binds = do
             Nothing -> LBody rhs
         pushPending
           ( Lifted
-              { name, params: [ "$u" ], captures: sharedLayout, body, selfName: Nothing, captureFns: [], exported: false }
+              { name
+              , params: [ "$u" ]
+              -- the shared layout is `members ++ outside`: a member slot holds that member's cell
+              -- (ACTIVE for a function member, nothing for a value member) and an outside slot is an
+              -- ordinary capture of the enclosing env (ADR-0113 §2).
+              , captures: map
+                  ( \c -> case Array.find (\r -> r.m == c) memberFns of
+                      Just r -> { name: c, fact: FActive (requireCapturableFact "buildGrec/suspension" r.info) }
+                      Nothing ->
+                        if Array.elem c members then { name: c, fact: FNone }
+                        else { name: c, fact: outsideCaptureFact env c }
+                  )
+                  sharedLayout
+              , body
+              , selfName: Nothing
+              , exported: false
+              }
           )
         pure name
     )
@@ -968,8 +1053,10 @@ buildGrec frame named env binds = do
   -- 4. bind each member to its cell — function members carry their direct-call info.
   pure $ foldl
     ( \e (Tuple m ch) -> case Array.find (\r -> r.m == m) memberFns of
-        Just r -> bindFnVar e m ch r.info
-        Nothing -> bindVar e m ch
+        -- a member's info is `SForceCell` by construction, so `capturableFact` holds; the fallback
+        -- keeps the fold total.
+        Just r -> bindFnVar e OGrecLambda m ch (requireCapturableFact "buildGrec/member" r.info)
+        Nothing -> bindVar e OGrecValue m ch FNone
     )
     env
     (Array.zip members cellHs)
@@ -995,19 +1082,30 @@ expr frame env0 tail = tailRecM step <<< Tuple env0
             , src: if Array.null lr.captures then SSentinel else SClosureEnv
             }
         rootIt <- shouldRoot x
+        -- a let-bound lambda's own `FnInfo` is never `SSelf` (it is `SSentinel`/`SClosureEnv` by
+        -- construction just above), so a refusal is a compiler bug and crashes rather than quietly
+        -- demoting this binding to the opaque population.
+        let fact = requireCapturableFact "expr/letLambda" info
         if rootIt then do
           rv <- ensureRooted frame v
-          pure (Loop (Tuple (bindFnVar env x rv info) body))
-        else pure (Loop (Tuple (bindDirectFnVar env x v info) body))
+          pure (Loop (Tuple (bindFnVar env OLetLambda x rv fact) body))
+        else pure (Loop (Tuple (bindDirectFnVar env OLetLambda x v fact) body))
       _ -> do
         mv <- cexpr frame env false c
+        -- ADR-0113 §2: an alias `Let x (CAtom (AtomVar y))` had a fact at this bind site and dropped
+        -- it. The lookup mirrors `directTarget`'s OWN order — local scope, then this module's
+        -- `gfns`, then the published `xfns` — so a local rebinding never masquerades as the global,
+        -- and which table answered decides the kind.
+        aliasFact <- case c of
+          CAtom (AtomVar y) -> aliasCandidate env y
+          _ -> pure FNone
         case mv of
           Just v -> do
             rootIt <- shouldRoot x
             if rootIt then do
               rv <- ensureRooted frame v
-              pure (Loop (Tuple (bindVar env x rv) body))
-            else pure (Loop (Tuple (bindDirectVar env x v) body))
+              pure (Loop (Tuple (bindVar env OLetValue x rv aliasFact) body))
+            else pure (Loop (Tuple (bindDirectVar env OLetValue x v aliasFact) body))
           Nothing ->
             unsafeCrashWith "Backend.LLVM.Emit.expr: non-tail cexpr produced no value"
     LetRec binds body -> do
@@ -1047,7 +1145,7 @@ argBuffer operands =
 -- | of its free variables, then `pv_make_closure` over the lifted function's address.
 makeClosure :: Env -> Lifted -> Codegen Val
 makeClosure env (Lifted l) = do
-  envWord <- case l.captures of
+  envWord <- case map _.name l.captures of
     [] -> pure (vImm immUnit)
     caps -> do
       vals <- forA caps (readVar env)
@@ -1056,6 +1154,30 @@ makeClosure env (Lifted l) = do
   addr <- fresh
   emit ("  " <> addr <> " = ptrtoint ptr @" <> l.name <> " to i64")
   rtCall RtMakeClosure [ I64 addr, I32 (show (Array.length l.params)), V envWord ]
+
+-- | The [`LocalFact`] a capture of `c` carries, derived from the env the capture's VALUE is read
+-- | from (ADR-0113 §2). `candidateOf`, not `activeFn`, so a capture of a capture — or of an alias —
+-- | is recoverable at any depth; the kind is `Capture` because THIS is the bind site a lowering
+-- | would have to fix.
+-- |
+-- | Shared by `lift` and `buildGrec` on purpose: two copies of this expression would be two
+-- | populations, and the census could not say which one it had measured.
+outsideCaptureFact :: Env -> String -> LocalFact
+outsideCaptureFact env c = case lookupEnv c env >>= candidateOf of
+  Just f -> FCandidate { fact: f, kind: Capture }
+  Nothing -> FNone
+
+-- | A fact the emitter has just CONSTRUCTED and knows to be capturable — a let-bound lambda
+-- | (`SSentinel`/`SClosureEnv`) or a `Grec` member (`SForceCell`). `capturableFact` can only decline
+-- | on `SSelf`, which none of these produce, so a `Nothing` here is a compiler bug and must not be
+-- | quietly demoted to `FNone`: that would silently move a binding from the ACTIVE population to the
+-- | opaque one and corrupt the very census this ADR exists to produce.
+requireCapturableFact :: String -> FnInfo -> CapturableFact
+requireCapturableFact site info = case capturableFact info of
+  Just f -> f
+  Nothing ->
+    unsafeCrashWith
+      ("Backend.LLVM.Emit." <> site <> ": a constructed FnInfo was not capturable (src = SSelf): " <> info.dsym)
 
 -- | Register an inline lambda for hoisting and return its `Lifted` record (captures fixed in sorted
 -- | order). A top-level global is read via its `$root` handle, never captured — except a global shadowed
@@ -1068,14 +1190,19 @@ lift env params body = do
     bound = Set.fromFoldable params
     localNames = Set.fromFoldable (map fst env)
     globalsUnshadowed = Set.difference gkeys localNames
-    captures = Set.toUnfoldable (Set.difference (fvExpr bound body) globalsUnshadowed)
+    captureNames = Set.toUnfoldable (Set.difference (fvExpr bound body) globalsUnshadowed) :: Array String
+    -- ADR-0113 §2: the fact for each capture is derived HERE, from the same `env` `makeClosure`
+    -- reads the capture's VALUE from — so measurement and any later lowering share one expression
+    -- over one binding. `candidateOf`, not `activeFn`, so a capture of a capture (or of an alias)
+    -- is recoverable at any depth; the kind is re-stamped as `Capture` because THIS is the bind
+    -- site a lowering would have to fix.
+    captures = map (\c -> { name: c, fact: outsideCaptureFact env c }) captureNames
     l = Lifted
       { name
       , params
       , captures
       , body: LBody body
       , selfName: Nothing
-      , captureFns: []
       , exported: false
       }
   modify_ \c -> c { pending = Cons l c.pending }
@@ -1100,7 +1227,7 @@ emitFunction (Lifted l) = do
       -- (ADR-0109 §5.2): the counterfactual leg allocates at every foreign reference, and a plan
       -- that did not know it would under-root the operands around that allocation.
       mode <- gets _.foreignClosure
-      let p = activationPlanWith { byNeed: byNeedOn } { params: l.params, captures: l.captures, selfName: l.selfName, foreignClosure: mode } e
+      let p = activationPlanWith { byNeed: byNeedOn } { params: l.params, captures: map _.name l.captures, selfName: l.selfName, foreignClosure: mode } e
       modify_ \c -> c { rootAll = false, crossing = p.crossing, byNeed = p.byNeed }
       pure (Just p)
     LClosure _ -> pure Nothing
@@ -1118,25 +1245,25 @@ emitFunction (Lifted l) = do
       pTok <- mintParam i
       if shouldRootName p then do
         rv <- ensureRooted mtok pTok
-        pure (bindVar env p rv)
-      else pure (bindDirectVar env p pTok)
+        pure (bindVar env OParam p rv FNone)
+      else pure (bindDirectVar env OParam p pTok FNone)
   env1 <- foldA bindParam Nil (Array.mapWithIndex (\i p -> Tuple p i) l.params)
   -- the `%env` word is itself a function-entry value; its token mints once at the prologue
   -- (the capture reads and any later self-call inherit it — never re-stamped, §6.2).
   envTok <- mintEnvWord
-  -- captures: positional reads from the env word `%env` (the shared/captured array); a capture that is
-  -- a known recursive-group function member carries its direct-call info (`captureFns`). `selfHandle`
-  -- is the identity of the captured self binding (a member calling itself through its capture).
+  -- captures: positional reads from the env word `%env` (the shared/captured array); each element
+  -- carries its own `LocalFact` (ADR-0113 §2), so the value and what is known about it travel
+  -- together. `selfHandle` is the identity of the captured self binding (a member calling itself
+  -- through its capture).
   let
-    stepCap (Tuple env sh) (Tuple i c) = do
+    -- ADR-0113 §2: one array, one traversal — `cap.name` fetches the value and `cap.fact` stamps
+    -- the binding, so `%env[i]`, its value and its fact cannot drift apart.
+    stepCap (Tuple env sh) (Tuple i cap) = do
+      let c = cap.name
       v <- rtCall RtReadField [ V envTok, I64 (show i) ]
-      env' <- case Array.find (\(Tuple k _) -> k == c) l.captureFns of
-        Just (Tuple _ info) ->
-          if shouldRootName c then ensureRooted mtok v <#> \rv -> bindFnVar env c rv info
-          else pure (bindDirectFnVar env c v info)
-        Nothing ->
-          if shouldRootName c then ensureRooted mtok v <#> \rv -> bindVar env c rv
-          else pure (bindDirectVar env c v)
+      env' <-
+        if shouldRootName c then ensureRooted mtok v <#> \rv -> bindVar env OCapture c rv cap.fact
+        else pure (bindDirectVar env OCapture c v cap.fact)
       let
         sh' =
           if Just c == l.selfName then case lookupEnv c env' of
@@ -1189,7 +1316,7 @@ emitFunction (Lifted l) = do
   -- object's direct-call count is `direct-nontail + wrapper-entry`, never one of them alone.
   noteCall WrapperEntry
   beginFn
-  envw <- case l.captures of
+  envw <- case map _.name l.captures of
     [] -> pure (vImm immUnit)
     _ -> do
       cloTok <- mintCloWord

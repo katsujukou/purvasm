@@ -29,7 +29,6 @@ identIntLifted = Lifted
   , captures: []
   , body: LBody (Ret (CAtom (AtomVar "x")))
   , selfName: Nothing
-  , captureFns: []
   , exported: true
   }
 
@@ -75,7 +74,6 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Emit" do
                       , captures: []
                       , body: LBody body
                       , selfName: Nothing
-                      , captureFns: []
                       , exported: true
                       }
                   )

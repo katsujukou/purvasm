@@ -8,8 +8,10 @@
 -- | **The event is a SUM, not a form/outcome pair (ADR-0108 §1).** A pair would make
 -- | `DirectNonTail` + a `MissReason`, or `GenericApply` + an `FnInfo`, constructible — states that
 -- | mean nothing. As a sum a direct form carries only a target and a generic form only a reason,
--- | so the invalid combinations are unrepresentable and the six constructors stand one-to-one with
--- | the six accounting columns the census reconciles against the emitted `.ll`.
+-- | so the invalid combinations are unrepresentable and each constructor stands one-to-one with an
+-- | accounting column the census reconciles against the emitted `.ll`. ADR-0109 added the four
+-- | foreign classes and ADR-0113 the two `local-deferred` ones; the count is not fixed, but the
+-- | one-to-one correspondence is.
 -- |
 -- | **The form is not the classifier's to decide.** Whether a target becomes a `musttail` or a
 -- | plain direct call, and whether a miss becomes a `pv_apply` or a `pv_tailcall`, is settled AFTER
@@ -18,6 +20,7 @@
 module Purvasm.Compiler.Backend.LLVM.CallClass
   ( MissReason(..)
   , CallTarget(..)
+  , LocalCandidate
   , Form(..)
   , callForm
   , EmissionDecision(..)
@@ -29,6 +32,8 @@ module Purvasm.Compiler.Backend.LLVM.CallClass
   , callClassName
   , callEventClass
   , callClasses
+  , allMissReasons
+  , profiledReasons
   , profileSlotNames
   , profileSlot
   , AllocSite(..)
@@ -43,7 +48,7 @@ import Data.Array as Array
 import Data.Maybe (Maybe(..))
 import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.Compiler.Backend.LLVM.ForeignRef (ForeignCallMode(..), ForeignRef, refArity, refKey)
-import Purvasm.Compiler.Backend.LLVM.Types (FnInfo)
+import Purvasm.Compiler.Backend.LLVM.Types (BindOrigin, CandidateKind, CapturableFact, FnInfo, bindOriginName, bindOrigins, candidateKindName, candidateKinds, unFact)
 
 -- | Why a call site could not be lowered to a direct known-arity call. The constructors mirror the
 -- | LEAVES of `directTarget`'s decision tree (ADR-0108 §1) — they are not a priority list: a
@@ -58,8 +63,12 @@ data MissReason
   -- | is not something a well-typed program does, so a non-zero count is a compiler-bug candidate
   -- | rather than an optimisation lever (ADR-0108 §4 slice 1) — it is measured, never assumed zero.
   | MissCalleeLiteral
-  -- | a local binding with no `knownFn` fact (a parameter, a capture, a `let`-bound value)
-  | MissLocalUnknownFn
+  -- | a local binding for which NO fact was derivable at its bind site, at any depth — ADR-0113's
+  -- | OPAQUE population. It carries WHERE the binding was made; a recoverability bit beside it would
+  -- | build a `BindOrigin × Recoverability` product with unreachable cells (`OLetLambda/opaque`,
+  -- | `OParam/recoverable`), and the recoverable population has its own class instead
+  -- | ([`CLocalDeferredApply`]/[`CLocalDeferredTail`]).
+  | MissLocalUnknownFn BindOrigin
   -- | a local `knownFn` whose arity ≠ this call's argument count
   | MissArityLocal
   -- | neither a local binding nor a known global key. A DIAGNOSTIC class: `readVar` crashes on such
@@ -90,7 +99,7 @@ missReasonName :: MissReason -> String
 missReasonName = case _ of
   MissCalleeForeign -> "callee-foreign"
   MissCalleeLiteral -> "callee-literal"
-  MissLocalUnknownFn -> "local-unknown-fn"
+  MissLocalUnknownFn o -> "local-unknown-fn/" <> bindOriginName o
   MissArityLocal -> "arity-local"
   MissUnknownKey -> "unknown-key"
   MissArityOwnModule -> "arity-own-module"
@@ -111,8 +120,24 @@ data CallTarget
   = GuestTarget FnInfo
   -- | a native leaf at its known, MATCHING arity (ADR-0109 §2)
   | ForeignTarget ForeignRef
+  -- | a local binding carrying a CANDIDATE fact (ADR-0113 §2): a fact the emitter derived at the
+  -- | bind site and does not use while the knob is off. ARITY IS DELIBERATELY NOT PART OF THIS —
+  -- | "a candidate exists here" is all the classifier says, so the off-leg population is one
+  -- | countable class, which is what makes ADR-0113 §4's transfer a closed sum rather than a
+  -- | partition whose halves are counted by different mechanisms. Slices 1-2 lower every candidate
+  -- | as DEFERRED; the knob that would lower some of them directly is slice 3's, and so are its
+  -- | direct/arity counters.
+  | LocalCandidateTarget LocalCandidate
   -- | no direct target, with the reason the classifier declined
   | GenericTarget MissReason
+
+-- | What the classifier hands the decision about a candidate: the fact, and the derivation that
+-- | produced it. The kind travels here rather than being recovered from the binding's
+-- | `BindOrigin`, which cannot distinguish `AliasLocal` from `AliasGlobal` (both `OLetValue`).
+type LocalCandidate =
+  { fact :: CapturableFact
+  , kind :: CandidateKind
+  }
 
 derive instance eqCallTarget :: Eq CallTarget
 
@@ -122,6 +147,10 @@ instance showCallTarget :: Show CallTarget where
   show = case _ of
     GuestTarget info -> "GuestTarget " <> info.dsym <> "/" <> show info.arity
     ForeignTarget ref -> "ForeignTarget " <> refKey ref <> "/" <> show (refArity ref)
+    LocalCandidateTarget c ->
+      "LocalCandidateTarget " <> candidateKindName c.kind <> " " <> (unFact c.fact).dsym
+        <> "/"
+        <> show (unFact c.fact).arity
     GenericTarget r -> "GenericTarget " <> missReasonName r
 
 -- | The two forms a call site can take. Not the classifier's to decide (ADR-0108 §1): it is settled
@@ -155,6 +184,11 @@ callForm :: { tail :: Boolean, inDirect :: Boolean } -> CallTarget -> Form
 callForm st = case _ of
   GuestTarget _ -> if st.tail && st.inDirect then FTail else FApply
   ForeignTarget _ -> if st.tail then FTail else FApply
+  -- a candidate is lowered generically while the knob is off, so it takes the generic shape here;
+  -- when slice 3 introduces the knob, a candidate that becomes a guest call must have its form
+  -- RECOMPUTED against `GuestTarget` (this function answers differently for it) — which is why the
+  -- form must not be decided before the knob (ADR-0113 §2).
+  LocalCandidateTarget _ -> if st.tail then FTail else FApply
   GenericTarget _ -> if st.tail then FTail else FApply
 
 -- | What the lowering actually EMITS: a closed function of (target × form × feature knob).
@@ -164,14 +198,24 @@ data EmissionDecision
   | EmitForeignDirect ForeignRef Form
   -- | eligible, slice DISABLED — the §5.2 counterfactual leg only
   | EmitForeignDeferred ForeignRef Form
+  -- | a CANDIDATE the knob left alone (ADR-0113 §2/§4). Emits today's generic dispatch
+  -- | byte-for-byte; it differs from [`EmitGeneric`] only in which counter it bumps, which is what
+  -- | lets slices 1–2 name the off-leg population without changing emission.
+  | EmitLocalDeferred CandidateKind Form
   | EmitGeneric MissReason Form
 
 -- | The decision, from the classifier's answer, the form, and whether foreign direct lowering is
 -- | enabled. Total and closed: there is no arm in which an eligible foreign call becomes a
 -- | `MissReason`, which is exactly the confusion §1.2 forbids.
+-- |
+-- | ADR-0113 slices 1–2 add one arm and no knob: a candidate is always DEFERRED.
 decide :: ForeignCallMode -> Form -> CallTarget -> EmissionDecision
 decide mode form = case _ of
   GuestTarget info -> EmitGuestDirect info form
+  -- ADR-0113 slices 1–2: a candidate is ALWAYS deferred. The direct/arity arms, the three-stage
+  -- knob and their counters are slice 3's, and slice 3 is a separate re-approval — so there is no
+  -- code path, from any caller, that lowers a recovered fact today.
+  LocalCandidateTarget c -> EmitLocalDeferred c.kind form
   ForeignTarget ref -> case mode, form of
     ViaApply, _ -> EmitForeignDeferred ref form
     -- slice B: the apply form only. The tail form stays DEFERRED here, which is what keeps
@@ -187,6 +231,8 @@ eventOf :: EmissionDecision -> CallEvent
 eventOf = case _ of
   EmitGuestDirect info FApply -> DirectNonTail info
   EmitGuestDirect info FTail -> DirectMusttail info
+  EmitLocalDeferred k FApply -> LocalDeferredApply k
+  EmitLocalDeferred k FTail -> LocalDeferredTail k
   EmitForeignDirect ref FApply -> ForeignDirectApply ref
   EmitForeignDirect ref FTail -> ForeignDirectTail ref
   EmitForeignDeferred ref FApply -> ForeignDeferredApply ref
@@ -202,6 +248,10 @@ data CallEvent
   = DirectNonTail FnInfo
   -- | `musttailWith`: a known target in tail position inside a direct entry
   | DirectMusttail FnInfo
+  -- | a candidate the knob left generic (ADR-0113). These ARE dispatches — they belong on the
+  -- | dispatch side of the §3 identities, not beside the direct forms.
+  | LocalDeferredApply CandidateKind
+  | LocalDeferredTail CandidateKind
   -- | `rtCall RtApply` at a non-tail `CApp`: generic dispatch, with the reason it stayed generic
   | GenericApply MissReason
   -- | `tailcallWith`: the generic TAIL form — a `pv_tailcall` trampoline store, NOT a `pv_apply`
@@ -229,6 +279,8 @@ data CallEvent
 data CallClass
   = CDirectNonTail
   | CDirectMusttail
+  | CLocalDeferredApply
+  | CLocalDeferredTail
   | CGenericApply
   | CGenericTail
   | CStructuralApply
@@ -251,6 +303,8 @@ callEventClass :: CallEvent -> CallClass
 callEventClass = case _ of
   DirectNonTail _ -> CDirectNonTail
   DirectMusttail _ -> CDirectMusttail
+  LocalDeferredApply _ -> CLocalDeferredApply
+  LocalDeferredTail _ -> CLocalDeferredTail
   GenericApply _ -> CGenericApply
   GenericTail _ -> CGenericTail
   StructuralApply -> CStructuralApply
@@ -265,6 +319,8 @@ callClassName :: CallClass -> String
 callClassName = case _ of
   CDirectNonTail -> "direct-nontail"
   CDirectMusttail -> "direct-musttail"
+  CLocalDeferredApply -> "local-deferred-apply"
+  CLocalDeferredTail -> "local-deferred-tail"
   CGenericApply -> "generic-apply"
   CGenericTail -> "generic-tail"
   CStructuralApply -> "structural-apply"
@@ -282,6 +338,8 @@ callClasses :: Array CallClass
 callClasses =
   [ CDirectNonTail
   , CDirectMusttail
+  , CLocalDeferredApply
+  , CLocalDeferredTail
   , CGenericApply
   , CGenericTail
   , CStructuralApply
@@ -294,6 +352,29 @@ callClasses =
 
 -- --- ADR-0108 §3: the dynamic profile's slot space -------------------------------------------------
 
+-- | EVERY `MissReason`, in report order — the STATIC enumeration.
+-- |
+-- | Distinct from [`profiledReasons`], and the difference is load-bearing. A dynamic counter for
+-- | `MissUnknownKey` would have to read zero by construction (`readVar` crashes on such a callee
+-- | first), so the profile does not reserve one. The static census has no such argument available:
+-- | it counts what the classifier RETURNED, and if the classifier ever returns `MissUnknownKey` the
+-- | census must have a row to put it in — otherwise the ADR-0113 §3 identity (i) is short by a count
+-- | that exists, and the shortfall reads as a broken sum rather than as the compiler bug it is.
+allMissReasons :: Array MissReason
+allMissReasons =
+  [ MissCalleeForeign
+  , MissCalleeLiteral
+  ]
+    <> map MissLocalUnknownFn bindOrigins
+    <>
+      [ MissArityLocal
+      , MissUnknownKey
+      , MissArityOwnModule
+      , MissOwnObjectNotFn
+      , MissDepNoDirectFact
+      , MissArityCrossModule
+      ]
+
 -- | The reasons a generic dispatch can EXECUTE with. `MissUnknownKey` is deliberately absent: it
 -- | cannot reach a dispatch in a valid build (`readVar` crashes first, §1), so instrumenting it
 -- | would reserve a counter that must always read zero.
@@ -301,13 +382,15 @@ profiledReasons :: Array MissReason
 profiledReasons =
   [ MissCalleeForeign
   , MissCalleeLiteral
-  , MissLocalUnknownFn
-  , MissArityLocal
-  , MissArityOwnModule
-  , MissOwnObjectNotFn
-  , MissDepNoDirectFact
-  , MissArityCrossModule
   ]
+    <> map MissLocalUnknownFn bindOrigins
+    <>
+      [ MissArityLocal
+      , MissArityOwnModule
+      , MissOwnObjectNotFn
+      , MissDepNoDirectFact
+      , MissArityCrossModule
+      ]
 
 -- | The generic FORMS a dispatch can take. A reason means a different thing in each — different
 -- | emitted operation, different lever — so the counters are the product, never the sum.
@@ -320,7 +403,16 @@ profiledForms = [ CGenericApply, CGenericTail ]
 dispatchSlotNames :: Array String
 dispatchSlotNames =
   (profiledForms >>= \f -> map (\r -> callClassName f <> "/" <> missReasonName r) profiledReasons)
+    <> localDeferredSlotNames
     <> [ callClassName CStructuralApply ]
+
+-- | The ADR-0113 candidate slots, `(form × kind)`. Keyed by [`CandidateKind`] and NOT by
+-- | `BindOrigin`: the two alias kinds share an origin, and the whole point of the split is that they
+-- | are separable in the dynamic table as well as the static one.
+localDeferredSlotNames :: Array String
+localDeferredSlotNames =
+  [ CLocalDeferredApply, CLocalDeferredTail ] >>= \f ->
+    map (\k -> callClassName f <> "/" <> candidateKindName k) candidateKinds
 
 -- | An instrumented ALLOCATION SITE (ADR-0108 §5 / ADR-0109 §5.1) — a place the emitter allocates,
 -- | counted so an allocation-removing change can be checked against the runtime's per-`Kind` census
@@ -398,7 +490,10 @@ profileSlot :: CallEvent -> Maybe Int
 profileSlot = case _ of
   GenericApply r -> slotOf CGenericApply r
   GenericTail r -> slotOf CGenericTail r
-  StructuralApply -> Just (Array.length profiledForms * Array.length profiledReasons)
+  StructuralApply ->
+    Just (Array.length profiledForms * Array.length profiledReasons + Array.length localDeferredSlotNames)
+  LocalDeferredApply k -> localSlot CLocalDeferredApply k
+  LocalDeferredTail k -> localSlot CLocalDeferredTail k
   ForeignDirectApply _ -> foreignSlot CForeignDirectApply
   ForeignDirectTail _ -> foreignSlot CForeignDirectTail
   ForeignDeferredApply _ -> foreignSlot CForeignDeferredApply
@@ -415,3 +510,7 @@ profileSlot = case _ of
   foreignSlot cls = do
     i <- Array.elemIndex (callClassName cls) foreignSlotNames
     pure (Array.length dispatchSlotNames + i)
+
+  localSlot cls k = do
+    i <- Array.elemIndex (callClassName cls <> "/" <> candidateKindName k) localDeferredSlotNames
+    pure (Array.length profiledForms * Array.length profiledReasons + i)

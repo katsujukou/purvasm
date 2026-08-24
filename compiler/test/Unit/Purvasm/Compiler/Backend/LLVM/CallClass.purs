@@ -22,17 +22,17 @@ import Data.Either (Either(..))
 import Data.Foldable (for_)
 import Data.List (List(..))
 import Data.Map as Map
-import Data.Maybe (Maybe(..), fromMaybe)
+import Data.Maybe (Maybe(..), fromMaybe, maybe)
 import Data.Set as Set
 import Data.String (Pattern(..))
 import Data.String as String
 import Data.Tuple (Tuple(..), fst, snd)
-import Purvasm.Compiler.Backend.LLVM.CallClass (CallTarget(..), Form(..), callForm, missReasonName, AllocSite(..), CallClass(..), CallEvent(..), MissReason(..), allocSiteName, allocSiteSlot, allocSites, callClassName, callClasses, callEventClass, profileSlot, profileSlotNames)
+import Purvasm.Compiler.Backend.LLVM.CallClass (AllocSite(..), CallClass(..), CallEvent(..), CallTarget(..), Form(..), MissReason(..), allocSiteName, allocSiteSlot, allocSites, callClassName, callClasses, callEventClass, callForm, missReasonName, profileSlot, profileSlotNames)
 import Purvasm.Compiler.Backend.LLVM.Emit (directTarget)
 import Purvasm.Compiler.Backend.LLVM.ForeignRef (ForeignCallMode(..), ForeignClosureMode(..), ForeignRef, refArity, refKey)
 import Purvasm.Compiler.Backend.LLVM.Monad (MakeCxOptions, foreignRef, makeCx, mintParam, runCodegen)
 import Purvasm.Compiler.Backend.LLVM.Program (entryLlWithEvents, gdefKeys, moduleLlWithEvents)
-import Purvasm.Compiler.Backend.LLVM.Types (BindingV(..), EnvSrc(..), FnInfo, Gdef(..), bindDirectFnVar, bindDirectVar)
+import Purvasm.Compiler.Backend.LLVM.Types (BindOrigin(..), BindingV(..), CandidateKind(..), EnvSrc(..), FnInfo, Gdef(..), LocalFact(..), bindDirectVar, capturableFact)
 import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..))
 import Purvasm.Compiler.Primitive (PrimOp(..))
@@ -89,12 +89,13 @@ classify cfg callee nargs = fst $ runCodegen (makeCx (opts { gkeys: cfg.gkeys, x
           { name: s.name, captureHandle: s.captureHandle, envBind: DirectV envw, fnInfo: s.fnInfo }
       }
   v <- mintParam 1
-  let env0 = bindDirectVar Nil "someLocal" v
+  let env0 = bindDirectVar Nil OParam "someLocal" v FNone
   env <- case cfg.localFn of
     Nothing -> pure env0
     Just info -> do
       fv <- mintParam 2
-      pure (bindDirectFnVar env0 "localFn" fv info)
+      -- ADR-0113: an ACTIVE fact, stamped through the one safe producer (SSelf cannot get here).
+      pure (bindDirectVar env0 OLetLambda "localFn" fv (maybe FNone FActive (capturableFact info)))
   directTarget env callee nargs
 
 -- | Occurrences of a fixed needle.
@@ -184,7 +185,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.CallClass" do
       classify base (int 1) 1 `shouldEqual` GenericTarget MissCalleeLiteral
 
     it "a local binding with no known-function fact" do
-      classify base (var "someLocal") 1 `shouldEqual` GenericTarget MissLocalUnknownFn
+      classify base (var "someLocal") 1 `shouldEqual` GenericTarget (MissLocalUnknownFn OParam)
 
     it "a local known function at the wrong arity — and the right one" do
       let cfg = base { localFn = Just (fnInfo "fn_1$d" 2) }
@@ -303,8 +304,9 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.CallClass" do
 
   describe "the accounting columns are a closed enumeration" do
     it "callClasses lists every class exactly once" do
-      -- 6 from ADR-0108 + the 4 ADR-0109 foreign classes (direct/deferred × apply/tail)
-      Array.length callClasses `shouldEqual` 10
+      -- 6 from ADR-0108 + 4 ADR-0109 foreign classes (direct/deferred × apply/tail)
+      -- + the 2 ADR-0113 local-deferred classes (apply/tail)
+      Array.length callClasses `shouldEqual` 12
       Array.length (Array.nub callClasses) `shouldEqual` Array.length callClasses
       Array.nub (map callClassName callClasses) `shouldEqual` map callClassName callClasses
 
@@ -313,6 +315,8 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.CallClass" do
         samples =
           [ DirectNonTail (fnInfo "d" 1)
           , DirectMusttail (fnInfo "d" 1)
+          , LocalDeferredApply Capture
+          , LocalDeferredTail Capture
           , GenericApply MissCalleeForeign
           , GenericTail MissCalleeForeign
           , StructuralApply
@@ -362,20 +366,37 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.CallClass" do
   -- the classes which cannot execute a dispatch get no slot at all.
   describe "the dynamic profile's slot space" do
     it "has a slot for every (generic form × executable reason), plus structural-apply" do
-      -- 2 forms × 8 reasons (every MissReason except the unreachable `unknown-key`) + 1, then the
-      -- ADR-0109 §5.1 allocation sites. `callee-literal` HAS a slot although it is expected to read
-      -- zero: ADR-0108 §4 measures it rather than assuming it, and a class with no counter cannot
-      -- be measured.
-      Array.length profileSlotNames `shouldEqual` (17 + 4 + Array.length allocSites)
+      -- ADR-0113 split `local-unknown-fn` by `BindOrigin`, so the reason axis is now 14 (the 7
+      -- other reachable reasons + one row per origin), and the candidate population has its own
+      -- `(form × CandidateKind)` block beside the generic ones:
+      --   2 forms × 14 reasons + 2 forms × 3 kinds + structural + 4 ADR-0109 foreign classes.
+      -- `callee-literal` HAS a slot although it is expected to read zero: ADR-0108 §4 measures it
+      -- rather than assuming it, and a class with no counter cannot be measured. The two
+      -- ADR-0113 DIAGNOSTIC origins (`let-lambda`, `grec-lambda`) get slots for the same reason —
+      -- their binders always stamp an ACTIVE fact, so a non-zero count is a compiler bug.
+      Array.length profileSlotNames `shouldEqual` (28 + 6 + 1 + 4 + Array.length allocSites)
       Array.nub profileSlotNames `shouldEqual` profileSlotNames
       Array.filter (String.contains (Pattern "unknown-key")) profileSlotNames `shouldEqual` []
+      -- every origin and every kind is present exactly once per form — the enumeration is what the
+      -- census columns and the §3 identities are stated over, so a missing row would silently
+      -- shrink a sum rather than fail it.
+      Array.length (Array.filter (String.contains (Pattern "local-unknown-fn/")) profileSlotNames)
+        `shouldEqual` 14
+      Array.length (Array.filter (String.contains (Pattern "local-deferred-")) profileSlotNames)
+        `shouldEqual` 6
 
     it "maps each event to the slot whose NAME describes it (names and indices are one mapping)" do
       let
         named ev = profileSlot ev >>= \i -> Array.index profileSlotNames i
       named (GenericApply MissCalleeLiteral) `shouldEqual` Just "generic-apply/callee-literal"
-      named (GenericApply MissLocalUnknownFn) `shouldEqual` Just "generic-apply/local-unknown-fn"
-      named (GenericTail MissLocalUnknownFn) `shouldEqual` Just "generic-tail/local-unknown-fn"
+      named (GenericApply (MissLocalUnknownFn OParam)) `shouldEqual` Just "generic-apply/local-unknown-fn/param"
+      named (GenericTail (MissLocalUnknownFn OParam)) `shouldEqual` Just "generic-tail/local-unknown-fn/param"
+      named (GenericApply (MissLocalUnknownFn OMatchBinder))
+        `shouldEqual` Just "generic-apply/local-unknown-fn/match-binder"
+      -- the candidate slots are keyed by CandidateKind, so the two alias populations stay apart
+      named (LocalDeferredApply Capture) `shouldEqual` Just "local-deferred-apply/capture"
+      named (LocalDeferredTail AliasLocal) `shouldEqual` Just "local-deferred-tail/alias-local"
+      named (LocalDeferredApply AliasGlobal) `shouldEqual` Just "local-deferred-apply/alias-global"
       named (GenericApply MissArityCrossModule) `shouldEqual` Just "generic-apply/arity-cross-module"
       named StructuralApply `shouldEqual` Just "structural-apply"
 
@@ -675,7 +696,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.CallClass" do
       let
         guest = GuestTarget (fnInfo "M.f$d" 1)
         leaf = ForeignTarget leafRef
-        generic = GenericTarget MissLocalUnknownFn
+        generic = GenericTarget (MissLocalUnknownFn OParam)
         at t d = { tail: t, inDirect: d }
       -- non-tail: everything is an apply
       for_ [ guest, leaf, generic ] \tgt -> do

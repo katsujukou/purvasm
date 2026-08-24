@@ -146,7 +146,6 @@ emitGdef = case _ of
         , captures: []
         , body: LBody body
         , selfName: Nothing
-        , captureFns: []
         , exported: Map.member key xfns
         }
     modify_ \c -> c { pending = lifted : c.pending }
