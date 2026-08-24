@@ -99,6 +99,46 @@ pub unsafe extern "C" fn pv_runtime_free(ctx: *mut Heap) {
     })
 }
 
+/// Replace the argv the **guest** of this context observes (ADR-0075 §4, ADR-0110 §4(a) Correction):
+/// what `Purvasm.System.Process.argvImpl` reports from here on. `argv` is an `Array String` value.
+///
+/// **Host control, not foreign-author API.** A runner that hosts a program — the owned VM — has a
+/// command line of its own naming an image and its flags, and the guest must see `[image] ++ its own
+/// arguments` instead. This is deliberately NOT in `purvasm.h`'s author section, NOT mirrored in
+/// `purvasm-sys`, and NOT in the export allowlist a `--host-foreign-api` executable hands to
+/// `dlopen`ed providers: it is declared in `purvasm_host.h` for an embedding runner's own trusted
+/// C, so a guest `ForeignRef` has no name to reach and a loaded provider has no symbol to bind.
+/// Nothing about ADR-0111 §4's provider rules changes — `argvImpl` still has exactly one provider,
+/// `host-runtime`; only the context it reads from is now the host's to set.
+///
+/// The strings are **copied out**. Retaining the array (or its element pointers) would leave a heap
+/// word in runtime state that the next collection invalidates and nothing traces.
+///
+/// # Safety
+/// `ctx` is a live context; `argv` is a value word denoting an `Array` of `String`s.
+#[no_mangle]
+pub unsafe extern "C" fn pv_runtime_set_guest_argv(ctx: *mut Heap, argv: u64) {
+    guard(|| {
+        // ONE borrow of the context for the whole read: re-deriving `&mut Heap` while an earlier one
+        // is live is the Stacked-Borrows fault the GC island is kept clean of (ADR-0063 §2), and it
+        // is invisible outside Miri. Nothing here allocates, so no element can move mid-copy.
+        let h = heap(ctx);
+        let word = TaggedWord::from_bits(argv);
+        let mut out = Vec::new();
+        if word.to_bits() != empty_array().to_bits() {
+            let array = h.checked_ptr(word);
+            let n = h.array_len(array);
+            out.reserve(n as usize);
+            for i in 0..n {
+                let element = h.read_field(array, i);
+                let string = h.checked_ptr(element);
+                out.push(h.str_read(string));
+            }
+        }
+        h.set_guest_argv(out);
+    })
+}
+
 // --- calling convention (ADR-0071 §3/§4) ------------------------------------------------------------
 
 /// Apply callable `f` to `nargs` argument words (ADR-0071 §3): the generic entry all v1 calls route
@@ -936,6 +976,99 @@ mod tests {
         assert_eq!(nargs, 2);
         let a = unsafe { args_slice(args, nargs) };
         TaggedWord::int(a[0].as_int() + a[1].as_int()).to_bits()
+    }
+
+    /// Build an `Array String` on `ctx` from `items`, rooting each element: `new_str` is a safepoint
+    /// that can move the ones already built (ADR-0066 §3).
+    unsafe fn string_array(ctx: *mut Heap, items: &[&str]) -> u64 {
+        let h = heap(ctx);
+        let frame = h.frame();
+        let roots: Vec<_> = items
+            .iter()
+            .map(|s| {
+                let v = h.new_str(s.as_bytes()).as_word();
+                h.root(v)
+            })
+            .collect();
+        let vals: Vec<TaggedWord> = roots.iter().map(|&r| h.get(r)).collect();
+        let array = h.new_array(&vals).as_word().to_bits();
+        h.pop_frame(frame);
+        array
+    }
+
+    /// The default (ADR-0075 §4): with no host above it, a compiled program IS the process, so the
+    /// context's argv is the process's. Asserted on element 0 alone — the test binary's own path is
+    /// whatever cargo chose, but that there IS one is the property.
+    #[test]
+    fn a_fresh_native_context_reports_the_process_argv() {
+        let ctx = pv_runtime_new(1 << 12);
+        unsafe {
+            assert_eq!(heap(ctx).guest_argv(), std::env::args().collect::<Vec<_>>());
+            pv_runtime_free(ctx);
+        }
+    }
+
+    /// The override a hosting runner performs before the guest runs.
+    #[test]
+    fn setting_the_guest_argv_replaces_what_the_context_reports() {
+        let ctx = pv_runtime_new(1 << 12);
+        unsafe {
+            let argv = string_array(ctx, &["app.pvm", "250"]);
+            pv_runtime_set_guest_argv(ctx, argv);
+            assert_eq!(heap(ctx).guest_argv(), ["app.pvm", "250"]);
+            pv_runtime_free(ctx);
+        }
+    }
+
+    /// Two contexts, two guests, no crossing — the reason this is not a process global. A host that
+    /// ran two images in one process would otherwise hand the second one the first one's arguments.
+    #[test]
+    fn two_contexts_keep_their_argvs_apart() {
+        let a = pv_runtime_new(1 << 12);
+        let b = pv_runtime_new(1 << 12);
+        unsafe {
+            let argv_a = string_array(a, &["a.pvm", "1"]);
+            let argv_b = string_array(b, &["b.pvm", "2"]);
+            pv_runtime_set_guest_argv(a, argv_a);
+            pv_runtime_set_guest_argv(b, argv_b);
+            assert_eq!(heap(a).guest_argv(), ["a.pvm", "1"]);
+            assert_eq!(heap(b).guest_argv(), ["b.pvm", "2"]);
+            pv_runtime_free(a);
+            pv_runtime_free(b);
+        }
+    }
+
+    /// An empty argv is the empty-array sentinel, not a heap object — the runtime rejects a
+    /// zero-length heap array, so the setter has to recognise it rather than dereference it.
+    #[test]
+    fn an_empty_guest_argv_is_accepted() {
+        let ctx = pv_runtime_new(1 << 12);
+        unsafe {
+            pv_runtime_set_guest_argv(ctx, pv_empty_array());
+            assert!(heap(ctx).guest_argv().is_empty());
+            pv_runtime_free(ctx);
+        }
+    }
+
+    /// The strings are copied, not referenced: after a collection the argv must still read back, which
+    /// it cannot if the runtime kept heap words. The array itself is unrooted here, so the collection
+    /// is free to move or reclaim every string it pointed at.
+    #[test]
+    fn the_argv_survives_a_collection_that_moves_its_source() {
+        let ctx = pv_runtime_new(1 << 12);
+        unsafe {
+            let argv = string_array(
+                ctx,
+                &["image.pvm", "an argument long enough to be its own object"],
+            );
+            pv_runtime_set_guest_argv(ctx, argv);
+            heap(ctx).collect(&mut []);
+            assert_eq!(
+                heap(ctx).guest_argv(),
+                ["image.pvm", "an argument long enough to be its own object"]
+            );
+            pv_runtime_free(ctx);
+        }
     }
 
     #[test]

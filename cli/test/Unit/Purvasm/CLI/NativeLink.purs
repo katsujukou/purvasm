@@ -31,7 +31,8 @@ header banner =
     , " *     PVWord mark = pv_frame(ctx);"
     , " *     v = pv_get(ctx, h);"
     , " *"
-    , " * NOT exposed here: the runtime lifecycle (`pv_runtime_new`/`pv_runtime_free`)."
+    , " * NOT exposed here: the runtime lifecycle (`pv_runtime_new`/`pv_runtime_free`), nor the"
+    , " * host-control `pv_runtime_set_guest_argv`."
     , " */"
     , "#ifndef PURVASM_H"
     , "#define PURVASM_H"
@@ -93,6 +94,10 @@ spec = describe "Purvasm.CLI.NativeLink" do
         Right names -> do
           Array.elem "pv_runtime_new" names `shouldEqual` false
           Array.elem "pv_runtime_free" names `shouldEqual` false
+          -- The host-control entry is named in the prose for exactly the reason it must never be in the
+          -- allowlist (ADR-0110 §4(a) Correction): exporting it would let a loaded provider
+          -- reconfigure the runtime that hosts it.
+          Array.elem "pv_runtime_set_guest_argv" names `shouldEqual` false
         Left e -> shouldEqual e "the parse to succeed"
 
     it "refuses a header with no banner, rather than parsing the whole file" do

@@ -29,6 +29,12 @@
  * NOT exposed here (deliberately): the runtime lifecycle (`pv_runtime_new`/`pv_runtime_free`), the entry
  * plumbing (`pv_run_effect`/`pv_drain_output`/`pv_print_int`/`pv_case_fail`), and the `pv_prim_*` primop
  * helpers — those are codegen's internal lowering ABI, emitted straight into the `.ll`, not a foreign's.
+ *
+ * Nor is the HOST-CONTROL surface a program that embeds the runtime uses to configure it for a guest
+ * it hosts (`pv_runtime_set_guest_argv`, ADR-0110 §4(a) Correction). That lives in `purvasm_host.h`,
+ * and the separation is load-bearing: everything declared *here* is retained and dynamically exported
+ * by a `--host-foreign-api` executable so providers can bind it, and an entry that reconfigures the
+ * runtime must not be among them.
  */
 #ifndef PURVASM_H
 #define PURVASM_H
