@@ -14,6 +14,7 @@ package:
     - prelude
     - purvasm-base
     - purvasm-fs
+    - purvasm-json
     - purvasm-stdio
     - purvasm-system
     - refs

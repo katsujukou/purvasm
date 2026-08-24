@@ -30,6 +30,8 @@ module Purvasm.VM.Instruction
 
 import Prelude
 
+import Data.Generic.Rep (class Generic)
+import Data.Show.Generic (genericShow)
 import Data.Tuple.Nested (type (/\))
 
 -- | A scalar literal, as a `SwitchLit` discriminant or a pushed constant.
@@ -40,6 +42,9 @@ data Literal
   | LString String
 
 derive instance eqLiteral :: Eq Literal
+derive instance genericLiteral :: Generic Literal _
+instance showLiteral :: Show Literal where
+  show = genericShow
 
 -- | The primitive operations, monomorphic by construction (ADR-0007). Bitwise `Int` ops follow the
 -- | `Data.Int.Bits` semantics the rest of the toolchain implements: results re-wrapped to signed 32
@@ -85,6 +90,9 @@ data PrimOp
   | RecordUnion
 
 derive instance eqPrimOp :: Eq PrimOp
+derive instance genericPrimOp :: Generic PrimOp _
+instance showPrimOp :: Show PrimOp where
+  show = genericShow
 
 -- | One clause of a guard chain (ADR-0013): run `guard`, and if it is true, run `rhs` as the `case`'s
 -- | result. Both are blocks so the chain nests like everything else in the tree form.
@@ -136,7 +144,28 @@ data Instruction
   | Guarded (Array GuardClause) CodeBlock
   -- No alternative matched (or every guard fell through): a stuck program.
   | Fail String
+  -- ── The linearised `case` forms, read from a pre-§4(b) image ──────────────────────────────────
+  --
+  -- Today's `.pvm` lowers a decision tree to switches over **relative offsets** into a flat block,
+  -- and the format change that replaces them (§4(b)) is the LAST step of ADR-0110's slice 2 — after
+  -- the owned VM has taken over the optimiser measurement field, since that changeover needs boot
+  -- and the owned VM to agree on instruction counts first. Until then the reader meets offsets, and
+  -- the alternative to executing them is delinearising on the way in: rebuilding the tree the
+  -- producer already had, which §4(b) calls the wrong direction and which would be thrown away at
+  -- the same moment these are.
+  --
+  -- They are therefore deliberately temporary, and deliberately dumb: an arm is a jump, exactly as
+  -- in boot's VM, so the two agree about what a step is while both are running the same corpus.
+  | SwitchCtorRel (Array (String /\ Int)) Int
+  | SwitchLitRel (Array (Literal /\ Int)) Int
+  | SwitchLenRel (Array (Int /\ Int)) Int
 
 derive instance eqInstruction :: Eq Instruction
+derive instance genericInstruction :: Generic Instruction _
+
+-- | Structural, for a reader's diagnostics and for tests that compare a decode against the vocabulary
+-- | it should have produced. `CodeBlock` nests, so this is recursive by construction.
+instance showInstruction :: Show Instruction where
+  show i = genericShow i
 
 type CodeBlock = Array Instruction

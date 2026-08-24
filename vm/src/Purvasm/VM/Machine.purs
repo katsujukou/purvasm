@@ -23,6 +23,7 @@
 module Purvasm.VM.Machine
   ( Env
   , checkManifest
+  , defineGlobal
   , executed
   , force
   , newEnv
@@ -104,6 +105,14 @@ newEnv globals providers = map Env $
 -- | provider set and the resolution cache coming with it.
 executed :: Env -> Effect Int
 executed (Env env) = Ref.read env.executed
+
+-- | Publish a global, as an image's definitions are loaded (ADR-0110 §6's slice 2). Here rather than
+-- | in the loader because the globals table is the `Env`'s, and the `Env` is opaque.
+-- |
+-- | Order matters to the caller, not to this: a strict CAF may read globals published before it, so a
+-- | loader walks the image's definitions in the order the linker wrote them.
+defineGlobal :: Env -> String -> Value -> Effect Unit
+defineGlobal (Env env) name value = Ref.modify_ (Map.insert name value) env.globals
 
 -- | A code frame: the running block, its instruction pointer, and the environment of locals.
 -- |
@@ -295,6 +304,9 @@ run wrapped@(Env env) frames0 = do
     -- Dispatch a switch: run the matching arm, else the default.
     enterArm fr arm = enterBlock fr.env fr.share arm
 
+    -- The pre-§4(b) dispatch: advance within the current block by a relative offset.
+    jumpRel fr rel = Ref.modify_ (_ + rel) fr.ip
+
     -- Resolve a native leaf once and cache it (ADR-0111 §2). The search spans both provider classes:
     -- `host-runtime` — the runtime staticlib linked into this executable, where `show`, stdio, FS and
     -- `argv` live, so a program using only those needs no `--ffi` and no manifest — and every module
@@ -478,6 +490,26 @@ run wrapped@(Env env) frames0 = do
           n <- VMArray.length cell
           enterArm fr (lookupArm (_ == n) arms default)
         Nothing -> stuck "array-length switch on a non-array value"
+      -- The pre-§4(b) forms: the arm is a relative jump within THIS block, not a nested one, so the
+      -- frame is untouched and the instruction pointer moves exactly as boot's VM moves it. That
+      -- correspondence is the point — while both runners execute the same corpus, a step has to mean
+      -- the same thing in each (ADR-0110's slice-2 staging note, step C).
+      SwitchCtorRel arms default -> pop >>= force >>= case _ of
+        VData tag _ -> jumpRel fr (lookupArm (\t -> t == tag) arms default)
+        VCarrier _ fv -> do
+          let tag = Foreign.adtTag fv
+          jumpRel fr (lookupArm (\name -> ctorTag name == tag) arms default)
+        _ -> stuck "switch on a non-data value"
+      SwitchLitRel arms default -> do
+        v <- pop >>= force >>= decodeLike (map (\(l /\ _) -> l) (Array.head arms))
+        case Array.head arms of
+          Just (l /\ _) | not (litKindEq l v) -> stuck "literal switch on a wrong-kind value"
+          _ -> jumpRel fr (lookupArm (\l -> litEq l v) arms default)
+      SwitchLenRel arms default -> pop >>= force >>= VMArray.asCell >>= case _ of
+        Just cell -> do
+          n <- VMArray.length cell
+          jumpRel fr (lookupArm (_ == n) arms default)
+        Nothing -> stuck "array-length switch on a non-array value"
       Guarded clauses fallthrough ->
         enterGuard { clauses, index: 0, fallthrough, env: fr.env, share: fr.share }
       Fail message -> stuck message
@@ -538,7 +570,10 @@ decodeLike literal value = case value, literal of
   _, _ -> pure value
 
 -- | The arm whose discriminant matches, else the default.
-lookupArm :: forall d. (d -> Boolean) -> Array (d /\ CodeBlock) -> CodeBlock -> CodeBlock
+-- | Polymorphic in what an arm CARRIES, so one selector serves both dispatch shapes: a nested block
+-- | (§4(b)) and a relative offset (the pre-§4(b) images the reader still meets). The selection rule is
+-- | the same in both — first match, else the default — and that is the part worth having once.
+lookupArm :: forall d a. (d -> Boolean) -> Array (d /\ a) -> a -> a
 lookupArm matches arms default = case Array.find (\(d /\ _) -> matches d) arms of
   Just (_ /\ block) -> block
   Nothing -> default

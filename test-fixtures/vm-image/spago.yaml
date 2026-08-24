@@ -1,0 +1,8 @@
+package:
+  name: vm-image-fixtures
+  dependencies:
+    - effect
+    - prelude
+    - purvasm-stdio
+    - purvasm-system
+    - strings

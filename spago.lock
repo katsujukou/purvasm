@@ -588,6 +588,7 @@
             "prelude",
             "purvasm-base",
             "purvasm-fs",
+            "purvasm-json",
             "purvasm-stdio",
             "purvasm-system",
             "refs",
@@ -601,6 +602,21 @@
             "spec",
             "spec-node"
           ]
+        }
+      },
+      "vm-image-fixtures": {
+        "path": "test-fixtures/vm-image",
+        "core": {
+          "dependencies": [
+            "effect",
+            "prelude",
+            "purvasm-stdio",
+            "purvasm-system",
+            "strings"
+          ]
+        },
+        "test": {
+          "dependencies": []
         }
       }
     },

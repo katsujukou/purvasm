@@ -24,13 +24,17 @@ import Data.String as String
 import Data.Traversable (traverse)
 import Data.Tuple.Nested ((/\))
 import Effect (Effect)
-import Purvasm.Stdio (writeLine)
+import Purvasm.Stdio (writeErrLine, writeLine)
 import Purvasm.System.Process as Process
 import Purvasm.VM.Error (stuck)
 import Purvasm.VM.Instruction (CodeBlock, Instruction(..), Literal(..), PrimOp(..))
+import Purvasm.VM.Host as Host
 import Purvasm.VM.Loader as Loader
+import Data.Either (Either(..))
 import Purvasm.FS as FS
-import Purvasm.VM.Machine (checkManifest, executed, newEnv, runBlock)
+import Purvasm.VM.Image as Image
+import Purvasm.VM.Program as Program
+import Purvasm.VM.Machine (Env, checkManifest, executed, newEnv, runBlock)
 import Purvasm.VM.Value (Value(..))
 
 -- | `let go n acc = if n == 0 then acc else go (n - 1) (acc + n) in go 10 0` — a tail-recursive
@@ -146,6 +150,63 @@ probe host key n = case Loader.arity n of
   Just a -> case Loader.resolve host key a of
     Just _ -> "resolved"
     Nothing -> "absent"
+
+-- | The image path named by `--image <path>`, if any. With one, the VM runs a real program instead of
+-- | the built-in smoke entries — which is what makes it a runner rather than a demonstration.
+imagePath :: Array String -> Effect (Maybe String)
+imagePath args = case Array.uncons args of
+  Nothing -> pure Nothing
+  Just { head: "--image", tail } -> case Array.uncons tail of
+    Just path -> pure (Just path.head)
+    Nothing -> stuck "--image needs a path"
+  Just { tail } -> imagePath tail
+
+-- | Run a linked image, under ADR-0110 §5's **typed terminal demand**.
+-- |
+-- | The image's `main` chunk already applies the entry to the run marker — the linker builds it as
+-- | `<module>.main` applied to `LInt 0` — so running it *is* performing the effect. The flag decides
+-- | only how the result is observed, and the two modes are not a formatting choice:
+-- |
+-- |   * an `Effect` entry is **run and discarded**, because its final value is frequently a carrier (a
+-- |     `main` ending in `Console.log` returns whatever that leaf's `pv_apply` returned) and observing
+-- |     it would fail the commonest program there is;
+-- |   * a **value** entry is printed, and a carrier there is the named escape error — the VM cannot
+-- |     render a value it is forbidden to introspect (ADR-0111 §3).
+runImage :: Env -> Boolean -> String -> Effect Unit
+runImage env counting path = FS.readTextFile path >>= case _ of
+  Nothing -> stuck ("cannot read the image at " <> path)
+  Just text -> case Image.decodeImage text of
+    Left e -> stuck ("cannot read the image at " <> path <> ": " <> e)
+    Right image -> do
+      Program.load env image
+      result <- runBlock env image.main Map.empty
+      -- On stderr, in boot's wording, so one reader parses either runner (ADR-0110 §6, step C): the
+      -- guest owns stdout, and the count must not appear in output a differential compares.
+      when counting do
+        n <- executed env
+        writeErrLine ("instructions " <> show n)
+      if image.isEffect then pure unit
+      else case result of
+        VCarrier origin _ -> stuck
+          ( "native value escaped as the program result (from " <> origin
+              <> "): a value entry must produce something the VM can render"
+          )
+        v -> writeLine (describe v)
+
+-- | The arguments meant for the guest: everything after a `--` separator, empty when there is none.
+-- |
+-- | A separator rather than "whatever is left over" because the VM's own flags are open-ended: a
+-- | positional guest argument that happened to look like a future flag would change meaning when
+-- | that flag lands, and it would do so silently. So `--image`, `--count`, `--ffi` and `--manifest`
+-- | are the VM's and never the guest's, and the guest's are exactly what it asked for.
+guestArgs :: Array String -> Array String
+guestArgs args = case Array.elemIndex "--" args of
+  Nothing -> []
+  Just i -> Array.drop (i + 1) args
+
+-- | Whether a bare flag appears in the arguments.
+flagSet :: String -> Array String -> Boolean
+flagSet flag = Array.elem flag
 
 -- | The manifest path named by `--manifest <path>`, if any.
 -- |
@@ -516,9 +577,22 @@ main = do
   -- Providers load *before* the program runs, so a module's own initialisers cannot be mistaken for
   -- program output — which is what makes the ADR-0111 §5 stale-module gate observable.
   args <- Process.argv
-  case selfTest (Array.drop 1 args) of
-    Just name -> runSelfTest (Array.drop 1 args) name
-    Nothing -> ordinaryRun (Array.drop 1 args)
+  let rest = Array.drop 1 args
+  case selfTest rest of
+    Just name -> runSelfTest rest name
+    Nothing -> imagePath rest >>= case _ of
+      Just path -> do
+        handles <- loadAll rest
+        -- Before anything of the guest's runs: the argv it observes is ITS command line, not the
+        -- VM's (ADR-0075 §4). Without this the program reads `--image` where its first argument
+        -- belongs — the runtime's leaf reports the process's argv, and the process is the VM.
+        Host.setGuestArgv ([ path ] <> guestArgs rest)
+        env <- newEnv Map.empty handles
+        manifestPath rest >>= case _ of
+          Nothing -> pure unit
+          Just manifest -> readManifest manifest >>= checkManifest env
+        runImage env (flagSet "--count" rest) path
+      Nothing -> ordinaryRun rest
 
 -- | The ordinary run: load whatever `--ffi` names, then the guest programs.
 ordinaryRun :: Array String -> Effect Unit
