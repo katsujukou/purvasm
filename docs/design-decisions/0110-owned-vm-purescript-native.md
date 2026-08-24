@@ -443,7 +443,8 @@ Each slice ships with its gates; none of them requires boot to change.
 >   hands over. An image referencing a leaf those shapes do not describe is **refused, naming every
 >   such key**, rather than written with a guessed arity.
 >
-> - **Both forms come out of one compilation** (`app.pvm` v3, `app.v4.pvm` v4) for as long as the two
+> - **Both forms come out of one compilation** (`app.pvm` v3, `app.v4.pvm` v4 — renamed `app.owned.pvm`
+>   and bumped to version 5 by step D below) for as long as the two
 >   runners coexist. The reader accepts both versions and refuses to read v4 syntax under a v3 stamp:
 >   a stamp a reader overrides is not a stamp.
 >
