@@ -126,6 +126,64 @@ if [ "$OPT_EFFECT" = "1" ]; then
   # `purvm run --count` prints stats to stderr, the guest's result to stdout.
   instr_count() { "$PURVM" run --count "$1" "$2" 2>&1 1>/dev/null | awk '/instructions/{print $2}'; }
   guest_out() { "$PURVM" run "$1" "$2" 2>/dev/null; }
+
+  # The owned VM (ADR-0110), run alongside boot's on the SAME compilation: `l2_compile` writes both
+  # image forms, so `app.pvm` (version 3) goes to boot and `app.v4.pvm` (version 4, carrying each
+  # native leaf's arity) goes here. §4(a) adds metadata without touching the instruction sequence, so
+  # the two runners must agree on the COUNT, not merely on the output — and that equality is available
+  # exactly once, while both runners exist. Step D changes what a count means (a `case` stops being a
+  # linear region), and boot's leg comes out then.
+  #
+  # Opt-in by path because building the owned VM is a native link of minutes; when it is absent the
+  # legs below say SKIPPED rather than passing quietly.
+  OWNED_VM="${PURVASM_VM:-}"
+  # The ulib leaves, as a loadable provider. A leaf like `Data.Number.isFinite` is shipped by ulib as
+  # a `.c` and linked into a natively compiled program — the owned VM's guest has no such link, so it
+  # reaches those keys the way ADR-0111 §4 says a workspace-provided key is reached: through a module
+  # the runner loads. The whole corpus needs eight of them from two files, so one `.so` covers it.
+  #
+  # Built here rather than found, because nothing packages ulib's native side as a shared object yet;
+  # ADR-0110 §6 step E owes that (a manifest beside the image, and the provider to go with it). Until
+  # then this is the harness's own, and it uses the ordinary `--ffi` path with nothing special about it.
+  OWNED_FFI=""
+  if [ -n "$OWNED_VM" ]; then
+    ULIB_C="$(node -e 'const m=require("fs").readFileSync(process.argv[1],"utf8");const f=JSON.parse(m).foreign||{};console.log([...new Set(Object.values(f))].join(" "))' "$ULIB/ulib.json" 2>/dev/null)"
+    if [ -n "$ULIB_C" ]; then
+      # shellcheck disable=SC2086
+      set -- $ULIB_C
+      abs=""
+      for c in "$@"; do abs="$abs $ULIB/$c"; done
+      OWNED_FFI="$OUT/ulib-provider.so"
+      # A provider leaves every `pv_*` undefined and binds it against the host at `dlopen` — the same
+      # link shape `tools/vm-loader-e2e.sh` uses, the ABI stamp `pv_foreign_abi_v1` included: its
+      # unresolved reference is what makes a version mismatch fail the load (ADR-0111 §5).
+      case "$(uname -s)" in
+        Darwin) SHARED_FLAGS="-shared -undefined dynamic_lookup" ;;
+        *)      SHARED_FLAGS="-shared -fPIC" ;;
+      esac
+      # shellcheck disable=SC2086
+      if ! clang $SHARED_FLAGS -O2 -I "${PURVASM_INCLUDE:-runtime/include}" $abs -o "$OWNED_FFI" \
+             >"$OUT/ulib-provider.log" 2>&1; then
+        echo "error: could not build the ulib provider for the owned VM — see $OUT/ulib-provider.log" >&2
+        exit 2
+      fi
+    fi
+  fi
+  # `--` separates the VM's flags from the guest's argv (the owned VM's convention; boot takes the
+  # trailing arguments positionally). Both runners must hand the program the SAME size, or the two
+  # legs measure different programs and their counts have nothing to say to each other.
+  owned_count() { "$OWNED_VM" ${OWNED_FFI:+--ffi "$OWNED_FFI"} --image "$1" --count -- "$2" 2>&1 1>/dev/null | awk '/instructions/{print $2}'; }
+  # Keeps the exit status: a REFUSED image and a diverging one are different findings, and a runner
+  # that failed produces empty output — which any content-based diagnosis below would misread.
+  owned_out() { "$OWNED_VM" ${OWNED_FFI:+--ffi "$OWNED_FFI"} --image "$1" -- "$2" 2>"$OUT/owned.err"; }
+  # Whether the owned VM's guest reads the size at all: the same image run at two different sizes.
+  # An identical count means the argument never reached the program — which is the known gap (the VM
+  # does not virtualise argv, so the guest reads the VM's own command line) rather than a
+  # disagreement between the runners. Asked of the owned VM alone, so no assumption about how boot's
+  # own flag parsing would treat a mimicked command line can creep into the attribution.
+  owned_ignores_size() {
+    [ "$(owned_count "$1" "$2")" = "$(owned_count "$1" "$3")" ]
+  }
   now() { perl -MTime::HiRes=time -e 'printf "%.3f", time'; }
   pmo_bytes() { cat "$1"/_build/*.pmo 2>/dev/null | wc -c | tr -d ' '; }
 
@@ -137,7 +195,12 @@ if [ "$OPT_EFFECT" = "1" ]; then
   TIME_RATIO_MAX=4.0
 
   optsum="$OUT/opt-effect.txt"
-  printf '%-16s %-10s %14s %14s %8s %7s %7s %7s\n' bench n opt no-opt ratio 'red%' 'size×' 'time×' | tee "$optsum"
+  if [ -n "$OWNED_VM" ]; then
+    echo "owned VM: $OWNED_VM (running alongside boot on the same compilation)" | tee "$optsum"
+  else
+    echo "owned VM: SKIPPED (set PURVASM_VM to the built owned VM to run the ADR-0110 step-C leg)" | tee "$optsum"
+  fi
+  printf '%-16s %-10s %14s %14s %8s %7s %7s %7s %8s\n' bench n opt no-opt ratio 'red%' 'size×' 'time×' owned | tee -a "$optsum"
   echo "$BENCH_TABLE" | while read -r name module start heap; do
     [ -n "$name" ] || continue
     if [ -n "$ONLY" ] && ! echo "$ONLY" | tr ' ' '\n' | grep -qx "$name"; then continue; fi
@@ -204,7 +267,56 @@ if [ "$OPT_EFFECT" = "1" ]; then
       gate="$gate TIME-GATE-EXCEEDED(>$TIME_RATIO_MAX)"
       touch "$OUT/.opt-failed"
     fi
-    printf '%-16s %-10s %14s %14s %8s %7s %7s %7s%s\n' "$name" "$start" "$oi" "$ni" "$ratio" "$red" "$sizer" "$timer" "$gate" | tee -a "$optsum"
+    # The ADR-0110 step-C leg. Both modes are checked: `--opt` and `--no-opt` reach the leaf lowering
+    # by different routes, and only one of them running the optimiser is exactly the asymmetry that
+    # would hide a divergence in the other.
+    owned="-"
+    if [ -n "$OWNED_VM" ]; then
+      owned="≡"
+      for m in opt noopt; do
+        [ "$m" = "opt" ] && d="$odir" || d="$ndir"
+        [ "$m" = "opt" ] && bi="$oi" || bi="$ni"
+        [ "$m" = "opt" ] && bo="$oo" || bo="$no"
+        if [ ! -f "$d/app.v4.pvm" ]; then
+          owned="NO-V4-IMAGE($m)"; touch "$OUT/.opt-failed"; break
+        fi
+        if ! vo=$(owned_out "$d/app.v4.pvm" "$start"); then
+          owned="REFUSED($m)"; touch "$OUT/.opt-failed"
+          sed 's/^/    /' "$OUT/owned.err" >>"$optsum"
+          break
+        fi
+        if [ "$vo" != "$bo" ]; then
+          # Name the cause when it is the known one. The corpus reads its input size from the guest's
+          # argv (ADR-0075 §4), and the owned VM does not yet give a guest an argv of its own: it
+          # resolves `argvImpl` through the runtime, which reports the VM's OWN command line. So the
+          # program runs at its default size no matter what is passed here, and the two legs measure
+          # different inputs. Distinguished from a real divergence by re-running with no size at all:
+          # identical output means the argument was never seen.
+          if [ "$vo" = "$(owned_out "$d/app.v4.pvm" '')" ]; then
+            owned="ARGV($m)"
+          else
+            owned="OUT($m)"
+          fi
+          touch "$OUT/.opt-failed"; break
+        fi
+        vi=$(owned_count "$d/app.v4.pvm" "$start")
+        if [ -z "$vi" ] || [ "$vi" != "$bi" ]; then
+          # The known cause first, established rather than assumed: the corpus reads its input size
+          # from argv, and the owned VM's guest reads the VM's OWN command line, so it parses
+          # "--image" where boot parses the size. Same program, different input — `Int.fromString`
+          # over a longer string is the whole difference, and the program then runs at its default
+          # size. Doubling the size we pass settles which it is: a count that does not move never saw
+          # the argument.
+          if owned_ignores_size "$d/app.v4.pvm" "$start" "$((start * 2))"; then
+            owned="ARGV($m)"
+          else
+            owned="COUNT($m:$vi/$bi)"
+          fi
+          touch "$OUT/.opt-failed"; break
+        fi
+      done
+    fi
+    printf '%-16s %-10s %14s %14s %8s %7s %7s %7s %8s%s\n' "$name" "$start" "$oi" "$ni" "$ratio" "$red" "$sizer" "$timer" "$owned" "$gate" | tee -a "$optsum"
   done
   # The self-compile size leg (ADR-0089 self-compile extension): the compiler's own closure is
   # the regression gate for the inliner blow-up class the five bench closures cannot see

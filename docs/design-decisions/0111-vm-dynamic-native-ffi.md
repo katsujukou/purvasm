@@ -398,6 +398,17 @@ member selection or load order would otherwise pick a winner quietly. A user pro
 otherwise). A duplicate is never resolved by precedence: the VM has no shadowing rule, deliberately,
 because "which `show` am I running?" is not a question a user should have to ask.
 
+> **Consistency note (2026-08-24), for [0110](0110-owned-vm-purescript-native.md)'s guest-argv
+> Correction:** nothing in this section changes. A hosted guest must observe *its own* argv rather
+> than the VM's, and the way that is done is **runtime context injection**, not a provider exception:
+> `Purvasm.System.Process.argvImpl` still has exactly one provider, `host-runtime`, and what the host
+> sets is the context that provider reads. No key is reserved, nothing is preferred by precedence,
+> and the runtime-shadow error above is unchanged. The setter is host-control API
+> (`purvasm_host.h`), so it is outside the retained/exported set of §1.1 and outside
+> `PV_FOREIGN_ABI_VERSION` — a `dlopen`ed provider has no symbol to bind and a guest `ForeignRef` no
+> name to resolve. The loader gate asserts that directly: nothing named `pv_runtime_*` may appear in
+> the executable's dynamic exports.
+
 A module is never `dlclose`d: a closure built in §2 holds a code address into it. That is the
 loader's contract, and §6 gives it a place to live.
 

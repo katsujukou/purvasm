@@ -54,16 +54,27 @@ case "$(uname -s)" in
   *)      SHARED=(-shared -fPIC) ;;
 esac
 
-echo "== building the VM with --host-foreign-api =="
-if ! node "$ROOT/cli/index.node.js" build --entry Main --corefn-dir "$COREFN_DIR" \
-       --outdir "$WORK/vm" --host-foreign-api >"$WORK/build.log" 2>&1; then
-  echo "  the VM build failed — see $WORK/build.log" >&2
-  tail -20 "$WORK/build.log" >&2
-  exit 2
+# The VM build is SHARED, not owned: `$PURVASM_VM_DIR` names an existing `purvasm build --outdir`
+# directory to reuse. A directory rather than an executable, because this gate inspects the link's
+# own artifacts (the export allowlist) and not only the binary. Unset, the script builds its own and
+# stays runnable alone — `tools/vm-e2e.sh` is what builds once and hands the same directory to both
+# gates.
+if [ -n "${PURVASM_VM_DIR:-}" ]; then
+  VMDIR="$PURVASM_VM_DIR"
+  echo "== using the VM build at $VMDIR =="
+  [ -x "$VMDIR/app" ] || { echo "  no executable at $VMDIR/app" >&2; exit 2; }
+else
+  VMDIR="$WORK/vm"
+  echo "== building the VM with --host-foreign-api =="
+  if ! node "$ROOT/cli/index.node.js" build --entry Main --corefn-dir "$COREFN_DIR" \
+         --outdir "$VMDIR" --host-foreign-api >"$WORK/build.log" 2>&1; then
+    echo "  the VM build failed — see $WORK/build.log" >&2
+    tail -20 "$WORK/build.log" >&2
+    exit 2
+  fi
+  grep -F "host-foreign-api: retaining" "$WORK/build.log" | sed 's/^ */  /'
 fi
-VM="$WORK/vm/app"
-[ -x "$VM" ] || { echo "  no executable at $VM" >&2; exit 2; }
-grep -F "host-foreign-api: retaining" "$WORK/build.log" | sed 's/^ */  /'
+VM="$VMDIR/app"
 
 rc=0
 
@@ -115,8 +126,8 @@ echo "== export allowlist ≡ what the executable actually exports (§1.1) =="
 #
 # The comparison is EXACT in both directions, not a spot check: missing means providers break,
 # extra means the allowlist is not the boundary it claims to be.
-ALLOW="$WORK/vm/_build/exported_symbols.txt"          # Mach-O: -exported_symbols_list
-[ -f "$ALLOW" ] || ALLOW="$WORK/vm/_build/dynamic.list" # ELF: --dynamic-list
+ALLOW="$VMDIR/_build/exported_symbols.txt"          # Mach-O: -exported_symbols_list
+[ -f "$ALLOW" ] || ALLOW="$VMDIR/_build/dynamic.list" # ELF: --dynamic-list
 if [ ! -f "$ALLOW" ]; then
   printf '  %-24s -> no export allowlist at %s FAIL\n' export-set "$ALLOW"; rc=1
 else
@@ -149,6 +160,18 @@ else
     printf '  %-24s -> exported but not allowlisted: %s FAIL\n' export-set "$(echo "$extra" | tr '\n' ' ' | cut -c1-200)"; rc=1
   fi
   [ -n "$missing$extra" ] || printf '  %-24s -> exactly the allowlist, nothing else OK\n' export-set
+
+  # The HOST-CONTROL surface (`purvasm_host.h`, ADR-0110 §4(a) Correction), named on its own even
+  # though the exact comparison above would already catch it. These entries configure the runtime
+  # *for* a guest — `pv_runtime_set_guest_argv` rewrites what the guest's `argvImpl` reports — so one
+  # of them appearing in the dynamic exports would let a loaded provider reach past its own program
+  # into the runner's decisions. Every other leg here is positive and none would notice.
+  host_control="$(printf '%s\n' "$actual_set" | grep -E '^pv_runtime_' || true)"
+  if [ -n "$host_control" ]; then
+    printf '  %-24s -> HOST-CONTROL API EXPORTED: %s FAIL\n' host-control "$(echo "$host_control" | tr '\n' ' ')"; rc=1
+  else
+    printf '  %-24s -> the runtime lifecycle and argv setter stay unexported OK\n' host-control
+  fi
 fi
 
 echo "== API coverage: every pv_* the header declares resolves against the VM (§1.1) =="
@@ -471,13 +494,13 @@ fi
 # The build's manifest is not fed in whole on purpose: it names the VM's OWN trusted leaves, which are
 # deliberately not exported (§6), so a host checking it against itself would fail by design. A
 # manifest belongs to the image a VM runs, not to the VM.
-head -1 "$WORK/vm/foreign-manifest" >"$WORK/manifest-from-build"
+head -1 "$VMDIR/foreign-manifest" >"$WORK/manifest-from-build"
 if "$VM" --self-test loaded-provider --ffi "$WORK/provider.so" --manifest "$WORK/manifest-from-build" \
      >/dev/null 2>"$WORK/banner.err"; then
   printf '  %-24s -> the VM accepts the format the build writes OK\n' manifest
 else
   printf '  %-24s -> writer and reader disagree about the format FAIL\n' manifest; rc=1
-  printf '      build wrote: %s\n' "$(head -1 "$WORK/vm/foreign-manifest")" >&2
+  printf '      build wrote: %s\n' "$(head -1 "$VMDIR/foreign-manifest")" >&2
   sed 's/^/      /' "$WORK/banner.err" >&2
 fi
 

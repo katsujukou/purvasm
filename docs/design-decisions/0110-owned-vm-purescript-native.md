@@ -133,6 +133,11 @@ bytecode format, it does not produce it, and the compiler must not gain a depend
 naming during the transition (both `purvm`s exist) is an implementation detail, pinned when the
 first slice ships.
 
+> **Pinned (2026-08-22):** `purvm` stays the frozen boot VM; the owned VM's executable is
+> **`purvasm-vm`**; and a later `purvasm run` is the user-facing command that launches it. No
+> provisional name (`purvm2`, `purvm-next`) reaches a public surface, and a harness distinguishes the
+> two with `PURVM` and `PURVASM_VM` rather than by path.
+
 > **Progress (2026-08-17):** §2's claim is measured, on **both** paths and with the same result
 > (`result: 55`, `instructions: 134`, from a tail-recursive guest loop run through `vm/src/Main.purs`):
 >
@@ -319,7 +324,56 @@ that exist:
    dispatch) — each a paired change to the Level-2 bytecode backend and the reader, version-stamped.
 3. Dynamic native FFI ([0111](0111-vm-dynamic-native-ffi.md)).
 4. Promote the owned VM to the reference runner for the optimiser measurement field; boot's VM stays
-   as the oracle.
+   as a **temporary calibration leg** — ~~the oracle~~ (§5's Correction: boot is not an oracle for this
+   VM, so its remaining role is to agree during the changeover, not to define correctness).
+
+> **Staging refinement (2026-08-22), forced by the scope correction in §Consequences:** slice 2 runs
+> in five steps, and the third is not optional.
+>
+> - **A.** The reader, against today's `.pvm`, verified on programs with no foreign leaf.
+> - **B.** §4(a) foreign arity — the paired backend/reader change, version-stamped. This is what lets
+>   the owned VM run the corpus at all, since every benchmark entry is `main :: Effect Unit`.
+> - **C.** The owned measurement leg in `benchmarks/run-benchmarks.sh`, **run alongside** boot's until
+>   it agrees. While it runs, one Level-2 compilation emits both forms — the legacy image for
+>   `purvm run --count` and the arity-carrying one for `purvasm-vm` — and because §4(a) adds metadata
+>   without changing the instruction sequence, the two must agree on the **instruction count**, not
+>   merely on output. That equality is the calibration; it is available exactly once, here.
+> - **D.** §4(b) tree dispatch. Instruction counts change meaning at this point (a `case` stops being
+>   a linear region), so the owned VM's counts become the baseline and boot's leg comes out.
+>
+>   > **Pinned before D (2026-08-24), on accepting B and C:**
+>   >
+>   > 1. Tree dispatch is a **new image version**. It does not redefine version 4 — an existing v4
+>   >    image keeps meaning exactly what it means today, so a reader can tell the two apart by the
+>   >    stamp rather than by inspecting a `case`.
+>   > 2. Through the migration the three forms are distinct and named: **v3** boot's, **v4** the owned
+>   >    VM's *linear* form, and the next version the owned VM's *tree* form.
+>   > 3. After D the owned VM must still agree with boot on **output**. That parity does not lapse
+>   >    because the encoding changed.
+>   > 4. **Instruction-count parity does not continue.** It was B/C's calibration and it is kept as
+>   >    evidence (the eight pairs above), not as a standing condition: tree dispatch changes the
+>   >    instruction vocabulary, so equal counts would no longer mean the same programs ran.
+>   > 5. The owned VM's counts are **re-taken after D** as the measurement field's new baseline. The
+>   >    old numbers describe the old vocabulary and do not carry over.
+>   > 6. D's completion must **write down the two dates the reader and the writer stop moving
+>   >    together**: how long the reader keeps accepting the older versions, and when the emitter
+>   >    stops producing v4. Leaving either implicit is how a format acquires a permanent tail.
+> - **E.** The CLI wiring, which also owes a **manifest beside the bytecode image**: manifest emission
+>   currently lives in the native linker (ADR-0111 §4), while `purvasm run` writes only `app.pvm`, so
+>   the bytecode finalisation must emit the matching manifest for `--manifest` to become discovery.
+>   ~~Not a blocker for B or C: the benchmark corpus uses runtime leaves only.~~ **Wrong, and only
+>   measurement showed it (2026-08-24):** `bench-json-parse` reaches `Data.Number.isFinite`, which ulib
+>   ships as a `.c` — a *workspace-provided* key, not a runtime one. A compiled program links it; a
+>   hosted guest must be handed a provider for it (ADR-0111 §4). C therefore needs one piece of E
+>   early, and the harness builds it itself until E packages ulib's native side properly.
+>
+> **B is not done when the reader and backend are.** It is done when C is green. A format bump that
+> lands without the owned measurement leg leaves `run-benchmarks.sh` writing images its own runner
+> cannot read.
+>
+> **Both closed 2026-08-24** — see the Corrections below for what C actually cost: §4(a) turned out
+> to be leaf recognition, lowering, emission and reading rather than one field; the reader owed
+> `Number` literals; and the VM owed its guest an argv.
 
 Each slice ships with its gates; none of them requires boot to change.
 
@@ -340,6 +394,173 @@ Each slice ships with its gates; none of them requires boot to change.
 >   worried about: the boot leg builds its own image with `purvm build` from CoreFn and never consumes
 >   Level-2's `.pvm`, so §4's format changes cost the gate nothing. There are no paired artifacts and
 >   no delinearizer; §Consequences' "one image per runner" note is thereby moot.
+
+> **Progress (2026-08-23): step A is done, and step B is wider than §4(a) reads.**
+>
+> - **A is complete.** The VM decodes today's `.pvm` and runs it: the three global shapes are three
+>   evaluation strategies (closure, strict CAF at load, by-need forced on use), and the entry is the
+>   typed terminal demand §5 describes. Its gate is `tools/vm-image-e2e.sh` — hand-written fixtures for
+>   the format's edges (a matching arm *and* the default edge, since an off-by-one in the relative
+>   offset base lands inside the wrong arm rather than failing; a stale version stamp refused by name),
+>   plus a foreign-free program compiled by the Level-2 bytecode path and run end to end, so the
+>   reader is not judged only against fixtures written by the person who wrote it.
+>
+> - **B's real scope, found while writing that gate.** The bytecode backend does not emit `ForeignRef`
+>   *at all* today — the gap is not a missing arity field. `Purvasm.Compiler.Ffi.resolver` has an
+>   intrinsic rung and a structural rung and nothing else, so a native key that neither answers stays
+>   an ordinary `Load` of an unbound global. boot's VM satisfies that from its compiled-in registry;
+>   the owned VM has no registry to satisfy it from, and must not acquire one. §4(a) is therefore four
+>   things, not one: leaf **recognition** (FSR-derived arities), **lowering** (a foreign atom rather
+>   than a variable), **emission** (`ForeignRef key arity`), and **reading**. The recognition side
+>   already exists — `nativeLeafArities`, `leafClosureArity`, `resolveNativeForeigns` in the LLVM
+>   backend — and is backend-neutral, so it moves to a shared module consumed by both backends rather
+>   than being reimplemented for bytecode.
+>
+> - The step-A gate **asserts** that boundary instead of leaving it implicit: a program with a native
+>   leaf must still fail as an unresolved `Load`. Step B flips that line, and its own gate must check
+>   the leaf is emitted as `ForeignRef key arity` — not merely that the program ran, which a resolver
+>   change could achieve by the wrong route.
+
+> **Progress (2026-08-23), continued: step B is implemented, and step C's calibration holds.**
+>
+> - **Recognition is now shared, not copied.** `leafClosureArity`, `nativeLeafArities` and
+>   `resolveNativeForeigns` moved out of the LLVM driver into `Purvasm.Compiler.NativeLeaf`, and both
+>   backends read them. A second derivation over the same FSR would have been the drift source this
+>   step exists to remove: two backends disagreeing about which keys are leaves fails as a link error
+>   on one side and a stuck run on the other, which do not look like the same bug.
+>
+> - **The bytecode backend applies the lowering** it never had, so a native leaf reaches the image as
+>   `ForeignRef` instead of an unbound `Load`. This does not move a decl's `deps` — the key migrates
+>   from `fvExpr` to `cfExpr` and the union is the same set — and it does not move the instruction
+>   count: the lowering is a one-for-one opcode substitution, confirmed by running one image both ways
+>   (2,544,920 instructions with `fr`, 2,544,920 with the `ld` it replaced).
+>
+> - **The arity rides the image, not the `.pmo`.** `.pmo`/`.pmi` stay at format 3 — boot reads those,
+>   and the `.pmi` is byte-identical to boot's by ADR-0088 §1 — while the *linked* image gains version
+>   4, whose `ForeignRef` carries the leaf's physical closure arity. The arity is a link-time fact
+>   (the linker compiles the FFI ladder's structural terms itself, and those reference leaves too), so
+>   it is resolved once at finalisation from the whole closure's FSR shapes, which `BuildProducts` now
+>   hands over. An image referencing a leaf those shapes do not describe is **refused, naming every
+>   such key**, rather than written with a guessed arity.
+>
+> - **Both forms come out of one compilation** (`app.pvm` v3, `app.v4.pvm` v4) for as long as the two
+>   runners coexist. The reader accepts both versions and refuses to read v4 syntax under a v3 stamp:
+>   a stamp a reader overrides is not a stamp.
+>
+> - **Step C's equality holds where it can be measured, and C is BLOCKED on one missing piece.**
+>   `benchmarks/run-benchmarks.sh` grew an owned leg beside boot's, opt-in through `PURVASM_VM` and
+>   reported as SKIPPED rather than passing quietly when absent; it checks output *and* instruction
+>   count, in `--opt` and `--no-opt` alike. On a program that takes no arguments the two runners agree
+>   exactly — `Gate.GcChurn`: boot 2,544,920, owned 2,544,920, same output.
+>
+>   Every benchmark in the corpus, however, reads its input size from the guest's argv (ADR-0075 §4),
+>   and at the time of writing **the owned VM had no notion of a guest argv**: it resolved
+>   `Purvasm.System.Process.argvImpl` through `host-runtime`, whose leaf reported the *process's*
+>   command line — so the guest saw `--image` where its first argument belongs and ran at its default
+>   size. That is resolved by the 2026-08-24 Correction below; the leg still carries the `ARGV(mode)`
+>   verdict, established by re-running at a doubled size rather than assumed, so a regression in the
+>   injection is named for what it is instead of appearing as a bare count mismatch.
+>
+>   It is worth being precise about what that does and does not leave in doubt, because the argv gap
+>   changes the *input*, not the agreement. Held to the same argv, the two runners agree exactly on a
+>   corpus program: `bench-st-ref` at `--opt` counts **60,873** on the owned VM, and boot handed the
+>   same three trailing arguments the VM's own command line gave its guest (`-- --image X --count`)
+>   counts **60,873** too, on a program that exercises `ST`, arrays and string parsing. Boot's
+>   ordinary run counts 60,581 — the whole 292 is `Int.fromString` walking `"--image"` instead of
+>   finding no argument at all. The hand-written fixtures and `Gate.GcChurn` (2,544,920 both ways)
+>   agree with no argument in play. So the calibration itself is demonstrated; what is missing is the
+>   ability to *run it over the corpus unattended*.
+>
+>   A **second** reader gap surfaced with it and is closed: a `Number` literal is written as the
+>   signed 64-bit decimal spelling of its IEEE-754 bit pattern (ADR-0038 §4), which step A's reader
+>   refused. `Int.fromString` — which `Bench.Common.sizeArg` itself calls — reaches one, so no
+>   benchmark could even be decoded. The inverse now lives in `Purvasm.Abi.Float64`, beside `Mangle`
+>   and `Fnv1a64` and for the same reason: it is a fact about the artifact format that a writer and a
+>   reader must not derive twice. It is pure PureScript — no `Math` leaf and no runtime API — and is
+>   tested as a round trip *through the writer*, on the values where exact and approximate part
+>   company (negative zero, subnormals, both infinities, both 64-bit extremes).
+>
+>   Writing that inverse turned up a **pre-existing optimiser bug**, unrelated to this record and
+>   reported here only because it is what the code above is shaped around: an expression the
+>   optimiser can constant-fold to **NaN** never reaches a fixpoint, so `Nbe` exhausts its rewrite
+>   fuel on the binding and the build dies. `v = 0.0 / 0.0` reproduces it alone; `(1.0e308 * 10.0) -
+>   (1.0e308 * 10.0)` and `inf / inf` too; ±Infinity folds correctly. The likely cause is a fixpoint
+>   test comparing successive literals, since a NaN literal compares unequal to itself. `Float64`
+>   avoids it by deriving both infinities and the NaN from its arguments, which leaves nothing to
+>   fold — a workaround in *this* module, not a fix, and the bug is still there for the next caller.
+>
+>   The argv fix was a decision rather than an implementation detail, and it was taken by the
+>   maintainer rather than in passing. See the Correction below.
+
+> **Correction (2026-08-24): guest argv is runtime *context injection*, not a provider exception.**
+> Accepted by the maintainer over two alternatives (a reserved VM-answered key set; deferring to step
+> E). It closes step C's last blocker and leaves [0111](0111-vm-dynamic-native-ffi.md) §4 untouched.
+>
+> `argv` is not a question about *who provides* a leaf — it is the execution context a runner hands
+> to the one provider there already is. So `Purvasm.System.Process.argvImpl` keeps `host-runtime` as
+> its sole provider, exactly-one stands, and no key is reserved or given precedence anywhere.
+>
+> - The argv the guest observes lives on the **context** (`Heap`), not in a process global, so two
+>   contexts hosting two guests cannot cross. It defaults to the process argv, so a compiled program
+>   with no host above it is unchanged.
+> - A host overrides it with `pv_runtime_set_guest_argv(ctx, argv)` before the guest runs, handing
+>   over `[image path] ++ the guest's own arguments`. The VM's flags (`--image`, `--count`, `--ffi`,
+>   `--manifest`) are never among them; the guest's start after an explicit `--`.
+> - The strings are **copied out**. Retaining a `PVWord` would leave a heap pointer in runtime state
+>   that the next collection invalidates and nothing traces.
+> - The setter is **host-control, not foreign-author API**: declared in a separate
+>   `runtime/include/purvasm_host.h`, absent from `purvasm.h`, absent from `purvasm-sys`, and
+>   therefore absent from the export allowlist — so it is not in a `--host-foreign-api` executable's
+>   dynamic exports, unbindable by a `dlopen`ed provider, and unnameable by a guest `ForeignRef`.
+>   `PV_FOREIGN_ABI_VERSION` does not move: no provider can reference it, so no provider's
+>   compatibility depends on it. The VM reaches it through one trusted sibling, `Purvasm/VM/Host.c`.
+>
+> Running the corpus turned up one more thing the record should carry, and it is **not** an argv
+> problem: `bench-json-parse` needs `Data.Number.isFinite`, which ulib ships as a `.c` and a natively
+> compiled program gets by *linking* it. A hosted guest has no such link, so it reaches that key the
+> way [0111](0111-vm-dynamic-native-ffi.md) §4 already says a workspace-provided key is reached —
+> through a module the runner loads. The VM side of that works today (§4's loaded-provider gate); what
+> is missing is that nothing *packages* ulib's native side as a shared object, which is step E's
+> manifest-beside-the-image work. The benchmark harness builds one itself in the meantime (eight keys,
+> two files, the ordinary `--ffi` path) and says so where it does it.
+>
+> **Step C is green (2026-08-24).** All eight benchmarks agree with boot on output *and* instruction
+> count, in `--opt` and `--no-opt` alike — the calibration this record said would be available
+> exactly once, taken: `fib` 9,376,516/29,355,171 · `count-state` 193,341/347,393 · `effect-ref`
+> 61,129/118,652 · `run-state-except` 3,390,879/4,200,677 · `st-ref` 61,120/91,566 ·
+> `map-fold-array` 317,280/599,308 · `quicksort` 4,224,348/7,896,107 · `json-parse`
+> 2,193,851/4,346,910. **B is therefore closed too**, on this record's own condition.
+>
+> One thing the run flags that is **not** step C's: `run-state-except` exceeds the ADR-0089 §7
+> compile-*time* gate at ratio ≈ 4.3 against a 4.0 threshold, and it does so with the owned leg
+> switched off. Measured directly, `--opt` takes ~6.0 s against `--no-opt`'s ~1.5 s, repeatably — a
+> real optimiser-time property of that module, not noise, and against the 1.5–2.4 band the threshold
+> was set over in 2026-07-11. Nothing here caused it: every cost this slice adds to a compile (a
+> per-module ANF traversal, one extra 48 KB image write) falls on **both** modes, and adding a
+> constant to both sides of a ratio above 1 moves it toward 1, not away.
+>
+> It is **not** blocking integration either: `--opt-effect` is a mode `.github/workflows/benchmarks.yaml`
+> never passes, and that workflow is `workflow_dispatch` plus a weekly cron rather than push/PR — so
+> the gate fires only when someone measures by hand. Tracked as its own question: which change took
+> the ratio past 4.0, answered by bisection rather than by raising the threshold.
+>
+> A **speed** observation, recorded so it is not rediscovered as a surprise: the owned VM is far
+> slower than boot's, which is expected of an interpreter with no performance work done to it and is
+> irrelevant to what step C measures (counts, not time) — but it decides the leg's cost. On
+> `bench-st-ref` at `--opt` (61,120 instructions) five runs took 1.96 s against boot's 0.041 s, so
+> roughly 45× on that one program, and the corpus leg runs each benchmark in both modes. That is why
+> it is opt-in and why CI does not carry it. §4(b)'s tree dispatch is the first thing that should move
+> the number; nothing here should be read as a measurement of the design.
+>
+> Verified: a fresh context reports the process argv; an override replaces it; two contexts keep
+> theirs apart; an empty argv (the empty-array sentinel, not a heap object) is accepted; and the argv
+> survives a collection that moves every string it was read from. The gates add `guest-argv` (the
+> guest sees the whole `[image] ++ args` array, not just the element the corpus reads),
+> `guest-argv-flags` (the VM's own flags never reach it), `host-control` (nothing named `pv_runtime_*`
+> appears in the executable's dynamic exports — asserted on its own, since every other loader leg is
+> positive and none would notice) and `host-control-reach`, which is what that absence is *for*: an
+> image whose `ForeignRef` names the trusted setter exactly must be refused as `unbound native
+> foreign`, since a guest able to reach it could rewrite the argv of the runner hosting it.
 
 ### 7. What this does not change
 
@@ -368,6 +589,19 @@ untouched until slice 2.
   > its **own** image (`purvm build` from CoreFn) and never reads Level-2's `.pvm`, so §4's changes
   > cost it nothing and no paired artifacts arise — see §6's Progress note. The version stamp is still
   > worth having, now purely so a stale *owned* image fails loudly rather than being misparsed.
+  >
+  > **Scope correction (2026-08-22):** the above holds for the behavioural gate and the examples
+  > sweep, and **only** for them. It was written after checking those two, and it generalised one
+  > step too far: `benchmarks/run-benchmarks.sh` — the optimiser measurement field
+  > ([0088](0088-vm-backend-lowers-like-native-release-boot-byte-identity.md) §0(a)'s "`--opt`
+  > bytecode routed onto boot's VM") — compiles with **Level-2's `purvasm run`** and then executes
+  > that image with `purvm run --count`. boot reads a Level-2 `.pvm` there, so §4 **does** break it.
+  >
+  > Two consequences, and they are what §6's staging note now encodes: the §4(a) switchover and the
+  > introduction of an owned measurement leg are **one migration, not two**; and a benchmark entry is
+  > `main :: Effect Unit`, so it reaches a stdio leaf — which means the owned VM cannot run the corpus
+  > at all until arity is in the image. "Reader first, format later" is therefore not available as a
+  > way to stage this.
 - The optimiser measurement field moves onto an artifact the project owns, so a measurement can be
   refined (new counters, allocation attribution, per-key profiles) instead of being limited to what
   frozen boot happens to count.

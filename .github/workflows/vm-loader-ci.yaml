@@ -10,9 +10,9 @@ name: VM-Loader-CI
 #                  host's symbols are made visible, so `--gc-sections` retention and each export mode
 #                  get an independent verdict. When the full gate below fails, this says whether the
 #                  cause is the link recipe or something above it.
-#   `loader`     — the real thing: the VM built with `--host-foreign-api`, then handed an
-#                  API-coverage provider and a stale one (tools/vm-loader-e2e.sh), exactly as it runs
-#                  on macOS today.
+#   `loader`     — the real thing, in two gates over ONE build of the VM: `vm-image-e2e.sh` for
+#                  ADR-0110's image format and reader, and `vm-loader-e2e.sh` for ADR-0111's foreign
+#                  frontier. Separate steps, because they break for unrelated reasons.
 #
 # Same gate topology as the sibling workflows (ADR-0057): the workflow always triggers so the
 # required `vm-loader-ci-gate` status is always produced, and the heavy job is gated on whether any
@@ -50,7 +50,11 @@ jobs:
               - 'packages/**'
               - 'ulib/**'
               - 'ulib-tools/**'
+              - 'test-fixtures/vm-image/**'
+              - 'runtime/include/**'
               - 'tools/vm-loader-e2e.sh'
+              - 'tools/vm-image-e2e.sh'
+              - 'tools/vm-e2e.sh'
               - 'tools/elf-export-probe.sh'
               - 'spago.yaml'
               - 'spago.lock'
@@ -115,16 +119,33 @@ jobs:
       - name: Stage ulib
         run: node ulib-tools/index.js build --prepare-release
 
-      # This runs the ELF measurement the ADR owes AND asserts it. In particular its `export-set` leg
-      # compares the generated allowlist against the executable's actual `.dynsym` exactly, in both
-      # directions, and fails on a re-exported `pvf_Purvasm_2eVM_2eLoader_2e*` or `pv_g_*` — the
-      # regression that would hand a guest the trusted loader (§6). Every number the ADR wants
-      # recorded is printed by the harness itself, so there is no separate report step that could
-      # print a violation and still pass.
-      - name: Run the VM loader gate
+      # The owned VM is built ONCE and both gates run against that build. They stay separate steps so a
+      # failure names which contract broke: the image format and its reader (ADR-0110) and the foreign
+      # frontier (ADR-0111) have different lifetimes — §4(b) will rewrite every image assertion and
+      # leave the loader gate untouched.
+      - name: Build the owned VM (shared by both gates)
+        run: |
+          node cli/index.node.js build --entry Main --corefn-dir output \
+            --outdir "$RUNNER_TEMP/vm" --host-foreign-api
+        env:
+          PURVASM_LIB: dist/ulib
+
+      - name: Run the VM image gate (ADR-0110 slice 2)
+        run: ./tools/vm-image-e2e.sh
+        env:
+          PURVASM_LIB: dist/ulib
+          PURVASM_VM_DIR: ${{ runner.temp }}/vm
+
+      # The `export-set` leg compares the generated allowlist against the executable's actual
+      # `.dynsym` exactly, in both directions, and fails on a re-exported
+      # `pvf_Purvasm_2eVM_2eLoader_2e*` or `pv_g_*` — the regression that would hand a guest the
+      # trusted loader (ADR-0111 §6). Every number the ADR wants recorded is printed by the harness
+      # itself, so there is no separate report step that could print a violation and still pass.
+      - name: Run the VM loader gate (ADR-0111)
         run: ./tools/vm-loader-e2e.sh
         env:
           PURVASM_LIB: dist/ulib
+          PURVASM_VM_DIR: ${{ runner.temp }}/vm
 
   # The single required status check; point branch protection at `vm-loader-ci-gate`.
   vm-loader-ci-gate:
