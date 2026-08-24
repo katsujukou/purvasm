@@ -6,10 +6,16 @@ module Purvasm.Compiler.Bytecode.Image where
 
 import Prelude
 
-import Data.Array (fromFoldable) as Array
+import Data.Array (filter, fromFoldable, null) as Array
 import Data.Char (toCharCode)
 import Data.Foldable (foldl)
+import Data.Either (Either(..))
 import Data.Int (hexadecimal, toStringAs)
+import Data.Map (Map)
+import Data.Map as Map
+import Data.Maybe (fromMaybe)
+import Data.Set (Set)
+import Data.Set as Set
 import Data.List (List(..), (:))
 import Data.List as List
 import Data.String (length) as Str
@@ -29,6 +35,24 @@ import Purvasm.Number (floatBitsHi, floatBitsLo)
 -- | `Image.format_version`). Bump on any codegen change so a stale object is rejected.
 formatVersion :: Int
 formatVersion = 3
+
+-- | The **linked image** format that carries each native leaf's physical arity on its `ForeignRef`
+-- | ([ADR-0110](../../../../../docs/design-decisions/0110-owned-vm-purescript-native.md) §4(a)). Only
+-- | the `app.pvm` version field moves: `.pmo`/`.pmi` stay at `formatVersion`, since boot reads those
+-- | and the arity is a *link-time* fact the linker resolves from the whole closure's FSR shapes.
+-- |
+-- | boot's frozen VM cannot read it — its reader accepts `["fr", key]` and nothing else — which is the
+-- | whole reason the two forms are emitted side by side during the migration: boot keeps running the
+-- | legacy image while the owned VM runs this one, and the pair is what makes the changeover
+-- | measurable (ADR-0110 §6, step C).
+foreignArityVersion :: Int
+foreignArityVersion = 4
+
+-- | How a `ForeignRef` is written. The legacy form drops the arity, because that is the only form
+-- | boot's reader accepts; `ArityFrom` writes it, looked up in the link-time leaf map.
+data ForeignArity
+  = ArityErased
+  | ArityFrom (Map String Int)
 
 -- --- a JSON tree with a Yojson-faithful compact serialiser --------------------------
 
@@ -148,17 +172,27 @@ primTag = case _ of
 
 -- --- instructions / chunks / gdefs --------------------------------------------------
 
+-- | The legacy encoding — every existing reader's, boot's included.
 instrToJson :: Instruction -> Json
-instrToJson i = case i of
+instrToJson = instrToJsonWith ArityErased
+
+instrToJsonWith :: ForeignArity -> Instruction -> Json
+instrToJsonWith fa i = case i of
   PushInt n -> t "pi" [ JInt n ]
   PushNumber f -> t "pn" [ floatToJson f ]
   PushBool b -> t "pb" [ JBool b ]
   PushString s -> t "ps" [ JStr s ]
   Load s -> t "ld" [ JStr s ]
-  ForeignRef s -> t "fr" [ JStr s ]
+  ForeignRef s -> case fa of
+    ArityErased -> t "fr" [ JStr s ]
+    -- Unreachable: `missingForeignArities` refuses the image before this runs. Written as an
+    -- **impossible** arity rather than a plausible `0` (a foreign constant legitimately has arity 0),
+    -- so a future caller that skips the check is refused by the reader instead of silently
+    -- under-applying a leaf at run time.
+    ArityFrom m -> t "fr" [ JStr s, JInt (fromMaybe (-1) (Map.lookup s m)) ]
   Bind s -> t "bd" [ JStr s ]
-  Closure ps body -> t "cl" [ strs ps, chunkToJson body ]
-  MakeRec ms -> t "mr" [ JArr (map (\(n /\ c) -> JArr [ JStr n, chunkToJson c ]) ms) ]
+  Closure ps body -> t "cl" [ strs ps, chunkToJsonWith fa body ]
+  MakeRec ms -> t "mr" [ JArr (map (\(n /\ c) -> JArr [ JStr n, chunkToJsonWith fa c ]) ms) ]
   Ctor tag arity n -> t "ct" [ JStr tag, JInt arity, JInt n ]
   Record ls -> t "rc" [ strs ls ]
   Array n -> t "arr" [ JInt n ]
@@ -180,13 +214,19 @@ instrToJson i = case i of
   t tag rest = JArr ([ JStr tag ] <> rest)
 
 chunkToJson :: CodeBlock -> Json
-chunkToJson c = JArr (map instrToJson c)
+chunkToJson = chunkToJsonWith ArityErased
+
+chunkToJsonWith :: ForeignArity -> CodeBlock -> Json
+chunkToJsonWith fa c = JArr (map (instrToJsonWith fa) c)
 
 gdefToJson :: Gdef -> Json
-gdefToJson = case _ of
-  Gfun ps c -> JArr [ JStr "fn", strs ps, chunkToJson c ]
-  Gcaf c -> JArr [ JStr "caf", chunkToJson c ]
-  Grec c -> JArr [ JStr "rec", chunkToJson c ]
+gdefToJson = gdefToJsonWith ArityErased
+
+gdefToJsonWith :: ForeignArity -> Gdef -> Json
+gdefToJsonWith fa = case _ of
+  Gfun ps c -> JArr [ JStr "fn", strs ps, chunkToJsonWith fa c ]
+  Gcaf c -> JArr [ JStr "caf", chunkToJsonWith fa c ]
+  Grec c -> JArr [ JStr "rec", chunkToJsonWith fa c ]
 
 -- --- the linked image (app.pvm) -----------------------------------------------------
 
@@ -209,3 +249,60 @@ imageToJson img = JObj
 
 imageToString :: Image -> String
 imageToString = stringify <<< imageToJson
+
+-- | The same program in the arity-carrying format (ADR-0110 §4(a)): every `ForeignRef` gains the
+-- | leaf's **physical closure arity**, so a VM can build the leaf's closure without a compiled-in
+-- | registry of its own — the fact boot's VM supplies from `Ffi.foreign_arity` and an owned VM has no
+-- | way to know. `arities` is `NativeLeaf.nativeLeafArities` over the whole closure's FSR shapes, the
+-- | same derivation the backends use to decide which keys are leaves at all.
+-- |
+-- | `Left` when the image references a leaf the map does not describe. That is a wiring fault rather
+-- | than a user error, but it is reported as data instead of a crash because it is genuinely
+-- | reachable: the linker compiles the FFI ladder's structural terms itself, and one of those can
+-- | reference a leaf no module in the closure declares.
+imageToStringWithArities :: Map String Int -> Image -> Either String String
+imageToStringWithArities arities img = case missingForeignArities arities img of
+  missing
+    | Array.null missing -> Right (stringify (imageToJsonWith (ArityFrom arities) img))
+    | otherwise -> Left
+        ( "the linked image references native leaves with no reconstructed arity: "
+            <> joinWith ", " missing
+            <> " (FSR must describe every native leaf, ADR-0090)"
+        )
+
+imageToJsonWith :: ForeignArity -> Image -> Json
+imageToJsonWith fa img = JObj
+  [ "version" /\ JInt version
+  , "gdefs" /\ JArr (map (\(n /\ g) -> JArr [ JStr n, gdefToJsonWith fa g ]) img.gdefs)
+  , "main" /\ chunkToJsonWith fa img.main
+  , "effect" /\ JBool img.isEffect
+  ]
+  where
+  version = case fa of
+    ArityErased -> formatVersion
+    ArityFrom _ -> foreignArityVersion
+
+-- | The `ForeignRef` keys the image references but `arities` does not describe, sorted. Collected
+-- | over the same tree the writer walks — gdef bodies and the `main` chunk, descending into nested
+-- | closure and recursive-group chunks — so a leaf reachable only from inside a closure cannot slip
+-- | past the check and be written with the impossible arity.
+missingForeignArities :: Map String Int -> Image -> Array String
+missingForeignArities arities img =
+  Array.filter (\k -> not (Map.member k arities)) (Set.toUnfoldable (foreignRefKeys img))
+
+foreignRefKeys :: Image -> Set String
+foreignRefKeys img =
+  foldl (\acc (_ /\ g) -> Set.union acc (gdefKeys g)) (chunkKeys img.main) img.gdefs
+  where
+  gdefKeys = case _ of
+    Gfun _ c -> chunkKeys c
+    Gcaf c -> chunkKeys c
+    Grec c -> chunkKeys c
+
+  chunkKeys = foldl (\acc i -> Set.union acc (instrKeys i)) Set.empty
+
+  instrKeys = case _ of
+    ForeignRef k -> Set.singleton k
+    Closure _ body -> chunkKeys body
+    MakeRec ms -> foldl (\acc (_ /\ c) -> Set.union acc (chunkKeys c)) Set.empty ms
+    _ -> Set.empty

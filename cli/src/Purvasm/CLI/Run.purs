@@ -32,12 +32,13 @@ import Purvasm.CLI.Ulib (corefnPathFor, requireUlibDir)
 import Purvasm.Compiler (BuildError(..), CompilerAction, LoadResult(..), build, loadClosure)
 import Purvasm.Compiler.Backend.Bytecode (bytecodeBackend)
 import Purvasm.Compiler.Bytecode.Artifact (ModuleArtifact, interfaceToString, moduleToString)
-import Purvasm.Compiler.Bytecode.Image (imageToString)
+import Purvasm.Compiler.Bytecode.Image (imageToString, imageToStringWithArities)
 import Purvasm.Compiler.CESK.AST (Term(..))
 import Purvasm.Compiler.CESK.Translate (nameKey)
 import Purvasm.Compiler.Ffi as Ffi
 import Purvasm.Compiler.Link (link)
 import Purvasm.Compiler.Literal (Literal(..))
+import Purvasm.Compiler.NativeLeaf (nativeLeafArities)
 import Run (EFFECT, Run, liftEffect)
 import Run.Except (EXCEPT, throw)
 import Type.Row (type (+))
@@ -176,4 +177,15 @@ cmd opts = do
         image = (link artifacts Ffi.resolver mainTerm) { isEffect = true }
       appPath <- FS.joinPath [ opts.outDir, "app.pvm" ]
       FS.writeText appPath (imageToString image)
+      -- Both forms, from ONE compilation, for as long as the two VMs coexist (ADR-0110 §6, step C):
+      -- boot's frozen VM reads `app.pvm` and cannot read an arity-carrying `ForeignRef`, while the owned
+      -- VM needs the arity and has no registry to recover it from. Emitting them side by side is what
+      -- makes the changeover measurable — the instruction sequences are identical, so the two runners'
+      -- counts must agree, and that equality is available only while both exist. Step D removes the
+      -- legacy leg once tree dispatch changes what an instruction count means.
+      case imageToStringWithArities (nativeLeafArities products.foreignSigs) image of
+        Left err -> throw err
+        Right text -> do
+          v4Path <- FS.joinPath [ opts.outDir, "app.v4.pvm" ]
+          FS.writeText v4Path text
       Log.info $ Fmt.fmt @"✓ Build finished → {app}" { app: appPath }

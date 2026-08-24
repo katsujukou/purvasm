@@ -8,7 +8,9 @@ import Prelude
 import Effect (Effect)
 import Test.Spec.Reporter (consoleReporter)
 import Test.Spec.Runner.Node (runSpecAndExitProcess)
+import Test.Unit.Purvasm.Abi.Float64 as Abi.Float64
 import Test.Unit.Purvasm.Compiler.Bytecode.Artifact as Bytecode.Artifact
+import Test.Unit.Purvasm.Compiler.NativeLeaf as NativeLeaf
 import Test.Unit.Purvasm.Compiler.Bytecode.Image as Bytecode.Image
 import Test.Unit.Purvasm.Compiler.Bytecode.Lower as Bytecode.Lower
 import Test.Unit.Purvasm.Compiler.Bytecode.Lower.Match as Bytecode.Lower.Match
@@ -78,6 +80,8 @@ main = runSpecAndExitProcess [ consoleReporter ] do
   Backend.LLVM.Driver.spec
   Backend.Bytecode.spec
   Bytecode.Image.spec
+  NativeLeaf.spec
+  Abi.Float64.spec
   Bytecode.Artifact.spec
   Compile.spec
   Build.spec

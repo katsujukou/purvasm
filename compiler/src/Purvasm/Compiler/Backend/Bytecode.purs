@@ -6,6 +6,15 @@
 -- | released (the `.pmo` `deps` now come from the ANF, not the CESK term), but the `.pmi` is unchanged
 -- | (ADR-0088 §1) and stays byte-identical to boot.
 -- |
+-- | It carries the **backend-required native-leaf lowering** (`NativeLeaf.resolveNativeForeigns`,
+-- | ADR-0110 §4(a)) that the native backend has always carried: a reference to a host-provided leaf
+-- | becomes an `AtomForeign`, and so a `ForeignRef` the VM resolves through its provider ladder.
+-- | Without it the reference stays an ordinary global `Load` of a name nothing in the program defines,
+-- | which boot's VM rescues from its compiled-in registry (`Machine.lookup`'s native-foreign
+-- | fall-through) and an owned VM has no way to rescue. The recognition is shared with the native
+-- | backend rather than repeated, so both agree on which keys are leaves. It does not move a decl's
+-- | `deps`: the key merely migrates from `fvExpr` to `cfExpr`, and the union below is the same set.
+-- |
 -- | Reachability stays with `Link.link` in this scope (ADR-0088 §0/§4), so a decl's `deps` are its full
 -- | ANF free references — free **global** vars (`fvExpr`) ∪ referenced **foreign** keys (`cfExpr`) — the
 -- | superset `Link.link`'s `visitKey`/`resolveGroup` already tolerates (unknown/foreign keys resolve to no
@@ -27,7 +36,8 @@ import Purvasm.Compiler.Bytecode.Artifact (Group, ModuleArtifact, interfaceOf)
 import Purvasm.Compiler.Bytecode.Codegen (gdefOfExpr)
 import Purvasm.Compiler.CESK.Translate (nameKey, qualifiedKey)
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (cfExpr, fvExpr)
-import Purvasm.Compiler.MiddleEnd.Module (Decl)
+import Purvasm.Compiler.MiddleEnd.Module (Decl, mapDeclBodies)
+import Purvasm.Compiler.NativeLeaf (nativeLeafArities, resolveNativeForeigns)
 
 -- | The bytecode backend. `o = ModuleArtifact` (a `.pmo`); the cross-module context is `Unit` — bytecode
 -- | is per-module independent, and cross-module reachability is `Link.link`'s at finalisation (ADR-0088 §0).
@@ -51,7 +61,8 @@ moduleArtifactOf :: LoweredModule -> ModuleArtifact
 moduleArtifactOf lm =
   let
     key = qualifiedKey lm.source.name
-    groups = map groupOfDecl lm.module.decls
+    leaves = nativeLeafArities lm.foreignSigs
+    groups = map (groupOfDecl <<< mapDeclBodies (resolveNativeForeigns leaves)) lm.module.decls
     defined = Set.fromFoldable (Array.concatMap _.keys groups)
   in
     { name: nameKey lm.source.name

@@ -6,9 +6,12 @@ module Test.Unit.Purvasm.Compiler.Bytecode.Image where
 
 import Prelude
 
+import Data.Either (Either(..), isLeft)
+import Data.Map as Map
+import Data.String as String
 import Data.Tuple.Nested ((/\))
 import Purvasm.Compiler.Bytecode.Codegen (Gdef(..))
-import Purvasm.Compiler.Bytecode.Image (Json(..), floatToJson, imageToString, primTag, stringify)
+import Purvasm.Compiler.Bytecode.Image (Json(..), floatToJson, imageToString, imageToStringWithArities, primTag, stringify)
 import Purvasm.Compiler.Bytecode.Instruction (Instruction(..))
 import Purvasm.Compiler.Primitive (PrimOp(..))
 import Test.Spec (Spec, describe, it)
@@ -55,3 +58,66 @@ spec = describe "Purvasm.Compiler.Bytecode.Image" do
         }
         `shouldEqual`
           """{"version":3,"gdefs":[["M.x",["caf",[["pi",1],["rt"]]]]],"main":[["ld","M.x"],["rt"]],"effect":false}"""
+
+    it "writes a foreign reference without its arity, the only form boot's reader accepts" do
+      -- The legacy form is not merely "the old one": boot's VM is frozen, so this encoding is fixed
+      -- for as long as the two runners coexist (ADR-0110 §6, step C).
+      imageToString
+        { gdefs: []
+        , main: [ ForeignRef "Data.Show.showIntImpl", Return ]
+        , isEffect: false
+        }
+        `shouldEqual`
+          """{"version":3,"gdefs":[],"main":[["fr","Data.Show.showIntImpl"],["rt"]],"effect":false}"""
+
+  describe "imageToStringWithArities" do
+    it "stamps version 4 and writes each leaf's physical arity" do
+      imageToStringWithArities (Map.fromFoldable [ "Data.Show.showIntImpl" /\ 1 ])
+        { gdefs: []
+        , main: [ ForeignRef "Data.Show.showIntImpl", Return ]
+        , isEffect: false
+        }
+        `shouldEqual`
+          Right """{"version":4,"gdefs":[],"main":[["fr","Data.Show.showIntImpl",1],["rt"]],"effect":false}"""
+
+    it "finds a leaf nested inside a closure, not only one in the main chunk" do
+      -- The check walks the same tree the writer does. A leaf reachable only from inside a closure or
+      -- a recursive group is the case where a shallower check would pass and then write the
+      -- impossible arity — refusal has to see everything the writer sees.
+      isLeft
+        ( imageToStringWithArities Map.empty
+            { gdefs: [ "M.f" /\ Gfun [ "x" ] [ Closure [ "y" ] [ ForeignRef "M.leaf", Return ], Return ] ]
+            , main: [ Return ]
+            , isEffect: false
+            }
+        ) `shouldEqual` true
+
+    it "finds a leaf inside a recursive group's member chunk" do
+      isLeft
+        ( imageToStringWithArities Map.empty
+            { gdefs: []
+            , main: [ MakeRec [ "g" /\ [ ForeignRef "M.leaf", Return ] ], Return ]
+            , isEffect: false
+            }
+        ) `shouldEqual` true
+
+    it "names every leaf it cannot describe, so one build reports them all" do
+      case
+        imageToStringWithArities Map.empty
+          { gdefs: []
+          , main: [ ForeignRef "M.a", ForeignRef "M.b", Return ]
+          , isEffect: false
+          }
+        of
+        Left e -> do
+          String.contains (String.Pattern "M.a") e `shouldEqual` true
+          String.contains (String.Pattern "M.b") e `shouldEqual` true
+        Right _ -> shouldEqual "a rejection" "an image"
+
+    it "writes an arity-0 leaf as 0 — a foreign constant is not a missing fact" do
+      -- `leafClosureArity` answers 0 for a non-effect leaf with no arguments. Conflating that with
+      -- "no arity known" would refuse a legitimate program.
+      imageToStringWithArities (Map.fromFoldable [ "M.k" /\ 0 ])
+        { gdefs: [], main: [ ForeignRef "M.k", Return ], isEffect: false }
+        `shouldEqual`
+          Right """{"version":4,"gdefs":[],"main":[["fr","M.k",0],["rt"]],"effect":false}"""
