@@ -1,6 +1,23 @@
 {
   "workspace": {
     "packages": {
+      "abi": {
+        "path": "abi",
+        "core": {
+          "dependencies": [
+            "arrays",
+            "enums",
+            "foldable-traversable",
+            "integers",
+            "numbers",
+            "prelude",
+            "strings"
+          ]
+        },
+        "test": {
+          "dependencies": []
+        }
+      },
       "bench-common": {
         "path": "benchmarks/common",
         "core": {
@@ -206,7 +223,10 @@
           ]
         },
         "test": {
-          "dependencies": []
+          "dependencies": [
+            "spec",
+            "spec-node"
+          ]
         }
       },
       "cli-lib": {
@@ -236,6 +256,7 @@
         "path": "compiler",
         "core": {
           "dependencies": [
+            "abi",
             "argonaut",
             "console",
             "effect",
@@ -425,7 +446,12 @@
           "dependencies": []
         },
         "test": {
-          "dependencies": []
+          "dependencies": [
+            "effect",
+            "prelude",
+            "spec",
+            "spec-node"
+          ]
         }
       },
       "purvasm-fs": {
@@ -543,6 +569,54 @@
             "spec",
             "spec-node"
           ]
+        }
+      },
+      "vm": {
+        "path": "vm",
+        "core": {
+          "dependencies": [
+            "abi",
+            "arrays",
+            "effect",
+            "exceptions",
+            "foldable-traversable",
+            "integers",
+            "lists",
+            "maybe",
+            "numbers",
+            "ordered-collections",
+            "prelude",
+            "purvasm-base",
+            "purvasm-fs",
+            "purvasm-json",
+            "purvasm-stdio",
+            "purvasm-system",
+            "refs",
+            "strings",
+            "tailrec",
+            "tuples"
+          ]
+        },
+        "test": {
+          "dependencies": [
+            "spec",
+            "spec-node"
+          ]
+        }
+      },
+      "vm-image-fixtures": {
+        "path": "test-fixtures/vm-image",
+        "core": {
+          "dependencies": [
+            "effect",
+            "prelude",
+            "purvasm-stdio",
+            "purvasm-system",
+            "strings"
+          ]
+        },
+        "test": {
+          "dependencies": []
         }
       }
     },

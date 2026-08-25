@@ -1,0 +1,8 @@
+{"version":5,
+ "gdefs":[["area",["fn",["s"],
+   [["ld","s"],
+    ["sc",[["Circle",[["ld","s"],["pj",0],["ld","s"],["pj",0],["pm","MulInt",2],["rt"]]],
+           ["Square",[["ld","s"],["pj",0],["pi",10],["pm","MulInt",2],["rt"]]]],
+          [["fl","no match"]]]]]]],
+ "main":[["ld","area"],["pi",5],["ct","Square",1,1],["ca",1],["rt"]],
+ "effect":false}

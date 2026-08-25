@@ -119,6 +119,9 @@ cmd opts = do
       , optMaxIter: Build.optMaxIterCap
       , runtimeLib: Nothing
       , rustFfi: Nothing
+      -- The census stops at `--emit-llvm`, and nothing loads a provider into what it does not link
+      -- (ADR-0111 §1.1 is for a program that hosts `dlopen`ed modules — the VM).
+      , hostForeignApi: false
       }
 
     -- ADR-0113 §3: the identities are checked on the rows AS RENDERED, per object, before the

@@ -312,9 +312,24 @@ fn expand(args: Args, func: &ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         }
     };
 
+    // ADR-0111 §5: the foreign-ABI version reference, which a Rust leaf cannot get from
+    // `purvasm.h` (it never compiles the header). Emitted **per leaf**, beside its exported
+    // wrapper, so the reference shares an object file with a symbol the link is certain to keep —
+    // a single `#[used]` static in `purvasm-foreign` survives the compiler but not necessarily an
+    // unreferenced object. Named after the `pvf_` symbol, so two leaves in one crate cannot
+    // collide.
+    let stamp_ident = format_ident!("__PVF_ABI_STAMP_{}", symbol);
+    let stamp = quote! {
+        #[doc(hidden)]
+        #[used]
+        #[allow(non_upper_case_globals)]
+        static #stamp_ident: unsafe extern "C" fn() = ::purvasm_foreign::__rt::PV_FOREIGN_ABI_STAMP;
+    };
+
     Ok(quote! {
         #func
         #generated
+        #stamp
     })
 }
 

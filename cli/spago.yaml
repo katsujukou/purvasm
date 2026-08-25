@@ -19,3 +19,8 @@ package:
     - purvasm-fs
     - purvasm-system
     - run
+  test:
+    main: Test.Unit.Purvasm.CLI
+    dependencies:
+      - spec
+      - spec-node

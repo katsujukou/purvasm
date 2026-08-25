@@ -143,6 +143,21 @@ pub struct Heap {
     /// [`output`](Heap::output). (`Effect.Console.log` is a `ulib` shadow over the leaf, not a runtime
     /// concern.)
     output: Vec<String>,
+    /// The argv the guest observes (ADR-0075 §4), per **context** rather than per process.
+    ///
+    /// A runner that hosts a program — the owned VM (ADR-0110) — is not the program: its own command
+    /// line names an image and its flags, which is not what the hosted guest's `argvImpl` should
+    /// report. So the leaf reads this, and a host overrides it through
+    /// [`pv_runtime_set_guest_argv`](crate::abi::pv_runtime_set_guest_argv) before the guest runs.
+    /// Keeping it here rather than in a process global is what lets two contexts in one process host
+    /// two guests without their argvs crossing.
+    ///
+    /// Owned `String`s, never heap words: a `PVWord` retained across a collection would be a stale
+    /// pointer, and the setter copies out at the boundary precisely so nothing traced can be reached
+    /// from here. Empty on a `lib`/Miri heap, which reads no environment at all (as `trace` and
+    /// `stats` do not) — [`new_native`](Heap::new_native) seeds it from the process argv, which is
+    /// what a compiled program with no host above it should see.
+    guest_argv: Vec<String>,
     /// Interpretation of a closure's `code` word (ADR-0071 §3). `false` (the [`Heap::new`] bring-up /
     /// Miri path): an index into [`code_table`](Heap::code_table). `true` (the [`Heap::new_native`]
     /// codegen path): a **real `extern "C"` fn address** [`apply`](Heap::apply) calls directly. A single
@@ -230,6 +245,7 @@ impl Heap {
             next_gen: 0,
             code_table: Vec::new(),
             output: Vec::new(),
+            guest_argv: Vec::new(),
             code_is_address: false,
             pending_tail: None,
             trace: false,
@@ -275,6 +291,10 @@ impl Heap {
         };
         let mut h = Heap::new(words_per_space);
         h.code_is_address = true;
+        // The default the ADR-0075 §4 convention describes: with no host above it, a compiled program
+        // IS the process, so its guest argv is the process argv (element 0 the executable). Read here
+        // rather than in `new` so `lib`/Miri heaps never touch the environment.
+        h.guest_argv = std::env::args().collect();
         // Opt-in value-flow tracing for the compiled binary; read here (not in `new`) so `lib`/Miri
         // heaps never touch the environment (ADR-0072 §11).
         h.trace = std::env::var_os("PURVASM_TRACE").is_some();
@@ -309,6 +329,18 @@ impl Heap {
             },
         };
         h
+    }
+
+    /// The argv the guest observes. See [`guest_argv`](Heap::guest_argv).
+    pub(crate) fn guest_argv(&self) -> &[String] {
+        &self.guest_argv
+    }
+
+    /// Replace the argv the guest observes. Host-control (ADR-0110 §4(a) Correction): reachable from
+    /// the embedding runner, never from a guest `ForeignRef` — the entry point is not in the
+    /// foreign-author API and not in the executable's dynamic exports.
+    pub(crate) fn set_guest_argv(&mut self, argv: Vec<String>) {
+        self.guest_argv = argv;
     }
 
     /// This heap's semi-space word count — **test-only** (ADR-0102 §4 Verification): lets a
@@ -965,6 +997,15 @@ impl Heap {
         let hdr = self.header(a); // checked: validates `a` is a live object header
         assert_eq!(hdr.kind(), Kind::Array, "array_len on a non-Array object");
         hdr.size_words()
+    }
+
+    /// An `Adt`'s constructor tag — payload slot 0, which `new_adt` writes raw. Shape-checked like
+    /// [`Self::array_len`]: reading a tag off anything else would answer with whatever word happened
+    /// to be first.
+    pub fn adt_tag(&self, a: HeapPtr) -> u32 {
+        let hdr = self.header(a); // checked: validates `a` is a live object header
+        assert_eq!(hdr.kind(), Kind::Adt, "adt_tag on a non-Adt object");
+        self.read_raw(a, 0) as u32
     }
 
     /// Copy a string value's bytes out to an owned `String` (`Str` or `StrSlice`). Copies (never

@@ -1,3 +1,10 @@
 package:
   name: purvasm-base
   dependencies: []
+  test:
+    main: Test.Unit.Purvasm.Int
+    dependencies:
+      - effect
+      - prelude
+      - spec
+      - spec-node

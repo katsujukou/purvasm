@@ -3,3 +3,4 @@ packages:
   - "./cli/**"
   - "./compiler/**"
   - "./ulib-tools/**"
+  - "./vm/**"

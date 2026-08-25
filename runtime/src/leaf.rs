@@ -268,7 +268,12 @@ extern "C" fn leaf_getenv_thunk(ctx: *mut Heap, clo: u64, _a: *const u64, _n: us
 }
 
 /// `Purvasm.System.Process.argvImpl :: Effect (Array String)` (ADR-0056) — the leaf itself is the
-/// thunk (arity 1, boot parity): forcing it reads the process argv, element 0 the executable.
+/// thunk (arity 1, boot parity): forcing it reads the argv of the **context**, element 0 the
+/// executable or, under a host, the image.
+///
+/// Not `std::env::args()` directly (ADR-0110 §4(a) Correction): a runner that hosts a program has a
+/// command line of its own, and the guest must not read it. The context's argv defaults to the
+/// process's, so a compiled program with no host above it is unaffected.
 #[export_name = "pvf_Purvasm_2eSystem_2eProcess_2eargvImpl"]
 extern "C" fn leaf_argv(ctx: *mut Heap, _clo: u64, _args: *const u64, _nargs: usize) -> u64 {
     // SAFETY: as [`leaf_write_line`]. Each `new_str` is a safepoint that can move the earlier ones,
@@ -276,7 +281,11 @@ extern "C" fn leaf_argv(ctx: *mut Heap, _clo: u64, _args: *const u64, _nargs: us
     guard(|| unsafe {
         let h = heap(ctx);
         let f = h.frame();
-        let handles: Vec<_> = std::env::args()
+        // Copied before building, because `new_str` needs the heap mutably while the argv is being
+        // read. Reading argv is a once-per-program act, so the copy costs nothing that matters.
+        let args: Vec<String> = h.guest_argv().to_vec();
+        let handles: Vec<_> = args
+            .iter()
             .map(|arg| {
                 let s = h.new_str(arg.as_bytes()).as_word();
                 h.root(s)

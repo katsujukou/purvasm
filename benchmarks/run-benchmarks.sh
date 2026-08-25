@@ -126,6 +126,64 @@ if [ "$OPT_EFFECT" = "1" ]; then
   # `purvm run --count` prints stats to stderr, the guest's result to stdout.
   instr_count() { "$PURVM" run --count "$1" "$2" 2>&1 1>/dev/null | awk '/instructions/{print $2}'; }
   guest_out() { "$PURVM" run "$1" "$2" 2>/dev/null; }
+
+  # The owned VM (ADR-0110), run alongside boot's on the SAME compilation: `l2_compile` writes both
+  # image forms, so `app.pvm` (version 3) goes to boot and `app.owned.pvm` goes here.
+  #
+  # What is compared is the **output**. The two runners were also held to equal instruction counts
+  # while §4(a) was the only difference (§6 step C — taken, 8/8, and recorded in the ADR); §4(b)'s
+  # tree dispatch then changed what a step is, so equal counts would no longer mean the same program
+  # ran. The owned VM's own counts are the measurement field's baseline from here on.
+  #
+  # Opt-in by path because building the owned VM is a native link of minutes; when it is absent the
+  # legs below say SKIPPED rather than passing quietly.
+  OWNED_VM="${PURVASM_VM:-}"
+  # The ulib leaves, as a loadable provider. A leaf like `Data.Number.isFinite` is shipped by ulib as
+  # a `.c` and linked into a natively compiled program — the owned VM's guest has no such link, so it
+  # reaches those keys the way ADR-0111 §4 says a workspace-provided key is reached: through a module
+  # the runner loads. The whole corpus needs eight of them from two files, so one `.so` covers it.
+  #
+  # Built here rather than found, because nothing packages ulib's native side as a shared object yet;
+  # ADR-0110 §6 step E owes that (a manifest beside the image, and the provider to go with it). Until
+  # then this is the harness's own, and it uses the ordinary `--ffi` path with nothing special about it.
+  OWNED_FFI=""
+  if [ -n "$OWNED_VM" ]; then
+    ULIB_C="$(node -e 'const m=require("fs").readFileSync(process.argv[1],"utf8");const f=JSON.parse(m).foreign||{};console.log([...new Set(Object.values(f))].join(" "))' "$ULIB/ulib.json" 2>/dev/null)"
+    if [ -n "$ULIB_C" ]; then
+      # shellcheck disable=SC2086
+      set -- $ULIB_C
+      abs=""
+      for c in "$@"; do abs="$abs $ULIB/$c"; done
+      OWNED_FFI="$OUT/ulib-provider.so"
+      # A provider leaves every `pv_*` undefined and binds it against the host at `dlopen` — the same
+      # link shape `tools/vm-loader-e2e.sh` uses, the ABI stamp `pv_foreign_abi_v1` included: its
+      # unresolved reference is what makes a version mismatch fail the load (ADR-0111 §5).
+      case "$(uname -s)" in
+        Darwin) SHARED_FLAGS="-shared -undefined dynamic_lookup" ;;
+        *)      SHARED_FLAGS="-shared -fPIC" ;;
+      esac
+      # shellcheck disable=SC2086
+      if ! clang $SHARED_FLAGS -O2 -I "${PURVASM_INCLUDE:-runtime/include}" $abs -o "$OWNED_FFI" \
+             >"$OUT/ulib-provider.log" 2>&1; then
+        echo "error: could not build the ulib provider for the owned VM — see $OUT/ulib-provider.log" >&2
+        exit 2
+      fi
+    fi
+  fi
+  # `--` separates the VM's flags from the guest's argv (the owned VM's convention; boot takes the
+  # trailing arguments positionally). Both runners must hand the program the SAME size, or the two
+  # legs measure different programs and their counts have nothing to say to each other.
+  owned_count() { "$OWNED_VM" ${OWNED_FFI:+--ffi "$OWNED_FFI"} --image "$1" --count -- "$2" 2>&1 1>/dev/null | awk '/instructions/{print $2}'; }
+  # Keeps the exit status: a REFUSED image and a diverging one are different findings, and a runner
+  # that failed produces empty output — which any content-based diagnosis below would misread.
+  owned_out() { "$OWNED_VM" ${OWNED_FFI:+--ffi "$OWNED_FFI"} --image "$1" -- "$2" 2>"$OUT/owned.err"; }
+  # Whether the owned VM's guest reads the size at all: the same image run at two different sizes.
+  # Identical output means the argument never reached the program — an argv-injection regression
+  # rather than the two runners disagreeing. Asked of the owned VM alone, so no assumption about how
+  # boot's flag parsing would treat a mimicked command line can creep into the attribution.
+  owned_ignores_size() {
+    [ "$(owned_out "$1" "$2")" = "$(owned_out "$1" "$3")" ]
+  }
   now() { perl -MTime::HiRes=time -e 'printf "%.3f", time'; }
   pmo_bytes() { cat "$1"/_build/*.pmo 2>/dev/null | wc -c | tr -d ' '; }
 
@@ -137,7 +195,13 @@ if [ "$OPT_EFFECT" = "1" ]; then
   TIME_RATIO_MAX=4.0
 
   optsum="$OUT/opt-effect.txt"
-  printf '%-16s %-10s %14s %14s %8s %7s %7s %7s\n' bench n opt no-opt ratio 'red%' 'size×' 'time×' | tee "$optsum"
+  if [ -n "$OWNED_VM" ]; then
+    echo "owned VM: $OWNED_VM (running alongside boot on the same compilation)" | tee "$optsum"
+  else
+    echo "owned VM: SKIPPED (set PURVASM_VM to the built owned VM to run the ADR-0110 step-C leg)" | tee "$optsum"
+  fi
+  printf '%-16s %-10s %14s %14s %8s %7s %7s %7s %8s %14s %14s %8s\n' \
+    bench n opt no-opt ratio 'red%' 'size×' 'time×' owned 'own-opt' 'own-no-opt' 'own-r' | tee -a "$optsum"
   echo "$BENCH_TABLE" | while read -r name module start heap; do
     [ -n "$name" ] || continue
     if [ -n "$ONLY" ] && ! echo "$ONLY" | tr ' ' '\n' | grep -qx "$name"; then continue; fi
@@ -204,7 +268,51 @@ if [ "$OPT_EFFECT" = "1" ]; then
       gate="$gate TIME-GATE-EXCEEDED(>$TIME_RATIO_MAX)"
       touch "$OUT/.opt-failed"
     fi
-    printf '%-16s %-10s %14s %14s %8s %7s %7s %7s%s\n' "$name" "$start" "$oi" "$ni" "$ratio" "$red" "$sizer" "$timer" "$gate" | tee -a "$optsum"
+    # The ADR-0110 step-C leg. Both modes are checked: `--opt` and `--no-opt` reach the leaf lowering
+    # by different routes, and only one of them running the optimiser is exactly the asymmetry that
+    # would hide a divergence in the other.
+    owned="-"
+    if [ -n "$OWNED_VM" ]; then
+      owned="≡"
+      for m in opt noopt; do
+        [ "$m" = "opt" ] && d="$odir" || d="$ndir"
+        [ "$m" = "opt" ] && bo="$oo" || bo="$no"
+        if [ ! -f "$d/app.owned.pvm" ]; then
+          owned="NO-IMAGE($m)"; touch "$OUT/.opt-failed"; break
+        fi
+        if ! vo=$(owned_out "$d/app.owned.pvm" "$start"); then
+          owned="REFUSED($m)"; touch "$OUT/.opt-failed"
+          sed 's/^/    /' "$OUT/owned.err" >>"$optsum"
+          break
+        fi
+        if [ "$vo" != "$bo" ]; then
+          # Name the cause when it is a known one rather than reporting a bare mismatch. The corpus
+          # reads its input size from the guest's argv (ADR-0075 §4); if the owned run is insensitive
+          # to a doubled size, the guest never received one and the argv injection has regressed —
+          # which is a different bug from the two runners disagreeing about the program.
+          if owned_ignores_size "$d/app.owned.pvm" "$start" "$((start * 2))"; then
+            owned="ARGV($m)"
+          else
+            owned="OUT($m)"
+          fi
+          touch "$OUT/.opt-failed"; break
+        fi
+      done
+      # The owned VM's OWN counts: the measurement field's baseline from §4(b) on (ADR-0110 §6's
+      # pinned terms). Reported, not compared — boot's numbers describe a different instruction
+      # vocabulary now, and the ratio here is the one an optimiser change should move.
+      if [ "$owned" = "≡" ]; then
+        voi=$(owned_count "$odir/app.owned.pvm" "$start")
+        vni=$(owned_count "$ndir/app.owned.pvm" "$start")
+        oratio=$(awk -v n="$vni" -v o="$voi" 'BEGIN { if (o > 0) printf "%.3f", n / o; else printf "n/a" }')
+      else
+        voi="-"; vni="-"; oratio="-"
+      fi
+    else
+      voi="-"; vni="-"; oratio="-"
+    fi
+    printf '%-16s %-10s %14s %14s %8s %7s %7s %7s %8s %14s %14s %8s%s\n' \
+      "$name" "$start" "$oi" "$ni" "$ratio" "$red" "$sizer" "$timer" "$owned" "$voi" "$vni" "$oratio" "$gate" | tee -a "$optsum"
   done
   # The self-compile size leg (ADR-0089 self-compile extension): the compiler's own closure is
   # the regression gate for the inliner blow-up class the five bench closures cannot see

@@ -251,11 +251,11 @@ fromStringAs = fromStringAsImpl Just Nothing
 -- | div 2 (-3) == 0
 -- | quot 2 (-3) == 0
 -- | ```
--- ulib shadow (was a foreign): truncating division, exactly JS `x / y | 0` — a `Number` divide
--- then `ToInt32` (`Purvasm.Int.fromNumber`), which truncates toward zero and yields `0` when
--- `y == 0` (the quotient is non-finite). (`EuclideanRing`'s `div` differs for negative dividends.)
+-- ulib shadow (was a foreign): re-exported from `Purvasm.Int`, which is where the truncating pair
+-- lives as the peer of the Euclidean one (ADR-0112 §3). The definition moved down rather than being
+-- duplicated here, so `Data.Int` and any other consumer select from one implementation.
 quot :: Int -> Int -> Int
-quot x y = PI.fromNumber (PN.div (PI.toNumber x) (PI.toNumber y))
+quot = PI.quot
 
 -- | The `rem` function provides the remainder after _truncating_ integer
 -- | division (see the documentation for the `EuclideanRing` class). It is
@@ -273,10 +273,11 @@ quot x y = PI.fromNumber (PN.div (PI.toNumber x) (PI.toNumber y))
 -- | mod 2 (-3) == 2
 -- | rem 2 (-3) == 2
 -- | ```
--- ulib shadow (was a foreign): the matching truncating remainder, `x - (x `quot` y) * y`
--- (JS `x % y`, whose result takes the sign of the dividend).
+-- ulib shadow (was a foreign): the matching truncating remainder, likewise re-exported from
+-- `Purvasm.Int`. Note `rem x 0 == x` here, where the registry's foreign is JS `x % 0` = `NaN`
+-- (ADR-0112 §1 pins the value; the registry's is not an `Int` at all).
 rem :: Int -> Int -> Int
-rem x y = x - quot x y * y
+rem = PI.rem
 
 -- | Raise an Int to the power of another Int.
 -- ulib shadow (was a foreign): `Math.pow(x, y) | 0`. For `y >= 0`, exponentiation by squaring

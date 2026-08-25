@@ -37,7 +37,8 @@ import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Bytecode.Instruction (CodeBlock, Instruction(..))
 import Purvasm.Compiler.Literal (Literal)
-import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom, Expr, Rhs(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom, Expr, Rhs)
+import Purvasm.Compiler.MiddleEnd.ANF as ANF
 import Purvasm.Compiler.MiddleEnd.MatchCompile (Arm, DTree(..), Proj(..))
 import Purvasm.Compiler.MiddleEnd.MatchCompile as MC
 
@@ -121,9 +122,9 @@ resolve pseudos = Array.fromFoldable (List.reverse (List.foldl step { self: 0, o
     Pinstr i -> i
     Pjump l -> Jump (rel self l)
     PjumpUnless l -> JumpUnless (rel self l)
-    PswitchCtor cs d -> SwitchCtor (map (\(t /\ l) -> t /\ rel self l) cs) (rel self d)
-    PswitchLit cs d -> SwitchLit (map (\(x /\ l) -> x /\ rel self l) cs) (rel self d)
-    PswitchLen cs d -> SwitchLen (map (\(x /\ l) -> x /\ rel self l) cs) (rel self d)
+    PswitchCtor cs d -> SwitchCtorRel (map (\(t /\ l) -> t /\ rel self l) cs) (rel self d)
+    PswitchLit cs d -> SwitchLitRel (map (\(x /\ l) -> x /\ rel self l) cs) (rel self d)
+    PswitchLen cs d -> SwitchLenRel (map (\(x /\ l) -> x /\ rel self l) cs) (rel self d)
     Plabel _ -> unsafeCrashWith "resolve: label not skipped"
 
 -- | Thread the assembler state through an array left-to-right, collecting a result per
@@ -148,105 +149,59 @@ projInstr = case _ of
   Pelem j -> Proj_arr j
   Precord l -> GetField l
 
--- | Lower the shared decision tree to bytecode. The tree fixes the occurrence names
--- | (ADR-0083 byte-identity contract); this walk only turns switches into `Pswitch*` with
--- | back-patched labels and threads `atom`/`body`.
+-- | Lower the shared decision tree to bytecode, **keeping its shape**
+-- | ([ADR-0110](../../../../../docs/design-decisions/0110-owned-vm-purescript-native.md) §4(b)): a
+-- | switch's arms and default are nested blocks, not back-patched offsets into a flat region.
+-- |
+-- | The tree fixes the occurrence names (ADR-0083's byte-identity contract); this walk only turns
+-- | each node into its instruction. There are no labels and no jumps left to resolve — an arm yields
+-- | the `case`'s value and control resumes in the enclosing block, which is exactly what the linear
+-- | form's single end-join label did. `Linearise.linearise` recovers that form for the older
+-- | artifacts (`.pmo`, boot's version-3 image), which is the direction the information flows now:
+-- | the compiler keeps the structure it built and *drops* it on the way out, rather than every
+-- | consumer rebuilding it from offsets.
+-- |
+-- | Recursion here follows genuine tree nesting only, and each node's instructions are concatenated
+-- | into the block that owns them — so an arm's body is copied once into its own block, never into
+-- | an enclosing one (a switch's arms live inside the instruction, not beside it).
 compileTree :: Lowerers -> Boolean -> Array Atom -> Array Alt -> CodeBlock
-compileTree lw tail scruts alts = resolve (List.reverse (build asmInit).buf)
+compileTree lw tail scruts alts = Array.concatMap scrutBind scrutBinds <> lower tree
   where
   { scrutBinds, tree } = MC.compile scruts alts
 
-  build :: AsmState -> AsmState
-  build s0 =
-    let
-      end = freshLbl s0
-      s1 = Array.foldl
-        (\s (o /\ a) -> emit (Pinstr (Bind o)) (emit (Pinstr (lw.atom a)) s))
-        end.s
-        scrutBinds
-    in
-      emit (Plabel end.lbl) (lower end.lbl tree s1)
+  scrutBind (occ /\ a) = [ lw.atom a, Bind occ ]
 
-  emitLeafBinds :: Array (String /\ String) -> AsmState -> AsmState
-  emitLeafBinds binds s0 = Array.foldl
-    (\s (name /\ occ) -> emit (Pinstr (Bind name)) (emit (Pinstr (Load occ)) s))
-    s0
-    binds
+  -- A leaf's variable bindings, and a node's sub-occurrence extractions: both are
+  -- `Load`-then-`Bind` pairs onto fresh locals, so the operand stack is empty at every branch
+  -- boundary (ADR-0003).
+  leafBinds = Array.concatMap (\(name /\ occ) -> [ Load occ, Bind name ])
+  extractsOf occ_c = Array.concatMap (\(o /\ pr) -> [ Load occ_c, projInstr pr, Bind o ])
 
-  emitExtracts :: String -> Array (String /\ Proj) -> AsmState -> AsmState
-  emitExtracts occ_c extracts s0 =
-    Array.foldl (\s (o /\ pr) -> emitExtract occ_c (projInstr pr) o s) s0 extracts
-
-  lower :: Int -> DTree -> AsmState -> AsmState
-  lower endLbl t s0 = case t of
-    Dfail msg -> emit (Pinstr (Fail msg)) s0
-    Dleaf binds e -> emitBody lw tail endLbl e (emitLeafBinds binds s0)
+  lower :: DTree -> CodeBlock
+  lower = case _ of
+    Dfail msg -> [ Fail msg ]
+    Dleaf binds e -> leafBinds binds <> lw.body tail e
     Dguard binds clauses ft ->
-      let
-        s1 = emitLeafBinds binds s0
-        s2 = Array.foldl
-          ( \s g ->
-              let
-                sg = emitChunk (lw.body false g.guard) s
-                gnext = freshLbl sg
-                sr = emitBody lw tail endLbl g.rhs (emit (PjumpUnless gnext.lbl) gnext.s)
-              in
-                emit (Plabel gnext.lbl) sr
-          )
-          s1
-          clauses
-      in
-        lower endLbl ft s2
+      leafBinds binds <>
+        [ Guarded (map (\g -> { guard: lw.body false g.guard, rhs: lw.body tail g.rhs }) clauses)
+            (lower ft)
+        ]
     DswitchCtor occ_c arms default ->
-      let
-        dflt = freshLbl s0
-        minted = threadMap
-          (\s (tag /\ arm) -> let l = freshLbl s in { s: l.s, r: { tag, arm, l: l.lbl } })
-          dflt.s
-          arms
-        s1 = emit (PswitchCtor (minted.rs <#> \h -> h.tag /\ h.l) dflt.lbl)
-          (emit (Pinstr (Load occ_c)) minted.s)
-        s2 = Array.foldl
-          (\s h -> emitArm endLbl occ_c h.arm (emit (Plabel h.l) s))
-          s1
-          minted.rs
-      in
-        lower endLbl default (emit (Plabel dflt.lbl) s2)
+      [ Load occ_c
+      , SwitchCtor (map (\(t /\ a) -> t /\ emitArm occ_c a) arms) (lower default)
+      ]
     DswitchLit occ_c arms default ->
-      let
-        dflt = freshLbl s0
-        minted = threadMap
-          (\s (l /\ sub) -> let lbl = freshLbl s in { s: lbl.s, r: { l, sub, lbl: lbl.lbl } })
-          dflt.s
-          arms
-        s1 = emit (PswitchLit (minted.rs <#> \h -> h.l /\ h.lbl) dflt.lbl)
-          (emit (Pinstr (Load occ_c)) minted.s)
-        s2 = Array.foldl
-          (\s h -> lower endLbl h.sub (emit (Plabel h.lbl) s))
-          s1
-          minted.rs
-      in
-        lower endLbl default (emit (Plabel dflt.lbl) s2)
+      [ Load occ_c
+      , SwitchLit (map (\(l /\ sub) -> l /\ lower sub) arms) (lower default)
+      ]
     DswitchLen occ_c arms default ->
-      let
-        dflt = freshLbl s0
-        minted = threadMap
-          (\s (len /\ arm) -> let l = freshLbl s in { s: l.s, r: { len, arm, l: l.lbl } })
-          dflt.s
-          arms
-        s1 = emit (PswitchLen (minted.rs <#> \h -> h.len /\ h.l) dflt.lbl)
-          (emit (Pinstr (Load occ_c)) minted.s)
-        s2 = Array.foldl
-          (\s h -> emitArm endLbl occ_c h.arm (emit (Plabel h.l) s))
-          s1
-          minted.rs
-      in
-        lower endLbl default (emit (Plabel dflt.lbl) s2)
-    DexpandRecord occ_c extracts sub ->
-      lower endLbl sub (emitExtracts occ_c extracts s0)
+      [ Load occ_c
+      , SwitchLen (map (\(n /\ a) -> n /\ emitArm occ_c a) arms) (lower default)
+      ]
+    DexpandRecord occ_c extracts sub -> extractsOf occ_c extracts <> lower sub
 
-  emitArm :: Int -> String -> Arm -> AsmState -> AsmState
-  emitArm endLbl occ_c arm s0 = lower endLbl arm.sub (emitExtracts occ_c arm.extracts s0)
+  emitArm :: String -> Arm -> CodeBlock
+  emitArm occ_c arm = extractsOf occ_c arm.extracts <> lower arm.sub
 
 -- --- naive matcher (per-alternative re-testing) -------------------------------------
 
@@ -255,8 +210,8 @@ compileTree lw tail scruts alts = resolve (List.reverse (build asmInit).buf)
 -- | is false.
 emitRhs :: Lowerers -> Boolean -> Int -> Rhs -> (AsmState -> AsmState) -> AsmState -> AsmState
 emitRhs lw tail endLbl rhs onFail s0 = case rhs of
-  Uncond e -> emitBody lw tail endLbl e s0
-  Guarded clauses ->
+  ANF.Uncond e -> emitBody lw tail endLbl e s0
+  ANF.Guarded clauses ->
     let
       s1 = Array.foldl
         ( \s g ->

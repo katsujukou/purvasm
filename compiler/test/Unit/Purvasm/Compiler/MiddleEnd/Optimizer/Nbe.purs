@@ -21,6 +21,7 @@ import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Analysis (inlineMarks)
 import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
 import Purvasm.Compiler.MiddleEnd.Module (Decl)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe (candidatesOf, nbeBinding, nbeEnvOf)
+import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Eval (foldPrim)
 import Purvasm.Compiler.Primitive (PrimOp(..))
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
@@ -1363,3 +1364,19 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
       -- the call survives (the universal appliedHead conjunct refuses); pin the fixpoint.
       nbeCross mixed [] out `shouldEqual` out
       (out /= Ret (CAtom (int 1))) `shouldEqual` true
+
+  -- ADR-0112 §4: `foldPrim` must answer what the *machine* answers, not what the compiler happened
+  -- to be built against. These two inputs are where a host `Prelude` / `Data.Int.Bits` fold and the
+  -- machine disagree, so they are the cases that would silently differ between a node-built and a
+  -- natively-built compiler.
+  describe "Int folds stay inside Int (ADR-0112)" do
+    it "wraps the Euclidean quotient that leaves the range" do
+      foldPrim DivInt [ LInt (-2147483648), LInt (-1) ] `shouldEqual` Just (LInt (-2147483648))
+
+    it "keeps the zero-fill shift signed" do
+      foldPrim ZshrInt [ LInt (-1), LInt 0 ] `shouldEqual` Just (LInt (-1))
+
+    it "folds the ordinary cases as the machine does" do
+      foldPrim DivInt [ LInt (-7), LInt 3 ] `shouldEqual` Just (LInt (-3))
+      foldPrim ModInt [ LInt (-7), LInt 3 ] `shouldEqual` Just (LInt 2)
+      foldPrim DivInt [ LInt 7, LInt 0 ] `shouldEqual` Just (LInt 0)

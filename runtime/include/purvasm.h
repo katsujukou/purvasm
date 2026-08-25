@@ -29,6 +29,12 @@
  * NOT exposed here (deliberately): the runtime lifecycle (`pv_runtime_new`/`pv_runtime_free`), the entry
  * plumbing (`pv_run_effect`/`pv_drain_output`/`pv_print_int`/`pv_case_fail`), and the `pv_prim_*` primop
  * helpers — those are codegen's internal lowering ABI, emitted straight into the `.ll`, not a foreign's.
+ *
+ * Nor is the HOST-CONTROL surface a program that embeds the runtime uses to configure it for a guest
+ * it hosts (`pv_runtime_set_guest_argv`, ADR-0110 §4(a) Correction). That lives in `purvasm_host.h`,
+ * and the separation is load-bearing: everything declared *here* is retained and dynamically exported
+ * by a `--host-foreign-api` executable so providers can bind it, and an entry that reconfigures the
+ * runtime must not be among them.
  */
 #ifndef PURVASM_H
 #define PURVASM_H
@@ -123,8 +129,27 @@ PVWord pv_empty_array(void);
 /** An `Array`'s element count (the empty array reads as 0) — pairs with `pv_read_field` for the
     FFI's array conversions (ADR-0078). */
 size_t pv_array_len(PVContext *ctx, PVWord array);
-/** An algebraic-data value: constructor `tag`, then `n` field words at `fields`. */
+/** A field-carrying algebraic-data value: constructor `tag`, then `n` field words at `fields`.
+    A NULLARY constructor is `pv_new_nullary_adt`, not this: the two representations differ.
+    `n == 0` is LEGACY and non-canonical: it allocates a zero-field heap object, which
+    carries the right tag and matches no native `case` at all. It is kept because refusing it would
+    change what an existing v1 symbol does — a provider built before the nullary entry existed would
+    pass the version check and then fault inside a call that used to return. */
 PVWord pv_new_adt(PVContext *ctx, uint32_t tag, const PVWord *fields, size_t n);
+/** The NULLARY constructor `tag` — an immediate, so no allocation and no ctx.
+    This is the only representation a nullary constructor has, and the one a generated `case` matches:
+    a `case` splits on representation before comparing tags, so a zero-field heap object would carry
+    the right tag and miss every `case Nothing`. Build `Nothing` with this, never by hand. */
+PVWord pv_new_nullary_adt(uint32_t tag);
+/** An algebraic-data value's constructor tag — the number `pv_new_adt` was given, which is
+    `fnv1a64(name).lo & 0x7fffffff` for the constructor NAME. Answers for a NULLARY constructor too:
+    that one has no heap object (it is an immediate whose payload is the tag), and a caller holding an
+    opaque word cannot tell the two apart, so the accessor does. A typed accessor, not introspection:
+    it answers what tag THIS ADT carries, never what kind a word is.
+    NOTE the shape check reaches only the pointer case: a heap non-ADT aborts, but a nullary
+    constructor is indistinguishable from an `Int`/`Boolean`/`Unit` — all immediates — so the caller
+    must be a site whose TYPE already established that this is an ADT. */
+uint32_t pv_adt_tag(PVContext *ctx, PVWord adt);
 /** A record from parallel `ids` (sorted FNV-1a-64 label ids) and `values`, length `n` (ADR-0069). */
 PVWord pv_new_record(PVContext *ctx, const PVWord *ids, const PVWord *values, size_t n);
 /** A mutable one-cell `Ref` initialised to `init`. */
@@ -156,6 +181,47 @@ void pv_write_field(PVContext *ctx, PVWord obj, uint64_t i, PVWord v);
 PVWord pv_apply(PVContext *ctx, PVWord f, const PVWord *args, size_t nargs);
 /** Force a by-need cell to its value; passes any non-cell through unchanged (ADR-0070). */
 PVWord pv_force_if_byneed(PVContext *ctx, PVWord v);
+
+/* ── Foreign-ABI version (ADR-0111 §5) ─────────────────────────────────────────────────────────────── */
+
+/**
+ * The version of the foreign-author surface above — the `pv_*` functions, their signatures and their
+ * contracts. Bumped when that surface changes incompatibly; an additive entry does not bump it.
+ *
+ * Deliberately NOT `PV_CTX_HEADER_VERSION`, which versions the generated-code `pv_ctx_header` layout
+ * below and is explicitly not the foreign surface: the two change for different reasons and a shared
+ * counter would make each one's bump a false alarm for the other.
+ */
+#define PV_FOREIGN_ABI_VERSION 1
+
+#if defined(__GNUC__) || defined(__clang__)
+#define PVF_USED __attribute__((used))
+#else
+#define PVF_USED
+#endif
+
+/*
+ * The version travels as an undefined **reference**, not as a stamp to be read back after loading.
+ * Every translation unit that includes this header carries a reference to `pv_foreign_abi_v<N>`, and
+ * the runtime defines that symbol for its own N only — so a provider built against a different header
+ * fails to *resolve*: at link when it is linked statically, and at `dlopen` when the VM loads it as a
+ * shared object (ADR-0111 §6 loads with RTLD_NOW, which binds every reference before the module's
+ * initialisers run).
+ *
+ * That ordering is the whole point. A version read *after* `dlopen` is too late: `dlopen` runs
+ * `init_array` / `+load` / a Rust `ctor` before it returns, so a stale module would already have
+ * called into a `pv_*` surface it disagrees with. Nothing here is ever called or read; the reference
+ * alone carries the version, and it costs one word of unreferenced data per object.
+ *
+ * The author writes nothing for this and no build flag selects it — the reference is unconditional,
+ * so a statically linked provider gets the same protection from the runtime staticlib's definition.
+ */
+#define PV_FOREIGN_ABI_SYM_(n) pv_foreign_abi_v##n
+#define PV_FOREIGN_ABI_SYM(n) PV_FOREIGN_ABI_SYM_(n)
+
+void PV_FOREIGN_ABI_SYM(PV_FOREIGN_ABI_VERSION)(void);
+
+static void (*const pv_foreign_abi_stamp)(void) PVF_USED = PV_FOREIGN_ABI_SYM(PV_FOREIGN_ABI_VERSION);
 
 /* ════════════════════════════════════════════════════════════════════════════════════════════════════
  * GENERATED-CODE ABI (ADR-0079) — NOT part of the foreign-author API above.

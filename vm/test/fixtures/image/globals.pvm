@@ -1,0 +1,6 @@
+{"version":5,
+ "gdefs":[["twice",["fn",["n"],[["ld","n"],["ld","n"],["pm","AddInt",2],["rt"]]]],
+          ["base",["caf",[["pi",20],["rt"]]]],
+          ["lazy",["rec",[["pi",2],["rt"]]]]],
+ "main":[["ld","twice"],["ld","base"],["ca",1],["ld","lazy"],["pm","AddInt",2],["rt"]],
+ "effect":false}

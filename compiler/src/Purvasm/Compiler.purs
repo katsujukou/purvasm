@@ -114,6 +114,13 @@ type EmittedModule o = { artifact :: ModuleArtifacts o, path :: String }
 type BuildProducts o =
   { modules :: Array (EmittedModule o)
   , entry :: { ir :: o, path :: String }
+  -- | The whole closure's foreign shapes: the union of every lowered module's **visible** map (its own
+  -- | ∪ its dependencies' exported). Codegen reads shapes per module, but a *finalisation* step can be
+  -- | module-less — the bytecode linker compiles the FFI ladder's structural terms itself (ADR-0033), and
+  -- | those terms reference native leaves whose physical arity the linked image must carry (ADR-0110
+  -- | §4(a)). Handing over the union the fold already accumulated keeps that one derivation
+  -- | (`NativeLeaf.nativeLeafArities` over these shapes) rather than a second FSR pass in the CLI.
+  , foreignSigs :: ForeignSigMap
   }
 
 -- | The **pre-optimisation, pre-FSR** view `moduleContext` reads to derive ONE module's context
@@ -396,7 +403,13 @@ build backend action opts =
           -- the final accumulated one — the entry imports the world (ADR-0104 §5-1).
           let entryIr = backend.lowerEntry final.total { modules: final.lowered, entry: entryExprOf opts }
           entryPath <- action.emitEntry entryIr
-          pure (Right { modules: final.emitted, entry: { ir: entryIr, path: entryPath } })
+          pure
+            ( Right
+                { modules: final.emitted
+                , entry: { ir: entryIr, path: entryPath }
+                , foreignSigs: foldl (\acc lm -> Map.union acc lm.foreignSigs) Map.empty final.lowered
+                }
+            )
   where
   stepModule :: Set String -> FoldState c o -> { mod ∷ CF.Module, name ∷ String } -> m (Either BuildError (FoldState c o))
   stepModule localNames st item = do

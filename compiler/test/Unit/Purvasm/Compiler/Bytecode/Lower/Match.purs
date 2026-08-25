@@ -11,13 +11,15 @@ import Prelude
 
 import Data.Array as Array
 import Data.Maybe (Maybe(..), fromMaybe)
-import Data.Tuple.Nested (type (/\), (/\))
+import Data.Tuple.Nested ((/\))
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Bytecode.Instruction (CodeBlock, Instruction(..))
 import Purvasm.Compiler.Bytecode.Lower (lowerAtom, lowerExpr)
 import Purvasm.Compiler.Bytecode.Lower.Match (Lowerers, compileNaive, compileTree)
 import Purvasm.Compiler.Literal (Literal(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.Bytecode.Linearise (linearise)
+import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr(..), Expr(..), Rhs)
+import Purvasm.Compiler.MiddleEnd.ANF as ANF
 import Purvasm.Compiler.Primitive (PrimOp(LtInt))
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
@@ -27,7 +29,7 @@ lw = { atom: lowerAtom, body: lowerExpr }
 
 -- | An unconditional body returning the literal `n`.
 bdy :: Int -> Rhs
-bdy n = Uncond (Ret (CAtom (AtomLit (LInt n))))
+bdy n = ANF.Uncond (Ret (CAtom (AtomLit (LInt n))))
 
 alt :: Array Binder -> Rhs -> Alt
 alt binders result = { binders, result }
@@ -35,12 +37,29 @@ alt binders result = { binders, result }
 tree :: Array Atom -> Array Alt -> CodeBlock
 tree = compileTree lw false
 
+-- | Every instruction of a block, descending into the nested blocks a tree-shaped `case` carries
+-- | (ADR-0110 §4(b)) — a `switch`'s arms and default, and a guard chain's clauses. Closure and
+-- | recursive-group bodies are separate chunks and are NOT descended into: an assertion about "this
+-- | `case`" should not count instructions of a function that happens to be built inside it.
+everyInstruction :: CodeBlock -> Array Instruction
+everyInstruction = Array.concatMap \i -> case i of
+  SwitchCtor cs d -> Array.cons i $ nested (map (\(_ /\ b) -> b) cs) d
+  SwitchLit cs d -> Array.cons i $ nested (map (\(_ /\ b) -> b) cs) d
+  SwitchLen cs d -> Array.cons i $ nested (map (\(_ /\ b) -> b) cs) d
+  Guarded cs ft -> Array.cons i $ nested (Array.concatMap (\c -> [ c.guard, c.rhs ]) cs) ft
+  _ -> [ i ]
+  where
+  nested blocks default = Array.concatMap everyInstruction (Array.snoc blocks default)
+
 -- predicates / extractors over emitted bytecode
 isSwitch :: Instruction -> Boolean
 isSwitch = case _ of
   SwitchCtor _ _ -> true
   SwitchLit _ _ -> true
   SwitchLen _ _ -> true
+  SwitchCtorRel _ _ -> true
+  SwitchLitRel _ _ -> true
+  SwitchLenRel _ _ -> true
   _ -> false
 
 countOf :: (Instruction -> Boolean) -> CodeBlock -> Int
@@ -51,29 +70,48 @@ isJumpUnless = case _ of
   JumpUnless _ -> true
   _ -> false
 
+-- | How many clauses the guard chains in a block carry.
+guardClauses :: CodeBlock -> Int
+guardClauses = Array.foldl step 0 <<< everyInstruction
+  where
+  step acc = case _ of
+    Guarded cs _ -> acc + Array.length cs
+    _ -> acc
+
 switchCount :: CodeBlock -> Int
-switchCount = countOf isSwitch
+switchCount = countOf isSwitch <<< everyInstruction
 
 failCount :: CodeBlock -> Int
-failCount = countOf case _ of
-  Fail _ -> true
-  _ -> false
+failCount =
+  countOf
+    ( case _ of
+        Fail _ -> true
+        _ -> false
+    ) <<< everyInstruction
 
 ctorHeads :: CodeBlock -> Array String
-ctorHeads = fromMaybe [] <<< Array.findMap case _ of
-  SwitchCtor cs _ -> Just (map (\(t /\ _) -> t) cs)
-  _ -> Nothing
+ctorHeads = fromMaybe []
+  <<< Array.findMap
+    ( case _ of
+        SwitchCtor cs _ -> Just (map (\(t /\ _) -> t) cs)
+        _ -> Nothing
+    )
+  <<< everyInstruction
 
 litHeads :: CodeBlock -> Array Literal
-litHeads = fromMaybe [] <<< Array.findMap case _ of
-  SwitchLit cs _ -> Just (map (\(l /\ _) -> l) cs)
-  _ -> Nothing
+litHeads = fromMaybe []
+  <<< Array.findMap
+    ( case _ of
+        SwitchLit cs _ -> Just (map (\(l /\ _) -> l) cs)
+        _ -> Nothing
+    )
+  <<< everyInstruction
 
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.Bytecode.Lower.Match" do
   stackSafetySpec
   describe "compileTree — exact bytecode for new discriminants" do
-    it "lowers a literal case to one SwitchLit with a wildcard default" do
+    it "lowers a literal case to one tree-shaped SwitchLit with a wildcard default" do
       tree [ AtomVar "n" ]
         [ alt [ BLit (LInt 1) ] (bdy 10)
         , alt [ BLit (LInt 2) ] (bdy 20)
@@ -83,7 +121,26 @@ spec = describe "Purvasm.Compiler.Bytecode.Lower.Match" do
           [ Load "n"
           , Bind "$dt1"
           , Load "$dt1"
-          , SwitchLit [ LInt 1 /\ 0, LInt 2 /\ 2 ] 4
+          , SwitchLit [ LInt 1 /\ [ PushInt 10 ], LInt 2 /\ [ PushInt 20 ] ]
+              [ Load "$dt1", Bind "x", PushInt 0 ]
+          ]
+
+    -- The flattened form is what boot's reader and the `.pmo` still see, and it must be the layout
+    -- the linearising lowering used to emit *exactly* — same regions in the same order, the same
+    -- join, the same fall-through jumps. A shift here would move boot's instruction counts.
+    it "flattens back to the pre-tree layout, offset for offset" do
+      linearise
+        ( tree [ AtomVar "n" ]
+            [ alt [ BLit (LInt 1) ] (bdy 10)
+            , alt [ BLit (LInt 2) ] (bdy 20)
+            , alt [ BVar "x" ] (bdy 0)
+            ]
+        )
+        `shouldEqual`
+          [ Load "n"
+          , Bind "$dt1"
+          , Load "$dt1"
+          , SwitchLitRel [ LInt 1 /\ 0, LInt 2 /\ 2 ] 4
           , PushInt 10
           , Jump 6
           , PushInt 20
@@ -95,15 +152,17 @@ spec = describe "Purvasm.Compiler.Bytecode.Lower.Match" do
           ]
 
     it "lowers an array case to one SwitchLen, projecting elements" do
-      tree [ AtomVar "xs" ]
-        [ alt [ BArray [ BVar "a" ] ] (Uncond (Ret (CAtom (AtomVar "a"))))
-        , alt [ BVar "z" ] (bdy 0)
-        ]
+      linearise
+        ( tree [ AtomVar "xs" ]
+            [ alt [ BArray [ BVar "a" ] ] (ANF.Uncond (Ret (CAtom (AtomVar "a"))))
+            , alt [ BVar "z" ] (bdy 0)
+            ]
+        )
         `shouldEqual`
           [ Load "xs"
           , Bind "$dt1"
           , Load "$dt1"
-          , SwitchLen [ 1 /\ 0 ] 7
+          , SwitchLenRel [ 1 /\ 0 ] 7
           , Load "$dt1"
           , Proj_arr 0
           , Bind "$dt2"
@@ -142,7 +201,7 @@ spec = describe "Purvasm.Compiler.Bytecode.Lower.Match" do
     it "switches at each level of a nested constructor pattern" do
       switchCount
         ( tree [ AtomVar "x" ]
-            [ alt [ BCtor "Just" [ BCtor "Just" [ BVar "a" ] ] ] (Uncond (Ret (CAtom (AtomVar "a"))))
+            [ alt [ BCtor "Just" [ BCtor "Just" [ BVar "a" ] ] ] (ANF.Uncond (Ret (CAtom (AtomVar "a"))))
             , alt [ BNull ] (bdy 0)
             ]
         )
@@ -151,11 +210,11 @@ spec = describe "Purvasm.Compiler.Bytecode.Lower.Match" do
     it "binds an as-pattern's name while still switching on its constructor" do
       let
         code = tree [ AtomVar "x" ]
-          [ alt [ BNamed "n" (BCtor "Just" [ BVar "a" ]) ] (Uncond (Ret (CAtom (AtomVar "n"))))
+          [ alt [ BNamed "n" (BCtor "Just" [ BVar "a" ]) ] (ANF.Uncond (Ret (CAtom (AtomVar "n"))))
           , alt [ BNull ] (bdy 0)
           ]
       switchCount code `shouldEqual` 1
-      Array.any (eq (Bind "n")) code `shouldEqual` true
+      Array.any (eq (Bind "n")) (everyInstruction code) `shouldEqual` true
 
     it "binds each of several scrutinees in order" do
       Array.take 4 (tree [ AtomVar "x", AtomVar "y" ] [ alt [ BVar "a", BVar "b" ] (bdy 1) ])
@@ -164,7 +223,7 @@ spec = describe "Purvasm.Compiler.Bytecode.Lower.Match" do
     it "expands a record pattern with field access and no discriminant switch" do
       let
         code = tree [ AtomVar "r" ]
-          [ alt [ BRecord [ { prop: "x", binder: BVar "a" } ] ] (Uncond (Ret (CAtom (AtomVar "a")))) ]
+          [ alt [ BRecord [ { prop: "x", binder: BVar "a" } ] ] (ANF.Uncond (Ret (CAtom (AtomVar "a")))) ]
       switchCount code `shouldEqual` 0
       Array.any (eq (GetField "x")) code `shouldEqual` true
 
@@ -172,13 +231,16 @@ spec = describe "Purvasm.Compiler.Bytecode.Lower.Match" do
       let
         code = tree [ AtomVar "x" ]
           [ alt [ BVar "y" ]
-              ( Guarded
+              ( ANF.Guarded
                   [ { guard: Ret (CPrim LtInt [ AtomLit (LInt 0), AtomVar "y" ]), rhs: Ret (CAtom (AtomLit (LInt 1))) }
                   , { guard: Ret (CAtom (AtomLit (LBool true))), rhs: Ret (CAtom (AtomLit (LInt 2))) }
                   ]
               )
           ]
-      countOf isJumpUnless code `shouldEqual` 2
+      -- The chain is one `Guarded` carrying both clauses, not two conditional jumps: §4(b) covers the
+      -- guard chain as well as the switches. Flattened, it is still the two `JumpUnless`es boot reads.
+      guardClauses code `shouldEqual` 2
+      countOf isJumpUnless (linearise code) `shouldEqual` 2
 
   describe "compileTree — exhaustiveness" do
     it "falls through to a single Fail when no alternative is total" do
@@ -193,14 +255,17 @@ spec = describe "Purvasm.Compiler.Bytecode.Lower.Match" do
         `shouldEqual` 0
 
   describe "compileNaive — per-alternative re-testing" do
+    -- The baseline keeps emitting the LINEAR form. It exists to be measured against (ADR-0031), it is
+    -- reached by no production path, and re-shaping it would only invent a second tree lowering to
+    -- maintain.
     it "binds the scrutinee, switches on the tag, projects the field, and falls through to Fail" do
       compileNaive lw false [ AtomVar "x" ]
-        [ alt [ BCtor "Just" [ BVar "y" ] ] (Uncond (Ret (CAtom (AtomVar "y")))) ]
+        [ alt [ BCtor "Just" [ BVar "y" ] ] (ANF.Uncond (Ret (CAtom (AtomVar "y")))) ]
         `shouldEqual`
           [ Load "x"
           , Bind "$nv1"
           , Load "$nv1"
-          , SwitchCtor [ "Just" /\ 0 ] 7
+          , SwitchCtorRel [ "Just" /\ 0 ] 7
           , Load "$nv1"
           , Proj 0
           , Bind "$nv2"
