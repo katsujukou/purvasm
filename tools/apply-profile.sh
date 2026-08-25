@@ -279,6 +279,51 @@ alloc_census() { # $1=slots tsv
     END { printf "\nADR-0109 §5.1 terms for this leg: materialisations=%d hoisted-inits=%d Kind::Closure=%d\n", m+0, i+0, c+0 }' "$1"
 }
 
+# --- the joined table's key derivation, ONE rule, shared by the report and its self-test ---------
+#
+# These two functions are the report's key space. They are functions and not inline awk because a
+# self-test that re-implements them tests its own copy: the `structural-apply` rows below were
+# first written against `reconcile` alone, and `reconcile` had counted structural since ADR-0108 —
+# so deleting the report's structural branches left the suite green. A gate over a second spelling
+# is not a gate over the thing that ships.
+#
+# The rule, applied identically to both sides:
+#   generic-<form>/<reason…>         -> <reason…>            (a reason may contain "/", so the
+#                                                             split takes the FIRST separator only:
+#                                                             ADR-0113's local-unknown-fn/<origin>)
+#   local-deferred-<form>/<kind>     -> candidate/<kind>     (its own namespace: "capture" is both
+#                                                             an origin and a kind, and merging them
+#                                                             would sum a population the emitter can
+#                                                             act on with one it cannot)
+#   foreign-deferred-<form>          -> foreign/<class>
+#   foreign-direct-<form>            -> DROPPED: a direct call is not a dispatch
+#   structural-apply                 -> itself (no reason axis; its SITES come from a `class` row)
+
+# sites per population, from a census TSV
+sites_by_population() { # $1 = census tsv
+  awk -F'\t' '/^#/ { next }
+      $3 == "reason" { slash = index($4, "/"); if (slash) s[substr($4, slash + 1)] += $5 }
+      $3 == "kind"   { slash = index($4, "/"); if (slash) s["candidate/" substr($4, slash + 1)] += $5 }
+      $3 == "class" && $4 == "structural-apply" { s["structural-apply"] += $5 }
+    END { for (k in s) printf "%s\t%d\n", k, s[k] }' "$1" | sort
+}
+
+# executions per population, from dispatch slot rows on stdin
+execs_by_population() {
+  awk -F'\t' '{
+      if ($1 == "structural-apply") { e[$1] += $2; next }
+      slash = index($1, "/")
+      if (slash == 0) { cls = $1; rest = "" } else { cls = substr($1, 1, slash - 1); rest = substr($1, slash + 1) }
+      if (index(cls, "foreign-direct-") == 1) next
+      if (index(cls, "local-deferred-") == 1) k = "candidate/" rest
+      else if (index(cls, "foreign-") == 1) k = "foreign/" cls
+      else if (rest == "") next
+      else k = rest
+      e[k] += $2
+    }
+    END { for (k in e) printf "%s\t%d\n", k, e[k] }' | sort
+}
+
 # The two identities. Echoes two verdict strings; returns non-zero if either fails.
 reconcile() { # $1=slots tsv  $2=stderr file
   local sum_apply sum_tail rt_apply rt_tail rcl=0
@@ -501,6 +546,59 @@ if [ "$SELF_TEST" = "1" ]; then
     "pv_apply_entries=0 pv_tailcall_writes=7"
   # a three-level generic key must survive the parse intact (local-unknown-fn/<origin>)
   pcheck "a three-level generic reason row parses" pass "generic-apply/local-unknown-fn/match-binder=4"
+  # `structural-apply` has no reason axis, so it is the row most easily dropped from a table keyed
+  # by reason — and dropping it leaves the footnote claiming a total the rows do not add up to.
+  # It is a dispatch and must be inside the identity.
+  rcheck "structural-apply counts toward pv_apply_entries" pass \
+    "generic-apply/local-unknown-fn/param=3 structural-apply=4" \
+    "pv_apply_entries=7 pv_tailcall_writes=0"
+  rcheck "omitting structural-apply from the runtime total FAILS" fail \
+    "generic-apply/local-unknown-fn/param=3 structural-apply=4" \
+    "pv_apply_entries=3 pv_tailcall_writes=0"
+
+  # --- the REPORT's key derivation, over the functions the report itself calls -------------------
+  # The two rows above exercise `reconcile`, which has counted `structural-apply` since ADR-0108 —
+  # so they stay green even if the joined table drops it. These exercise `sites_by_population` and
+  # `execs_by_population`, which is where it was actually lost, using the real corpus's numbers.
+  echo
+  echo "== self-test: the report's key derivation (both sides) ============="
+  cat >"$t/sites.tsv" <<'CENSUS'
+#index	object	row	key	count
+0	M	class	structural-apply	98
+0	M	class	generic-apply	3
+0	M	reason	generic-apply/local-unknown-fn/param	3
+0	M	kind	local-deferred-apply/capture	696
+CENSUS
+  printf 'structural-apply	2314702
+generic-apply/local-unknown-fn/param	81252445
+local-deferred-apply/capture	16869596
+foreign-direct-apply	442522201
+' >"$t/dslots.tsv"
+
+  kcheck() { # $1=label  $2=file  $3=expected line
+    if grep -qxF "$3" "$2"; then printf '  ok    %-52s (%s)\n' "$1" "present"
+    else printf '  FAIL  %-52s (missing: %s)\n' "$1" "$3"; st_rc=1; fi
+  }
+  kmissing() { # $1=label  $2=file  $3=key that must NOT appear
+    if grep -q "^$3	" "$2"; then printf '  FAIL  %-52s (%s leaked)\n' "$1" "$3"; st_rc=1
+    else printf '  ok    %-52s (%s)\n' "$1" "absent"; fi
+  }
+  sites_by_population "$t/sites.tsv" >"$t/s.tsv"
+  execs_by_population <"$t/dslots.tsv" >"$t/e.tsv"
+  kcheck "structural-apply has SITES (from its class row)"   "$t/s.tsv" "$(printf 'structural-apply\t98')"
+  kcheck "structural-apply has EXECUTIONS"                   "$t/e.tsv" "$(printf 'structural-apply\t2314702')"
+  kcheck "a three-level origin survives on the sites side"   "$t/s.tsv" "$(printf 'local-unknown-fn/param\t3')"
+  kcheck "a three-level origin survives on the execs side"   "$t/e.tsv" "$(printf 'local-unknown-fn/param\t81252445')"
+  kcheck "a candidate keeps its own namespace (sites)"       "$t/s.tsv" "$(printf 'candidate/capture\t696')"
+  kcheck "a candidate keeps its own namespace (execs)"       "$t/e.tsv" "$(printf 'candidate/capture\t16869596')"
+  kmissing "a DIRECT call is not in the dispatch denominator" "$t/e.tsv" "foreign/foreign-direct-apply"
+  kmissing "…and does not leak under a truncated key"         "$t/e.tsv" "local-unknown-fn"
+  # the sides must agree on their key SPACE: every key one produces, the other can produce too.
+  if [ "$(cut -f1 "$t/s.tsv" | sort)" = "$(cut -f1 "$t/e.tsv" | sort)" ]; then
+    printf '  ok    %-52s (%s)\n' "both sides derive the SAME key space" "equal"
+  else
+    printf '  FAIL  %-52s\n' "both sides derive the SAME key space"; st_rc=1
+  fi
 
   # --- the TRANSFER verdict (ADR-0109 §5.1's completion condition for a direct-lowering slice) ---
   # This is the gate the first self-host `--paired apply` run did NOT have: its predecessor only
@@ -1054,25 +1152,10 @@ if [ "$SELFHOST" = "1" ]; then
     #   structural-apply                -> dropped (no reason axis)
     #
     # sites per population (both forms), from the census's `reason` and `kind` rows
-    awk -F'\t' '/^#/ { next }
-        $3 == "reason" { slash = index($4, "/"); if (slash) s[substr($4, slash + 1)] += $5 }
-        $3 == "kind"   { slash = index($4, "/"); if (slash) s["candidate/" substr($4, slash + 1)] += $5 }
-      END { for (k in s) printf "%s\t%d\n", k, s[k] }' "$WORK/census-work/sites.tsv" | sort >"$WORK/sites-by-reason.tsv"
+    sites_by_population "$WORK/census-work/sites.tsv" >"$WORK/sites-by-reason.tsv"
     # executions per population, from this run's DISPATCH slots (an allocation row is a different
     # measurement on the same line and has no reason axis).
-    dispatch_rows "$WORK/slots.tsv" \
-      | awk -F'\t' '{
-            if ($1 == "structural-apply") next
-            slash = index($1, "/")
-            if (slash == 0) { cls = $1; rest = "" } else { cls = substr($1, 1, slash - 1); rest = substr($1, slash + 1) }
-            if (index(cls, "foreign-direct-") == 1) next
-            if (index(cls, "local-deferred-") == 1) k = "candidate/" rest
-            else if (index(cls, "foreign-") == 1) k = "foreign/" cls
-            else if (rest == "") next
-            else k = rest
-            e[k] += $2
-          }
-          END { for (k in e) printf "%s\t%d\n", k, e[k] }' | sort >"$WORK/execs-by-reason.tsv"
+    dispatch_rows "$WORK/slots.tsv" | execs_by_population >"$WORK/execs-by-reason.tsv"
     # The DIRECT classes, counted separately. They are calls, not dispatches: no pv_apply entry, no
     # trampoline write. Keeping them out of the denominator matters on THIS run, where ADR-0109 had
     # just converted 442.5 M dispatches into direct calls — leaving them in made every dispatch
@@ -1095,9 +1178,6 @@ if [ "$SELFHOST" = "1" ]; then
     echo "(the executions column counts DISPATCHES only, so its total is pv_apply_entries +"
     echo " pv_tailcall_writes. A direct call is a different operation and is excluded:"
     echo " $direct_calls foreign-direct calls in this run, the population ADR-0109 moved.)"
-    echo "(the executions column counts DISPATCHES only — its total is pv_apply_entries +"
-    echo " pv_tailcall_writes. Direct calls are a different operation and are excluded:"
-    echo " $(cat "$WORK/direct-calls.txt" 2>/dev/null || echo 0) foreign-direct calls in this run, ADR-0109's population.)"
   fi
 
   echo

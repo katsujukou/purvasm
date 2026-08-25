@@ -6,6 +6,11 @@
   the three-stage knob with two independently verdictable transfers, `EmitLocalArity` keeping the
   unsaturated share attributable, and the three independent accounting identities. **Slices 1–2
   only**; slice 3 remains an explicit re-approval after the numbers)_
+- Outcome: ~~Slices 1–2 accepted, slice 3 pending~~ **Slices 1–2 COMPLETE (2026-08-20 / 2026-08-24);
+  slice 3 NOT AUTHORISED and intentionally stopped** — the measurement it was conditional on says
+  the recoverable population is 5.16 % of dispatches (an upper bound), its second knob stage has
+  nothing to move, and the dominant lever in the class is the out-of-scope `OParam`. No emitter
+  change was made; the measurement substrate is kept. See the 2026-08-24 progress note.
 - Date: 2026-08-17
 - Deciders: maintainer
 - Technical story: ADR-0108's second-ranked class — 195,562,878 generic dispatches (26.1 % of
@@ -688,6 +693,121 @@ explicit re-approval after slice 2's numbers, and the vocabulary that would expr
 (`LocalFactsMode`, `decideLocal`, `EmitLocalDirect`, `EmitLocalArity`, and the direct/arity events)
 is pinned at zero occurrences in `compiler/src` by `tools/seam-audit.sh`, whose self-test injects
 each identifier separately from the audit's own token list.
+
+
+#### Progress (2026-08-24): Slice 2 CLOSED, and Slice 3 is NOT authorised — stopped on its own numbers
+
+**`Slices 1–2 COMPLETE. Slice 3 NOT AUTHORISED — intentionally stopped.`** The measurement this
+record was written to obtain is done, and it says the lowering it was sizing is not worth doing on
+this corpus. That is a result, not a failure: §4 made slice 3 conditional on exactly this table.
+
+##### The measurement
+
+`tools/apply-profile.sh --selfhost --build-mode opt --work-mode no-opt` — the ADR-0108 conditions,
+one snapshot, one classifier, sites and executions from the same run. Both whole-program identities
+hold EXACTLY, with the ADR-0113 classes inside them:
+
+```text
+Σ generic-apply/<reason> + Σ local-deferred-apply/<kind> + foreign-deferred-apply + structural-apply
+  == 210,234,708 == pv_apply_entries
+Σ generic-tail/<reason>  + Σ local-deferred-tail/<kind>  + foreign-deferred-tail
+  == 116,711,504 == pv_tailcall_writes
+```
+
+Output unperturbed; the static census leg's gates green on the same snapshot.
+
+| population | sites | share | executions | share | exec/site |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **`local-unknown-fn/param`** | 654 | 4.16 % | **81,252,445** | **24.85 %** | **5.97×** |
+| `dep-no-direct-fact` | 2,202 | 14.02 % | 60,381,120 | 18.47 % | 1.32× |
+| `local-unknown-fn/capture` | 4,699 | 29.91 % | 58,392,877 | 17.86 % | 0.60× |
+| `own-object-not-fn` | 2,806 | 17.86 % | 56,651,728 | 17.33 % | 0.97× |
+| `local-unknown-fn/let-value` | 2,669 | 16.99 % | 25,436,176 | 7.78 % | 0.46× |
+| `local-unknown-fn/match-binder` | 590 | 3.76 % | 18,879,557 | 5.77 % | 1.54× |
+| **`candidate/capture`** | 696 | 4.43 % | **16,869,596** | **5.16 %** | 1.16× |
+| `arity-cross-module` | 872 | 5.55 % | 4,349,620 | 1.33 % | 0.24× |
+| `structural-apply` | 98 | 0.62 % | 2,314,702 | 0.71 % | 1.13× |
+| `arity-local` | 119 | 0.76 % | 1,889,419 | 0.58 % | 0.76× |
+| `arity-own-module` | 299 | 1.90 % | 528,972 | 0.16 % | 0.09× |
+| `callee-foreign` | 6 | 0.04 % | 0 | 0 % | — |
+| **total** | **15,710** | | **326,946,212** | | |
+
+`candidate/alias-local`, `candidate/alias-global` and the diagnostic origins are zero on both axes.
+By form: opaque 108.0 M apply / 75.9 M tail; candidate 14.6 M apply / 2.2 M tail.
+
+**The executions column counts DISPATCHES only**, so its total is `pv_apply_entries +
+pv_tailcall_writes`. The 442,522,201 `foreign-direct` calls ADR-0109 created are a different
+operation and sit outside the table — counting them in the denominator (which this harness did once)
+makes every dispatch share read about 2.3× smaller than it is.
+
+##### What it says
+
+- **The class is now the LARGEST dispatch class: 200,830,651 executions, 61.43 % of all dispatches**
+  — up from ADR-0108's 26.1 %, not because it grew but because ADR-0109 removed the 57.8 % foreign
+  population that used to sit above it.
+- **The recoverable part is 16,869,596 — 8.40 % of the class, 5.16 % of all dispatches.**
+- **The static and dynamic rankings invert INSIDE the class**, as they did one level up:
+  `capture` holds 29.91 % of the sites and 17.86 % of the executions (0.60×), while `param` holds
+  4.16 % of the sites and 24.85 % of the executions (5.97×).
+- **The hot population is `OParam`** — 81.25 M, 24.85 % of all dispatches — and §5 puts it out of
+  scope by construction: no local fact exists to recover, so it is caller-homed specialisation, a
+  different mechanism with its own prior-art study and its own blow-up failure mode.
+
+##### Why slice 3 stops here
+
+Six reasons, each of which alone would be worth stating:
+
+1. **16.9 M is an UPPER BOUND, not a removal.** It is the candidate population; saturated and
+   unsaturated are not separated, and an unsaturated candidate becomes `local-arity`, not a direct
+   call. The achievable figure is ≤ this and unmeasured.
+2. **Even the bound is 5.16 % of dispatches** — about **1/25** of ADR-0109 slice B's 430.2 M.
+3. **Against ADR-0109's own run-time evidence, the expected effect is ~0.1–0.3 %**, which is at or
+   under the noise floor that harness measures (slice B resolved a ~3 % effect only once the floor
+   was ±2 %).
+4. **The tail candidates are 2.25 M.** ADR-0109 slice C removed 9.42 M — four times more — and came
+   out INCONCLUSIVE on a quiet box.
+5. **The second knob stage has nothing to move.** `AliasLocal` and `AliasGlobal` are zero on both
+   axes, so §4's `before local-deferred-<form>/k > 0` completion condition is unsatisfiable for
+   `K(S1→S2)`. The three-stage knob would have a stage that cannot be verdicted.
+6. **The dominant lever is out of scope**: `OParam`, 24.85 % of all dispatches, needs a different
+   mechanism entirely.
+
+**No emitter change is made.** The slice-3 vocabulary stays absent and stays pinned at zero by
+`tools/seam-audit.sh`; `PURVASM_LOCAL_FACTS` is never introduced.
+
+##### What is kept, and why
+
+The slice-1 substrate stays: `BindOrigin`, `LocalFact`/`CandidateFact`, the opaque
+`CapturableFact` boundary, the `local-deferred` classes and their census/profile rows. It costs no
+emission (303/303 `.ll` byte-identical) and it is what makes this decision re-checkable: the numbers
+above are a property of THIS corpus, and a corpus in which the alias populations were non-zero, or in
+which captures ran hotter than their sites, would be measured by re-running the same two commands
+rather than by rebuilding the instrument.
+
+##### Harness defects this slice surfaced (all fixed)
+
+- **The joined table's key derivation did not follow the three-level key.** `split($1, "/")` then
+  `p[2]` truncated `local-unknown-fn/<origin>` to one bucket and dropped the candidate rows into an
+  empty-named row. Both sides now derive their key by ONE shared rule, splitting on the first
+  separator only, with candidates in their own namespace — "capture" is both an origin and a kind,
+  and merging them would sum a population the emitter can act on with one it cannot.
+- **Direct calls were inside the executions denominator** (see above).
+- **`structural-apply` fell out of both sides**: it has no reason axis, so its sites come from the
+  census's `class` row rather than a `reason` row — and the footnote then claimed a total the rows
+  did not add up to. It is an independent row on both sides now, and two self-test injections pin it
+  inside the identity.
+- The self-test gained the candidate rows (3 kinds × 2 forms, plus the missing-from-runtime and
+  wrong-form negatives) and the three-level-parse row. Verified by fault injection: removing the
+  candidate terms from `reconcile` fails exactly those rows.
+
+##### Next
+
+Not in this record: **`OParam` is the standing lever, and it needs its own ADR** — and that ADR's
+first slice is a MEASUREMENT, not a design. 81.25 M dispatches at 5.97× says the population is hot;
+it does not say whether it is a few call sites in hot loops or a broad population, and caller-homed
+specialisation is the technique whose known failure mode is exactly that a size/use metric cannot
+tell a reducing clone from a non-reducing one. The drill that decision needs is by site, by
+function, by caller and by arity — the ADR-0108 §4 escalation rule, applied one class over.
 
 
 ## Consequences
