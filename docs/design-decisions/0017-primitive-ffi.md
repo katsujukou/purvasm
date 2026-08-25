@@ -82,11 +82,21 @@ so `eqCharImpl` maps to the same primop as `eqIntImpl`.
 
 ### New primops this batch needs
 
-`DivInt`, `ModInt` (truncating, matching the JS `intDiv`/`intMod`; division or
+`DivInt`, `ModInt` (~~truncating, matching the JS `intDiv`/`intMod`~~; division or
 modulo by zero yields `0` as the JS FFI does — noted because it differs from
 OCaml's exception), `EqBool`, and boolean `AndBool` / `OrBool` / `NotBool`. The
 existing primops cover the rest (`AddInt`/`SubInt`/`MulInt`, the `Number` ops,
 `EqInt`/`EqNumber`/`EqString`, `Append`).
+
+> **Correction (2026-08-17):** `DivInt`/`ModInt` are **Euclidean**, not truncating — a
+> non-negative remainder, with the zero divisor still yielding `0`. The record described the
+> registry `intDiv`/`intMod` of Prelude 3.x; Prelude 4.x deliberately moved `EuclideanRing Int`
+> to Euclidean division and supplied `quot`/`rem` for the truncating pair
+> ([purescript-prelude#168](https://github.com/purescript/purescript-prelude/pull/168)), and
+> every purvasm implementation has followed that since (boot's `Vm.Machine`/`Cesk.Prim`, the Rust
+> runtime's `ediv`/`emod`, `Purvasm.Int`). The zero-divisor sentence stands.
+> [0112](0112-int-32-bit-invariant-and-division-layering.md) records the semantics and the
+> `Int`-range invariant that goes with them.
 
 ### Deferred to later batches / the higher-order slice
 

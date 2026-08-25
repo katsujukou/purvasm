@@ -6,6 +6,12 @@
 -- | (`--gc-sections` / `-dead_strip`). Over the CLI `PROC`/`FS` effects.
 module Purvasm.CLI.NativeLink
   ( LinkOptions
+  -- | Exported for its unit tests: they decide what a loaded provider may reach, so their parses are
+  -- | checked directly rather than only through a native build.
+  , foreignAbiStamp
+  , foreignAuthorApi
+  , foreignManifest
+  , generatedBanner
   , link
   ) where
 
@@ -17,7 +23,7 @@ import Data.Array ((..))
 import Data.Array as Array
 import Data.Char (toCharCode)
 import Data.Either (Either(..))
-import Data.Foldable (any, foldMap)
+import Data.Foldable (all, any, foldMap)
 import Data.Int as Int
 import Data.Map (Map)
 import Data.Map as Map
@@ -32,6 +38,7 @@ import Data.Tuple (Tuple(..))
 import Data.Tuple.Nested (type (/\), (/\))
 import Fmt as Fmt
 import Foreign.Object as Object
+import Purvasm.Abi.Mangle (unescapeIdent)
 import Purvasm.Compiler.Backend.LLVM.Mangle (escapeIdent, mangleForeign)
 import Purvasm.CLI.Effect.Env (ENV)
 import Purvasm.CLI.Effect.Env as Env
@@ -59,7 +66,192 @@ type LinkOptions =
   -- | app-C provider *compilation* (siblings are still scanned to enforce C-xor-Rust) and links the
   -- | crate as a `purvasm-bundle` staticlib folding the runtime rlib (ADR-0078 §5).
   , rustFfiDir :: Maybe FilePath
+  -- | `--host-foreign-api` (ADR-0111 §1.1): this executable will host providers loaded with `dlopen`,
+  -- | so the whole foreign-author ABI must survive the link and stay visible. Off, the linker keeps
+  -- | only what the program itself calls — which is right for every program that is not a VM.
+  , hostForeignApi :: Boolean
   }
+
+-- | The foreign-author API a provider may call, **read out of `purvasm.h` itself** (ADR-0073 §2).
+-- |
+-- | Deriving beats listing here, and the list this replaced showed why twice over: a hand-list only
+-- | catches drift in one direction (a name it has that the runtime lacks), and it had already
+-- | acquired `pv_abi_check`, which the header files under GENERATED-CODE ABI — emphatically *not* the
+-- | foreign surface. The header is the contract, so the header is what is parsed: everything before
+-- | its generated-code marker, declaration lines only.
+-- |
+-- | ADR-0111 §5's `pv_foreign_abi_v<N>` reference is retained on the same footing but is not found
+-- | here: it is declared through a macro paste (`PV_FOREIGN_ABI_SYM(…)`), which no reader of
+-- | declaration lines can resolve. [foreignAbiStamp] derives it from the version the header defines.
+-- |
+-- | `Left` when the header does not carry **exactly one** generated-code banner. The banner is what
+-- | separates a provider's API from codegen's, so losing it must not degrade to "parse the whole
+-- | file" — that would quietly put `pv_ctx_header` and the inline rooting entries into the export
+-- | allowlist, which is the opposite of what this list is for. A safety boundary fails closed.
+foreignAuthorApi :: String -> Either String (Array String)
+foreignAuthorApi header = case String.split (Pattern generatedBanner) header of
+  [ authorRegion, _ ] -> Right (Array.nub (Array.mapMaybe declaration (String.split (Pattern "\n") authorRegion)))
+  pieces -> Left
+    ( "purvasm.h must contain exactly one `"
+        <> generatedBanner
+        <> "` banner (found "
+        <> show (Array.length pieces - 1)
+        <> "); it is what separates the foreign-author API from the generated-code ABI"
+    )
+  where
+  declaration line =
+    let
+      t = String.trim line
+    in
+      if isComment t then Nothing else Array.head (Array.mapMaybe called (String.split (Pattern "pv_") t))
+
+  -- Prose mentions a `pv_*` name without a following `(`; a declaration always has one.
+  called fragment =
+    let
+      ident = SCU.takeWhile identChar fragment
+    in
+      if ident /= "" && String.take 1 (String.drop (String.length ident) fragment) == "(" then Just ("pv_" <> ident)
+      else Nothing
+
+  identChar c = let n = toCharCode c in n == 95 || (n >= 48 && n <= 57) || (n >= 65 && n <= 90) || (n >= 97 && n <= 122)
+
+  isComment t =
+    isJust (String.stripPrefix (Pattern "*") t)
+      || isJust (String.stripPrefix (Pattern "/*") t)
+      || isJust (String.stripPrefix (Pattern "//") t)
+      || isJust (String.stripPrefix (Pattern "#") t)
+
+-- | ADR-0111 §5's link-time version reference, `pv_foreign_abi_v<N>`, derived from the header's
+-- | `#define PV_FOREIGN_ABI_VERSION <N>`.
+-- |
+-- | Derived rather than named: every provider carries an undefined reference to this symbol, so the
+-- | host that must satisfy it and the header that emits it have to agree on `N` exactly. Reading the
+-- | version from the same file the provider compiled against is what makes a bump one edit — and a
+-- | host that failed to export the bumped symbol would not fail quietly, but by refusing to load
+-- | every provider built after it.
+-- |
+-- | `Left` when the header defines no version, defines it more than once, or spells it as anything
+-- | but a canonical decimal: this feeds the retained set of a program that hosts providers, and
+-- | guessing a version there would produce an executable that silently accepts modules built against
+-- | a different ABI.
+foreignAbiStamp :: String -> Either String String
+foreignAbiStamp header = case Array.mapMaybe versionOf (String.split (Pattern "\n") header) of
+  [ token ]
+    | isCanonicalDecimal token -> Right ("pv_foreign_abi_v" <> token)
+    | otherwise -> Left
+        ( "#define "
+            <> foreignAbiVersionMacro
+            <> " "
+            <> token
+            <> " is not a canonical decimal version; the token is pasted into a symbol name, so a "
+            <> "sign or a leading zero names something no provider references"
+        )
+  found -> Left
+    ( "purvasm.h must `#define "
+        <> foreignAbiVersionMacro
+        <> "` exactly once (found "
+        <> show (Array.length found)
+        <> "); it is the version every provider references, so it cannot be guessed"
+    )
+  where
+  versionOf line = do
+    rest <- String.stripPrefix (Pattern "#define") (String.trim line)
+    value <- String.stripPrefix (Pattern foreignAbiVersionMacro) (String.trim rest)
+    -- A macro whose name merely *starts* with this one (a hypothetical `…_VERSION_MINOR`) is not it:
+    -- a version must be separated from its name by whitespace, which `trim` then removes.
+    if String.trim value == value then Nothing else Just (String.trim value)
+
+  -- The version is a **token**, never a number: the header pastes it into the symbol name, so `01`
+  -- makes every provider reference `pv_foreign_abi_v01`, and a host that parsed-then-reprinted it
+  -- would export `…_v1` and refuse all of them. Parsing would also bound an ABI version by `Int`'s
+  -- range for no reason. So the token is returned verbatim, and only a canonical decimal is accepted
+  -- — a sign is refused because `-1`/`+1` cannot even be part of a valid identifier.
+  isCanonicalDecimal token = case SCU.uncons token of
+    Just { head, tail } -> head >= '1' && head <= '9' && all isDigit (SCU.toCharArray tail)
+    Nothing -> false
+
+  isDigit c = c >= '0' && c <= '9'
+
+-- | The header macro carrying ADR-0111 §5's foreign-ABI version. Named once: [foreignAbiStamp] and
+-- | its tests must agree on the exact spelling.
+foreignAbiVersionMacro :: String
+foreignAbiVersionMacro = "PV_FOREIGN_ABI_VERSION"
+
+-- | The build-emitted foreign manifest (ADR-0111 §4): the **workspace-provided** keys this program
+-- | references, one per line, for a VM to check eagerly before running the image.
+-- |
+-- | Only the workspace class is listed, and that scope is the point. The referenced-key set
+-- | over-approximates what a run needs — a `ForeignRef` can sit in a branch that never executes, and
+-- | a VM has no dead-strip to tell the difference — so a manifest naming *every* key would turn a
+-- | working program into a startup failure ([0091](0091-user-native-ffi-c-sibling-rust-dir.md) §1's
+-- | false positive, transplanted). For a key the user authored a provider for, though, a reference
+-- | means it is genuinely meant to be provided, and a missing `.so` is the likely error — so those,
+-- | and only those, are worth failing early on.
+-- |
+-- | Line-oriented rather than JSON: the consumer is the owned VM, which would otherwise need a JSON
+-- | parser to read four fields. The header line is the format's version, so a VM meeting a manifest
+-- | it does not understand says so instead of misreading it.
+-- | `Left` names a symbol whose key cannot be recovered exactly. The manifest is a CONTRACT the VM
+-- | re-mangles, so a lossy key there is worse than no manifest: it reports a missing provider for a
+-- | key the link had just checked. `demangleKey` is fine for a diagnostic and wrong here.
+foreignManifest :: Array String -> Either String String
+foreignManifest symbols = do
+  keys <- traverse recover (Array.sort symbols)
+  pure (String.joinWith "\n" ([ manifestBanner ] <> keys) <> "\n")
+  where
+  recover symbol = case String.stripPrefix (Pattern "pvf_") symbol >>= unescapeIdent of
+    Just key -> Right key
+    Nothing -> Left
+      ( "cannot recover the foreign key from " <> symbol
+          <> ": the manifest is re-mangled by its reader, so an inexact key would report a missing "
+          <> "provider for a key this link just resolved"
+      )
+
+-- | The manifest's first line, naming the format and its version.
+manifestBanner :: String
+manifestBanner = "purvasm-foreign-manifest:v1"
+
+-- | The banner separating the foreign-author API from the generated-code ABI in `purvasm.h`
+-- | (ADR-0079). Named here because both the parse and its tests depend on the exact text.
+generatedBanner :: String
+generatedBanner = "GENERATED-CODE ABI"
+
+-- | Ask the linker to keep a symbol even though nothing in the program references it: it pulls the
+-- | defining archive member in, and gives dead-strip a root. Mach-O prefixes symbol names with `_`.
+forceUndefined :: Boolean -> String -> String
+forceUndefined macos sym = "-Wl,-u," <> (if macos then "_" else "") <> sym
+
+-- | The dynamic symbol table a `dlopen`ed provider may resolve against — **exactly** the retained
+-- | set, never "everything global" (ADR-0111 §1.1).
+-- |
+-- | The difference is not tidiness. An executable that exports its whole global table also exports
+-- | the VM's *own* leaves, including `Purvasm.VM.Loader`'s: a guest program could then declare
+-- | `foreign import` on `Purvasm.VM.Loader.resolveImpl`, resolve it through the ordinary frontier,
+-- | and hold the trusted loader itself — the one thing §6 exists to keep out of guest reach. It also
+-- | exports every `pv_g_*` generated global and the Rust runtime's internals.
+-- |
+-- | The two platforms need different files *and* differently-shaped claims, which a measurement
+-- | settled (`tools/elf-export-probe.sh`, run in CI on clang/LLD 21.1.7 + GNU ld 2.44):
+-- |
+-- |   * **Mach-O** — `-exported_symbols_list` both adds to the export table and confines it, so one
+-- |     file does the whole job.
+-- |   * **ELF** — an executable populates `.dynsym` with *nothing* by default, and a version script
+-- |     only filters what is exported rather than deciding that anything is. Measured, a version
+-- |     script alone exported **0** symbols and no provider could load. `--dynamic-list` is the flag
+-- |     that means what is wanted here — put exactly these in `.dynsym` — in one file, with an
+-- |     unrelated host function verified absent from the result.
+exportAllowlist :: Boolean -> FilePath -> Array String -> { path :: FilePath, contents :: String, flag :: String }
+exportAllowlist macos path syms
+  | macos =
+      { path
+      , contents: String.joinWith "\n" (map ("_" <> _) syms) <> "\n"
+      , flag: "-Wl,-exported_symbols_list," <> path
+      }
+  | otherwise =
+      { path
+      , contents: "{\n" <> foldMap (\s -> "  " <> s <> ";\n") syms <> "};\n"
+      , flag: "-Wl,--dynamic-list," <> path
+      }
 
 -- | The default conventional runtime staticlib path (release profile — the inline-ABI objects this
 -- | backend emits pair with the release runtime, ADR-0079 §2).
@@ -151,7 +343,14 @@ pvfSymbolsIn ll =
 -- | bundle audit (ADR-0078 §5) can count definitions per key (0 = missing, 1 = ok, > 1 = two members define
 -- | it). `nmDefinedPvf` dedups this to a `Set` for the provider-membership checks.
 nmDefinedPvfList :: forall r. FilePath -> Run (PROC + EXCEPT String + r) (Array String)
-nmDefinedPvfList path = do
+nmDefinedPvfList =
+  map (Array.filter (isJust <<< String.stripPrefix (Pattern "pvf_"))) <<< nmDefinedList
+
+-- | Every symbol an object/archive **defines**, `_`-stripped and with duplicates kept. The shared
+-- | substrate: the ADR-0091 §4 provider audit filters it to `pvf_*`, and ADR-0111 §1.1's retention
+-- | needs the `pv_*` API too — one parser, so the two cannot disagree about what "defined" means.
+nmDefinedList :: forall r. FilePath -> Run (PROC + EXCEPT String + r) (Array String)
+nmDefinedList path = do
   -- Prefer `llvm-nm` (ADR-0078 §5): it reads Rust-produced archives cleanly, where Apple `nm` can warn
   -- and exit non-zero. Fall back to `nm`; a failure of *both* is an error, never an empty (masked) result.
   -- `execCaptureQuiet`: discard the lister's stderr — `llvm-nm` prints "no symbols" per empty archive
@@ -170,11 +369,7 @@ nmDefinedPvfList path = do
     in
       case Array.last toks, Array.index toks (Array.length toks - 2) of
         Just name, Just ty
-          | ty /= "U" && ty /= "u" ->
-              let
-                sym = fromMaybe name (String.stripPrefix (Pattern "_") name)
-              in
-                if isJust (String.stripPrefix (Pattern "pvf_") sym) then Just sym else Nothing
+          | ty /= "U" && ty /= "u" -> Just (fromMaybe name (String.stripPrefix (Pattern "_") name))
         _, _ -> Nothing
 
 -- | The set of `pvf_*` symbols an object/archive **defines** (`nm`, ADR-0091 §4's symbol audit): the
@@ -188,11 +383,16 @@ nmDefinedPvf = map Set.fromFoldable <<< nmDefinedPvfList
 -- | `pvf_<escape key>` symbol by undoing the two escapes that occur in practice (`_2e`→`.`, `_5f`→`_`).
 -- | Rarer byte escapes stay as `_<hex>` — this feeds an error message, not the link.
 demangleKey :: String -> String
-demangleKey sym =
-  String.replaceAll (Pattern "_5f") (Replacement "_")
-    ( String.replaceAll (Pattern "_2e") (Replacement ".")
-        (fromMaybe sym (String.stripPrefix (Pattern "pvf_") sym))
-    )
+demangleKey sym = case String.stripPrefix (Pattern "pvf_") sym >>= unescapeIdent of
+  Just key -> key
+  -- A diagnostic must print SOMETHING, so an unrecoverable symbol falls back to the two escapes that
+  -- occur in practice and then to the raw symbol. The manifest writer does not share this fallback:
+  -- there, an inexact key is a wrong contract rather than an imperfect message.
+  Nothing ->
+    String.replaceAll (Pattern "_5f") (Replacement "_")
+      ( String.replaceAll (Pattern "_2e") (Replacement ".")
+          (fromMaybe sym (String.stripPrefix (Pattern "pvf_") sym))
+      )
 
 -- | The `purvasm-rt` runtime **crate** dir (its `Cargo.toml`) the app-Rust bundle folds as an rlib
 -- | (ADR-0091 §Addendum / ADR-0078 §5): `$PURVASM_RT_CRATE`, else the conventional `runtime`. Distinct
@@ -351,7 +551,65 @@ link opts = do
         "--runtime-lib is not used with --rust-ffi: the runtime is built from its crate. Set $PURVASM_RT_CRATE instead."
       bundle <- resolveAppRust appSyms ulibSyms crateDir
       pure (Tuple bundle [])
-  linkExe archive deadStrip objs (ulibObjs <> extraObjs)
+  -- ADR-0111 §1.1: a program that hosts `dlopen`ed providers must *contain* and *export* the ABI they
+  -- resolve against. Neither is the default — an archive member is pulled in only if something already
+  -- references it, and dead-strip then drops what survives unreferenced — and the VM calls almost none
+  -- of it. The `pvf_*` half is derived from the archive rather than listed, so a leaf added to the
+  -- runtime is retained without an edit here.
+  hostFlags <-
+    if not opts.hostForeignApi then pure []
+    else do
+      -- Under `--rust-ffi` the archive is the *bundle* — the runtime rlib folded together with the
+      -- app crate (ADR-0078 §5) — so its `pvf_*` cannot be told apart by origin, and every app leaf
+      -- would be retained and exported as though it were the runtime's, quietly joining
+      -- `host-runtime`'s provider set (ADR-0111 §4). Refuse the combination rather than guess.
+      when (isJust opts.rustFfiDir) $ throw
+        "--host-foreign-api cannot be combined with --rust-ffi: the bundle folds the app crate into \
+        \the runtime archive, so the runtime's own leaves cannot be told from the app's."
+      inc <- resolveInclude
+      headerPath <- FS.joinPath [ inc, "purvasm.h" ]
+      header <- FS.readText headerPath >>= case _ of
+        Just t -> pure t
+        Nothing -> throw ("--host-foreign-api: cannot read " <> headerPath)
+      api <- case foreignAuthorApi header of
+        Right names -> pure names
+        Left e -> throw ("--host-foreign-api: " <> e)
+      -- ADR-0111 §5: every provider references this, so a host that does not export it can load no
+      -- provider at all. Retained on the same footing as the API it versions.
+      stamp <- case foreignAbiStamp header of
+        Right sym -> pure sym
+        Left e -> throw ("--host-foreign-api: " <> e)
+      defined <- nmDefinedList archive
+      let
+        definedSet = Set.fromFoldable defined
+        -- A header entry the runtime does not define would otherwise reach the linker as `-u` and
+        -- fail as a raw undefined symbol; name it here instead. The version reference is checked the
+        -- same way, where the diagnostic can say the two disagree — a bumped header against an
+        -- unbuilt runtime is the likeliest way to arrive here.
+        missing = Array.filter (\s -> not (Set.member s definedSet)) (api <> [ stamp ])
+        runtimeLeaves = Array.filter (isJust <<< String.stripPrefix (Pattern "pvf_")) defined
+        retained = api <> [ stamp ] <> runtimeLeaves
+      when (Array.null api) $ throw
+        ("--host-foreign-api: no `pv_*` declarations found in " <> headerPath)
+      unless (Array.null missing) $ throw
+        ( "--host-foreign-api: the runtime staticlib does not define "
+            <> String.joinWith ", " missing
+            <> " (purvasm.h and the runtime disagree)"
+        )
+      listPath <- FS.joinPath [ opts.buildDir, if macos then "exported_symbols.txt" else "dynamic.list" ]
+      let allow = exportAllowlist macos listPath retained
+      FS.writeText allow.path allow.contents
+      Log.info $ Fmt.fmt @"  host-foreign-api: retaining {n} symbols, exporting exactly those"
+        { n: show (Array.length retained) }
+      pure (map (forceUndefined macos) retained <> [ allow.flag ])
+  -- The provider map this link just enforced, written down for the VM (ADR-0111 §4). It is a
+  -- projection of what `enforceAppProviders` checked, not a second derivation, so the two cannot
+  -- disagree about which keys the workspace provides.
+  manifestPath <- FS.joinPath [ opts.output, "foreign-manifest" ]
+  case foreignManifest appSyms of
+    Right manifest -> FS.writeText manifestPath manifest
+    Left e -> throw ("foreign manifest: " <> e)
+  linkExe archive ([ deadStrip ] <> hostFlags) objs (ulibObjs <> extraObjs)
   where
   inAppNamespace s =
     any (\m -> isJust (String.stripPrefix (Pattern ("pvf_" <> escapeIdent m.key <> "_2e")) s)) opts.appModules
@@ -365,7 +623,7 @@ link opts = do
   compileObj sectionFlags tag = do
     ll <- FS.joinPath [ opts.buildDir, tag <> ".ll" ]
     obj <- FS.joinPath [ opts.buildDir, tag <> ".o" ]
-    runClang (tag <> " (clang -c)") ([ "-c", "-O2" ] <> sectionFlags <> [ ll, "-o", obj ])
+    runClang (tag <> " (clang -c)") ([ "-c", "-O2", "-Wno-unused-command-line-argument", "-Wno-override-module" ] <> sectionFlags <> [ ll, "-o", obj ])
     pure obj
 
   compileForeign sectionFlags inc (Tuple i (Tuple cPath keys)) = do
@@ -478,10 +736,10 @@ link opts = do
   -- The last `.`-segment of a qualified key, for the `PVF_EXPORT(ident)` hint.
   identOf key = fromMaybe key (Array.last (String.split (Pattern ".") key))
 
-  linkExe rt deadStrip objs extraObjs = do
+  linkExe rt linkFlags objs extraObjs = do
     exe <- FS.joinPath [ opts.output, "app" ]
     -- `-lm` for libm calls a native foreign `.c` may emit; harmless with none.
-    runClang "link" ([ deadStrip ] <> objs <> extraObjs <> [ rt, "-lm", "-o", exe ])
+    runClang "link" (linkFlags <> objs <> extraObjs <> [ rt, "-lm", "-o", exe ])
     Log.info $ Fmt.fmt @"✓ Linked native executable → {exe}" { exe }
 
   runClang label args = Proc.exec "clang" args >>= case _ of

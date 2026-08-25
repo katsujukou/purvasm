@@ -74,8 +74,25 @@ extern "C" {
     pub fn pv_empty_array() -> PVWord;
     /// An `Array`'s element count (the empty array reads as 0).
     pub fn pv_array_len(ctx: *mut PVContext, array: PVWord) -> usize;
-    /// An algebraic-data value: constructor `tag`, then `n` field words.
+    /// A field-carrying algebraic-data value: constructor `tag`, then `n` field words. A NULLARY
+    /// constructor is [`pv_new_nullary_adt`] — the representations differ.
+    ///
+    /// `n == 0` here is LEGACY and non-canonical: it allocates a zero-field heap object, which
+    /// carries the right tag and matches no native `case`. Kept because refusing it would change
+    /// what an existing v1 symbol does.
     pub fn pv_new_adt(ctx: *mut PVContext, tag: u32, fields: *const PVWord, n: usize) -> PVWord;
+    /// The NULLARY constructor `tag`: an immediate, allocating nothing. The only representation a
+    /// nullary constructor has, and the one a generated `case` matches.
+    pub fn pv_new_nullary_adt(tag: u32) -> PVWord;
+    /// An algebraic-data value's constructor tag — the number [`pv_new_adt`] or
+    /// [`pv_new_nullary_adt`] was given, which is `fnv1a64(name).lo & 0x7fffffff` for the
+    /// constructor NAME. Answers for both representations. NOT introspection: it asks what tag this
+    /// ADT carries, never what kind a word is.
+    ///
+    /// The shape check reaches only the pointer case: a heap non-ADT faults, but a nullary
+    /// constructor is an immediate and so is indistinguishable from an `Int`/`Boolean`/`Unit`. The
+    /// caller must therefore be a site whose TYPE already established that this is an ADT.
+    pub fn pv_adt_tag(ctx: *mut PVContext, adt: PVWord) -> u32;
     /// A record from parallel sorted FNV-1a-64 `ids` and `values` (ADR-0069).
     pub fn pv_new_record(
         ctx: *mut PVContext,
@@ -108,7 +125,24 @@ extern "C" {
     pub fn pv_apply(ctx: *mut PVContext, f: PVWord, args: *const PVWord, nargs: usize) -> PVWord;
     /// Force a by-need cell to its value; passes any non-cell through unchanged (ADR-0070).
     pub fn pv_force_if_byneed(ctx: *mut PVContext, v: PVWord) -> PVWord;
+
+    /* ── Foreign-ABI version (ADR-0111 §5) ─────────────────────────────────────────────────── */
+
+    /// The link-time version reference every provider carries. Never called: `purvasm.h` emits an
+    /// undefined reference to it from every translation unit, and `purvasm-foreign` emits the same
+    /// reference for a Rust leaf (which never compiles the header, so a `cdylib` would otherwise
+    /// carry no version at all). Only the symbol for the runtime's own version exists, so a
+    /// provider built against a different one fails to resolve — at link when linked statically,
+    /// and at `dlopen` **before the module's initialisers run** when the VM loads it (RTLD_NOW).
+    ///
+    /// The name pastes the version, so bumping [`PV_FOREIGN_ABI_VERSION`] renames this.
+    pub fn pv_foreign_abi_v1();
 }
+
+/// `PV_FOREIGN_ABI_VERSION` in `purvasm.h` (ADR-0111 §5): the version of the foreign-author
+/// surface declared above. Distinct from [`PV_CTX_HEADER_VERSION`], which versions generated-code
+/// ABI — the two change for different reasons.
+pub const PV_FOREIGN_ABI_VERSION: u32 = 1;
 
 /* ══════════════════════════════════════════════════════════════════════════════════════════════
  * GENERATED-CODE ABI (ADR-0079) — mirrored for layout verification, NOT for foreign use.

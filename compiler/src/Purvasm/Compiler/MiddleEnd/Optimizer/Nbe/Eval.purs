@@ -19,8 +19,7 @@ module Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Eval
 import Prelude
 
 import Data.Array as Array
-import Data.Int (toNumber) as Int
-import Data.Int.Bits (complement, shl, shr, xor, zshr, (.&.), (.|.))
+
 import Data.Lazy (force)
 import Data.Map as Map
 import Data.Maybe (Maybe(..), isNothing)
@@ -34,6 +33,7 @@ import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (cfExpr, fvExpr)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Quote (quote)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (ArgUse, Comp(..), EvalEnv, NRhs(..), RefTarget(..), Sem(..), binderVarsOrdered)
 import Purvasm.Compiler.Primitive (PrimOp(..))
+import Purvasm.Int as PI
 
 -- | Float a value's inner sequencing outward: the continuation receives the settled value, and any
 -- | `SLet`/`SLetRec` the sub-evaluation produced stays outside (order preserved).
@@ -477,34 +477,41 @@ combine = Array.foldl step (MYes [])
 -- --- VM-exact constant folding (ADR-0089 §5) -----------------------------------------------------
 
 -- | Fold a primop on literal operands, with exactly the boot-VM semantics (`machine.ml eval_prim`):
--- | 32-bit-wrapping `Int` arithmetic, the registry's Euclidean `div`/`mod` with division-by-zero
--- | → 0 (this compiler's own `Prelude` `div`/`mod` *are* those registry implementations), JS
--- | `Data.Int.Bits` bitwise semantics, IEEE `Number` (NaN-correct comparisons). Anything doubtful
--- | is left unfolded — notably `LtString` (the VM compares UTF-8 bytes = code points; the JS host's
--- | `<` compares UTF-16 code units, which disagree above the BMP) and `NumberToInt` (`ToInt32`).
+-- | `Int` operations fold through **`Purvasm.Int`**, never through the host's `Prelude` or
+-- | `Data.Int.Bits` (ADR-0112 §4). The fold must answer what the *machine* answers, and the host's
+-- | operations answer what the compiler happened to be *built* against: a node-built compiler folded
+-- | `DivInt bottom (-1)` to `2147483648` through the registry's `intDiv`, while the same compiler
+-- | built natively folded it to `bottom` through the ulib — so the constant baked into a program
+-- | depended on how its compiler was compiled. `zshr` had the same split (the registry's is `n >>> m`,
+-- | so `zshr (-1) 0` is `4294967295`, not an `Int`). Delegating the whole family closes the class.
+-- |
+-- | `Number` folds stay on the host's IEEE arithmetic (NaN-correct comparisons), which is the same
+-- | on both. Anything doubtful is left unfolded — notably `LtString` (the VM compares UTF-8 bytes =
+-- | code points; the JS host's `<` compares UTF-16 code units, which disagree above the BMP) and
+-- | `NumberToInt` (`ToInt32`).
 foldPrim :: PrimOp -> Array Literal -> Maybe Literal
 foldPrim op args = case op, args of
-  AddInt, [ LInt a, LInt b ] -> Just (LInt (a + b))
-  SubInt, [ LInt a, LInt b ] -> Just (LInt (a - b))
-  MulInt, [ LInt a, LInt b ] -> Just (LInt (a * b))
-  DivInt, [ LInt a, LInt b ] -> Just (LInt (div a b))
-  ModInt, [ LInt a, LInt b ] -> Just (LInt (mod a b))
-  AndInt, [ LInt a, LInt b ] -> Just (LInt (a .&. b))
-  OrInt, [ LInt a, LInt b ] -> Just (LInt (a .|. b))
-  XorInt, [ LInt a, LInt b ] -> Just (LInt (xor a b))
-  ShlInt, [ LInt a, LInt b ] -> Just (LInt (shl a b))
-  ShrInt, [ LInt a, LInt b ] -> Just (LInt (shr a b))
-  ZshrInt, [ LInt a, LInt b ] -> Just (LInt (zshr a b))
-  ComplementInt, [ LInt a ] -> Just (LInt (complement a))
-  EqInt, [ LInt a, LInt b ] -> Just (LBool (a == b))
-  LtInt, [ LInt a, LInt b ] -> Just (LBool (a < b))
+  AddInt, [ LInt a, LInt b ] -> Just (LInt (PI.add a b))
+  SubInt, [ LInt a, LInt b ] -> Just (LInt (PI.sub a b))
+  MulInt, [ LInt a, LInt b ] -> Just (LInt (PI.mul a b))
+  DivInt, [ LInt a, LInt b ] -> Just (LInt (PI.div a b))
+  ModInt, [ LInt a, LInt b ] -> Just (LInt (PI.mod a b))
+  AndInt, [ LInt a, LInt b ] -> Just (LInt (PI.and a b))
+  OrInt, [ LInt a, LInt b ] -> Just (LInt (PI.or a b))
+  XorInt, [ LInt a, LInt b ] -> Just (LInt (PI.xor a b))
+  ShlInt, [ LInt a, LInt b ] -> Just (LInt (PI.shl a b))
+  ShrInt, [ LInt a, LInt b ] -> Just (LInt (PI.shr a b))
+  ZshrInt, [ LInt a, LInt b ] -> Just (LInt (PI.zshr a b))
+  ComplementInt, [ LInt a ] -> Just (LInt (PI.complement a))
+  EqInt, [ LInt a, LInt b ] -> Just (LBool (PI.eq a b))
+  LtInt, [ LInt a, LInt b ] -> Just (LBool (PI.lt a b))
   AddNumber, [ LNumber a, LNumber b ] -> Just (LNumber (a + b))
   SubNumber, [ LNumber a, LNumber b ] -> Just (LNumber (a - b))
   MulNumber, [ LNumber a, LNumber b ] -> Just (LNumber (a * b))
   DivNumber, [ LNumber a, LNumber b ] -> Just (LNumber (a / b))
   EqNumber, [ LNumber a, LNumber b ] -> Just (LBool (a == b))
   LtNumber, [ LNumber a, LNumber b ] -> Just (LBool (a < b))
-  IntToNumber, [ LInt a ] -> Just (LNumber (Int.toNumber a))
+  IntToNumber, [ LInt a ] -> Just (LNumber (PI.toNumber a))
   EqString, [ LString a, LString b ] -> Just (LBool (a == b))
   Append, [ LString a, LString b ] -> Just (LString (a <> b))
   EqBool, [ LBool a, LBool b ] -> Just (LBool (a == b))

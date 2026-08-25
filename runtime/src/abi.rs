@@ -99,6 +99,46 @@ pub unsafe extern "C" fn pv_runtime_free(ctx: *mut Heap) {
     })
 }
 
+/// Replace the argv the **guest** of this context observes (ADR-0075 §4, ADR-0110 §4(a) Correction):
+/// what `Purvasm.System.Process.argvImpl` reports from here on. `argv` is an `Array String` value.
+///
+/// **Host control, not foreign-author API.** A runner that hosts a program — the owned VM — has a
+/// command line of its own naming an image and its flags, and the guest must see `[image] ++ its own
+/// arguments` instead. This is deliberately NOT in `purvasm.h`'s author section, NOT mirrored in
+/// `purvasm-sys`, and NOT in the export allowlist a `--host-foreign-api` executable hands to
+/// `dlopen`ed providers: it is declared in `purvasm_host.h` for an embedding runner's own trusted
+/// C, so a guest `ForeignRef` has no name to reach and a loaded provider has no symbol to bind.
+/// Nothing about ADR-0111 §4's provider rules changes — `argvImpl` still has exactly one provider,
+/// `host-runtime`; only the context it reads from is now the host's to set.
+///
+/// The strings are **copied out**. Retaining the array (or its element pointers) would leave a heap
+/// word in runtime state that the next collection invalidates and nothing traces.
+///
+/// # Safety
+/// `ctx` is a live context; `argv` is a value word denoting an `Array` of `String`s.
+#[no_mangle]
+pub unsafe extern "C" fn pv_runtime_set_guest_argv(ctx: *mut Heap, argv: u64) {
+    guard(|| {
+        // ONE borrow of the context for the whole read: re-deriving `&mut Heap` while an earlier one
+        // is live is the Stacked-Borrows fault the GC island is kept clean of (ADR-0063 §2), and it
+        // is invisible outside Miri. Nothing here allocates, so no element can move mid-copy.
+        let h = heap(ctx);
+        let word = TaggedWord::from_bits(argv);
+        let mut out = Vec::new();
+        if word.to_bits() != empty_array().to_bits() {
+            let array = h.checked_ptr(word);
+            let n = h.array_len(array);
+            out.reserve(n as usize);
+            for i in 0..n {
+                let element = h.read_field(array, i);
+                let string = h.checked_ptr(element);
+                out.push(h.str_read(string));
+            }
+        }
+        h.set_guest_argv(out);
+    })
+}
+
 // --- calling convention (ADR-0071 §3/§4) ------------------------------------------------------------
 
 /// Apply callable `f` to `nargs` argument words (ADR-0071 §3): the generic entry all v1 calls route
@@ -319,6 +359,36 @@ pub extern "C" fn pv_abi_check(version: u32) {
     }
 }
 
+// --- the foreign-ABI version (ADR-0111 §5) ----------------------------------------------------------
+
+/// The version of the **foreign-author** surface — the `pv_*` functions a native leaf may call
+/// (mirrors `PV_FOREIGN_ABI_VERSION` in `include/purvasm.h`). Distinct from
+/// [`PV_CTX_HEADER_VERSION`] on purpose: that one versions generated-code ABI, and a shared counter
+/// would make each side's bump a false alarm for the other.
+pub const PV_FOREIGN_ABI_VERSION: u32 = 1;
+
+/// The link-time version *reference* every provider carries (ADR-0111 §5): `purvasm.h` — and, for a
+/// Rust leaf, `purvasm-foreign` — emits an undefined reference to `pv_foreign_abi_v<N>`, and only
+/// the symbol for THIS runtime's N exists. A provider built against a different header therefore
+/// fails to resolve: at link when it is linked statically, and at `dlopen` when the VM loads it as a
+/// shared object — with `RTLD_NOW`, *before* the module's initialisers run, which a post-load
+/// version read cannot achieve.
+///
+/// Never called; only its address is referenced. Unlike [`pv_ctx_abi_v1`] this has no profile
+/// split — a foreign provider reaches the runtime only through real `pv_*` calls, so the debug/release
+/// difference in inline rooting (ADR-0079 §2) is not part of the contract it is built against.
+#[no_mangle]
+pub extern "C" fn pv_foreign_abi_v1() {}
+
+// The symbol name above pastes the version by hand (a `#[no_mangle]` name cannot be computed), so
+// this is the net that keeps the two in step: bumping the constant without renaming the symbol —
+// which would leave every provider referencing a version the runtime no longer implements — stops
+// the build here rather than at a user's `dlopen`.
+const _: () = assert!(
+    PV_FOREIGN_ABI_VERSION == 1,
+    "rename `pv_foreign_abi_v1` (and purvasm.h's / purvasm-sys's mirrors) to match the bumped version"
+);
+
 // --- ADR-0108 §3 apply profile (instrumented builds only) -------------------------------------------
 
 /// Register the apply profile's slot layout, called once from an INSTRUMENTED entry stub before
@@ -499,8 +569,21 @@ pub unsafe extern "C" fn pv_write_raw(ctx: *mut Heap, obj: u64, i: u64, bits: u6
 
 // --- allocation / constructors (ADR-0071 §6) --------------------------------------------------------
 
-/// Allocate a field-carrying [`Adt`](crate::heap::Kind::Adt) `tag(fields…)` (ADR-0071 §6). A *nullary*
-/// constructor is an immediate (codegen emits it inline), so this is only for `arity >= 1`. Self-rooting.
+/// Allocate a field-carrying [`Adt`](crate::heap::Kind::Adt) `tag(fields…)` (ADR-0071 §6).
+/// Self-rooting.
+///
+/// **Use [`pv_new_nullary_adt`] for a nullary constructor.** `nfields == 0` here is *legacy and
+/// non-canonical*: it allocates a zero-field heap object, which carries the right tag and matches no
+/// native `case` at all, because a generated `case` splits on representation before comparing tags
+/// (`Emit.purs`). That is a wrong value, and it is nonetheless what this entry did in v1 of the
+/// foreign ABI — so it keeps doing it.
+///
+/// Refusing it instead would be a **behaviour change to an existing v1 symbol**, which is precisely
+/// what the version contract cannot express: a provider built before the nullary entry existed
+/// resolves this symbol, passes the version check, and would then abort inside a call that used to
+/// return. Either the old entry keeps its old behaviour and the new one is additive (this), or the
+/// old behaviour goes and `PV_FOREIGN_ABI_VERSION` moves (§5). There is no third option, and the
+/// second is not worth spending on a case the correct entry now covers.
 ///
 /// # Safety
 /// `ctx` live; `fields`/`nfields` a valid value-word buffer.
@@ -517,6 +600,26 @@ pub unsafe extern "C" fn pv_new_adt(
             .as_word()
             .to_bits()
     })
+}
+
+/// The **nullary** constructor `tag` — an immediate, allocating nothing (hence no `ctx`, like
+/// [`pv_int`] and [`pv_empty_array`]).
+///
+/// This is the only representation a nullary constructor has. Codegen emits one inline (`Emit.purs`'s
+/// `arity == 0` arm) and a generated `case` splits on representation BEFORE comparing tags —
+/// immediate/nullary down one path, pointer/field-carrying down the other — so a zero-field heap
+/// object would carry the right tag and fail every native `case Nothing`. Without this entry a
+/// provider had to know the encoding and build the immediate by hand, which is exactly the leak the
+/// foreign surface exists to prevent.
+///
+/// **A separate symbol rather than a meaning change** (ADR-0111 §5): teaching `pv_new_adt` to answer
+/// for `n == 0` would have altered what an existing v1 symbol does, so a provider built against the
+/// new header and loaded by an older runtime would have been accepted and then silently misbehaved.
+/// A new name is refused by an older runtime as an undefined symbol — the failure the version
+/// contract is for — and stays additive, so `PV_FOREIGN_ABI_VERSION` does not move.
+#[no_mangle]
+pub extern "C" fn pv_new_nullary_adt(tag: u32) -> u64 {
+    TaggedWord::nullary_ctor(tag).to_bits()
 }
 
 /// Box a `Number` (`f64`) (ADR-0071 §6). `bits` is the IEEE-754 bit pattern (codegen passes `f64` bits).
@@ -703,6 +806,51 @@ pub unsafe extern "C" fn pv_array_len(ctx: *mut Heap, a: u64) -> usize {
     })
 }
 
+/// An `Adt`'s constructor tag (ADR-0111 §3): the number `pv_new_adt` was given, which is
+/// `fnv1a64(name).lo & 0x7fffffff` for the constructor's NAME (`Purvasm.Abi.Mangle.ctorTag`).
+///
+/// Added for the owned VM's `SwitchCtor`: a data value a native leaf returned is opaque like any
+/// other carrier, and dispatching on it needs the tag — the one question the foreign API could not
+/// answer, which is why a leaf could not return a `Maybe` before this. It is a shape-checked typed
+/// accessor in the same family as [`pv_array_len`], not introspection: it answers "what tag does
+/// this ADT carry", never "what kind is this word" (ADR-0069's opacity is unchanged).
+///
+/// The shape check is **representation-dependent, and only the pointer half is checked**: a heap
+/// argument that is not an `Adt` aborts, but an immediate carries no kind, so this cannot tell a nullary
+/// constructor from an `Int`, a `Boolean` or `Unit` — all four are immediates, and reading a
+/// tag out of one answers with its payload. That is not a hole this accessor could close (the
+/// representation genuinely does not distinguish them); it is why the caller must be a site whose
+/// TYPE already said "this is an ADT", which is exactly how the owned VM uses it (a `SwitchCtor` the
+/// compiler emitted).
+///
+/// Additive, so it does not bump `PV_FOREIGN_ABI_VERSION` (ADR-0111 §5): a provider built before it
+/// existed references nothing new, and one built after it fails to link against an older runtime by
+/// the symbol's own absence.
+///
+/// # Safety
+/// `ctx` live; `adt` a value word denoting an ADT — either a field-carrying heap `Adt` or a nullary
+/// constructor's immediate, both of which this answers for.
+#[no_mangle]
+pub unsafe extern "C" fn pv_adt_tag(ctx: *mut Heap, adt: u64) -> u32 {
+    guard(|| {
+        let w = TaggedWord::from_bits(adt);
+        // A NULLARY constructor has no heap object: codegen emits it as the immediate whose payload
+        // *is* the tag (ADR-0064 §1). Answering for both representations is what makes this an
+        // accessor rather than introspection — one question, one answer, whichever shape the value
+        // has — and it is the same shape `pv_array_len` already has, where the empty array is an
+        // immediate sentinel and a non-empty one is a heap object.
+        //
+        // Without this arm a leaf could return `Just x` but not `Nothing`, which is not a coherent
+        // surface: the VM cannot ask which one it is holding, so it cannot avoid the bad call.
+        if w.is_immediate() {
+            return w.as_ctor_tag();
+        }
+        let h = heap(ctx);
+        let p = h.checked_ptr(w);
+        h.adt_tag(p)
+    })
+}
+
 /// Allocate a [`Str`](crate::heap::Kind::Str) from UTF-8 `bytes` (ADR-0071 §6). Asserts valid UTF-8
 /// (ADR-0067 §5); the empty string is a valid `Str`. Self-rooting is trivial (bytes are raw).
 ///
@@ -828,6 +976,99 @@ mod tests {
         assert_eq!(nargs, 2);
         let a = unsafe { args_slice(args, nargs) };
         TaggedWord::int(a[0].as_int() + a[1].as_int()).to_bits()
+    }
+
+    /// Build an `Array String` on `ctx` from `items`, rooting each element: `new_str` is a safepoint
+    /// that can move the ones already built (ADR-0066 §3).
+    unsafe fn string_array(ctx: *mut Heap, items: &[&str]) -> u64 {
+        let h = heap(ctx);
+        let frame = h.frame();
+        let roots: Vec<_> = items
+            .iter()
+            .map(|s| {
+                let v = h.new_str(s.as_bytes()).as_word();
+                h.root(v)
+            })
+            .collect();
+        let vals: Vec<TaggedWord> = roots.iter().map(|&r| h.get(r)).collect();
+        let array = h.new_array(&vals).as_word().to_bits();
+        h.pop_frame(frame);
+        array
+    }
+
+    /// The default (ADR-0075 §4): with no host above it, a compiled program IS the process, so the
+    /// context's argv is the process's. Asserted on element 0 alone — the test binary's own path is
+    /// whatever cargo chose, but that there IS one is the property.
+    #[test]
+    fn a_fresh_native_context_reports_the_process_argv() {
+        let ctx = pv_runtime_new(1 << 12);
+        unsafe {
+            assert_eq!(heap(ctx).guest_argv(), std::env::args().collect::<Vec<_>>());
+            pv_runtime_free(ctx);
+        }
+    }
+
+    /// The override a hosting runner performs before the guest runs.
+    #[test]
+    fn setting_the_guest_argv_replaces_what_the_context_reports() {
+        let ctx = pv_runtime_new(1 << 12);
+        unsafe {
+            let argv = string_array(ctx, &["app.pvm", "250"]);
+            pv_runtime_set_guest_argv(ctx, argv);
+            assert_eq!(heap(ctx).guest_argv(), ["app.pvm", "250"]);
+            pv_runtime_free(ctx);
+        }
+    }
+
+    /// Two contexts, two guests, no crossing — the reason this is not a process global. A host that
+    /// ran two images in one process would otherwise hand the second one the first one's arguments.
+    #[test]
+    fn two_contexts_keep_their_argvs_apart() {
+        let a = pv_runtime_new(1 << 12);
+        let b = pv_runtime_new(1 << 12);
+        unsafe {
+            let argv_a = string_array(a, &["a.pvm", "1"]);
+            let argv_b = string_array(b, &["b.pvm", "2"]);
+            pv_runtime_set_guest_argv(a, argv_a);
+            pv_runtime_set_guest_argv(b, argv_b);
+            assert_eq!(heap(a).guest_argv(), ["a.pvm", "1"]);
+            assert_eq!(heap(b).guest_argv(), ["b.pvm", "2"]);
+            pv_runtime_free(a);
+            pv_runtime_free(b);
+        }
+    }
+
+    /// An empty argv is the empty-array sentinel, not a heap object — the runtime rejects a
+    /// zero-length heap array, so the setter has to recognise it rather than dereference it.
+    #[test]
+    fn an_empty_guest_argv_is_accepted() {
+        let ctx = pv_runtime_new(1 << 12);
+        unsafe {
+            pv_runtime_set_guest_argv(ctx, pv_empty_array());
+            assert!(heap(ctx).guest_argv().is_empty());
+            pv_runtime_free(ctx);
+        }
+    }
+
+    /// The strings are copied, not referenced: after a collection the argv must still read back, which
+    /// it cannot if the runtime kept heap words. The array itself is unrooted here, so the collection
+    /// is free to move or reclaim every string it pointed at.
+    #[test]
+    fn the_argv_survives_a_collection_that_moves_its_source() {
+        let ctx = pv_runtime_new(1 << 12);
+        unsafe {
+            let argv = string_array(
+                ctx,
+                &["image.pvm", "an argument long enough to be its own object"],
+            );
+            pv_runtime_set_guest_argv(ctx, argv);
+            heap(ctx).collect(&mut []);
+            assert_eq!(
+                heap(ctx).guest_argv(),
+                ["image.pvm", "an argument long enough to be its own object"]
+            );
+            pv_runtime_free(ctx);
+        }
     }
 
     #[test]

@@ -1,0 +1,28 @@
+package:
+  name: vm
+  dependencies:
+    - abi
+    - arrays
+    - effect
+    - exceptions
+    - foldable-traversable
+    - integers
+    - lists
+    - maybe
+    - numbers
+    - ordered-collections
+    - prelude
+    - purvasm-base
+    - purvasm-fs
+    - purvasm-json
+    - purvasm-stdio
+    - purvasm-system
+    - refs
+    - strings
+    - tailrec
+    - tuples
+  test:
+    main: Test.Unit.Purvasm.VM
+    dependencies:
+      - spec
+      - spec-node

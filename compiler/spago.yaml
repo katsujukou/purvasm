@@ -1,6 +1,7 @@
 package:
   name: compiler
   dependencies:
+    - abi
     - argonaut
     - console
     - effect

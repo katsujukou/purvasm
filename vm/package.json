@@ -1,0 +1,21 @@
+{
+  "name": "purvasm-vm",
+  "version": "0.1.0",
+  "description": "The owned purvasm VM: a PureScript bytecode interpreter, compiled natively (ADR-0110)",
+  "keywords": [
+    "purescript",
+    "purvasm"
+  ],
+  "license": "MIT",
+  "author": "Katsujukou Kineya",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "compile": "cd .. && spago build -p vm",
+    "test:unit": "cd .. && spago test -p vm",
+    "test:e2e": "cd .. && tools/vm-loader-e2e.sh",
+    "test": "pnpm run test:unit",
+    "format": "purs-tidy format-in-place src test",
+    "check": "purs-tidy check src test"
+  }
+}
