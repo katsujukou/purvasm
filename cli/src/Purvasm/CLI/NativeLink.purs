@@ -13,6 +13,17 @@ module Purvasm.CLI.NativeLink
   , foreignManifest
   , generatedBanner
   , link
+  -- | Shared with `ForeignProvider`, which builds the same ulib `.c` sources into a *loadable*
+  -- | provider for the owned VM (ADR-0110 §6 step E). One derivation of "which key comes from which
+  -- | source", one manifest writer, one include-path rule — a second copy of any of them would be a
+  -- | provider map that disagrees with the one a native link enforces.
+  , loadForeignSources
+  , manifestOfKeys
+  , hostIsMacos
+  , nmDefinedPvf
+  , resolveInclude
+  , resolveRuntimeLib
+  , sharedObjectFlags
   ) where
 
 import Prelude
@@ -195,9 +206,7 @@ foreignAbiVersionMacro = "PV_FOREIGN_ABI_VERSION"
 -- | re-mangles, so a lossy key there is worse than no manifest: it reports a missing provider for a
 -- | key the link had just checked. `demangleKey` is fine for a diagnostic and wrong here.
 foreignManifest :: Array String -> Either String String
-foreignManifest symbols = do
-  keys <- traverse recover (Array.sort symbols)
-  pure (String.joinWith "\n" ([ manifestBanner ] <> keys) <> "\n")
+foreignManifest symbols = manifestOfKeys <$> traverse recover symbols
   where
   recover symbol = case String.stripPrefix (Pattern "pvf_") symbol >>= unescapeIdent of
     Just key -> Right key
@@ -206,6 +215,13 @@ foreignManifest symbols = do
           <> ": the manifest is re-mangled by its reader, so an inexact key would report a missing "
           <> "provider for a key this link just resolved"
       )
+
+-- | The manifest itself, from keys that are already exact: the banner, then one key per line, sorted,
+-- | ending in a newline. Both producers route through here — the native link, which recovers its keys
+-- | from the symbols it just enforced, and the bytecode finalisation, which has them from the image —
+-- | so the two cannot drift on the format.
+manifestOfKeys :: Array String -> String
+manifestOfKeys keys = String.joinWith "\n" ([ manifestBanner ] <> Array.sort keys) <> "\n"
 
 -- | The manifest's first line, naming the format and its version.
 manifestBanner :: String
@@ -277,6 +293,18 @@ resolveRuntimeLib = case _ of
           <> p
           <> ". Pass --runtime-lib PATH, set $PURVASM_RT_A, or `cargo build --release` in runtime/."
       )
+
+-- | The clang flags that build a **loadable provider** — a shared object every `pv_*` of which is left
+-- | undefined and bound against the host at `dlopen` (ADR-0111 §1.1). That includes the ABI stamp
+-- | `pv_foreign_abi_v<N>`: its unresolved reference is what makes a version mismatch fail the *load*
+-- | rather than surface later as a missing symbol (§5).
+-- |
+-- | Apple's linker refuses undefined symbols by default and needs telling; ELF's default is what is
+-- | wanted, and only `-fPIC` has to be asked for.
+sharedObjectFlags :: Boolean -> Array String
+sharedObjectFlags macos
+  | macos = [ "-shared", "-undefined", "dynamic_lookup" ]
+  | otherwise = [ "-shared", "-fPIC" ]
 
 -- | Whether the host linker is Apple ld64 (macOS) — its tree-shaking / section flags differ from
 -- | GNU ld / lld. Detected via `uname -s`, matching boot.
