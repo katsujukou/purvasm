@@ -27,12 +27,14 @@ import Purvasm.CLI.Effect.Filesystem (FS, FilePath)
 import Purvasm.CLI.Effect.Filesystem as FS
 import Purvasm.CLI.Effect.Log (LOG)
 import Purvasm.CLI.Effect.Log as Log
+import Purvasm.CLI.Effect.Process (PROC)
+import Purvasm.CLI.ForeignProvider as ForeignProvider
 import Purvasm.CLI.ForeignSigs as ForeignSigs
 import Purvasm.CLI.Ulib (corefnPathFor, requireUlibDir)
 import Purvasm.Compiler (BuildError(..), CompilerAction, LoadResult(..), build, loadClosure)
 import Purvasm.Compiler.Backend.Bytecode (bytecodeBackend)
 import Purvasm.Compiler.Bytecode.Artifact (ModuleArtifact, interfaceToString, moduleToString)
-import Purvasm.Compiler.Bytecode.Image (imageToString, imageToStringWithArities)
+import Purvasm.Compiler.Bytecode.Image (foreignRefKeys, imageToString, imageToStringWithArities)
 import Purvasm.Compiler.CESK.AST (Term(..))
 import Purvasm.Compiler.CESK.Translate (nameKey)
 import Purvasm.Compiler.Ffi as Ffi
@@ -141,7 +143,7 @@ mkAction opts ulibDir buildDir fsEnv irBuf =
 
 -- | Compile every module reachable from the entry to its `.pmo`/`.pmi`, then link the closure into a
 -- | single runnable `app.pvm` — the entry `<module>.main` is an `Effect`, forced by applying it to unit.
-cmd :: forall r. Options -> Run (ENV + LOG + FS + EXCEPT String + EFFECT + r) Unit
+cmd :: forall r. Options -> Run (ENV + PROC + LOG + FS + EXCEPT String + EFFECT + r) Unit
 cmd opts = do
   Log.info $ Fmt.fmt @"Building from entry {entry}" { entry: opts.entryModule }
   ulibDir <- requireUlibDir
@@ -191,4 +193,12 @@ cmd opts = do
         Right text -> do
           ownedPath <- FS.joinPath [ opts.outDir, "app.owned.pvm" ]
           FS.writeText ownedPath text
+      -- What the owned VM needs *beside* the image (ADR-0110 §6 step E): the manifest of keys the
+      -- workspace provides, and — since a hosted guest cannot link a ulib `.c` the way a compiled
+      -- program does — a loadable provider built from those same sources.
+      foreignArtifacts <- ForeignProvider.emitProvider
+        { outDir: opts.outDir, ulibDir, referenced: foreignRefKeys image }
       Log.info $ Fmt.fmt @"✓ Build finished → {app}" { app: appPath }
+      case foreignArtifacts.provider of
+        Nothing -> pure unit
+        Just provider -> Log.info $ Fmt.fmt @"  foreign provider → {provider}" { provider }

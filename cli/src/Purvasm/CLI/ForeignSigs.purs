@@ -129,8 +129,10 @@ fromUlib env name foreigns = do
     case Map.lookup key ulibSigs of
       Just shape -> pure (key /\ shape)
       Nothing ->
+        -- The library is ours to build and ship, not the caller's to repair: point at the artifact
+        -- that is incomplete, never at the command that would have produced it.
         throw $ Fmt.fmt
-          @"foreign-sigs: {key}: ulib-overlaid but absent from ulib.json foreignSigs (restage the ulib)"
+          @"foreign-sigs: {key}: overlaid from the purvasm library, but its `ulib.json` signs no such foreign — that library is incomplete"
           { key }
 
 -- | A non-ulib module is reconstructed from its source (`cache-db.json`-located). Every corefn
