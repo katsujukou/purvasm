@@ -608,8 +608,11 @@
         "path": "test-fixtures/vm-image",
         "core": {
           "dependencies": [
+            "arrays",
             "effect",
             "exceptions",
+            "integers",
+            "maybe",
             "prelude",
             "purvasm-stdio",
             "purvasm-system",

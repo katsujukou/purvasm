@@ -236,6 +236,19 @@ else
   ok launch-guest-failure "a failing program fails the command"
 fi
 
+# A runner's shell contract: the program's status is what the caller sees. Three codes, because one
+# would not separate "propagated" from "collapsed to 1" — 0 must stay 0, and a non-1 code is the only
+# way to tell a real propagation from the old behaviour, which reported 1 for every failure.
+for code in 0 1 42; do
+  launch "$WORK/exit-$code" VMGate.ExitCode "$code" >/dev/null 2>&1
+  got=$?
+  if [ "$got" = "$code" ]; then
+    ok "launch-exit-$code" "the program's status reached the caller"
+  else
+    fail "launch-exit-$code" "the program exited $code, the command exited $got"
+  fi
+done
+
 if [ "$rc" -eq 0 ]; then
   echo "★ the build packages what a hosted guest needs, and refuses what it cannot"
 else

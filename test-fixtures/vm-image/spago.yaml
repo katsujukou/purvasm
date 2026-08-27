@@ -2,7 +2,10 @@ package:
   name: vm-image-fixtures
   dependencies:
     - effect
+    - arrays
     - exceptions
+    - integers
+    - maybe
     - prelude
     - purvasm-stdio
     - purvasm-system
