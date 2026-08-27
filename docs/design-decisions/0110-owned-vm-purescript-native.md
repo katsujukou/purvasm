@@ -634,6 +634,52 @@ Each slice ships with its gates; none of them requires boot to change.
 >   `purvm`". The benchmark leg compares **output** and now *reports* the owned VM's own counts as the
 >   measurement field's new baseline.
 
+> **Progress (2026-08-27): step E — the CLI wiring.** `purvasm run` compiles, links, packages and
+> **runs** the program on the owned VM.
+>
+> - **The names swapped, as pinned.** `app.pvm` is the owned VM's image (version 5) and boot's is
+>   `app.boot.pvm`. boot's copy is still emitted from the same compilation, because §6's terms hold the
+>   two runners to the same *output* and that needs one compilation to produce something each can run.
+>   The reuse is safe because the **stamp** protects it: boot handed a version-5 image refuses it by
+>   number.
+>
+> - **`-m`/`--main` names the module whose `main` is the entry point**, replacing `--entry` on this
+>   command. A module without one is refused after linking but *before execution* — reachability starts
+>   at the entry, so its absence from the linked definitions is exactly the question — rather than
+>   surfacing as a stuck run with a mangled key in it. The flag lifts to a later `-p` unchanged. (`build` keeps `--entry`;
+>   only `run` moved.)
+>
+> - **Guest arguments come from after `--`.** The VM's flags are the VM's; a program's arguments are
+>   never guessed out of what is left over.
+>
+> - **`--build-only` stops after the artifacts.** Adding a run to `run` removed the way to ask for the
+>   image alone, which a harness and a build system both want; it is the sibling of the `--no-build`
+>   axis a later increment adds.
+>
+> - **The provider is passed, never discovered.** [0111](0111-vm-dynamic-native-ffi.md) §4 makes
+>   loading an explicit act and that is unchanged: what moved is *who* is explicit — the launcher,
+>   which built the provider a moment ago, instead of a person retyping its path. The `Maybe` comes
+>   from the packaging step, never from whether a file happens to sit in the output directory, so a
+>   reused outdir cannot hand the VM a stale module.
+>
+> - **Finding the VM: `$PURVASM_VM`, and nothing else.** No conventional path is searched. Where an
+>   installation puts its executables is the open `dist`-layout question, and guessing here would
+>   answer it by accident; unset is refused by name. The intended destination is `$PURVASM_LIB/purvm`,
+>   which this record notes as the direction rather than implements.
+>
+> - **Packaging.** A ulib native leaf is shipped as `.c` and *linked* into a compiled program
+>   ([0073](0073-ulib-shipped-native-foreign-and-link-time-resolution.md) §2 — an object is
+>   target-specific, so source is the distributed form). A hosted guest has no such link, so the build
+>   compiles the sources providing the keys the image **references** into one loadable provider and
+>   writes the manifest beside it. Every referenced leaf must be runtime-defined or library-mapped, or
+>   the build stops and names it: the quiet failure that motivated this is a library whose `foreign`
+>   map cannot be read being taken for "the workspace provides nothing".
+>
+> - **Owed, and deliberately its own increment:** the guest's exit code does not propagate — a program
+>   exiting 42 makes `purvasm run` exit 1, because the process effect collapses its result to
+>   `Unit`. Zero-vs-non-zero is preserved. A runner's shell contract wants the real code, and that
+>   needs a structured exit status in the effect and its Node provider.
+
 ### 7. What this does not change
 
 boot stays frozen and stays the bootstrap seed. The native backend, the runtime ABI, the `.pmi`
