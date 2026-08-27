@@ -17,8 +17,9 @@
   executions) at 9,229 call sites (48.3 % of sites) in one self-host build, all of them a local
   binding about which the emitter holds no function fact
 
-> **Numbering note.** `0110`–`0112` are taken on the `feat/vm-native-ffi` branch (the owned-VM
-> track). This record takes `0113` so the two lines can merge without a collision.
+> **Numbering note.** `0110`–`0112` were taken on the owned-VM track, then in flight on
+> `feat/vm-native-ffi`; this record took `0113` so the two lines could merge without a collision.
+> They merged at `a873da0` (2026-08-25) and the numbering held.
 
 ## Context
 

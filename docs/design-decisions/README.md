@@ -45,8 +45,8 @@ language and are kept out of version control.)
 
 ## Index
 
-| # | Title | Status |
-| - | - | - |
+| # | Title | Status | Remark |
+| - | - | - | - |
 | [0001](0001-phase-1-host-language-ocaml.md) | Implement the phase-1 host in OCaml; reject a PureScript-on-V8 seed | Accepted |
 | [0002](0002-cesk-execution-model.md) | Start phase 1 with a CESK machine over a minimal strict core | Accepted |
 | [0003](0003-stack-based-bytecode.md) | PURVASM bytecode is a stack machine | Accepted |
@@ -158,6 +158,7 @@ language and are kept out of version control.)
 | [0110](0110-owned-vm-purescript-native.md) | The owned VM: a PureScript interpreter, natively compiled | Accepted |
 | [0111](0111-vm-dynamic-native-ffi.md) | VM dynamic native FFI: load the provider, apply through the runtime | Accepted |
 | [0112](0112-int-32-bit-invariant-and-division-layering.md) | `Int`'s 32-bit invariant is absolute: normalise every quotient, and let Prelude choose the division | Accepted |
-| [0113](0113-local-unknown-fn-attribution.md) | `local-unknown-fn` attribution: bind-time provenance, then the facts already in hand | Accepted |
+| [0113](0113-local-unknown-fn-attribution.md) | `local-unknown-fn` attribution: bind-time provenance, then the facts already in hand | Accepted | slices 1–2 complete; slice 3 stopped on its numbers |
+| [0114](0114-oparam-dispatch-drill.md) | The `OParam` use-site drill: which parameters and sites carry the higher-order dispatches | Accepted (slice 1 only) | |
 
 ## Scope
