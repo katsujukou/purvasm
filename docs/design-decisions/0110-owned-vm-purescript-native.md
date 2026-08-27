@@ -139,7 +139,8 @@ first slice ships.
 > two with `PURVM` and `PURVASM_VM` rather than by path.
 
 > **Progress (2026-08-17):** §2's claim is measured, on **both** paths and with the same result
-> (`result: 55`, `instructions: 134`, from a tail-recursive guest loop run through `vm/src/Main.purs`):
+> (`result: 55`, `instructions: 134`, from a tail-recursive guest loop run through the VM's entry,
+> then at `vm/src/Main.purs` and since renamed `Purvasm.VM.Main`):
 >
 > - via **boot** — `purvm native --backend llvm --corefn-dir output --ulib ./purvasm_lib -m Main`,
 >   a 929K executable;
@@ -443,8 +444,9 @@ Each slice ships with its gates; none of them requires boot to change.
 >   hands over. An image referencing a leaf those shapes do not describe is **refused, naming every
 >   such key**, rather than written with a guessed arity.
 >
-> - **Both forms come out of one compilation** (`app.pvm` v3, `app.v4.pvm` v4 — renamed `app.owned.pvm`
->   and bumped to version 5 by step D below) for as long as the two
+> - **Both forms come out of one compilation** (`app.pvm` v3, `app.v4.pvm` v4 — version 5 by step D
+>   below, and the two names swapped by step E: the owned image is `app.pvm` and boot's is
+>   `app.boot.pvm`) for as long as the two
 >   runners coexist. The reader accepts both versions and refuses to read v4 syntax under a v3 stamp:
 >   a stamp a reader overrides is not a stamp.
 >
@@ -593,7 +595,8 @@ Each slice ships with its gates; none of them requires boot to change.
 >
 > - **Version 5** is the owned VM's format: arities (§4(a)) *and* tree `case`s (§4(b)). It does not
 >   redefine version 4, which is no longer produced — the calibration it existed for is taken and
->   recorded. The owned image's filename is now `app.owned.pvm`: the stamp inside says which format it
+>   recorded. The owned image's filename is `app.owned.pvm` at this point — step E swaps it with
+>   boot's, leaving the owned image as `app.pvm` — and the stamp inside says which format it
 >   is, and a name repeating the number would need renaming at every bump.
 >
 > - **Answering the pinned question about dates.** The reader takes **version 5 only**, from this step.
