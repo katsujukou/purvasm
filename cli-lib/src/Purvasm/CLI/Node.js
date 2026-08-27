@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync, statSync } from "node:fs";
 
 export const execFileImpl = (cmd) => (args) => () => {
@@ -37,3 +37,13 @@ export const readFileBytesImpl = (path) => () => readFileSync(path);
 export const writeFileBytesImpl = (path) => (bytes) => () => writeFileSync(path, bytes);
 
 export const fileSizeImpl = (path) => () => statSync(path).size;
+
+// Run a tool with stdio inherited and report its exit STATUS rather than collapsing it to a throw.
+// `spawnSync` is used instead of `execFileSync` because that is the difference: `execFileSync` throws
+// on a non-zero exit and the code survives only inside an error object, while a launcher needs the
+// number itself. `status` is null when the child was killed, in which case `signal` names it.
+export const execFileStatusImpl = (cmd) => (args) => () => {
+  const r = spawnSync(cmd, args, { stdio: "inherit" });
+  if (r.error) return { spawned: false, status: 1, signal: "", message: r.error.message };
+  return { spawned: true, status: r.status === null ? 1 : r.status, signal: r.signal ?? "", message: "" };
+};

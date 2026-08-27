@@ -93,12 +93,26 @@ nodeProcHandler = case _ of
     pure case res of
       Left e -> Left (Exn.message e)
       Right _ -> Right unit
+  ExecStatus cmd args k -> k <$> liftEffect do
+    res <- execFileStatusImpl cmd args
+    pure
+      if res.spawned then
+        if res.signal == "" then Right res.status
+        else Left ("killed by " <> res.signal)
+      else Left res.message
 
 -- | Run an external tool synchronously (`execFileSync`, stdio inherited; throws on non-zero exit).
 foreign import execFileImpl :: String -> Array String -> Effect Unit
 
 -- | Like `execFileImpl` but pipes `input` to the child's stdin (stdout/stderr inherited).
 foreign import execFileInputImpl :: String -> Array String -> String -> Effect Unit
+
+-- | Run a tool with stdio inherited and report its exit status. `spawned` is false when the tool
+-- | could not be started at all; `signal` names the signal when the child was killed.
+foreign import execFileStatusImpl
+  :: String
+  -> Array String
+  -> Effect { spawned :: Boolean, status :: Int, signal :: String, message :: String }
 
 -- | Read this process's entire stdin synchronously (`fs.readFileSync(0)`).
 foreign import readStdinImpl :: Effect String

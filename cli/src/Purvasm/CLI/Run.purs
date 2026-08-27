@@ -158,7 +158,9 @@ mkAction opts ulibDir buildDir fsEnv irBuf =
 
 -- | Compile every module reachable from the entry to its `.pmo`/`.pmi`, then link the closure into a
 -- | single runnable `app.pvm` — the entry `<module>.main` is an `Effect`, forced by applying it to unit.
-cmd :: forall r. Options -> Run (ENV + PROC + LOG + FS + EXCEPT String + EFFECT + r) Unit
+-- | The status this command asks the process to end with: the program's own when one ran, and 0 when
+-- | the work was a build.
+cmd :: forall r. Options -> Run (ENV + PROC + LOG + FS + EXCEPT String + EFFECT + r) Int
 cmd opts = do
   Log.info $ Fmt.fmt @"Building from entry {entry}" { entry: opts.entryModule }
   ulibDir <- requireUlibDir
@@ -230,7 +232,7 @@ cmd opts = do
       case foreignArtifacts.provider of
         Nothing -> pure unit
         Just provider -> Log.debug $ Fmt.fmt @"  foreign provider → {provider}" { provider }
-      unless opts.buildOnly (launch opts appPath foreignArtifacts)
+      if opts.buildOnly then pure 0 else launch opts appPath foreignArtifacts
 
 -- | Run the linked image on the owned VM (ADR-0110 §6 step E).
 -- |
@@ -245,7 +247,7 @@ launch
    . Options
   -> FilePath
   -> ForeignProvider.ProviderArtifacts
-  -> Run (ENV + PROC + LOG + FS + EXCEPT String + r) Unit
+  -> Run (ENV + PROC + LOG + FS + EXCEPT String + r) Int
 launch opts image artifacts = do
   vm <- resolveOwnedVm
   let
@@ -253,12 +255,16 @@ launch opts image artifacts = do
     args = provider <> [ "--manifest", artifacts.manifest, "--image", image ]
       <> (if Array.null opts.guestArgs then [] else [ "--" ] <> opts.guestArgs)
   Log.debug $ Fmt.fmt @"  running {vm}" { vm }
-  Proc.exec vm args >>= case _ of
-    Right _ -> pure unit
-    -- The program's own failure is the program's, not the compiler's. Its output has already gone to
-    -- the terminal (the child inherits stdio), so this adds the one thing that would otherwise be
-    -- missing: which program, and that it ran at all.
-    Left err -> throw (Fmt.fmt @"{image} exited with a failure ({err})" { image, err })
+  -- The program's status is handed back rather than translated into one of ours. A program that
+  -- exits 42 is reporting 42 to whoever ran this command, and a launcher that turned every non-zero
+  -- code into 1 would make its own shell contract useless. Its output has already reached the
+  -- terminal (the child inherits stdio), so nothing needs restating here.
+  --
+  -- `Left` is the case where the program did not run at all — the VM could not be spawned, or was
+  -- killed — which IS this command's failure to report.
+  Proc.execStatus vm args >>= case _ of
+    Right code -> pure code
+    Left err -> throw (Fmt.fmt @"could not run {image}: {err}" { image, err })
 
 -- | Locate the owned VM. `$PURVASM_VM` names it; there is deliberately no conventional path yet,
 -- | because where a purvasm installation puts its executables is an open question (the `dist` layout)
