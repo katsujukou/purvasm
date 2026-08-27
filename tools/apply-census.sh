@@ -71,8 +71,14 @@ done
 [ -e "$COREFN_DIR/$ENTRY_MODULE/corefn.json" ] ||
   { echo "apply-census.sh: missing $COREFN_DIR/$ENTRY_MODULE/corefn.json" >&2; exit 1; }
 
+
+# --- toolchain provenance (2026-08-26) ----------------------------------------------------------
+# Sourced here; the CHECK runs after the build and respects the pinned-toolchain branch (below).
+. "$ROOT/tools/toolchain-manifest.sh"
+
 WORK="${APPLY_WORK:-$ROOT/_build/apply-census-$MODE_LABEL}"
 rm -rf "$WORK"; mkdir -p "$WORK"
+
 
 if [ -n "$TOOLCHAIN" ]; then
   # --- caller-supplied toolchain -----------------------------------------------------------------
@@ -88,6 +94,39 @@ if [ -n "$TOOLCHAIN" ]; then
   for required in "$TOOLCHAIN/output" "$TOOLCHAIN/cli/index.node.js" "$TOOLCHAIN/census/index.js" "$TOOLCHAIN/ulib"; do
     [ -e "$required" ] || { echo "apply-census.sh: --toolchain is missing $required" >&2; exit 1; }
   done
+  # A PINNED snapshot is HISTORICAL: comparing it against today source dates is meaningless — it
+  # was correct when it was taken. What must still hold is that it has not changed since, so the
+  # snapshot is verified against the manifest recorded when it was built, when one is present.
+  # FAIL-CLOSED: a pinned toolchain must carry the manifest recorded when it was BUILT, and that
+  # manifest must be a prepared one. A missing manifest was a warning here once, which made the
+  # provenance condition satisfiable by deleting a file — the same "absent input reads as a pass"
+  # shape every other gate in this repo refuses.
+  #
+  # `TOOLCHAIN_ALLOW_UNPREPARED=1` exists for measuring a HISTORICAL snapshot on purpose (an
+  # archived tree, a reconstructed corpus). It is a different mode, not a softer default, and this
+  # run records what it consumed — the input manifest's own hash and whether the override was used —
+  # into `$WORK/toolchain-input.tsv`, since a pinned run builds nothing and so has no manifest of
+  # its own to carry that fact.
+  if [ ! -f "$TOOLCHAIN/toolchain-manifest.tsv" ]; then
+    echo "apply-census.sh: --toolchain has no toolchain-manifest.tsv — its provenance is unrecorded." >&2
+    echo "  Re-create it with a prepared run, or set TOOLCHAIN_ALLOW_UNPREPARED=1 to measure it as a" >&2
+    echo "  historical artifact." >&2
+    [ "${TOOLCHAIN_ALLOW_UNPREPARED:-}" = 1 ] || exit 1
+  elif [ "${TOOLCHAIN_ALLOW_UNPREPARED:-}" = 1 ]; then
+    toolchain_verify_snapshot "$TOOLCHAIN/toolchain-manifest.tsv" "$TOOLCHAIN" \
+      || { echo "apply-census.sh: the pinned toolchain no longer matches its manifest" >&2; exit 1; }
+  else
+    toolchain_verify_snapshot "$TOOLCHAIN/toolchain-manifest.tsv" "$TOOLCHAIN" require-prepared \
+      || { echo "apply-census.sh: the pinned toolchain is unverified or was not prepared" >&2; exit 1; }
+  fi
+  # What this run consumed, recorded where its outputs are, so a report can be traced to the exact
+  # pinned toolchain that produced it — and to whether it took the historical-artifact override.
+  #
+  # Written HERE: inside the branch, after the verification above, from the pinned path directly.
+  # The first version set a variable at this point and wrote the file dozens of lines EARLIER, where
+  # the variable was still unset — so the record was never produced, and an ambient variable of the
+  # same name would have had it describe a manifest this run never verified.
+  toolchain_record_input "$TOOLCHAIN" "$WORK/toolchain-input.tsv"
   CLI_JS="$TOOLCHAIN/cli/index.node.js"
   CENSUS_JS="$TOOLCHAIN/census/index.js"
   SNAP_COREFN="$COREFN_DIR"
@@ -104,6 +143,12 @@ else
   echo "== building (${MODE_LABEL}) =========================================="
   spago build -p census >"$WORK/spago.log" 2>&1 ||
     { echo "apply-census.sh: spago build failed; see $WORK/spago.log" >&2; exit 1; }
+  # AFTER the build: `output/` is this script's own product, so checking it beforehand would refuse
+  # a tree the run is about to refresh. Advisory — see tools/toolchain-manifest.sh for what a
+  # timestamp can and cannot prove; `toolchain_prepare` is the leg that proves it.
+  toolchain_declare_defaults
+  toolchain_check || echo "apply-census.sh: continuing with a STALE input (recorded in the manifest)" >&2
+  toolchain_write "$WORK/toolchain-manifest.tsv"
 
   # --- pin the inputs (see byneed-census.sh: `output/` is BOTH compiler JS and the default closure)
   echo "== snapshotting inputs (compiler JS, CoreFn closure, wrappers, ulib) ="

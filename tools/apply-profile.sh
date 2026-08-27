@@ -73,7 +73,9 @@
 #   tools/apply-profile.sh --alloc-identity BEFORE.err AFTER.err
 #                                         (ADR-0109 §5.1 as a VERDICT over two captured runs)
 #
-# Prerequisites (located, not built): the staged ulib (`dist/ulib`), the RELEASE runtime staticlib
+# Prerequisites. `--selfhost` BUILDS them (`toolchain_prepare`: runtime, ulib and `output/` in one
+# leg, with a source digest either side), because its numbers get published and their provenance has
+# to be true by construction. Every other leg LOCATES them: the staged ulib (`dist/ulib`), the RELEASE runtime staticlib
 # (or $PURVASM_RT_A), `clang`, `node`, and fixture CoreFn in `output/` (workspace `spago build`).
 set -uo pipefail
 
@@ -724,15 +726,52 @@ foreign-direct-apply	442522201
   exit "$st_rc"
 fi
 
-for tool in "$PURVASM_RT_A" "$PURVASM_LIB" "$ROOT/output/$ENTRY_MODULE/corefn.json"; do
-  [ -e "$tool" ] || { echo "missing prerequisite: $tool" >&2; exit 2; }
-done
+# WHICH prerequisites, and WHEN, depends on who is going to build them.
+#
+# `--selfhost` calls `toolchain_prepare`, whose whole contract is that it CREATES the runtime
+# staticlib, the staged ulib and `output/`. Requiring them to exist first made a clean checkout —
+# or a `cargo clean` — unable to reach the leg that would have produced them. So the headline path
+# checks the BUILD TOOLS up front and the artifacts afterwards; every other path locates them, and
+# checks them here as before.
 for cmd in node clang; do
   command -v "$cmd" >/dev/null || { echo "missing prerequisite: $cmd on PATH (run inside nix develop)" >&2; exit 2; }
 done
+if [ "$SELFHOST" = 1 ]; then
+  for cmd in cargo npx sh; do
+    command -v "$cmd" >/dev/null || { echo "missing prerequisite: $cmd on PATH (needed to prepare the toolchain)" >&2; exit 2; }
+  done
+  for src in "$ROOT/runtime/Cargo.toml" "$ROOT/ulib-tools/prepare-release.sh" "$ROOT/spago.yaml"; do
+    [ -e "$src" ] || { echo "missing prerequisite: $src (needed to prepare the toolchain)" >&2; exit 2; }
+  done
+  # The headline run OWNS where its runtime comes from. An ambient `PURVASM_RT_A` pointing at a
+  # custom path would leave `toolchain_prepare` building the default cargo target while the
+  # manifest and the snapshot recorded a different file — `prepared 1` for a runtime this leg never
+  # produced. Refuse rather than record a provenance claim that is not true.
+  if [ -n "${PURVASM_RT_A:-}" ] && [ "$PURVASM_RT_A" != "$ROOT/runtime/target/release/libpurvasm_rt.a" ]; then
+    echo "apply-profile.sh: --selfhost prepares its own runtime, so PURVASM_RT_A must be the" >&2
+    echo "  cargo release artifact it builds ($ROOT/runtime/target/release/libpurvasm_rt.a)," >&2
+    echo "  not $PURVASM_RT_A. Unset it, or run without --selfhost." >&2
+    exit 2
+  fi
+  if [ -n "${PURVASM_LIB:-}" ] && [ "$PURVASM_LIB" != "$ROOT/dist/ulib" ]; then
+    echo "apply-profile.sh: --selfhost stages its own ulib, so PURVASM_LIB must be $ROOT/dist/ulib," >&2
+    echo "  not $PURVASM_LIB. Unset it, or run without --selfhost." >&2
+    exit 2
+  fi
+else
+  for tool in "$PURVASM_RT_A" "$PURVASM_LIB" "$ROOT/output/$ENTRY_MODULE/corefn.json"; do
+    [ -e "$tool" ] || { echo "missing prerequisite: $tool" >&2; exit 2; }
+  done
+fi
+
+
+# --- toolchain provenance (2026-08-26) ----------------------------------------------------------
+# Sourced here; the CHECK runs after the build and respects the pinned-toolchain branch (below).
+. "$ROOT/tools/toolchain-manifest.sh"
 
 WORK="${PROFILE_WORK:-$ROOT/_build/apply-profile}"
 rm -rf "$WORK"; mkdir -p "$WORK"
+
 
 # --- pin the inputs ---------------------------------------------------------------------------
 # Every leg runs from the snapshot, never from the tree. Without this a concurrent `spago build`
@@ -745,8 +784,26 @@ rm -rf "$WORK"; mkdir -p "$WORK"
 # holds by the time the earlier legs finish. So everything is built ONCE here, snapshotted ONCE
 # below, and the census leg is handed that snapshot (`--toolchain`) instead of rebuilding.
 echo "== building the toolchain once (compiler + census) =================="
-spago build -p census >"$WORK/spago.log" 2>&1 ||
-  { echo "apply-profile.sh: spago build failed; see $WORK/spago.log" >&2; exit 1; }
+# THE HEADLINE PATH PREPARES ITS OWN TOOLCHAIN. `--selfhost` is the run whose numbers get published,
+# so its provenance is established by CONSTRUCTION — runtime, ulib and `output/` built in one leg
+# from one tree state, verified by a source digest taken either side of it — and not inferred from a
+# timestamp. The fixture legs keep the cheap path: they are a smoke test, not a published figure.
+if [ "$SELFHOST" = 1 ]; then
+  toolchain_prepare "$WORK" || exit 1
+  # the artifacts the prepare leg was contracted to produce — checked AFTER it, which is the only
+  # point at which their absence is a real failure rather than a starting condition.
+  for tool in "$PURVASM_RT_A" "$PURVASM_LIB" "$ROOT/output/$ENTRY_MODULE/corefn.json"; do
+    [ -e "$tool" ] || { echo "apply-profile.sh: toolchain_prepare did not produce $tool" >&2; exit 1; }
+  done
+else
+  spago build -p census >"$WORK/spago.log" 2>&1 ||
+    { echo "apply-profile.sh: spago build failed; see $WORK/spago.log" >&2; exit 1; }
+  # AFTER the build: `output/` is this run's own product, so checking it beforehand would refuse a
+  # tree the run is about to refresh. Advisory — see tools/toolchain-manifest.sh.
+  toolchain_declare_defaults
+  toolchain_check || echo "apply-profile.sh: continuing with a STALE input (recorded in the manifest)" >&2
+  toolchain_write "$WORK/toolchain-manifest.tsv"
+fi
 
 echo "== snapshotting inputs (compiler JS, CoreFn, wrappers, ulib, rt .a, traces) ="
 cp -R "$ROOT/output" "$WORK/output"
@@ -755,6 +812,10 @@ cp "$ROOT/cli/index.node.js" "$WORK/cli/index.node.js"
 cp "$ROOT/census/index.js" "$WORK/census/index.js"
 cp -R "$PURVASM_LIB" "$WORK/ulib"
 cp "$PURVASM_RT_A" "$WORK/rt/libpurvasm_rt.a"
+# The manifest travels WITH the snapshot — and there is exactly ONE of it. `$WORK` IS the snapshot
+# root a caller pins with `--toolchain`, so `$WORK/toolchain-manifest.tsv` is already in the right
+# place; copying it to a second name would leave two files that could disagree, and consumers
+# reading whichever they happened to know about.
 cp -R "$ROOT/test-fixtures/l2-behavioural/expected" "$WORK/expected"
 export PURVASM_LIB="$WORK/ulib"
 export PURVASM_RT_A="$WORK/rt/libpurvasm_rt.a"
