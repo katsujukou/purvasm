@@ -108,8 +108,8 @@ emitProvider opts = do
     staged <- FS.exists ulibJson
     throw
       ( Fmt.fmt
-          @"the image references native leaves nothing can provide: {keys}\n  \
-            \Each must be defined by the runtime staticlib or mapped to a `.c` by the purvasm library.\n  {hint}"
+          @"the image references native leaves nothing can provide: {keys}\n\
+          \  Each must be defined by the runtime staticlib or mapped to a `.c` by the purvasm library.\n  {hint}"
           { keys: String.joinWith ", " keys
           , hint:
               if staged then

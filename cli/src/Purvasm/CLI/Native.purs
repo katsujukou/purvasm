@@ -86,7 +86,7 @@ nativeProcHandler = case _ of
   ExecCaptureQuiet _ _ _ -> unsafeCrashWith notYet
   ExecInput _ _ _ _ -> unsafeCrashWith notYet
   where
-  notYet = "Process: exec not yet available on the purvasm-native CLI (ADR-0045); use the Node CLI for `build`."
+  notYet = "Process: exec is not available on the purvasm-native CLI yet; use the Node CLI for `build`."
 
 -- | Discharge `Env` to `Purvasm.System.Env` (an unset/empty variable is `Nothing`).
 nativeEnvHandler :: forall r. Env ~> Run (EFFECT + r)
@@ -113,4 +113,4 @@ nativeFsHandler = case _ of
   FileSize _ _ -> unsafeCrashWith notYet
   ResolvePath _ _ _ -> unsafeCrashWith notYet
   where
-  notYet = "Filesystem: action not yet implemented on the purvasm-native backend (ADR-0045)"
+  notYet = "Filesystem: this action is not implemented on the purvasm-native backend yet"

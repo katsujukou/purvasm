@@ -299,7 +299,7 @@ imageToStringWithArities arities img = case missingForeignArities arities img of
     | otherwise -> Left
         ( "the linked image references native leaves with no reconstructed arity: "
             <> joinWith ", " missing
-            <> " (FSR must describe every native leaf, ADR-0090)"
+            <> " (every native leaf needs a reconstructed signature)"
         )
 
 imageToJsonWith :: ForeignArity -> Image -> Json

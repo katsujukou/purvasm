@@ -183,8 +183,8 @@ static int pvm_load(const char *path) {
   if (!pvm_host_exports_abi_stamp()) {
     snprintf(pvm_error, sizeof pvm_error,
              "this VM does not export " PVM_ABI_SYMBOL ", so no provider can resolve against it — it "
-             "was linked without the host foreign API (ADR-0111 §1.1); relink the VM before provider "
-             "compatibility can be assessed");
+             "was linked without the host foreign API; relink it with --host-foreign-api before "
+             "provider compatibility can be assessed");
     return -1;
   }
   (void)dlerror(); /* clear any stale error before the call whose failure we report */

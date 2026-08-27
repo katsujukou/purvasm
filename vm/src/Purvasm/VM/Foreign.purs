@@ -100,7 +100,7 @@ toPv key = case _ of
   -- than a cost: a leaf's write would land on the copy, and two VM bindings holding the same array
   -- would stop agreeing.
   VArray cell -> promote cell
-  VRecord _ -> boundary key "a record (records do not cross on either backend, ADR-0111 §3)"
+  VRecord _ -> boundary key "a record (records do not cross to native code on either backend)"
   -- A data value is built with the native backend's own tag derivation over the constructor NAME the
   -- bytecode carries (§3). Nothing stores a tag anywhere: `ctorTag` is a pure function of the name,
   -- shared with codegen from one definition, so the two sides agree by construction.
@@ -111,7 +111,7 @@ toPv key = case _ of
     | Array.null fields -> pure (newNullaryAdtImpl (ctorTag tag))
     | otherwise -> traverse (toPv key) fields >>= newAdtImpl (ctorTag tag)
   VCtor tag _ _ -> boundary key ("a partially applied constructor (" <> tag <> ")")
-  VClosure _ -> boundary key "a VM closure (guest closures are not runtime closures, ADR-0110 §1.1)"
+  VClosure _ -> boundary key "a VM closure (a guest closure is not a native one)"
   VPap _ _ -> boundary key "a partially applied VM closure"
   VThunk _ -> stuck ("foreign boundary: an unforced value reached " <> key <> " (a VM defect)")
 
