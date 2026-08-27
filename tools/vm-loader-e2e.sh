@@ -42,7 +42,7 @@ FIX="$ROOT/vm/test/fixtures/loader"
 : "${COREFN_DIR:=$ROOT/output}"
 export PURVASM_RT_A PURVASM_LIB PURVASM_INCLUDE
 
-for f in "$PURVASM_RT_A" "$PURVASM_LIB" "$PURVASM_INCLUDE/purvasm.h" "$COREFN_DIR/Main/corefn.json"; do
+for f in "$PURVASM_RT_A" "$PURVASM_LIB" "$PURVASM_INCLUDE/purvasm.h" "$COREFN_DIR/Purvasm.VM.Main/corefn.json"; do
   [ -e "$f" ] || { echo "missing prerequisite: $f" >&2; exit 2; }
 done
 
@@ -66,7 +66,7 @@ if [ -n "${PURVASM_VM_DIR:-}" ]; then
 else
   VMDIR="$WORK/vm"
   echo "== building the VM with --host-foreign-api =="
-  if ! node "$ROOT/cli/index.node.js" build --entry Main --corefn-dir "$COREFN_DIR" \
+  if ! node "$ROOT/cli/index.node.js" build --entry Purvasm.VM.Main --corefn-dir "$COREFN_DIR" \
          --outdir "$VMDIR" --host-foreign-api >"$WORK/build.log" 2>&1; then
     echo "  the VM build failed — see $WORK/build.log" >&2
     tail -20 "$WORK/build.log" >&2
@@ -192,7 +192,7 @@ if build_provider "$WORK/apicoverage.so" "$FIX/ApiCoverage.c" Test_2eLoader; the
   else
     printf '  %-24s -> no export allowlist at %s FAIL\n' api-coverage "$ALLOW"; rc=1
   fi
-  if out="$("$VM" --ffi "$WORK/apicoverage.so" 2>"$WORK/apicoverage.err")"; then
+  if out="$("$VM" --self-test load --ffi "$WORK/apicoverage.so" 2>"$WORK/apicoverage.err")"; then
     if printf '%s' "$out" | grep -qF "loaded: $WORK/apicoverage.so"; then
       printf '  %-24s -> loaded OK\n' api-coverage
     else
@@ -213,7 +213,7 @@ echo "== runtime leaves: the corpus's own providers, with NO module loaded (§1.
 # to 42, hands the resulting CARRIER straight to `writeLineImpl` without decoding it (§3), and runs the
 # effect thunk it gets back. So a printed 42 means resolution, firing, argument conversion, the carrier
 # pass-through and the effect run all worked — and none of it is reachable from a unit test.
-if out="$("$VM" 2>"$WORK/leaves.err")"; then
+if out="$("$VM" --self-test runtime-leaves 2>"$WORK/leaves.err")"; then
   # One assertion per boundary arm a leaf actually READS, because "it ran" is not the claim — the
   # claim is that a VM scalar already is a runtime value of the right representation, and only a leaf
   # reading it can say so. `floatBitsHi 1.0` is the sharpest of the three: 1072693248 is 0x3FF00000,
@@ -548,7 +548,7 @@ fi
 # verdict is carried, and the stale leg refuses to conclude without it.
 positive_control=no
 if build_provider "$WORK/marker.so" "$FIX/Marker.c" Test_2eLoader; then
-  if "$VM" --ffi "$WORK/marker.so" >"$WORK/marker.out" 2>"$WORK/marker.err"; then
+  if "$VM" --self-test load --ffi "$WORK/marker.so" >"$WORK/marker.out" 2>"$WORK/marker.err"; then
     if grep -qF "MARKER: provider initialiser ran" "$WORK/marker.err"; then
       printf '  %-24s -> loaded, initialiser ran OK\n' current-version
       positive_control=yes
@@ -568,7 +568,7 @@ if build_provider "$WORK/stale.so" "$FIX/Marker.c" Test_2eLoader "$WORK/stale-in
     # Not "FAIL" for a defect of its own, and emphatically not OK: with nothing loadable, a refusal
     # here carries no information about the version at all.
     printf '  %-24s -> INCONCLUSIVE: the positive control above did not load FAIL\n' stale-version; rc=1
-  elif "$VM" --ffi "$WORK/stale.so" >"$WORK/stale.out" 2>"$WORK/stale.err"; then
+  elif "$VM" --self-test load --ffi "$WORK/stale.so" >"$WORK/stale.out" 2>"$WORK/stale.err"; then
     printf '  %-24s -> loaded (expected a refusal) FAIL\n' stale-version; rc=1
   elif ! grep -qF "built against foreign ABI v99" "$WORK/stale.err"; then
     # The version in the message, not just the words: the loader distinguishes "built against
@@ -590,7 +590,7 @@ fi
 # `pv_foreign_abi_v99-bad.so`. Both version verdicts are therefore wrong answers here, and the plain
 # one — naming the symbol that is actually missing — is the only right one.
 if build_provider "$WORK/pv_foreign_abi_v99-bad.so" "$FIX/Unresolved.c" Test_2eLoader; then
-  if "$VM" --ffi "$WORK/pv_foreign_abi_v99-bad.so" >"$WORK/unresolved.out" 2>"$WORK/unresolved.err"; then
+  if "$VM" --self-test load --ffi "$WORK/pv_foreign_abi_v99-bad.so" >"$WORK/unresolved.out" 2>"$WORK/unresolved.err"; then
     printf '  %-24s -> loaded (expected a refusal) FAIL\n' spoofed-path; rc=1
   elif grep -qE "built against foreign ABI|does not export pv_foreign_abi_v" "$WORK/unresolved.err"; then
     printf '  %-24s -> the path forged an ABI verdict FAIL\n' spoofed-path; rc=1

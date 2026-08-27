@@ -116,11 +116,12 @@ if [ "$OPT_EFFECT" = "1" ]; then
   L2_ENTRY="$OUT/l2-cli.mjs"
   printf 'import { main } from "%s/%s";\nmain();\n' "$PWD" "$L2_JS" >"$L2_ENTRY"
 
-  # Compile <module> to <outdir>/app.pvm at the given optimisation mode (opt|noopt).
+  # Compile <module> into <outdir> at the given optimisation mode (opt|noopt), without running it:
+  # this harness runs each image itself, on the runner it is measuring.
   l2_compile() {
     local flag=""
     [ "$3" = "noopt" ] && flag="--no-opt"
-    PURVASM_LIB="$ULIB" node "$L2_ENTRY" run --corefn-dir output --outdir "$2" --entry "$1" $flag \
+    PURVASM_LIB="$ULIB" node "$L2_ENTRY" run --corefn-dir output --outdir "$2" --build-only -m "$1" $flag \
       >"$2/compile.log" 2>&1
   }
   # `purvm run --count` prints stats to stderr, the guest's result to stdout.
@@ -128,7 +129,7 @@ if [ "$OPT_EFFECT" = "1" ]; then
   guest_out() { "$PURVM" run "$1" "$2" 2>/dev/null; }
 
   # The owned VM (ADR-0110), run alongside boot's on the SAME compilation: `l2_compile` writes both
-  # image forms, so `app.pvm` (version 3) goes to boot and `app.owned.pvm` goes here.
+  # image forms, so `app.boot.pvm` (version 3) goes to boot and `app.pvm` goes here.
   #
   # What is compared is the **output**. The two runners were also held to equal instruction counts
   # while §4(a) was the only difference (§6 step C — taken, 8/8, and recorded in the ADR); §4(b)'s
@@ -237,15 +238,15 @@ if [ "$OPT_EFFECT" = "1" ]; then
       continue
     fi
     # Correctness: --opt must not change the observable output, and must equal --no-opt.
-    oo=$(guest_out "$odir/app.pvm" "$start")
-    no=$(guest_out "$ndir/app.pvm" "$start")
+    oo=$(guest_out "$odir/app.boot.pvm" "$start")
+    no=$(guest_out "$ndir/app.boot.pvm" "$start")
     if [ -z "$oo" ] || [ "$oo" != "$no" ]; then
       printf '%-16s %-10s %14s (opt=%s / noopt=%s)\n' "$name" "$start" "RUN-FAILED/DIVERGED" "$oo" "$no" | tee -a "$optsum"
       touch "$OUT/.opt-failed"
       continue
     fi
-    oi=$(instr_count "$odir/app.pvm" "$start")
-    ni=$(instr_count "$ndir/app.pvm" "$start")
+    oi=$(instr_count "$odir/app.boot.pvm" "$start")
+    ni=$(instr_count "$ndir/app.boot.pvm" "$start")
     ratio=$(awk -v n="$ni" -v o="$oi" 'BEGIN { if (o > 0) printf "%.3f", n / o; else printf "n/a" }')
     red=$(awk -v n="$ni" -v o="$oi" 'BEGIN { if (n > 0) printf "%.1f", (n - o) * 100 / n; else printf "n/a" }')
     # The size/time gate (ADR-0089 §7). Zero emitted bytes on either side means the compile did
@@ -277,10 +278,10 @@ if [ "$OPT_EFFECT" = "1" ]; then
       for m in opt noopt; do
         [ "$m" = "opt" ] && d="$odir" || d="$ndir"
         [ "$m" = "opt" ] && bo="$oo" || bo="$no"
-        if [ ! -f "$d/app.owned.pvm" ]; then
+        if [ ! -f "$d/app.pvm" ]; then
           owned="NO-IMAGE($m)"; touch "$OUT/.opt-failed"; break
         fi
-        if ! vo=$(owned_out "$d/app.owned.pvm" "$start"); then
+        if ! vo=$(owned_out "$d/app.pvm" "$start"); then
           owned="REFUSED($m)"; touch "$OUT/.opt-failed"
           sed 's/^/    /' "$OUT/owned.err" >>"$optsum"
           break
@@ -290,7 +291,7 @@ if [ "$OPT_EFFECT" = "1" ]; then
           # reads its input size from the guest's argv (ADR-0075 §4); if the owned run is insensitive
           # to a doubled size, the guest never received one and the argv injection has regressed —
           # which is a different bug from the two runners disagreeing about the program.
-          if owned_ignores_size "$d/app.owned.pvm" "$start" "$((start * 2))"; then
+          if owned_ignores_size "$d/app.pvm" "$start" "$((start * 2))"; then
             owned="ARGV($m)"
           else
             owned="OUT($m)"
@@ -302,8 +303,8 @@ if [ "$OPT_EFFECT" = "1" ]; then
       # pinned terms). Reported, not compared — boot's numbers describe a different instruction
       # vocabulary now, and the ratio here is the one an optimiser change should move.
       if [ "$owned" = "≡" ]; then
-        voi=$(owned_count "$odir/app.owned.pvm" "$start")
-        vni=$(owned_count "$ndir/app.owned.pvm" "$start")
+        voi=$(owned_count "$odir/app.pvm" "$start")
+        vni=$(owned_count "$ndir/app.pvm" "$start")
         oratio=$(awk -v n="$vni" -v o="$voi" 'BEGIN { if (o > 0) printf "%.3f", n / o; else printf "n/a" }')
       else
         voi="-"; vni="-"; oratio="-"
@@ -326,9 +327,9 @@ if [ "$OPT_EFFECT" = "1" ]; then
     mkdir -p "$sdir/opt" "$sdir/noopt"
     sc_ok=1
     PURVASM_LIB="$ULIB" node "$L2_ENTRY" run --corefn-dir output \
-      --outdir "$sdir/noopt" --entry Purvasm.CLI.Main --no-opt >"$sdir/noopt.log" 2>&1 || sc_ok=0
+      --outdir "$sdir/noopt" --build-only -m Purvasm.CLI.Main --no-opt >"$sdir/noopt.log" 2>&1 || sc_ok=0
     PURVASM_LIB="$ULIB" node "$L2_ENTRY" run --corefn-dir output \
-      --outdir "$sdir/opt" --entry Purvasm.CLI.Main >"$sdir/opt.log" 2>&1 || sc_ok=0
+      --outdir "$sdir/opt" --build-only -m Purvasm.CLI.Main >"$sdir/opt.log" 2>&1 || sc_ok=0
     if [ "$sc_ok" = "0" ]; then
       printf '%-16s %-10s %14s\n' "self-compile" "-" "COMPILE-FAILED" | tee -a "$optsum"
       touch "$OUT/.opt-failed"

@@ -609,6 +609,7 @@
         "core": {
           "dependencies": [
             "effect",
+            "exceptions",
             "prelude",
             "purvasm-stdio",
             "purvasm-system",
