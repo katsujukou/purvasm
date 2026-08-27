@@ -675,10 +675,17 @@ Each slice ships with its gates; none of them requires boot to change.
 >   the build stops and names it: the quiet failure that motivated this is a library whose `foreign`
 >   map cannot be read being taken for "the workspace provides nothing".
 >
-> - **Owed, and deliberately its own increment:** the guest's exit code does not propagate — a program
->   exiting 42 makes `purvasm run` exit 1, because the process effect collapses its result to
->   `Unit`. Zero-vs-non-zero is preserved. A runner's shell contract wants the real code, and that
->   needs a structured exit status in the effect and its Node provider.
+> - **The guest's status reaches the caller** (closed in its own increment, 2026-08-27). It did not
+>   at first: the process effect collapsed a run to success-or-failure, so a program exiting 42 made
+>   `purvasm run` exit 1 — which makes a runner's shell contract useless, since every failure looks
+>   alike. `Proc.execStatus` now reports the child's code, every command answers with the status the
+>   process should end with (only `run` has anything but 0 to say), and the exit happens where the
+>   CLI's other exits already do. `Left` is reserved for *not running* — the VM could not be spawned,
+>   or was killed — which is this command's failure rather than the program's. A signal is reported by
+>   name rather than encoded as 128+n: that mapping is a shell convention and this is not a shell.
+>
+>   Gated on three codes, not one: 0 must stay 0, and only a non-1 code separates a real propagation
+>   from the old behaviour.
 
 ### 7. What this does not change
 
