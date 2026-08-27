@@ -1,19 +1,14 @@
--- | The owned VM's native entry point
--- | ([ADR-0110](../../docs/design-decisions/0110-owned-vm-purescript-native.md) §2).
+-- | The owned VM's native entry point: it reads a linked bytecode image and runs it.
 -- |
--- | It runs a guest program built **in memory**: the image reader is slice 2, and the foreign
--- | frontier is [0111](../../docs/design-decisions/0111-vm-dynamic-native-ffi.md). What this entry
--- | exists to establish is §2's claim — that an interpreter written in PureScript compiles to a
--- | native executable and runs — because everything downstream (`dlopen`, `pv_make_closure`, the
--- | link-time retention of the foreign API) is only reachable from a natively compiled VM. On node it
--- | runs the same program through the same code, so the two targets can be compared by eye.
+-- | `--image <path>` names the program. `--ffi <path>` loads a native provider before the program
+-- | starts, and `--manifest <path>` names the keys the build says a loaded module must supply — both
+-- | are the runner's to pass, never discovered beside the image, so what a hosted program may reach
+-- | is decided by whoever launched it. `--` separates the VM's own arguments from the program's.
 -- |
--- | It also takes `--ffi <path>` and loads that provider before running, which is what
--- | `tools/vm-loader-e2e.sh` drives: loading with `RTLD_NOW` binds every reference a module makes, so
--- | a module that loads is a module whose whole `pv_*` surface the host exported (ADR-0111 §1.1), and
--- | a module built against another foreign ABI is refused before its initialisers run (§5). Neither
--- | is observable without a natively compiled host, and neither needs a leaf to be *called*.
-module Main (main) where
+-- | `--self-test <name>` is the diagnostic entry the loader gate drives. It is not a user feature:
+-- | each case builds a small guest program in memory to exercise one property of the foreign frontier
+-- | that no unit test can reach, because it needs a natively compiled host with real `dlopen`.
+module Purvasm.VM.Main (main) where
 
 import Prelude
 
@@ -144,15 +139,7 @@ describe = case _ of
   VData tag _ -> "data " <> tag
   _ -> "<value>"
 
-probe :: Loader.ModuleHandle -> String -> Int -> String
-probe host key n = case Loader.arity n of
-  Nothing -> "bad arity"
-  Just a -> case Loader.resolve host key a of
-    Just _ -> "resolved"
-    Nothing -> "absent"
-
--- | The image path named by `--image <path>`, if any. With one, the VM runs a real program instead of
--- | the built-in smoke entries — which is what makes it a runner rather than a demonstration.
+-- | The image path named by `--image <path>`, if any.
 imagePath :: Array String -> Effect (Maybe String)
 imagePath args = case Array.uncons args of
   Nothing -> pure Nothing
@@ -548,6 +535,21 @@ runSelfTest args = case _ of
     writeLine "runtime-shadow: unexpectedly resolved"
   -- With a provider loaded, resolution spans both classes (ADR-0111 §4): this calls a leaf the
   -- runtime does NOT define, so an answer can only have come from the loaded module.
+  -- Loading alone, reported: whether a module binds against this host is the whole question for the
+  -- retention, ABI-version and diagnosis legs, and none of them needs a leaf to be CALLED.
+  "load" -> void (traverse loadProvider =<< ffiPaths args)
+  -- Resolution, firing, argument conversion, the carrier pass-through and the effect run, all
+  -- through the runtime staticlib linked into this executable — with no module loaded and no
+  -- manifest, which is what makes it a test of retention rather than of loading.
+  "runtime-leaves" -> do
+    env <- newEnv Map.empty []
+    result <- runBlock env program Map.empty
+    writeLine ("result: " <> describe result)
+    leafEnv <- newEnv Map.empty []
+    leafResult <- runBlock leafEnv runtimeLeaves Map.empty
+    -- Reported through `describe`, which does NOT decode a carrier: what a leaf returned stays
+    -- opaque, and printing the string it holds would break the invariant the boundary exists for.
+    writeLine ("leaf result: " <> describe leafResult)
   "loaded-provider" -> runWithProviders args loadedProvider
   "aliasing" -> runWithProviders args aliasing
   "carrier-elimination" -> runWithProviders args carrierElimination
@@ -592,33 +594,18 @@ main = do
           Nothing -> pure unit
           Just manifest -> readManifest manifest >>= checkManifest env
         runImage env (flagSet "--count" rest) path
-      Nothing -> ordinaryRun rest
+      Nothing -> usage
 
--- | The ordinary run: load whatever `--ffi` names, then the guest programs.
-ordinaryRun :: Array String -> Effect Unit
-ordinaryRun args = do
-  paths <- ffiPaths args
-  handles <- traverse loadProvider paths
-  env <- newEnv Map.empty handles
-  -- Before the program runs: the keys the build says the workspace provides must each have exactly
-  -- one provider (ADR-0111 §4). Everything else stays lazy.
-  manifestPath args >>= case _ of
-    Nothing -> pure unit
-    Just path -> readManifest path >>= checkManifest env
-  result <- runBlock env program Map.empty
-  count <- executed env
-  writeLine ("result: " <> describe result)
-  writeLine ("instructions: " <> show count)
-  -- ADR-0111 slice 2 probe: can the host resolve a runtime leaf the VM itself never calls?
-  host <- Loader.hostRuntime
-  writeLine ("provider: " <> Loader.describe host)
-  writeLine ("resolve Data.Show.showIntImpl: " <> probe host "Data.Show.showIntImpl" 1)
-  writeLine ("resolve Purvasm.Stdio.writeLineImpl: " <> probe host "Purvasm.Stdio.writeLineImpl" 1)
-  writeLine ("resolve Nope.nope: " <> probe host "Nope.nope" 1)
-  -- ADR-0111 slice 2: resolve, fire, and run the effect — all through `host-runtime`. The line below
-  -- this one is written by the guest program, not by `main`.
-  writeLine "runtime leaves:"
-  leafEnv <- newEnv Map.empty handles
-  leafResult <- runBlock leafEnv runtimeLeaves Map.empty
-  writeLine ("leaf result: " <> describe leafResult)
-
+-- | What this program is, and the one argument it cannot do without.
+usage :: Effect Unit
+usage = do
+  writeErrLine "purvasm-vm: runs a linked purvasm bytecode image."
+  writeErrLine ""
+  writeErrLine "  purvasm-vm --image <path> [--ffi <path>]... [--manifest <path>] [--count] [-- <args>...]"
+  writeErrLine ""
+  writeErrLine "  --image <path>     the program to run (required)"
+  writeErrLine "  --ffi <path>       load a native provider before the program starts; repeatable"
+  writeErrLine "  --manifest <path>  the keys a loaded provider must supply, checked before the run"
+  writeErrLine "  --count            report the instruction count on stderr when the program ends"
+  writeErrLine "  -- <args>...       passed to the program as its own arguments"
+  stuck "no --image given"
