@@ -47,7 +47,7 @@ import Purvasm.Compiler.Backend.LLVM.Monad (Codegen, foreignRef, FnBody, MakeCxO
 import Purvasm.Compiler.Backend.LLVM.Root (emitForeignCloInit, emitGfunInit, emitInitFnFramed, entryTeardown, foreignCloInitSym, openFrame)
 import Purvasm.Compiler.Backend.LLVM.Safepoint (RtArg(..), RtOp(..), rtCall, rtCallVoid)
 import Purvasm.Compiler.Backend.LLVM.Types (CallFact(..), EnvSrc(..), FnInfo, Gdef(..), Lifted(..), LiftedBody(..), SplitOutput)
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), foldAtoms)
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..), foldAtoms)
 import Purvasm.Compiler.MiddleEnd.Module (Decl)
 
 -- | The root-handle-global keys a gdef defines.
@@ -68,10 +68,10 @@ gdefInitKey = case _ of
     Just (Tuple k _) -> k
     Nothing -> unsafeCrashWith "Program.gdefInitKey: empty Grec"
 
--- | Classify a non-recursive binding: a `Ret (CLam …)` is a function, anything else a strict CAF.
+-- | Classify a non-recursive binding: a `Ret (CLam unit …)` is a function, anything else a strict CAF.
 classifyNonrec :: String -> Expr -> Gdef
 classifyNonrec key = case _ of
-  Ret (CLam ps b) -> Gfun key ps b
+  Ret (CLam unit ps b) -> Gfun key ps b
   e -> Gcaf key e
 
 -- | Classify a post-optimiser `Decl` into a `Gdef` (ADR-0086 §4: `Gdef` classification is a backend
@@ -177,7 +177,7 @@ emitGdefs gdefs = do
     Gfun k ps _ -> Map.insert k { dsym: mangle k <> "$d", arity: Array.length ps, src: SSentinel } m
     Grec ms -> foldl
       ( \m2 (Tuple mkey rhs) -> case rhs of
-          Ret (CLam ps _) -> Map.insert mkey { dsym: mangle mkey <> "$d", arity: Array.length ps, src: SForceCell } m2
+          Ret (CLam unit ps _) -> Map.insert mkey { dsym: mangle mkey <> "$d", arity: Array.length ps, src: SForceCell } m2
           _ -> m2
       )
       m
@@ -448,7 +448,7 @@ surfaceFn surface acc = case _ of
   Gcaf _ _ -> acc
   Grec ms -> foldl
     ( \a (Tuple m rhs) -> case rhs, Map.lookup m surface of
-        Ret (CLam ps _), Just (Crecfn n) | n == Array.length ps -> Map.insert m { dsym: mangle m <> "$d", arity: n, src: SForceCell } a
+        Ret (CLam unit ps _), Just (Crecfn n) | n == Array.length ps -> Map.insert m { dsym: mangle m <> "$d", arity: n, src: SForceCell } a
         _, _ -> a
     )
     acc

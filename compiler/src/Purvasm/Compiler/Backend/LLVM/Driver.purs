@@ -41,7 +41,7 @@ import Purvasm.Compiler.Backend.LLVM.Types (CallFact(..), Gdef(..))
 import Purvasm.Compiler.CESK.AST (Term(..))
 import Purvasm.Compiler.CESK.Translate (qualifiedKey)
 import Purvasm.Compiler.Ffi (resolver)
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), mapAtoms)
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..), mapAtoms)
 import Purvasm.Compiler.NativeLeaf (nativeLeafArities, resolveNativeForeigns)
 import Purvasm.Compiler.MiddleEnd.Module (AnfModule, declsOfModule, mapDeclBodies)
 import Purvasm.Compiler.MiddleEnd.Normalize (normalize)
@@ -72,7 +72,7 @@ deriveSurface m gdefs = foldl over Map.empty gdefs
     Gcaf _ _ -> acc
 
   overMember acc (Tuple mk rhs) = case rhs of
-    Ret (CLam ps _) | Set.member mk exports -> Map.insert mk (Crecfn (Array.length ps)) acc
+    Ret (CLam unit ps _) | Set.member mk exports -> Map.insert mk (Crecfn (Array.length ps)) acc
     _ -> acc
 
 -- --- the ADR-0087 `Backend` value ------------------------------------------------------------------

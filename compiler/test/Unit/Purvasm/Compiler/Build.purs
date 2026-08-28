@@ -473,7 +473,7 @@ bsSummaryFlowsSpec =
       table = Map.fromFoldable [ Tuple "TQ" (loaded tq), Tuple "TD" (loaded td) ]
       memberOf key m = map (\(Tuple _ e) -> e)
         (Array.find (\(Tuple k _) -> k == key) (Array.concatMap _.members m.decls))
-      identityLam = ANF.Ret (ANF.CLam [ "$q1" ] (ANF.Ret (ANF.CAtom (ANF.AtomVar "$q1"))))
+      identityLam = ANF.Ret (ANF.CLam unit [ "$q1" ] (ANF.Ret (ANF.CAtom (ANF.AtomVar "$q1"))))
       tdBackend = testBackend
         { lowerModule = \_ lm ->
             if lm.module.name /= "TD" then "IR:" <> lm.module.name

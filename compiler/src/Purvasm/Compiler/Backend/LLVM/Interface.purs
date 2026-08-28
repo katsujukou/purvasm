@@ -8,7 +8,7 @@
 -- |
 -- | The native `Gdef → ExportKind` mapping mirrors boot's bytecode `kindOfGdef` exactly:
 -- | a `Gfun` is `Efn arity`; a `Gcaf` is `Ecaf`; a `Grec` member is `Erecfn arity` when its body is a
--- | lambda (`Ret (CLam …)`) and `Erec` otherwise (a recursive-group *value* member — e.g. a mutually
+-- | lambda (`Ret (CLam unit …)`) and `Erec` otherwise (a recursive-group *value* member — e.g. a mutually
 -- | recursive instance dictionary like `Data.List.Types.applyList`, which boot tags `rec`, not `caf`).
 module Purvasm.Compiler.Backend.LLVM.Interface
   ( interfaceOfAnf
@@ -26,10 +26,10 @@ import PureScript.CoreFn.Module (Module) as CF
 import Purvasm.Compiler.Backend.LLVM.Types (Gdef(..))
 import Purvasm.Compiler.Bytecode.Artifact (ExportKind(..), Interface, interfaceFromExports)
 import Purvasm.Compiler.CESK.Translate (nameKey, qualifiedKey)
-import Purvasm.Compiler.MiddleEnd.ANF (CExpr(..), Expr(..))
+import Purvasm.Compiler.MiddleEnd.ANF (CExpr, CExprF(..), Expr, ExprF(..))
 
 -- | Each defined key → its `ExportKind`, read off the native gdefs' ANF classification. A `Grec`'s
--- | members are keyed individually; a member whose body is `Ret (CLam ps _)` is a recursive function
+-- | members are keyed individually; a member whose body is `Ret (CLam unit ps _)` is a recursive function
 -- | (`Erecfn`), any other member body is a recursive-group value (`Erec`).
 gdefKindMap :: Array Gdef -> Map String ExportKind
 gdefKindMap = foldl over Map.empty
@@ -42,7 +42,7 @@ gdefKindMap = foldl over Map.empty
   overMember acc (Tuple k e) = Map.insert k (memberKind e) acc
 
   memberKind = case _ of
-    Ret (CLam ps _) -> Erecfn (Array.length ps)
+    Ret (CLam _ ps _) -> Erecfn (Array.length ps)
     _ -> Erec
 
 -- | A module's `.pmi` computed from its ANF gdefs and CoreFn interface: intersect the public exports

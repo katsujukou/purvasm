@@ -17,7 +17,7 @@ import Node.Encoding (Encoding(..))
 import Node.FS.Sync (exists, readTextFile, readdir) as FSSync
 import Node.Process (lookupEnv) as Process
 import Purvasm.Compiler.Literal (Literal(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..)) as A
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..), Rhs, RhsF(..)) as A
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (cfExpr, fvExpr)
 import Purvasm.Compiler.MiddleEnd.Module (declsOfModule)
 import Purvasm.Compiler.MiddleEnd.Optimizer (emptyBuildEnv, extendSummary, localFactsOf, optimizeModule)
@@ -169,7 +169,7 @@ usesPrim op = goE
 
   goC = case _ of
     A.CPrim o _ -> o == op
-    A.CLam _ b -> goE b
+    A.CLam _ _ b -> goE b
     A.CIf _ t e -> goE t || goE e
     A.CCase _ alts -> Array.any goAlt alts
     _ -> false
@@ -188,8 +188,8 @@ usesPerform = goE
     A.LetRec bs rest -> Array.any (goE <<< _.rhs) bs || goE rest
 
   goC = case _ of
-    A.CPerform _ -> true
-    A.CLam _ b -> goE b
+    A.CPerform _ _ -> true
+    A.CLam _ _ b -> goE b
     A.CIf _ t e -> goE t || goE e
     A.CCase _ alts -> Array.any goAlt alts
     _ -> false
@@ -215,8 +215,8 @@ paritySpec = describe "ADR-0094 fold parity (sliced structural keys ride the uli
     Array.length mods `shouldEqual` 3
     let
       out = optimizeProbe mods
-        [ Tuple "Parity.T.cmp" (A.Ret (A.CApp (avar "Data.Ord.compare") [ avar "Data.Ord.ordInt", aint 1, aint 2 ]))
-        , Tuple "Parity.T.lt" (A.Ret (A.CApp (avar "Data.Ord.lessThan") [ avar "Data.Ord.ordInt", aint 1, aint 2 ]))
+        [ Tuple "Parity.T.cmp" (A.Ret (A.CApp unit (avar "Data.Ord.compare") [ avar "Data.Ord.ordInt", aint 1, aint 2 ]))
+        , Tuple "Parity.T.lt" (A.Ret (A.CApp unit (avar "Data.Ord.lessThan") [ avar "Data.Ord.ordInt", aint 1, aint 2 ]))
         ]
     map snd out `shouldEqual`
       [ A.Ret (A.CCtor "LT" 0 [])
@@ -234,7 +234,7 @@ paritySpec = describe "ADR-0094 fold parity (sliced structural keys ride the uli
       str = A.AtomLit <<< LString
       out = optimizeProbe mods
         [ Tuple "Parity.T.s"
-            (A.Ret (A.CApp (avar "Data.Ord.compare") [ avar "Data.Ord.ordString", str "a", str "b" ]))
+            (A.Ret (A.CApp unit (avar "Data.Ord.compare") [ avar "Data.Ord.ordString", str "a", str "b" ]))
         ]
     Array.any (refsName "Data.Ord.compareStringImpl" <<< snd) out `shouldEqual` true
 
@@ -243,17 +243,17 @@ paritySpec = describe "ADR-0094 fold parity (sliced structural keys ride the uli
     let
       out = optimizeProbe mods
         [ Tuple "Parity.T.m"
-            ( A.Let "f" (A.CLam [ "x" ] (A.Ret (A.CPrim Po.AddInt [ avar "x", aint 1 ])))
+            ( A.Let "f" (A.CLam unit [ "x" ] (A.Ret (A.CPrim Po.AddInt [ avar "x", aint 1 ])))
                 ( A.Let "a" (A.CArray [ aint 1, aint 2 ])
-                    (A.Ret (A.CApp (avar "Data.Functor.arrayMap") [ avar "f", avar "a" ]))
+                    (A.Ret (A.CApp unit (avar "Data.Functor.arrayMap") [ avar "f", avar "a" ]))
                 )
             )
         ]
       outEq = optimizeProbe mods
         [ Tuple "Parity.T.e"
-            ( A.Let "f" (A.CLam [ "x", "y" ] (A.Ret (A.CPrim Po.EqInt [ avar "x", avar "y" ])))
+            ( A.Let "f" (A.CLam unit [ "x", "y" ] (A.Ret (A.CPrim Po.EqInt [ avar "x", avar "y" ])))
                 ( A.Let "a" (A.CArray [ aint 1, aint 2 ])
-                    (A.Ret (A.CApp (avar "Data.Eq.eqArrayImpl") [ avar "f", avar "a", avar "a" ]))
+                    (A.Ret (A.CApp unit (avar "Data.Eq.eqArrayImpl") [ avar "f", avar "a", avar "a" ]))
                 )
             )
         ]
@@ -301,10 +301,10 @@ paritySpec = describe "ADR-0094 fold parity (sliced structural keys ride the uli
     mods <- load [ "Data.Unit", "Type.Proxy", "Data.Functor", "Control.Apply", "Control.Applicative", "Control.Bind", "Control.Monad", "Effect" ]
     let
       out = optimizeProbe mods
-        [ Tuple "Parity.T.p" (A.Ret (A.CApp (avar "Control.Applicative.pure") [ avar "Effect.applicativeEffect", avar "x" ]))
-        , Tuple "Parity.T.b" (A.Ret (A.CApp (avar "Control.Bind.bind") [ avar "Effect.bindEffect", avar "m", avar "k" ]))
+        [ Tuple "Parity.T.p" (A.Ret (A.CApp unit (avar "Control.Applicative.pure") [ avar "Effect.applicativeEffect", avar "x" ]))
+        , Tuple "Parity.T.b" (A.Ret (A.CApp unit (avar "Control.Bind.bind") [ avar "Effect.bindEffect", avar "m", avar "k" ]))
         , Tuple "Parity.T.d"
-            (A.Ret (A.CApp (avar "Control.Bind.discard") [ avar "Control.Bind.discardUnit", avar "Effect.bindEffect", avar "a", avar "k" ]))
+            (A.Ret (A.CApp unit (avar "Control.Bind.discard") [ avar "Control.Bind.discardUnit", avar "Effect.bindEffect", avar "a", avar "k" ]))
         ]
       performs key = Array.any (\(Tuple k e) -> k == key && usesPerform e) out
       refsAny names = Array.any (\(Tuple _ e) -> Array.any (\n -> refsName n e) names) out
@@ -324,8 +324,8 @@ paritySpec = describe "ADR-0094 fold parity (sliced structural keys ride the uli
       out = optimizeProbe mods
         -- `map`: recognised at `early` as a dispatch (`Effect.functorEffect` ∈ effectFamily);
         -- `void`: NbE inlines it to a `functorEffect.map` projection, caught at `close`.
-        [ Tuple "Parity.T.m" (A.Ret (A.CApp (avar "Data.Functor.map") [ avar "Effect.functorEffect", avar "f", avar "m" ]))
-        , Tuple "Parity.T.v" (A.Ret (A.CApp (avar "Data.Functor.void") [ avar "Effect.functorEffect", avar "m" ]))
+        [ Tuple "Parity.T.m" (A.Ret (A.CApp unit (avar "Data.Functor.map") [ avar "Effect.functorEffect", avar "f", avar "m" ]))
+        , Tuple "Parity.T.v" (A.Ret (A.CApp unit (avar "Data.Functor.void") [ avar "Effect.functorEffect", avar "m" ]))
         ]
       performs key = Array.any (\(Tuple k e) -> k == key && usesPerform e) out
       refsAny names = Array.any (\(Tuple _ e) -> Array.any (\n -> refsName n e) names) out
@@ -339,7 +339,7 @@ paritySpec = describe "ADR-0094 fold parity (sliced structural keys ride the uli
     mods <- load [ "Data.Unit", "Effect" ]
     let
       out = optimizeProbe mods
-        [ Tuple "Loop.T.f" (A.Ret (A.CApp (avar "Effect.forE") [ avar "lo", avar "hi", avar "body" ])) ]
+        [ Tuple "Loop.T.f" (A.Ret (A.CApp unit (avar "Effect.forE") [ avar "lo", avar "hi", avar "body" ])) ]
       performs = Array.any (\(Tuple _ e) -> usesPerform e) out
       refsForE = Array.any (\(Tuple _ e) -> refsName "Effect.forE" e) out
     -- forE is lowered in-place (the loop body's `perform (body i)` is an explicit run marker) and the
@@ -351,10 +351,10 @@ paritySpec = describe "ADR-0094 fold parity (sliced structural keys ride the uli
     mods <- load [ "Data.Unit" ]
     let
       out = optimizeProbe mods
-        [ Tuple "STm.T.r" (A.Ret (A.CApp (avar "Control.Monad.ST.Internal.run") [ avar "st" ]))
-        , Tuple "STm.T.b" (A.Ret (A.CApp (avar "Control.Monad.ST.Internal.bind_") [ avar "m", avar "k" ]))
-        , Tuple "STm.T.nw" (A.Ret (A.CApp (avar "Control.Monad.ST.Internal.new") [ avar "v" ]))
-        , Tuple "STm.T.md" (A.Ret (A.CApp (avar "Control.Monad.ST.Internal.modifyImpl") [ avar "f", avar "ref" ]))
+        [ Tuple "STm.T.r" (A.Ret (A.CApp unit (avar "Control.Monad.ST.Internal.run") [ avar "st" ]))
+        , Tuple "STm.T.b" (A.Ret (A.CApp unit (avar "Control.Monad.ST.Internal.bind_") [ avar "m", avar "k" ]))
+        , Tuple "STm.T.nw" (A.Ret (A.CApp unit (avar "Control.Monad.ST.Internal.new") [ avar "v" ]))
+        , Tuple "STm.T.md" (A.Ret (A.CApp unit (avar "Control.Monad.ST.Internal.modifyImpl") [ avar "f", avar "ref" ]))
         ]
       performs key = Array.any (\(Tuple k e) -> k == key && usesPerform e) out
       usesP key op = Array.any (\(Tuple k e) -> k == key && usesPrim op e) out

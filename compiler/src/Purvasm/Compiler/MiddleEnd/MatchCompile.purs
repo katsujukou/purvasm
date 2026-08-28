@@ -33,7 +33,7 @@ import Data.Unfoldable (replicateA)
 import Partial.Unsafe (unsafeCrashWith, unsafePartial)
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Literal (Literal)
-import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom, Expr, Rhs(..))
+import Purvasm.Compiler.MiddleEnd.ANF (AltF, Atom, ExprF, RhsF(..))
 
 -- | A projection from a parent occurrence to a sub-occurrence: a constructor field, an
 -- | array element, or a record label.
@@ -52,29 +52,43 @@ instance Show Proj where
 
 -- | An explicit decision tree over the scrutinee occurrences. A backend lowers each node
 -- | to its own discriminant; the tree itself is discriminant-agnostic. Leaf right-hand
--- | sides carry raw ANF `Expr`s (`Dleaf`/`Dguard`), lowered by the backend.
-data DTree
+-- | sides carry raw ANF `ExprF f c`s (`Dleaf`/`Dguard`), lowered by the backend.
+-- |
+-- | **Why the tree is parameterised over the ANF annotations rather than fixed at `Unit`**
+-- | (ADR-0114 amendment, 2026-08-27). This builder DUPLICATES right-hand sides: `goCtor` copies a
+-- | wildcard row into every constructor arm and into the default, and `Dguard` recompiles the rows
+-- | below into its fall-through subtree. Under ADR-0114 those copies must carry the SAME call-
+-- | occurrence and function identities as the row they came from — one source-level call stays one
+-- | proof site however many times the emitter lowers it.
+-- |
+-- | Keeping `f` and `c` abstract is what makes that hold by construction rather than by review: with
+-- | them universally quantified this module has no way to build an `AnfOccurrenceId` or an
+-- | `AnfFunctionId` (their constructors do not leave `ANF.Occurrence`, and no producer is in scope at
+-- | an abstract type), so it can only move the annotations it was handed. Re-minting during
+-- | duplication — the failure that would silently inflate the site count by the match-expansion
+-- | factor — is a type error here, not a thing to remember.
+data DTree f c
   -- No alternative matched (or every guard fell through): a stuck program.
   = Dfail String
   -- A fully-matched row: bind its variables (`(var /\ occ)`), then run the body.
-  | Dleaf (Array (String /\ String)) Expr
+  | Dleaf (Array (String /\ String)) (ExprF f c)
   -- A fully-matched guarded row (ADR-0013): bind, then try each guard/body clause; if
   -- every guard is false, fall through to the subtree (the rows below).
-  | Dguard (Array (String /\ String)) (Array { guard :: Expr, rhs :: Expr }) DTree
+  | Dguard (Array (String /\ String)) (Array { guard :: ExprF f c, rhs :: ExprF f c }) (DTree f c)
   -- Switch on a constructor tag; each arm extracts the constructor's fields before its
   -- subtree, and the default keeps the wildcard rows.
-  | DswitchCtor String (Array (String /\ Arm)) DTree
+  | DswitchCtor String (Array (String /\ Arm f c)) (DTree f c)
   -- Switch on a scalar literal (Int/Bool/Number/String alike — ADR-0083).
-  | DswitchLit String (Array (Literal /\ DTree)) DTree
+  | DswitchLit String (Array (Literal /\ DTree f c)) (DTree f c)
   -- Switch on a `Varray`'s length (ADR-0012); each arm extracts the elements.
-  | DswitchLen String (Array (Int /\ Arm)) DTree
+  | DswitchLen String (Array (Int /\ Arm f c)) (DTree f c)
   -- A record pattern imposes no discriminant (ADR-0012): extract the union of named
   -- labels as sub-occurrences and continue — no switch.
-  | DexpandRecord String (Array (String /\ Proj)) DTree
+  | DexpandRecord String (Array (String /\ Proj)) (DTree f c)
 
 -- | A switch arm: the sub-occurrence extractions `(sub_occ /\ proj-of-parent)` to perform
 -- | on entry, then the subtree.
-type Arm = { extracts :: Array (String /\ Proj), sub :: DTree }
+type Arm f c = { extracts :: Array (String /\ Proj), sub :: DTree f c }
 
 -- | A scrutinee-occurrence binding to establish at the root: `(occ /\ atom)`.
 type ScrutBind = String /\ Atom
@@ -104,7 +118,7 @@ peel = case _ of
 
 -- | One clause of the pattern matrix: binders still to test (aligned to the current
 -- | occurrences), variable→occurrence bindings collected on the way down, and the rhs.
-type DtRow = { pats :: Array Binder, binds :: Array (String /\ String), rhs :: Rhs }
+type DtRow f c = { pats :: Array Binder, binds :: Array (String /\ String), rhs :: RhsF f c }
 
 bindsOf :: Array String -> String -> Array (String /\ String)
 bindsOf names occ = names <#> \n -> n /\ occ
@@ -139,10 +153,10 @@ freshOcc = do
 -- | scrutinee-occurrence bindings to establish at the root and the tree. The
 -- | fresh-occurrence order (scrutinees first, then per-head depth-first) is the
 -- | byte-identity contract (ADR-0083) and mirrors boot exactly.
-compile :: Array Atom -> Array Alt -> { scrutBinds :: Array ScrutBind, tree :: DTree }
+compile :: forall f c. Array Atom -> Array (AltF f c) -> { scrutBinds :: Array ScrutBind, tree :: DTree f c }
 compile scruts alts = evalState build 0
   where
-  build :: M { scrutBinds :: Array ScrutBind, tree :: DTree }
+  build :: M { scrutBinds :: Array ScrutBind, tree :: DTree f c }
   build = do
     scrutBinds <- for scruts \a -> do
       o <- freshOcc
@@ -151,7 +165,7 @@ compile scruts alts = evalState build 0
       (alts <#> \alt -> { pats: alt.binders, binds: [], rhs: alt.result })
     pure { scrutBinds, tree }
 
-  go :: Array String -> Array DtRow -> M DTree
+  go :: Array String -> Array (DtRow f c) -> M (DTree f c)
   go occs rows = case Array.uncons rows of
     Nothing -> pure (Dfail "case: no matching alternative")
     Just { head: row0 } ->
@@ -181,7 +195,7 @@ compile scruts alts = evalState build 0
               Cwild -> unsafeCrashWith "compile: refutable column is wild"
 
   -- switch on a constructor tag; each head specialises the matrix with its fields
-  goCtor :: Array String -> Array DtRow -> Int -> String -> M DTree
+  goCtor :: Array String -> Array (DtRow f c) -> Int -> String -> M (DTree f c)
   goCtor occs rows c occ_c = do
     let
       heads = Array.foldl
@@ -214,7 +228,7 @@ compile scruts alts = evalState build 0
     pure (DswitchCtor occ_c arms default)
 
   -- switch on a scalar literal; literal heads have no sub-columns
-  goLit :: Array String -> Array DtRow -> Int -> String -> M DTree
+  goLit :: Array String -> Array (DtRow f c) -> Int -> String -> M (DTree f c)
   goLit occs rows c occ_c = do
     let
       heads = Array.foldl
@@ -241,7 +255,7 @@ compile scruts alts = evalState build 0
     pure (DswitchLit occ_c arms default)
 
   -- switch on a `Varray`'s length (ADR-0012); each length head exposes its elements
-  goArr :: Array String -> Array DtRow -> Int -> String -> M DTree
+  goArr :: Array String -> Array (DtRow f c) -> Int -> String -> M (DTree f c)
   goArr occs rows c occ_c = do
     let
       heads = Array.foldl
@@ -274,7 +288,7 @@ compile scruts alts = evalState build 0
     pure (DswitchLen occ_c arms default)
 
   -- a record pattern imposes no discriminant; expand the union of named labels as columns
-  goRec :: Array String -> Array DtRow -> Int -> String -> M DTree
+  goRec :: Array String -> Array (DtRow f c) -> Int -> String -> M (DTree f c)
   goRec occs rows c occ_c = do
     let
       labels = Array.foldl
@@ -300,7 +314,7 @@ compile scruts alts = evalState build 0
     pure (DexpandRecord occ_c extracts sub)
 
   -- rows whose column `c` is a wildcard: keep them for the default edge, column removed
-  wildRows :: Array DtRow -> Int -> String -> Array DtRow
+  wildRows :: Array (DtRow f c) -> Int -> String -> Array (DtRow f c)
   wildRows rows c occ_c = Array.mapMaybe
     ( \row ->
         let

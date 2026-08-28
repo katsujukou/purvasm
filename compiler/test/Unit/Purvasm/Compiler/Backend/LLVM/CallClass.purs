@@ -34,7 +34,7 @@ import Purvasm.Compiler.Backend.LLVM.Monad (MakeCxOptions, foreignRef, makeCx, m
 import Purvasm.Compiler.Backend.LLVM.Program (entryLlWithEvents, gdefKeys, moduleLlWithEvents)
 import Purvasm.Compiler.Backend.LLVM.Types (BindOrigin(..), BindingV(..), CandidateKind(..), EnvSrc(..), FnInfo, Gdef(..), LocalFact(..), bindDirectVar, capturableFact)
 import Purvasm.Compiler.Literal (Literal(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..))
 import Purvasm.Compiler.Primitive (PrimOp(..))
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (fail, shouldEqual)
@@ -249,26 +249,26 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.CallClass" do
     let
       sibling = Gcaf "M.sibling" (Ret (CAtom (int 0)))
       matrix =
-        -- NOTE both of these are generic TAIL calls: a `Gfun`'s `Ret (CApp …)` is in tail position,
+        -- NOTE both of these are generic TAIL calls: a `Gfun`'s `Ret (CApp unit …)` is in tail position,
         -- whatever precedes it. `generic-apply` (the non-tail `pv_apply`) is exercised by the
         -- `Gcaf` shape below, whose body is not a tail context.
         [ Tuple "generic tail (unknown callee, called directly)"
-            (Gfun "M.f" [ "g", "x" ] (Ret (CApp (var "g") [ var "x" ])))
+            (Gfun "M.f" [ "g", "x" ] (Ret (CApp unit (var "g") [ var "x" ])))
         , Tuple "generic tail (unknown callee, after a let)"
-            (Gfun "M.f" [ "g", "x" ] (Let "r" (CPrim AddInt [ var "x", int 1 ]) (Ret (CApp (var "g") [ var "r" ]))))
+            (Gfun "M.f" [ "g", "x" ] (Let "r" (CPrim AddInt [ var "x", int 1 ]) (Ret (CApp unit (var "g") [ var "r" ]))))
         , Tuple "structural apply (unsaturated ctor with a supplied field)"
             (Gfun "M.f" [ "x" ] (Ret (CCtor "Pair" 2 [ var "x" ])))
         , Tuple "nullary unsaturated ctor (the builder alone — no apply)"
             (Gfun "M.f" [] (Ret (CCtor "Pair" 2 [])))
         , Tuple "a lambda and a call through it"
-            (Gfun "M.f" [ "x" ] (Let "k" (CLam [ "y" ] (Ret (CAtom (var "y")))) (Ret (CApp (var "k") [ var "x" ]))))
+            (Gfun "M.f" [ "x" ] (Let "k" (CLam unit [ "y" ] (Ret (CAtom (var "y")))) (Ret (CApp unit (var "k") [ var "x" ]))))
         , Tuple "generic apply (a caf body is not a tail context)"
-            (Gcaf "M.c" (Ret (CApp (var "M.sibling") [ int 1 ])))
+            (Gcaf "M.c" (Ret (CApp unit (var "M.sibling") [ int 1 ])))
         , Tuple "direct non-tail call to an own-object function"
             -- the call sits in a `Let` RHS, so it is NOT in tail position: `guestDirect` +
             -- `DirectNonTail`. Every other shape here reaches its direct target in tail position
             -- (a `musttail`), so without this one the `direct-nontail` column is never exercised.
-            (Gfun "M.f" [ "x" ] (Let "r" (CApp (var "M.callee") [ var "x" ]) (Ret (CPrim AddInt [ var "r", int 1 ]))))
+            (Gfun "M.f" [ "x" ] (Let "r" (CApp unit (var "M.callee") [ var "x" ]) (Ret (CPrim AddInt [ var "r", int 1 ]))))
         ]
     for_ matrix \(Tuple label gdef) ->
       it label do
@@ -280,14 +280,14 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.CallClass" do
     -- whose name says one column and whose emission takes another still passes the totals test.
     it "the caf shape really records GenericApply (a caf body is not a tail context)" do
       let
-        gdefs = [ Gcaf "M.sibling" (Ret (CAtom (int 0))), Gcaf "M.c" (Ret (CApp (var "M.sibling") [ int 1 ])) ]
+        gdefs = [ Gcaf "M.sibling" (Ret (CAtom (int 0))), Gcaf "M.c" (Ret (CApp unit (var "M.sibling") [ int 1 ])) ]
         classes = map callEventClass (eventsOf gdefs)
       Array.length (Array.filter (_ == CGenericApply) classes) `shouldEqual` 1
       Array.length (Array.filter (_ == CGenericTail) classes) `shouldEqual` 0
 
-    it "a Gfun's Ret (CApp …) really records GenericTail (it IS a tail context)" do
+    it "a Gfun's Ret (CApp unit …) really records GenericTail (it IS a tail context)" do
       let
-        gdefs = [ Gfun "M.f" [ "g", "x" ] (Ret (CApp (var "g") [ var "x" ])) ]
+        gdefs = [ Gfun "M.f" [ "g", "x" ] (Ret (CApp unit (var "g") [ var "x" ])) ]
         classes = map callEventClass (eventsOf gdefs)
       Array.length (Array.filter (_ == CGenericTail) classes) `shouldEqual` 1
       Array.length (Array.filter (_ == CGenericApply) classes) `shouldEqual` 0
@@ -296,7 +296,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.CallClass" do
       let
         gdefs =
           [ Gfun "M.callee" [ "y" ] (Ret (CAtom (var "y")))
-          , Gfun "M.f" [ "x" ] (Let "r" (CApp (var "M.callee") [ var "x" ]) (Ret (CPrim AddInt [ var "r", int 1 ])))
+          , Gfun "M.f" [ "x" ] (Let "r" (CApp unit (var "M.callee") [ var "x" ]) (Ret (CPrim AddInt [ var "r", int 1 ])))
           ]
         classes = map callEventClass (eventsOf gdefs)
       Array.length (Array.filter (_ == CDirectNonTail) classes) `shouldEqual` 1
@@ -350,7 +350,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.CallClass" do
           , foreignClosure: Hoisted
           }
         -- a call at the WRONG arity, so no direct fact matches and the leaf is an ownership question
-        entry = Ret (CApp (var callee) [ int 1, int 2 ])
+        entry = Ret (CApp unit (var callee) [ int 1, int 2 ])
         events = (entryLlWithEvents opts' true 1024 gdefs entry).events
         reasonOf = case _ of
           GenericApply r -> Just r
@@ -443,7 +443,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.CallClass" do
   describe "instrumentation is opt-in and inert when off" do
     it "emits no profile symbols in a normal build" do
       let
-        gdefs = [ Gfun "M.f" [ "g", "x" ] (Ret (CApp (var "g") [ var "x" ])) ]
+        gdefs = [ Gfun "M.f" [ "g", "x" ] (Ret (CApp unit (var "g") [ var "x" ])) ]
         keys = Set.fromFoldable (gdefs >>= gdefKeys)
         irOf profileApply =
           ( moduleLlWithEvents
@@ -467,8 +467,8 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.CallClass" do
         -- one generic apply (non-tail, `$r` forces the result), one generic tail, one structural
         -- apply (an unsaturated 2-ary constructor applied to one field).
         gdefs =
-          [ Gfun "M.ap" [ "g", "x" ] (Let "$r" (CApp (var "g") [ var "x" ]) (Ret (CAtom (var "$r"))))
-          , Gfun "M.tl" [ "g", "x" ] (Ret (CApp (var "g") [ var "x" ]))
+          [ Gfun "M.ap" [ "g", "x" ] (Let "$r" (CApp unit (var "g") [ var "x" ]) (Ret (CAtom (var "$r"))))
+          , Gfun "M.tl" [ "g", "x" ] (Ret (CApp unit (var "g") [ var "x" ]))
           , Gfun "M.st" [ "x" ] (Ret (CCtor "M.Pair" 2 [ var "x" ]))
           ]
         keys = Set.fromFoldable (gdefs >>= gdefKeys)
@@ -515,11 +515,11 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.CallClass" do
     it "drills a foreign callee by symbol, form and arity status — and nothing else" do
       let
         gdefs =
-          [ Gfun "M.ap" [ "x" ] (Let "$r" (CApp (AtomForeign "M.leaf") [ var "x" ]) (Ret (CAtom (var "$r"))))
-          , Gfun "M.tl" [ "x" ] (Ret (CApp (AtomForeign "M.leaf") [ var "x" ]))
-          , Gfun "M.part" [ "x" ] (Ret (CApp (AtomForeign "M.two") [ var "x" ]))
+          [ Gfun "M.ap" [ "x" ] (Let "$r" (CApp unit (AtomForeign "M.leaf") [ var "x" ]) (Ret (CAtom (var "$r"))))
+          , Gfun "M.tl" [ "x" ] (Ret (CApp unit (AtomForeign "M.leaf") [ var "x" ]))
+          , Gfun "M.part" [ "x" ] (Ret (CApp unit (AtomForeign "M.two") [ var "x" ]))
           -- a NON-foreign generic dispatch: drilled classes are opt-in, so this must add no key
-          , Gfun "M.other" [ "g", "x" ] (Ret (CApp (var "g") [ var "x" ]))
+          , Gfun "M.other" [ "g", "x" ] (Ret (CApp unit (var "g") [ var "x" ]))
           ]
         keys = Set.fromFoldable (gdefs >>= gdefKeys)
         ir =
@@ -550,7 +550,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.CallClass" do
 
     it "emits no drill at all when instrumentation is off" do
       let
-        gdefs = [ Gfun "M.f" [ "x" ] (Ret (CApp (AtomForeign "M.leaf") [ var "x" ])) ]
+        gdefs = [ Gfun "M.f" [ "x" ] (Ret (CApp unit (AtomForeign "M.leaf") [ var "x" ])) ]
         keys = Set.fromFoldable (gdefs >>= gdefKeys)
         irOf profileApply =
           ( moduleLlWithEvents
@@ -570,12 +570,12 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.CallClass" do
       String.contains (Pattern "pv_applyprofile_key") (irOf false) `shouldEqual` false
       -- and the key text itself must not leak into a shipped object as a dead string constant
       String.contains (Pattern "M.leaf|") (irOf false) `shouldEqual` false
-      -- `Ret (CApp …)` is a TAIL dispatch, so this is the tail key — the form axis is real
+      -- `Ret (CApp unit …)` is a TAIL dispatch, so this is the tail key — the form axis is real
       String.contains (Pattern "M.leaf|tail|known-match") (irOf true) `shouldEqual` true
 
     it "records the same events either way (instrumentation observes, it does not classify)" do
       let
-        gdefs = [ Gfun "M.f" [ "g", "x" ] (Ret (CApp (var "g") [ var "x" ])) ]
+        gdefs = [ Gfun "M.f" [ "g", "x" ] (Ret (CApp unit (var "g") [ var "x" ])) ]
         keys = Set.fromFoldable (gdefs >>= gdefKeys)
         eventsWith profileApply =
           map callEventClass
@@ -610,10 +610,10 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.CallClass" do
       -- draft of this fixture claimed it was the `tail && not inDirect` case and the counts said
       -- otherwise. That state is unreachable in emission and is pinned on `callForm` instead.
       leafGdefs =
-        [ Gfun "M.ap" [ "x" ] (Let "$r" (CApp (AtomForeign "M.leaf") [ var "x" ]) (Ret (CAtom (var "$r"))))
-        , Gfun "M.tl" [ "x" ] (Ret (CApp (AtomForeign "M.leaf") [ var "x" ]))
-        , Gfun "M.part" [ "x" ] (Ret (CApp (AtomForeign "M.two") [ var "x" ]))
-        , Gcaf "M.caf" (Ret (CApp (AtomForeign "M.leaf") [ int 7 ]))
+        [ Gfun "M.ap" [ "x" ] (Let "$r" (CApp unit (AtomForeign "M.leaf") [ var "x" ]) (Ret (CAtom (var "$r"))))
+        , Gfun "M.tl" [ "x" ] (Ret (CApp unit (AtomForeign "M.leaf") [ var "x" ]))
+        , Gfun "M.part" [ "x" ] (Ret (CApp unit (AtomForeign "M.two") [ var "x" ]))
+        , Gcaf "M.caf" (Ret (CApp unit (AtomForeign "M.leaf") [ int 7 ]))
         ]
       outOf mode =
         let

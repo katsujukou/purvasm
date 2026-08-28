@@ -37,7 +37,7 @@ import Data.Tuple.Nested (type (/\))
 import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.Compiler.Ffi (resolver)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Impurify (structuralExclusions)
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..), Rhs, RhsF(..))
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (cfExpr, fvExpr)
 import Purvasm.Compiler.MiddleEnd.Normalize (normalize)
 import Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis (EffectGlobals)
@@ -96,8 +96,8 @@ nbeBinding nbe effects key e0 = preserveOuterShape e0 (loop rewriteFuel Set.empt
 -- | pass uncurries), so only this one transition needs the guard.
 preserveOuterShape :: Expr -> Expr -> Expr
 preserveOuterShape input output = case input, output of
-  Ret (CLam _ _), _ -> output
-  _, Ret lam@(CLam _ _) -> Let "$q0" lam (Ret (CAtom (AtomVar "$q0")))
+  Ret (CLam _ _ _), _ -> output
+  _, Ret lam@(CLam _ _ _) -> Let "$q0" lam (Ret (CAtom (AtomVar "$q0")))
   _, _ -> output
 
 -- | The spine-independent, conservative **publish predicate** (ADR-0089 §8 slice 2): which of a
@@ -105,11 +105,11 @@ preserveOuterShape input output = case input, output of
 -- | own siblings). Deliberately a size-bounded superset — the consumer's gate site (A) makes the
 -- | final, spine-dependent call. Published shapes:
 -- |
--- |   * a lambda body `Ret (CLam …)` (arity = parameter count);
+-- |   * a lambda body `Ret (CLam unit …)` (arity = parameter count);
 -- |   * the slice-1 binding-surface wrap `let $q0 = \… in $q0` (the inner lambda — constructing a
 -- |     closure is pure, so inlining it never re-executes the CAF's init);
 -- |   * a value body (alias / data CAF — `arity: Nothing`, forced on demand);
--- |   * a **strictly under-applied** pure partial application `Ret (CApp t args)` where `t`'s
+-- |   * a **strictly under-applied** pure partial application `Ret (CApp unit t args)` where `t`'s
 -- |     arity is known (a dependency candidate, an intrinsic, or a local syntactic lambda) and
 -- |     `length args < arity` — the residual arity is published. A **saturated** (or
 -- |     unknown-arity) CAF application is a computation executed once at init and is **never**
@@ -140,7 +140,7 @@ candidatesOf intrinsic deps decls =
     else Array.filter (\(Tuple k _) -> not (isSpecKey k)) d.members
 
   -- ADR-0093 §4's other half: a *wrapper* body that references a clone (the rewritten call
-  -- site, `CApp M.$spec$… args` / `CAtom M.$spec$…`) must not travel either — inlined into a
+  -- site, `CApp _ M.$spec$… args` / `CAtom M.$spec$…`) must not travel either — inlined into a
   -- dependent it would carry the module-private clone reference across the module boundary.
   noSpecRefs body =
     Set.isEmpty (Set.filter isSpecKey (Set.union (fvExpr Set.empty body) (cfExpr body)))
@@ -159,7 +159,7 @@ candidatesOf intrinsic deps decls =
             group = Set.fromFoldable (map (\(Tuple k _) -> k) d.members)
           in
             d.members # Array.mapMaybe \(Tuple k e) -> case e of
-              Ret (CLam ps body)
+              Ret (CLam unit ps body)
                 | recordTail body, sizeExpr e < publishBound, noSpecRefs e -> Just $ Tuple k
                     { arity: Just (Array.length ps)
                     , size: sizeExpr e
@@ -231,7 +231,7 @@ candidatesOf intrinsic deps decls =
   localArity = Map.fromFoldable
     ( Array.mapMaybe
         ( \(Tuple k e) -> case e of
-            Ret (CLam ps _) -> Just (Tuple k (Array.length ps))
+            Ret (CLam unit ps _) -> Just (Tuple k (Array.length ps))
             _ -> Nothing
         )
         nonrecMembers
@@ -259,7 +259,7 @@ candidatesOf intrinsic deps decls =
       _ -> Nothing
 
     tailShape chain c = case c of
-      CLam ps body -> Just
+      CLam _ ps body -> Just
         { arity: Just (Array.length ps)
         , size: sizeExpr e0
         , cxLeqDeref: false
@@ -275,7 +275,7 @@ candidatesOf intrinsic deps decls =
       -- publishable as a value candidate — the ADR-pinned exception to the saturated-CAF-app
       -- rule (dictionary construction is pure, so a consumer re-materialising it re-executes
       -- nothing observable). Only the whole-body spelling (empty chain) is published.
-      CApp h args
+      CApp _ h args
         | Map.isEmpty chain
         , AtomVar t <- h
         , Just g <- groupOfHead t
@@ -288,7 +288,7 @@ candidatesOf intrinsic deps decls =
             , group: g.group
             , body: e0
             }
-      CApp h args
+      CApp _ h args
         | Just residual <- partialResidual h args -> Just
             { arity: Just residual, size: sizeExpr e0, cxLeqDeref: false, closed: false, argUses: [], group: Set.empty, body: e0 }
       _ | valueBody c -> Just
@@ -354,8 +354,8 @@ argUsesOf ps body = ps <#> \p -> goE p { total: 0, projected: 0, appliedHead: 0 
 
   goC p u = case _ of
     CAtom a -> hit p u a
-    CLam _ b -> goE p u b
-    CApp h as -> hits p (hd p u h) as
+    CLam _ _ b -> goE p u b
+    CApp _ h as -> hits p (hd p u h) as
     CPrim _ as -> hits p u as
     CCtor _ _ as -> hits p u as
     CArray as -> hits p u as
@@ -364,7 +364,7 @@ argUsesOf ps body = ps <#> \p -> goE p { total: 0, projected: 0, appliedHead: 0 
     CUpdate a us -> hits p (hit p u a) (map _.val us)
     CIf a t e -> goE p (goE p (hit p u a) t) e
     CCase ss alts -> Array.foldl (goAlt p) (Array.foldl (proj p) u ss) alts
-    CPerform a -> hd p u a
+    CPerform _ a -> hd p u a
 
   goAlt p u alt = case alt.result of
     Uncond e -> goE p u e
@@ -375,7 +375,7 @@ argUsesOf ps body = ps <#> \p -> goE p { total: 0, projected: 0, appliedHead: 0 
 pureValueRhs :: CExpr -> Boolean
 pureValueRhs = case _ of
   CAtom _ -> true
-  CLam _ _ -> true
+  CLam _ _ _ -> true
   CCtor _ _ _ -> true
   CArray _ -> true
   CRecord _ -> true
@@ -438,7 +438,7 @@ nbeEnvOf intrinsic deps decls =
         body = normalize term
       in
         case body of
-          Ret (CLam ps b) ->
+          Ret (CLam unit ps b) ->
             { arity: Just (Array.length ps)
             , size: sizeExpr body
             , cxLeqDeref: false
@@ -485,7 +485,7 @@ entryFromCandidate env c =
     else env { nbe = env.nbe { externs = Map.filterKeys (\k -> not (Set.member k c.group)) env.nbe.externs } }
 
   aliasRef = case c.body of
-    Ret (CApp h@(AtomVar t) args)
+    Ret (CApp unit h@(AtomVar t) args)
       | not (Set.isEmpty c.group), isNothing c.arity ->
           case Map.lookup t env.nbe.externs of
             Just hEntry | not (Set.isEmpty hEntry.group) -> Just
@@ -515,14 +515,14 @@ deferMarks nbe = goE Set.empty
   where
   goE acc = case _ of
     Ret c -> goC acc c
-    Let x (CApp h args) rest
+    Let x (CApp unit h args) rest
       | groupedSaturated h args
       , singleProjectionUse x rest -> goE (Set.insert x acc) rest
     Let _ c rest -> goE (goC acc c) rest
     LetRec bs rest -> goE (Array.foldl (\a b -> goE a b.rhs) acc bs) rest
 
   goC acc = case _ of
-    CLam _ b -> goE acc b
+    CLam _ _ b -> goE acc b
     CIf _ t e -> goE (goE acc t) e
     CCase _ alts -> Array.foldl goAlt acc alts
     _ -> acc
@@ -563,8 +563,8 @@ deferMarks nbe = goE Set.empty
 
       goUC deep u = case _ of
         CAtom a -> add u a
-        CLam _ b -> goUE true u b
-        CApp h as -> adds (add u h) as
+        CLam _ _ b -> goUE true u b
+        CApp _ h as -> adds (add u h) as
         CPrim _ as -> adds u as
         CCtor _ _ as -> adds u as
         CArray as -> adds u as
@@ -578,7 +578,7 @@ deferMarks nbe = goE Set.empty
         CUpdate a us -> adds (add u a) (map _.val us)
         CIf a t e -> goUE true (goUE true (add u a) t) e
         CCase ss alts -> Array.foldl (goUAlt) (adds u ss) alts
-        CPerform a -> add u a
+        CPerform _ a -> add u a
 
       goUAlt u alt = case alt.result of
         Uncond e -> goUE true u e

@@ -10,7 +10,7 @@ import Data.Map as Map
 import Data.Set as Set
 import Data.Tuple (Tuple(..))
 import Purvasm.Compiler.Literal (Literal(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..))
 import Purvasm.Compiler.MiddleEnd.Module (Decl)
 import Purvasm.Compiler.MiddleEnd.Optimizer.DictElim (DictMachinery, emptyMachinery)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Impurify (effectFamilyOf, impurifyExpr, structuralExclusions)
@@ -66,25 +66,25 @@ spec :: Spec Unit
 spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Impurify" do
   describe "canonical Effect glue (bare GER foreign, ADR-0099 §5)" do
     it "pureE a → \\$u -> a" do
-      imp (Ret (CApp (foreign_ "Effect.pureE") [ var "a" ]))
-        `shouldEqual` Ret (CLam [ "$ge1" ] (Ret (CAtom (var "a"))))
+      imp (Ret (CApp unit (foreign_ "Effect.pureE") [ var "a" ]))
+        `shouldEqual` Ret (CLam unit [ "$ge1" ] (Ret (CAtom (var "a"))))
 
     it "bindE m k → \\$u -> let x = perform m in let kx = k x in perform kx" do
-      imp (Ret (CApp (foreign_ "Effect.bindE") [ var "m", var "k" ]))
+      imp (Ret (CApp unit (foreign_ "Effect.bindE") [ var "m", var "k" ]))
         `shouldEqual`
           Ret
-            ( CLam [ "$ge1" ]
-                ( Let "$ge2" (CPerform (var "m"))
-                    ( Let "$ge3" (CApp (var "k") [ var "$ge2" ])
-                        (Ret (CPerform (var "$ge3")))
+            ( CLam unit [ "$ge1" ]
+                ( Let "$ge2" (CPerform unit (var "m"))
+                    ( Let "$ge3" (CApp unit (var "k") [ var "$ge2" ])
+                        (Ret (CPerform unit (var "$ge3")))
                     )
                 )
             )
 
     it "unsafePerformEffect e → perform e (the eliminator runs the thunk, no \\$u)" do
       -- recognised on the plain qualified `AtomVar` spelling (the ulib use site), no machinery needed.
-      imp (Ret (CApp (var "Effect.Unsafe.unsafePerformEffect") [ var "e" ]))
-        `shouldEqual` Ret (CPerform (var "e"))
+      imp (Ret (CApp unit (var "Effect.Unsafe.unsafePerformEffect") [ var "e" ]))
+        `shouldEqual` Ret (CPerform unit (var "e"))
 
   describe "dispatch recognition via DictMachinery (ADR-0099 §6, the main path)" do
     it "bind bindEffect m k → canonical bindE lowering (impl resolved through the machinery)" do
@@ -94,13 +94,13 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Impurify" do
           { accessors = Map.singleton "Control.Bind.bind" "bind"
           , instances = Map.singleton "Effect.bindEffect" (Map.singleton "bind" (foreign_ "Effect.bindE"))
           }
-      impurifyExpr machinery (Ret (CApp (var "Control.Bind.bind") [ var "Effect.bindEffect", var "m", var "k" ]))
+      impurifyExpr machinery (Ret (CApp unit (var "Control.Bind.bind") [ var "Effect.bindEffect", var "m", var "k" ]))
         `shouldEqual`
           Ret
-            ( CLam [ "$ge1" ]
-                ( Let "$ge2" (CPerform (var "m"))
-                    ( Let "$ge3" (CApp (var "k") [ var "$ge2" ])
-                        (Ret (CPerform (var "$ge3")))
+            ( CLam unit [ "$ge1" ]
+                ( Let "$ge2" (CPerform unit (var "m"))
+                    ( Let "$ge3" (CApp unit (var "k") [ var "$ge2" ])
+                        (Ret (CPerform unit (var "$ge3")))
                     )
                 )
             )
@@ -108,15 +108,15 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Impurify" do
   describe "saturation handling" do
     it "η-expands an under-applied bindE (never declines to a bare foreign)" do
       -- bindE m (1 of 2) → \k -> <bindE m k lowering>
-      imp (Ret (CApp (foreign_ "Effect.bindE") [ var "m" ]))
+      imp (Ret (CApp unit (foreign_ "Effect.bindE") [ var "m" ]))
         `shouldEqual`
           Ret
-            ( CLam [ "$ge1" ]
+            ( CLam unit [ "$ge1" ]
                 ( Ret
-                    ( CLam [ "$ge2" ]
-                        ( Let "$ge3" (CPerform (var "m"))
-                            ( Let "$ge4" (CApp (var "$ge1") [ var "$ge3" ])
-                                (Ret (CPerform (var "$ge4")))
+                    ( CLam unit [ "$ge2" ]
+                        ( Let "$ge3" (CPerform unit (var "m"))
+                            ( Let "$ge4" (CApp unit (var "$ge1") [ var "$ge3" ])
+                                (Ret (CPerform unit (var "$ge4")))
                             )
                         )
                     )
@@ -125,45 +125,45 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Impurify" do
 
     it "splices a let for an over-applied pureE (thunk then surplus application)" do
       -- pureE a u (2 of 1) → let $ge2 = (\$ge1 -> a) in $ge2 u
-      imp (Ret (CApp (foreign_ "Effect.pureE") [ var "a", var "u" ]))
+      imp (Ret (CApp unit (foreign_ "Effect.pureE") [ var "a", var "u" ]))
         `shouldEqual`
-          Let "$ge2" (CLam [ "$ge1" ] (Ret (CAtom (var "a"))))
-            (Ret (CApp (var "$ge2") [ var "u" ]))
+          Let "$ge2" (CLam unit [ "$ge1" ] (Ret (CAtom (var "a"))))
+            (Ret (CApp unit (var "$ge2") [ var "u" ]))
 
   describe "bare GER key in value position (ADR-0099 §5, P1 — never left as a residual foreign)" do
     it "a bare CAtom GER key η-expands to a closed thunk-builder" do
       -- Ret (CAtom Effect.pureE) → \a -> \$u -> a
       imp (Ret (CAtom (foreign_ "Effect.pureE")))
         `shouldEqual`
-          Ret (CLam [ "$ge1" ] (Ret (CLam [ "$ge2" ] (Ret (CAtom (var "$ge1"))))))
+          Ret (CLam unit [ "$ge1" ] (Ret (CLam unit [ "$ge2" ] (Ret (CAtom (var "$ge1"))))))
 
     it "a GER key stored in a record field is let-hoisted (η-expanded)" do
       imp (Ret (CRecord [ { prop: "m", val: foreign_ "Effect.pureE" } ]))
         `shouldEqual`
-          Let "$ge3" (CLam [ "$ge1" ] (Ret (CLam [ "$ge2" ] (Ret (CAtom (var "$ge1"))))))
+          Let "$ge3" (CLam unit [ "$ge1" ] (Ret (CLam unit [ "$ge2" ] (Ret (CAtom (var "$ge1"))))))
             (Ret (CRecord [ { prop: "m", val: var "$ge3" } ]))
 
     it "a GER key passed as a call argument is let-hoisted (η-expanded)" do
-      imp (Ret (CApp (var "g") [ foreign_ "Effect.pureE" ]))
+      imp (Ret (CApp unit (var "g") [ foreign_ "Effect.pureE" ]))
         `shouldEqual`
-          Let "$ge3" (CLam [ "$ge1" ] (Ret (CLam [ "$ge2" ] (Ret (CAtom (var "$ge1"))))))
-            (Ret (CApp (var "g") [ var "$ge3" ]))
+          Let "$ge3" (CLam unit [ "$ge1" ] (Ret (CLam unit [ "$ge2" ] (Ret (CAtom (var "$ge1"))))))
+            (Ret (CApp unit (var "g") [ var "$ge3" ]))
 
   describe "fresh-name hygiene (ADR-0099, P1 — no capture of existing $ge binders)" do
     it "does not capture an existing $ge binder when lowering (fresh seeds above maxGe)" do
       -- \$ge1 -> Effect.pureE $ge1 : the unit binder must NOT reuse $ge1 (which would capture the
       -- outer argument, turning `\_ -> $ge1` into identity). It seeds at $ge2.
-      imp (Ret (CLam [ "$ge1" ] (Ret (CApp (foreign_ "Effect.pureE") [ var "$ge1" ]))))
+      imp (Ret (CLam unit [ "$ge1" ] (Ret (CApp unit (foreign_ "Effect.pureE") [ var "$ge1" ]))))
         `shouldEqual`
-          Ret (CLam [ "$ge1" ] (Ret (CLam [ "$ge2" ] (Ret (CAtom (var "$ge1"))))))
+          Ret (CLam unit [ "$ge1" ] (Ret (CLam unit [ "$ge2" ] (Ret (CAtom (var "$ge1"))))))
 
   describe "idempotency" do
     it "a lowered CPerform tree is stable under re-impurification" do
-      let once = imp (Ret (CApp (foreign_ "Effect.bindE") [ var "m", var "k" ]))
+      let once = imp (Ret (CApp unit (foreign_ "Effect.bindE") [ var "m", var "k" ]))
       imp once `shouldEqual` once
 
     it "leaves a non-GER call untouched" do
-      let e = Ret (CApp (var "SomeModule.f") [ var "x", var "y" ])
+      let e = Ret (CApp unit (var "SomeModule.f") [ var "x", var "y" ])
       imp e `shouldEqual` e
 
   describe "Effect-family validator (ADR-0099 Slice 3, sidenote 0014, fail-closed)" do
@@ -205,24 +205,24 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Impurify" do
   describe "map/apply rewrite gated on effectFamily (ADR-0099 §5(a))" do
     it "map functorEffect f m → \\$u -> let a = perform m in f a" do
       impurifyExpr (machineryWith effectInstances (Set.singleton "Effect.functorEffect"))
-        (Ret (CApp (var "Data.Functor.map") [ var "Effect.functorEffect", var "f", var "m" ]))
+        (Ret (CApp unit (var "Data.Functor.map") [ var "Effect.functorEffect", var "f", var "m" ]))
         `shouldEqual`
-          Ret (CLam [ "$ge1" ] (Let "$ge2" (CPerform (var "m")) (Ret (CApp (var "f") [ var "$ge2" ]))))
+          Ret (CLam unit [ "$ge1" ] (Let "$ge2" (CPerform unit (var "m")) (Ret (CApp unit (var "f") [ var "$ge2" ]))))
 
     it "apply applyEffect mf ma → \\$u -> let f = perform mf in let a = perform ma in f a" do
       impurifyExpr (machineryWith effectInstances (Set.singleton "Effect.applyEffect"))
-        (Ret (CApp (var "Control.Apply.apply") [ var "Effect.applyEffect", var "mf", var "ma" ]))
+        (Ret (CApp unit (var "Control.Apply.apply") [ var "Effect.applyEffect", var "mf", var "ma" ]))
         `shouldEqual`
           Ret
-            ( CLam [ "$ge1" ]
-                ( Let "$ge2" (CPerform (var "mf"))
-                    (Let "$ge3" (CPerform (var "ma")) (Ret (CApp (var "$ge2") [ var "$ge3" ])))
+            ( CLam unit [ "$ge1" ]
+                ( Let "$ge2" (CPerform unit (var "mf"))
+                    (Let "$ge3" (CPerform unit (var "ma")) (Ret (CApp unit (var "$ge2") [ var "$ge3" ])))
                 )
             )
 
     it "leaves map on a NON-Effect-family dict alone (the fail-closed gate)" do
       -- same map dispatch, but the dict is not in effectFamily → not rewritten.
-      let e = Ret (CApp (var "Data.Functor.map") [ var "Some.otherFunctor", var "f", var "m" ])
+      let e = Ret (CApp unit (var "Data.Functor.map") [ var "Some.otherFunctor", var "f", var "m" ])
       impurifyExpr (machineryWith effectInstances Set.empty) e `shouldEqual` e
 
     it "rewrites a map field *projected* off an Effect-family dict (NbE's runtime `gf` form)" do
@@ -232,8 +232,8 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Impurify" do
         (Ret (CAccessor (var "Effect.functorEffect") "map"))
         `shouldEqual`
           Ret
-            ( CLam [ "$ge1", "$ge2" ]
-                (Ret (CLam [ "$ge3" ] (Let "$ge4" (CPerform (var "$ge2")) (Ret (CApp (var "$ge1") [ var "$ge4" ])))))
+            ( CLam unit [ "$ge1", "$ge2" ]
+                (Ret (CLam unit [ "$ge3" ] (Let "$ge4" (CPerform unit (var "$ge2")) (Ret (CApp unit (var "$ge1") [ var "$ge4" ])))))
             )
 
     it "leaves a map projection off a NON-Effect-family dict alone" do
@@ -245,11 +245,11 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Impurify" do
         (Ret (CAccessor (var "Effect.applyEffect") "apply"))
         `shouldEqual`
           Ret
-            ( CLam [ "$ge1", "$ge2" ]
+            ( CLam unit [ "$ge1", "$ge2" ]
                 ( Ret
-                    ( CLam [ "$ge3" ]
-                        ( Let "$ge4" (CPerform (var "$ge1"))
-                            (Let "$ge5" (CPerform (var "$ge2")) (Ret (CApp (var "$ge4") [ var "$ge5" ])))
+                    ( CLam unit [ "$ge3" ]
+                        ( Let "$ge4" (CPerform unit (var "$ge1"))
+                            (Let "$ge5" (CPerform unit (var "$ge2")) (Ret (CApp unit (var "$ge4") [ var "$ge5" ])))
                         )
                     )
                 )
@@ -257,40 +257,40 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Impurify" do
 
   describe "structural loop combinators → LetRec/CIf ANF (ADR-0099 §5, Slice 4)" do
     it "untilE f → \\$u -> letrec go _ = if perform f then unit else go unit in go unit" do
-      imp (Ret (CApp (foreign_ "Effect.untilE") [ var "f" ]))
+      imp (Ret (CApp unit (foreign_ "Effect.untilE") [ var "f" ]))
         `shouldEqual`
           Ret
-            ( CLam [ "$ge1" ]
+            ( CLam unit [ "$ge1" ]
                 ( LetRec
                     [ { var: "$ge2"
                       , rhs: Ret
-                          ( CLam [ "$ge3" ]
-                              ( Let "$ge4" (CPerform (var "f"))
-                                  (Ret (CIf (var "$ge4") (Ret (CAtom u0)) (Ret (CApp (var "$ge2") [ u0 ]))))
+                          ( CLam unit [ "$ge3" ]
+                              ( Let "$ge4" (CPerform unit (var "f"))
+                                  (Ret (CIf (var "$ge4") (Ret (CAtom u0)) (Ret (CApp unit (var "$ge2") [ u0 ]))))
                               )
                           )
                       }
                     ]
-                    (Ret (CApp (var "$ge2") [ u0 ]))
+                    (Ret (CApp unit (var "$ge2") [ u0 ]))
                 )
             )
 
     it "forE lo hi f → the counted LetRec loop with perform (f i) and go (i+1)" do
-      imp (Ret (CApp (foreign_ "Effect.forE") [ var "lo", var "hi", var "f" ]))
+      imp (Ret (CApp unit (foreign_ "Effect.forE") [ var "lo", var "hi", var "f" ]))
         `shouldEqual`
           Ret
-            ( CLam [ "$ge1" ]
+            ( CLam unit [ "$ge1" ]
                 ( LetRec
                     [ { var: "$ge2"
                       , rhs: Ret
-                          ( CLam [ "$ge3" ]
+                          ( CLam unit [ "$ge3" ]
                               ( Let "$ge4" (CPrim LtInt [ var "$ge3", var "hi" ])
                                   ( Ret
                                       ( CIf (var "$ge4")
-                                          ( Let "$ge5" (CApp (var "f") [ var "$ge3" ])
-                                              ( Let "$ge6" (CPerform (var "$ge5"))
+                                          ( Let "$ge5" (CApp unit (var "f") [ var "$ge3" ])
+                                              ( Let "$ge6" (CPerform unit (var "$ge5"))
                                                   ( Let "$ge7" (CPrim AddInt [ var "$ge3", AtomLit (LInt 1) ])
-                                                      (Ret (CApp (var "$ge2") [ var "$ge7" ]))
+                                                      (Ret (CApp unit (var "$ge2") [ var "$ge7" ]))
                                                   )
                                               )
                                           )
@@ -301,23 +301,23 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Impurify" do
                           )
                       }
                     ]
-                    (Ret (CApp (var "$ge2") [ var "lo" ]))
+                    (Ret (CApp unit (var "$ge2") [ var "lo" ]))
                 )
             )
 
     it "whileE cond body → perform cond, then perform body + recurse only on the true branch" do
-      imp (Ret (CApp (foreign_ "Effect.whileE") [ var "c", var "b" ]))
+      imp (Ret (CApp unit (foreign_ "Effect.whileE") [ var "c", var "b" ]))
         `shouldEqual`
           Ret
-            ( CLam [ "$ge1" ]
+            ( CLam unit [ "$ge1" ]
                 ( LetRec
                     [ { var: "$ge2"
                       , rhs: Ret
-                          ( CLam [ "$ge3" ]
-                              ( Let "$ge4" (CPerform (var "c"))
+                          ( CLam unit [ "$ge3" ]
+                              ( Let "$ge4" (CPerform unit (var "c"))
                                   ( Ret
                                       ( CIf (var "$ge4")
-                                          (Let "$ge5" (CPerform (var "b")) (Ret (CApp (var "$ge2") [ u0 ])))
+                                          (Let "$ge5" (CPerform unit (var "b")) (Ret (CApp unit (var "$ge2") [ u0 ])))
                                           (Ret (CAtom u0))
                                       )
                                   )
@@ -325,28 +325,28 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Impurify" do
                           )
                       }
                     ]
-                    (Ret (CApp (var "$ge2") [ u0 ]))
+                    (Ret (CApp unit (var "$ge2") [ u0 ]))
                 )
             )
 
     it "foreachE as f → length outside the loop, index + perform (f el) + i+1 on the true branch" do
-      imp (Ret (CApp (foreign_ "Effect.foreachE") [ var "as", var "f" ]))
+      imp (Ret (CApp unit (foreign_ "Effect.foreachE") [ var "as", var "f" ]))
         `shouldEqual`
           Ret
-            ( CLam [ "$ge1" ]
+            ( CLam unit [ "$ge1" ]
                 ( Let "$ge2" (CPrim LengthArray [ var "as" ])
                     ( LetRec
                         [ { var: "$ge3"
                           , rhs: Ret
-                              ( CLam [ "$ge4" ]
+                              ( CLam unit [ "$ge4" ]
                                   ( Let "$ge5" (CPrim LtInt [ var "$ge4", var "$ge2" ])
                                       ( Ret
                                           ( CIf (var "$ge5")
                                               ( Let "$ge6" (CPrim IndexArray [ var "as", var "$ge4" ])
-                                                  ( Let "$ge7" (CApp (var "f") [ var "$ge6" ])
-                                                      ( Let "$ge8" (CPerform (var "$ge7"))
+                                                  ( Let "$ge7" (CApp unit (var "f") [ var "$ge6" ])
+                                                      ( Let "$ge8" (CPerform unit (var "$ge7"))
                                                           ( Let "$ge9" (CPrim AddInt [ var "$ge4", AtomLit (LInt 1) ])
-                                                              (Ret (CApp (var "$ge3") [ var "$ge9" ]))
+                                                              (Ret (CApp unit (var "$ge3") [ var "$ge9" ]))
                                                           )
                                                       )
                                                   )
@@ -358,21 +358,21 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Impurify" do
                               )
                           }
                         ]
-                        (Ret (CApp (var "$ge3") [ AtomLit (LInt 0) ]))
+                        (Ret (CApp unit (var "$ge3") [ AtomLit (LInt 0) ]))
                     )
                 )
             )
 
     it "the ST loop twins use the same lowering as their Effect versions" do
-      imp (Ret (CApp (foreign_ "Control.Monad.ST.Internal.for") [ var "lo", var "hi", var "f" ]))
-        `shouldEqual` imp (Ret (CApp (foreign_ "Effect.forE") [ var "lo", var "hi", var "f" ]))
-      imp (Ret (CApp (foreign_ "Control.Monad.ST.Internal.while") [ var "c", var "b" ]))
-        `shouldEqual` imp (Ret (CApp (foreign_ "Effect.whileE") [ var "c", var "b" ]))
-      imp (Ret (CApp (foreign_ "Control.Monad.ST.Internal.foreach") [ var "as", var "f" ]))
-        `shouldEqual` imp (Ret (CApp (foreign_ "Effect.foreachE") [ var "as", var "f" ]))
+      imp (Ret (CApp unit (foreign_ "Control.Monad.ST.Internal.for") [ var "lo", var "hi", var "f" ]))
+        `shouldEqual` imp (Ret (CApp unit (foreign_ "Effect.forE") [ var "lo", var "hi", var "f" ]))
+      imp (Ret (CApp unit (foreign_ "Control.Monad.ST.Internal.while") [ var "c", var "b" ]))
+        `shouldEqual` imp (Ret (CApp unit (foreign_ "Effect.whileE") [ var "c", var "b" ]))
+      imp (Ret (CApp unit (foreign_ "Control.Monad.ST.Internal.foreach") [ var "as", var "f" ]))
+        `shouldEqual` imp (Ret (CApp unit (foreign_ "Effect.foreachE") [ var "as", var "f" ]))
 
     it "is idempotent: a lowered loop re-impurifies unchanged" do
-      let once = imp (Ret (CApp (foreign_ "Effect.whileE") [ var "c", var "b" ]))
+      let once = imp (Ret (CApp unit (foreign_ "Effect.whileE") [ var "c", var "b" ]))
       imp once `shouldEqual` once
 
     it "all seven loop-combinator keys leave the NbE structural rung (structuralExclusions)" do
@@ -390,46 +390,46 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Impurify" do
 
   describe "ST glue / eliminator / reference combinators → ordinary ANF (ADR-0099 §9, Slice 5)" do
     it "pure_ / bind_ share the Effect pureE / bindE lowering (same unit-thunk model)" do
-      imp (Ret (CApp (foreign_ "Control.Monad.ST.Internal.pure_") [ var "a" ]))
-        `shouldEqual` imp (Ret (CApp (foreign_ "Effect.pureE") [ var "a" ]))
-      imp (Ret (CApp (foreign_ "Control.Monad.ST.Internal.bind_") [ var "m", var "k" ]))
-        `shouldEqual` imp (Ret (CApp (foreign_ "Effect.bindE") [ var "m", var "k" ]))
+      imp (Ret (CApp unit (foreign_ "Control.Monad.ST.Internal.pure_") [ var "a" ]))
+        `shouldEqual` imp (Ret (CApp unit (foreign_ "Effect.pureE") [ var "a" ]))
+      imp (Ret (CApp unit (foreign_ "Control.Monad.ST.Internal.bind_") [ var "m", var "k" ]))
+        `shouldEqual` imp (Ret (CApp unit (foreign_ "Effect.bindE") [ var "m", var "k" ]))
 
     it "run e → perform e (the ST eliminator forces the thunk, no \\$u)" do
-      imp (Ret (CApp (foreign_ "Control.Monad.ST.Internal.run") [ var "e" ]))
-        `shouldEqual` Ret (CPerform (var "e"))
+      imp (Ret (CApp unit (foreign_ "Control.Monad.ST.Internal.run") [ var "e" ]))
+        `shouldEqual` Ret (CPerform unit (var "e"))
 
     it "new val → \\$u -> let arr = newArray 1 in setArray arr 0 val" do
-      imp (Ret (CApp (foreign_ "Control.Monad.ST.Internal.new") [ var "val" ]))
+      imp (Ret (CApp unit (foreign_ "Control.Monad.ST.Internal.new") [ var "val" ]))
         `shouldEqual`
           Ret
-            ( CLam [ "$ge1" ]
+            ( CLam unit [ "$ge1" ]
                 ( Let "$ge2" (CPrim NewArray [ AtomLit (LInt 1) ])
                     (Ret (CPrim SetArray [ var "$ge2", AtomLit (LInt 0), var "val" ]))
                 )
             )
 
     it "read ref → \\$u -> indexArray ref 0" do
-      imp (Ret (CApp (foreign_ "Control.Monad.ST.Internal.read") [ var "ref" ]))
-        `shouldEqual` Ret (CLam [ "$ge1" ] (Ret (CPrim IndexArray [ var "ref", AtomLit (LInt 0) ])))
+      imp (Ret (CApp unit (foreign_ "Control.Monad.ST.Internal.read") [ var "ref" ]))
+        `shouldEqual` Ret (CLam unit [ "$ge1" ] (Ret (CPrim IndexArray [ var "ref", AtomLit (LInt 0) ])))
 
     it "write val ref → \\$u -> let _ = setArray ref 0 val in val (returns the written value)" do
-      imp (Ret (CApp (foreign_ "Control.Monad.ST.Internal.write") [ var "val", var "ref" ]))
+      imp (Ret (CApp unit (foreign_ "Control.Monad.ST.Internal.write") [ var "val", var "ref" ]))
         `shouldEqual`
           Ret
-            ( CLam [ "$ge1" ]
+            ( CLam unit [ "$ge1" ]
                 ( Let "$ge2" (CPrim SetArray [ var "ref", AtomLit (LInt 0), var "val" ])
                     (Ret (CAtom (var "val")))
                 )
             )
 
     it "modifyImpl f ref → \\$u -> read; apply f; write back .state; return .value" do
-      imp (Ret (CApp (foreign_ "Control.Monad.ST.Internal.modifyImpl") [ var "f", var "ref" ]))
+      imp (Ret (CApp unit (foreign_ "Control.Monad.ST.Internal.modifyImpl") [ var "f", var "ref" ]))
         `shouldEqual`
           Ret
-            ( CLam [ "$ge1" ]
+            ( CLam unit [ "$ge1" ]
                 ( Let "$ge2" (CPrim IndexArray [ var "ref", AtomLit (LInt 0) ])
-                    ( Let "$ge3" (CApp (var "f") [ var "$ge2" ])
+                    ( Let "$ge3" (CApp unit (var "f") [ var "$ge2" ])
                         ( Let "$ge4" (CAccessor (var "$ge3") "state")
                             ( Let "$ge5" (CPrim SetArray [ var "ref", AtomLit (LInt 0), var "$ge4" ])
                                 (Ret (CAccessor (var "$ge3") "value"))
@@ -449,13 +449,13 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Impurify" do
               ]
           }
       impurifyExpr stMachinery
-        (Ret (CApp (var "Control.Bind.bind") [ var "Control.Monad.ST.Internal.bindST", var "m", var "k" ]))
-        `shouldEqual` imp (Ret (CApp (foreign_ "Control.Monad.ST.Internal.bind_") [ var "m", var "k" ]))
+        (Ret (CApp unit (var "Control.Bind.bind") [ var "Control.Monad.ST.Internal.bindST", var "m", var "k" ]))
+        `shouldEqual` imp (Ret (CApp unit (foreign_ "Control.Monad.ST.Internal.bind_") [ var "m", var "k" ]))
 
     it "is idempotent: a lowered new / modifyImpl re-impurifies unchanged" do
-      let n1 = imp (Ret (CApp (foreign_ "Control.Monad.ST.Internal.new") [ var "val" ]))
+      let n1 = imp (Ret (CApp unit (foreign_ "Control.Monad.ST.Internal.new") [ var "val" ]))
       imp n1 `shouldEqual` n1
-      let m1 = imp (Ret (CApp (foreign_ "Control.Monad.ST.Internal.modifyImpl") [ var "f", var "ref" ]))
+      let m1 = imp (Ret (CApp unit (foreign_ "Control.Monad.ST.Internal.modifyImpl") [ var "f", var "ref" ]))
       imp m1 `shouldEqual` m1
 
     it "all seven ST.Internal glue / eliminator / ref keys leave the NbE structural rung" do

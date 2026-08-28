@@ -29,7 +29,7 @@ import Purvasm.Compiler.Backend.LLVM.CallClass (callEventClass)
 import Purvasm.Compiler.Backend.LLVM.Program (entryLl, moduleLl, moduleLlWithEvents)
 import Purvasm.Compiler.Backend.LLVM.Types (Gdef(..))
 import Purvasm.Compiler.Literal (Literal(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..))
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (fail, shouldEqual)
 
@@ -132,8 +132,8 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Program" do
       -- `M.used` is reachable from the entry and calls the live leaf; `M.dead` is not reachable and
       -- is the only mention of the dead one.
       leafGdefs =
-        [ Gcaf "M.used" (Ret (CApp (AtomForeign "M.live") [ AtomLit (LInt 1) ]))
-        , Gcaf "M.dead" (Ret (CApp (AtomForeign "M.deadLeaf") [ AtomLit (LInt 1) ]))
+        [ Gcaf "M.used" (Ret (CApp unit (AtomForeign "M.live") [ AtomLit (LInt 1) ]))
+        , Gcaf "M.dead" (Ret (CApp unit (AtomForeign "M.deadLeaf") [ AtomLit (LInt 1) ]))
         ]
       leafEntry = Ret (CAtom (AtomVar "M.used"))
 
@@ -159,7 +159,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Program" do
       let
         ir = moduleLl (leafOpts { defined = Set.fromFoldable [ "M.used" ] })
           (Set.fromFoldable [ "M.used" ])
-          [ Gcaf "M.used" (Ret (CApp (AtomForeign "M.live") [ AtomLit (LInt 1) ])) ]
+          [ Gcaf "M.used" (Ret (CApp unit (AtomForeign "M.live") [ AtomLit (LInt 1) ])) ]
       ir `shouldContain` "@pvf_M_2elive$fclo = external global i64"
       ir `shouldNotContain` "@pvf_M_2elive$fclo = global i64 0"
       -- one declare, and the closure is NOT rebuilt here (slice A's whole point)
@@ -175,7 +175,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Program" do
         entryIr = entryLl perUse false 1048576 leafGdefs leafEntry
         modIr = moduleLl (perUse { defined = Set.fromFoldable [ "M.used" ] })
           (Set.fromFoldable [ "M.used" ])
-          [ Gcaf "M.used" (Ret (CApp (AtomForeign "M.live") [ AtomLit (LInt 1) ])) ]
+          [ Gcaf "M.used" (Ret (CApp unit (AtomForeign "M.live") [ AtomLit (LInt 1) ])) ]
       -- the reference builds its own closure again …
       modIr `shouldContain` "ptrtoint ptr @pvf_M_2elive to i64"
       modIr `shouldContain` "call i64 @pv_make_closure"
@@ -188,7 +188,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Program" do
 
     it "the two legs differ only in the closure strategy: same call events, same dispatch text" do
       let
-        gdefs = [ Gcaf "M.used" (Ret (CApp (AtomForeign "M.live") [ AtomLit (LInt 1) ])) ]
+        gdefs = [ Gcaf "M.used" (Ret (CApp unit (AtomForeign "M.live") [ AtomLit (LInt 1) ])) ]
         defined = Set.fromFoldable [ "M.used" ]
         out mode = moduleLlWithEvents (leafOpts { foreignClosure = mode, defined = defined }) defined gdefs
         hoisted = out Hoisted

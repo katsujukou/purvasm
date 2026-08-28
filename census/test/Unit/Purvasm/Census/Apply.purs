@@ -151,8 +151,9 @@ identitySpec = describe "Purvasm.Census.Apply.Report — the ADR-0113 §3 identi
   it "refuses a count moved BETWEEN FORMS (apply <-> tail are never one pool)" do
     let
       rows = patch "M\tkind\tlocal-deferred-apply/capture\t1" "M\tkind\tlocal-deferred-apply/capture\t0"
-        (patch "M\tkind\tlocal-deferred-tail/capture\t0" "M\tkind\tlocal-deferred-tail/capture\t1"
-          (rowsOf [ LocalDeferredApply Capture ]))
+        ( patch "M\tkind\tlocal-deferred-tail/capture\t0" "M\tkind\tlocal-deferred-tail/capture\t1"
+            (rowsOf [ LocalDeferredApply Capture ])
+        )
     -- both classes now disagree with their sums: apply is short, tail is over.
     Array.length (checkIdentities "M" rows).failures `shouldEqual` 2
 
@@ -161,9 +162,10 @@ identitySpec = describe "Purvasm.Census.Apply.Report — the ADR-0113 §3 identi
     -- the opaque one. One identity stated over both would balance and report nothing.
     let
       rows = patch "M\tkind\tlocal-deferred-apply/capture\t1" "M\tkind\tlocal-deferred-apply/capture\t0"
-        (patch "M\treason\tgeneric-apply/local-unknown-fn/param\t0"
-          "M\treason\tgeneric-apply/local-unknown-fn/param\t1"
-          (rowsOf [ LocalDeferredApply Capture ]))
+        ( patch "M\treason\tgeneric-apply/local-unknown-fn/param\t0"
+            "M\treason\tgeneric-apply/local-unknown-fn/param\t1"
+            (rowsOf [ LocalDeferredApply Capture ])
+        )
     Array.length (checkIdentities "M" rows).failures `shouldEqual` 2
 
   it "refuses an unparsable row instead of skipping it" do

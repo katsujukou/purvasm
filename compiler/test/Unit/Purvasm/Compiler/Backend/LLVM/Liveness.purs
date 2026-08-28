@@ -22,7 +22,7 @@ import Purvasm.Compiler.Backend.LLVM.Liveness (ActivationConfig, activationPlan,
 import Purvasm.Compiler.Backend.LLVM.Mangle (sortRecordFields)
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Literal (Literal(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..), Rhs, RhsF(..))
 import Purvasm.Compiler.Primitive (PrimOp(..))
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (fail, shouldEqual)
@@ -52,15 +52,15 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
       -- contract and held by the §6.2 token net.
       let
         body = Let "a" (CPrim SubInt [ var "n", int 1 ])
-          (Ret (CApp (var "f") [ var "a" ]))
+          (Ret (CApp unit (var "f") [ var "a" ]))
       crossingOf (cfg0 { params = [ "n" ] }) body `shouldEqual` []
 
     it "a value used after an intervening call crosses" do
       -- let x = g () in let y = h () in x + y — `x` crosses via liveAfter (live across the
       -- `h` call); `y` is hazarded by `x`'s earlier force in the prim's operand order (§6.3).
       let
-        body = Let "x" (CApp (var "g") [])
-          ( Let "y" (CApp (var "h") [])
+        body = Let "x" (CApp unit (var "g") [])
+          ( Let "y" (CApp unit (var "h") [])
               (Ret (CPrim AddInt [ var "x", var "y" ]))
           )
       crossingOf cfg0 body `shouldEqual` [ "x", "y" ]
@@ -74,8 +74,8 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
     -- shape with a still-allocating atom (a boxed string literal) DOES cross.
     it "a foreign reference no longer hazards an earlier operand; a boxed literal still does" do
       -- the §6.3 order: an ALLOCATING EARLIER operand hazards a later var.
-      crossingOf (cfg0 { params = [ "x" ] }) (Ret (CApp (var "f") [ AtomForeign "M.leaf", var "x" ])) `shouldEqual` []
-      crossingOf (cfg0 { params = [ "x" ] }) (Ret (CApp (var "f") [ str "s", var "x" ])) `shouldEqual` [ "x" ]
+      crossingOf (cfg0 { params = [ "x" ] }) (Ret (CApp unit (var "f") [ AtomForeign "M.leaf", var "x" ])) `shouldEqual` []
+      crossingOf (cfg0 { params = [ "x" ] }) (Ret (CApp unit (var "f") [ str "s", var "x" ])) `shouldEqual` [ "x" ]
 
     -- …and under the §5.2 counterfactual the plan moves BACK, because the emitter does: `PerUse`
     -- builds the closure at the reference, so the same list roots `x` again. This is the
@@ -83,13 +83,13 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
     -- leave this leg under-rooted, which is a GC bug, not a slower measurement.
     it "PerUse restores the hazard, because the reference allocates again (§5.2 co-switch)" do
       let perUse = cfg0 { params = [ "x" ], foreignClosure = PerUse }
-      crossingOf perUse (Ret (CApp (var "f") [ AtomForeign "M.leaf", var "x" ])) `shouldEqual` [ "x" ]
-      crossingOf perUse (Ret (CApp (var "f") [ var "x", AtomForeign "M.leaf" ])) `shouldEqual` []
+      crossingOf perUse (Ret (CApp unit (var "f") [ AtomForeign "M.leaf", var "x" ])) `shouldEqual` [ "x" ]
+      crossingOf perUse (Ret (CApp unit (var "f") [ var "x", AtomForeign "M.leaf" ])) `shouldEqual` []
 
     it "consumed-at-call is direct; a later use crosses via liveAfter (2b-1)" do
       let
-        mk after = Let "x" (CApp (var "g") [])
-          ( Let "r" (CApp (var "f") [ var "x" ])
+        mk after = Let "x" (CApp unit (var "g") [])
+          ( Let "r" (CApp unit (var "f") [ var "x" ])
               (Ret after)
           )
       -- x consumed by the f-call only: no pre-read hazard, no later use — direct (2b-1).
@@ -104,7 +104,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
       let
         body = Ret
           ( CIf (var "c")
-              (Ret (CApp (var "f") [ var "x" ]))
+              (Ret (CApp unit (var "f") [ var "x" ]))
               (Ret (CAtom (int 1)))
           )
       -- the condition's own read precedes its force (§6.3): `c` no longer crosses.
@@ -134,7 +134,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
       -- let g = \p -> p + cap in g — every capture read fills the arg buffer BEFORE
       -- pv_new_array/pv_make_closure allocate (§6.3), so cap has no pre-read hazard.
       let
-        body = Let "g" (CLam [ "p" ] (Ret (CPrim AddInt [ var "p", var "cap" ])))
+        body = Let "g" (CLam unit [ "p" ] (Ret (CPrim AddInt [ var "p", var "cap" ])))
           (Ret (CAtom (var "g")))
       -- §6.3: every capture read precedes makeClosure's first allocation — no hazard.
       crossingOf (cfg0 { params = [ "cap" ] }) body `shouldEqual` []
@@ -142,9 +142,9 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
     it "the closure value crosses a later safepoint; its captures stay direct (2b-1)" do
       -- let g = \p -> cap in let z = h () in g z
       let
-        body = Let "g" (CLam [ "p" ] (Ret (CAtom (var "cap"))))
-          ( Let "z" (CApp (var "h") [])
-              (Ret (CApp (var "g") [ var "z" ]))
+        body = Let "g" (CLam unit [ "p" ] (Ret (CAtom (var "cap"))))
+          ( Let "z" (CApp unit (var "h") [])
+              (Ret (CApp unit (var "g") [ var "z" ]))
           )
       -- g lives across the h-call (liveAfter); cap and z have no hazard and no later use.
       crossingOf (cfg0 { params = [ "cap" ] }) body `shouldEqual` [ "g" ]
@@ -152,11 +152,11 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
     it "a nested lambda body's own crossings do NOT leak into this activation (closure opacity)" do
       -- \p -> let q = f () in let s = h () in q + s — everything crossing is inside the lambda.
       let
-        lamBody = Let "q" (CApp (var "f") [])
-          ( Let "s" (CApp (var "h") [])
+        lamBody = Let "q" (CApp unit (var "f") [])
+          ( Let "s" (CApp unit (var "h") [])
               (Ret (CPrim AddInt [ var "q", var "s" ]))
           )
-        body = Ret (CLam [ "p" ] lamBody)
+        body = Ret (CLam unit [ "p" ] lamBody)
       crossingOf cfg0 body `shouldEqual` []
 
     it "the self %env word crosses when a self-call sits after a safepoint" do
@@ -164,7 +164,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
       let
         body = Ret
           ( CIf (var "c")
-              (Ret (CApp (var "loop") [ var "m" ]))
+              (Ret (CApp unit (var "loop") [ var "m" ]))
               (Ret (CAtom (var "n")))
           )
         plan = activationPlan { params: [ "c", "m", "n" ], captures: [], selfName: Just "loop", foreignClosure: Hoisted } body
@@ -175,14 +175,14 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
       -- safepoint there) BEFORE reading the env word, so `%env` is hazarded exactly when some
       -- argument materialises (§6.3's SSelf row).
       let
-        body = Ret (CApp (var "loop") [ var "m" ])
+        body = Ret (CApp unit (var "loop") [ var "m" ])
         plan = activationPlan { params: [ "m" ], captures: [], selfName: Just "loop", foreignClosure: Hoisted } body
       -- §6.3: a var argument cannot materialise, so the post-argument %env read has no
       -- pre-read hazard — recovered under 2b-1…
       Set.member envPseudo plan.crossing `shouldEqual` false
       -- …but an argument whose materialisation allocates (a string literal) hazards it.
       let
-        body' = Ret (CApp (var "loop") [ str "s" ])
+        body' = Ret (CApp unit (var "loop") [ str "s" ])
         plan' = activationPlan { params: [], captures: [], selfName: Just "loop", foreignClosure: Hoisted } body'
       Set.member envPseudo plan'.crossing `shouldEqual` true
 
@@ -194,7 +194,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
           ( CCase [ var "s" ]
               [ { binders: [ BVar "b" ]
                 , result: Guarded
-                    [ { guard: Ret (CApp (var "g") []), rhs: Ret (CAtom (int 1)) }
+                    [ { guard: Ret (CApp unit (var "g") []), rhs: Ret (CAtom (int 1)) }
                     , { guard: Ret (CAtom (AtomLit (LBool true))), rhs: Ret (CAtom (var "b")) }
                     ]
                 }
@@ -274,12 +274,12 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
               [ { binders: [ BCtor "Just" [ BVar "b" ] ], result: Uncond rhs } ]
           )
         crossing6 = arm
-          ( Let "z" (CApp (var "h") [])
+          ( Let "z" (CApp unit (var "h") [])
               (Ret (CPrim AddInt [ var "b", var "z" ]))
           )
         -- case s of Just b -> f b — b consumed at the call with no pre-read hazard: direct
         -- under 2b-1 (the handover leg is the §6.1 contract's).
-        consumed = arm (Ret (CApp (var "f") [ var "b" ]))
+        consumed = arm (Ret (CApp unit (var "f") [ var "b" ]))
         planC = activationPlan (cfg0 { params = [ "s" ] }) crossing6
         planN = activationPlan (cfg0 { params = [ "s" ] }) consumed
       Set.member "b" planC.crossing `shouldEqual` true
@@ -289,9 +289,9 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
     it "a LetRec group's captures are consumed at construction; later-live names cross it" do
       -- letrec go = \x -> go free in let z = h () in go z
       let
-        body = LetRec [ { var: "go", rhs: Ret (CLam [ "x" ] (Ret (CApp (var "go") [ var "free" ]))) } ]
-          ( Let "z" (CApp (var "h") [])
-              (Ret (CApp (var "go") [ var "z" ]))
+        body = LetRec [ { var: "go", rhs: Ret (CLam unit [ "x" ] (Ret (CApp unit (var "go") [ var "free" ]))) } ]
+          ( Let "z" (CApp unit (var "h") [])
+              (Ret (CApp unit (var "go") [ var "z" ]))
           )
         plan = activationPlan (cfg0 { params = [ "free" ] }) body
       -- `go` is live after the group's construction safepoints AND across the `h` call.
@@ -300,8 +300,8 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
 
   describe "the §6.3 preRead table (per-recipe fixture matrix, 2b-1)" do
     it "generic CApp: an allocating earlier operand hazards a later var; the reverse is direct" do
-      crossingOf (cfg0 { params = [ "x" ] }) (Ret (CApp (var "f") [ str "s", var "x" ])) `shouldEqual` [ "x" ]
-      crossingOf (cfg0 { params = [ "x" ] }) (Ret (CApp (var "f") [ var "x", str "s" ])) `shouldEqual` []
+      crossingOf (cfg0 { params = [ "x" ] }) (Ret (CApp unit (var "f") [ str "s", var "x" ])) `shouldEqual` [ "x" ]
+      crossingOf (cfg0 { params = [ "x" ] }) (Ret (CApp unit (var "f") [ var "x", str "s" ])) `shouldEqual` []
 
     it "saturated CCtor: the prefix rule in both directions" do
       crossingOf (cfg0 { params = [ "x" ] }) (Ret (CCtor "C" 2 [ str "s", var "x" ])) `shouldEqual` [ "x" ]
@@ -348,7 +348,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
     it "LetRec captures are read before the group's first allocation and stay direct" do
       let
         plan = activationPlan (cfg0 { params = [ "free" ] })
-          ( LetRec [ { var: "go", rhs: Ret (CLam [ "x" ] (Ret (CAtom (var "free")))) } ]
+          ( LetRec [ { var: "go", rhs: Ret (CLam unit [ "x" ] (Ret (CAtom (var "free")))) } ]
               (Ret (CAtom (int 1)))
           )
       Set.member "free" plan.crossing `shouldEqual` false
@@ -388,8 +388,8 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
       -- The release/debug RootPlan equality holds by construction: `activationPlan`'s signature
       -- admits no mode. Determinism is the residual property worth pinning.
       let
-        body = Let "x" (CApp (var "g") [])
-          ( Let "y" (CApp (var "h") [])
+        body = Let "x" (CApp unit (var "g") [])
+          ( Let "y" (CApp unit (var "h") [])
               (Ret (CPrim AddInt [ var "x", var "y" ]))
           )
         p1 = activationPlan cfg0 body
@@ -443,7 +443,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
     it "declares the recipes that root temporaries" do
       cexprMayRootLocally Hoisted noFacts (CUpdate (var "r") []) `shouldEqual` true
       cexprMayRootLocally Hoisted noFacts (CCase [ var "s" ] []) `shouldEqual` true
-      cexprMayRootLocally Hoisted noFacts (CApp (var "f") []) `shouldEqual` true
+      cexprMayRootLocally Hoisted noFacts (CApp unit (var "f") []) `shouldEqual` true
       cexprMayRootLocally Hoisted noFacts (CAtom (var "x")) `shouldEqual` false
       cexprMayRootLocally Hoisted noFacts (CAccessor (var "d") "f") `shouldEqual` false
       -- ctor: saturated with no later-safepoint operands needs no operand roots
@@ -461,7 +461,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Liveness" do
           (\inner i -> Let ("a" <> show i) (CPrim AddInt [ var ("a" <> show (i - 1)), int 1 ]) inner)
           (Ret (CAtom (var ("a" <> show n))))
           (Array.reverse (Array.range 1 n))
-        body = Let "a0" (CApp (var "g") []) spine
+        body = Let "a0" (CApp unit (var "g") []) spine
         plan = activationPlan cfg0 body
       -- a0 is read at its consuming prim's FIRST position (no pre-read hazard, §6.3) and has
       -- no later use, so it stays direct. The pin here is the walk finishing on the default

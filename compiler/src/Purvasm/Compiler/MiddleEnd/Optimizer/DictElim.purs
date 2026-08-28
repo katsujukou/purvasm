@@ -41,7 +41,7 @@ import Data.Set as Set
 import Data.Tuple (Tuple(..))
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Ffi (intrinsicPrim)
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..), Rhs, RhsF(..))
 
 -- | A module's dictionary machinery: its method **accessors** (binding key → the field `φ` it projects),
 -- | its instance **dictionaries** (binding key → the map `{ φ → impl atom }` of its members), and its
@@ -76,13 +76,13 @@ mergeMachinery a b =
 -- | The newtype dict wrapper lowers to the identity `\x -> x`; see through it.
 isIdentityLam :: CExpr -> Boolean
 isIdentityLam = case _ of
-  CLam [ x ] (Ret (CAtom (AtomVar y))) -> x == y
+  CLam _ [ x ] (Ret (CAtom (AtomVar y))) -> x == y
   _ -> false
 
 -- | Recognise a method accessor `\d -> case d of v -> v.φ` and return `φ`.
 accessorField :: CExpr -> Maybe String
 accessorField = case _ of
-  CLam [ p ] (Ret (CCase [ AtomVar s ] [ alt ])) ->
+  CLam _ [ p ] (Ret (CCase [ AtomVar s ] [ alt ])) ->
     case alt.binders, alt.result of
       [ BVar v ], Uncond (Ret (CAccessor (AtomVar w) field))
         | p == s && v == w -> Just field
@@ -156,7 +156,7 @@ machineryOf imported pairs =
     resolveTail seen locals = case _ of
       CRecord fields -> Just (Map.fromFoldable (map (\f -> Tuple f.prop f.val) fields))
       CAtom (AtomVar y) -> resolveRef seen locals y
-      CApp (AtomVar f) [ AtomVar a ] | isIdentityTop f -> resolveRef seen locals a
+      CApp _ (AtomVar f) [ AtomVar a ] | isIdentityTop f -> resolveRef seen locals a
       _ -> Nothing
 
     -- Resolve a name that is either a local `let` in `locals` or a top-level binding.
@@ -230,10 +230,10 @@ dictElimExpr foreignLift gkeys machinery = rwExpr
 
   rwCexpr :: CExpr -> CExpr
   rwCexpr c = case c of
-    CApp (AtomVar acc) args -> case Array.uncons args of
+    CApp _ (AtomVar acc) args -> case Array.uncons args of
       Just { head: AtomVar d, tail: rest } -> fromMaybe c (dispatch acc d rest)
       _ -> c
-    CLam ps body -> CLam ps (rwExpr body)
+    CLam _ ps body -> CLam unit ps (rwExpr body)
     CIf a t e -> CIf a (rwExpr t) (rwExpr e)
     CCase ats alts -> CCase ats (map rwAlt alts)
     _ -> c
@@ -249,5 +249,5 @@ dictElimExpr foreignLift gkeys machinery = rwExpr
     field <- Map.lookup acc machinery.accessors
     fields <- Map.lookup d machinery.instances
     impl <- Map.lookup field fields
-    if liftable foreignLift gkeys impl then Just (if Array.null rest then CAtom impl else CApp impl rest)
+    if liftable foreignLift gkeys impl then Just (if Array.null rest then CAtom impl else CApp unit impl rest)
     else Nothing

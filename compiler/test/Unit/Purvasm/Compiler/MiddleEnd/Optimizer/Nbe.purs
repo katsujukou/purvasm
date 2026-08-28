@@ -18,7 +18,7 @@ import Purvasm.Compiler.Literal (Literal(..))
 import Data.Set as Set
 import Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis (EffectFact, liftShape)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Analysis (inlineMarks)
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..), Rhs, RhsF(..))
 import Purvasm.Compiler.MiddleEnd.Module (Decl)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe (candidatesOf, nbeBinding, nbeEnvOf)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Eval (foldPrim)
@@ -75,8 +75,8 @@ lamDiamond n = go 1
     | otherwise =
         let
           rhs =
-            if i == 1 then CLam [ "a" ] (Ret (CPrim AddInt [ var "a", var "x" ]))
-            else CLam [ "a" ] (Ret (CCtor "Pair" 2 [ l (i - 1), l (i - 1) ]))
+            if i == 1 then CLam unit [ "a" ] (Ret (CPrim AddInt [ var "a", var "x" ]))
+            else CLam unit [ "a" ] (Ret (CCtor "Pair" 2 [ l (i - 1), l (i - 1) ]))
         in
           Let ("l" <> show i) rhs (go (i + 1))
 
@@ -104,7 +104,7 @@ knownAliasDiamond n = go 1
 p2Lambda :: Expr
 p2Lambda =
   Let "l"
-    ( CLam [ "a" ]
+    ( CLam unit [ "a" ]
         ( Let "t" (CPrim AddInt [ var "a", var "a" ])
             (Ret (CArray [ var "t", var "t", var "t", var "t", var "t", var "t", var "x" ]))
         )
@@ -124,7 +124,7 @@ countLams = goE
     Let _ c rest -> goC c + goE rest
     LetRec bs rest -> Array.foldl (\acc b -> acc + goE b.rhs) 0 bs + goE rest
   goC = case _ of
-    CLam _ b -> 1 + goE b
+    CLam _ _ b -> 1 + goE b
     CIf _ t e -> goE t + goE e
     CCase _ alts -> Array.foldl (\acc a -> acc + goAlt a) 0 alts
     _ -> 0
@@ -142,8 +142,8 @@ nodeCount = countE
     LetRec bs rest -> 1 + Array.foldl (\acc b -> acc + countE b.rhs) 0 bs + countE rest
   countC = case _ of
     CAtom _ -> 1
-    CLam _ b -> 1 + countE b
-    CApp _ as -> 1 + Array.length as
+    CLam _ _ b -> 1 + countE b
+    CApp _ _ as -> 1 + Array.length as
     CPrim _ as -> 1 + Array.length as
     CCtor _ _ as -> 1 + Array.length as
     CArray as -> 1 + Array.length as
@@ -152,7 +152,7 @@ nodeCount = countE
     CUpdate _ ups -> 1 + Array.length ups
     CIf _ t e -> 1 + countE t + countE e
     CCase ss alts -> 1 + Array.length ss + Array.foldl (\acc a -> acc + countAlt a) 0 alts
-    CPerform _ -> 2
+    CPerform _ _ -> 2
   countAlt a = case a.result of
     Uncond e -> countE e
     Guarded gs -> Array.foldl (\acc g -> acc + countE g.guard + countE g.rhs) 0 gs
@@ -202,8 +202,8 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
       let
         chain 0 = Ret (CAtom (var "x"))
         chain n = Let ("v" <> show n) (CPrim AddInt [ var "x", var "x" ]) (chain (n - 1))
-        big = nonrec "M.big" (Ret (CLam [ "x" ] (chain 20)))
-        call = Ret (CApp (var "M.big") [ var "y" ])
+        big = nonrec "M.big" (Ret (CLam unit [ "x" ] (chain 20)))
+        call = Ret (CApp unit (var "M.big") [ var "y" ])
       nbeWith [ big ] call `shouldEqual` call
 
     it "positive control: a small sibling unfolds and case-of-known-constructor collapses" do
@@ -211,7 +211,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
       let
         small = nonrec "M.small"
           ( Ret
-              ( CLam [ "x" ]
+              ( CLam unit [ "x" ]
                   ( Ret
                       ( CCase [ var "x" ]
                           [ { binders: [ BCtor "Just" [ BVar "v" ] ]
@@ -225,26 +225,26 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
           )
       nbeWith [ small ]
         ( Let "j" (CCtor "Just" 1 [ int 5 ])
-            (Ret (CApp (var "M.small") [ var "j" ]))
+            (Ret (CApp unit (var "M.small") [ var "j" ]))
         )
         `shouldEqual` Ret (CAtom (int 5))
 
     it "effect-reorder trap: pinned neutral calls keep their sequencing, even used in reverse" do
       let
         trap =
-          Let "a" (CApp (var "f") [ var "x" ])
-            ( Let "b" (CApp (var "g") [ var "y" ])
+          Let "a" (CApp unit (var "f") [ var "x" ])
+            ( Let "b" (CApp unit (var "g") [ var "y" ])
                 (Ret (CPrim AddInt [ var "b", var "a" ]))
             )
       nbe trap `shouldEqual`
-        Let "$q1" (CApp (var "f") [ var "x" ])
-          ( Let "$q2" (CApp (var "g") [ var "y" ])
+        Let "$q1" (CApp unit (var "f") [ var "x" ])
+          ( Let "$q2" (CApp unit (var "g") [ var "y" ])
               (Ret (CPrim AddInt [ var "$q2", var "$q1" ]))
           )
 
     it "a dead neutral call is kept absent purity facts (the conservative default)" do
-      nbe (Let "a" (CApp (var "f") [ var "x" ]) (Ret (CAtom (int 1))))
-        `shouldEqual` Let "$q1" (CApp (var "f") [ var "x" ]) (Ret (CAtom (int 1)))
+      nbe (Let "a" (CApp unit (var "f") [ var "x" ]) (Ret (CAtom (int 1))))
+        `shouldEqual` Let "$q1" (CApp unit (var "f") [ var "x" ]) (Ret (CAtom (int 1)))
 
   describe "materialised-size audit (ADR-0097 §4)" do
     -- The prim-version of the diamond: vN = v(N-1) + v(N-1), every level live. The small-deref
@@ -310,11 +310,11 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
       -- x = clean(a) (single-use → ADR-0096 sink); w = x; T(w, w). The alias inherits the call's
       -- ShareOnly policy and is shared, so the call materialises once — never duplicated at both uses.
       nbeFacts (Map.singleton "M.clean" cleanCallFact)
-        ( Let "x" (CApp (var "M.clean") [ var "a" ])
+        ( Let "x" (CApp unit (var "M.clean") [ var "a" ])
             (Let "w" (CAtom (var "x")) (Ret (CCtor "T" 2 [ var "w", var "w" ])))
         )
         `shouldEqual`
-          Let "$q1" (CApp (var "M.clean") [ var "a" ])
+          Let "$q1" (CApp unit (var "M.clean") [ var "a" ])
             (Ret (CCtor "T" 2 [ var "$q1", var "$q1" ]))
 
     it "P2: a small non-closed lambda whose materialised body exceeds the bound is shared, not copied" do
@@ -328,11 +328,11 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
       -- call's CapBranch motion cap and is stripped at multi-use even at CapNone — else the call
       -- would execute once per `p` copy. The call is bound once; `p` is the shared projection.
       nbeFacts (Map.singleton "M.clean" cleanCallFact)
-        ( Let "x" (CApp (var "M.clean") [ var "a" ])
+        ( Let "x" (CApp unit (var "M.clean") [ var "a" ])
             (Let "p" (CAccessor (var "x") "field") (Ret (CArray [ var "p", var "p" ])))
         )
         `shouldEqual`
-          Let "$q1" (CApp (var "M.clean") [ var "a" ])
+          Let "$q1" (CApp unit (var "M.clean") [ var "a" ])
             (Let "$q2" (CAccessor (var "$q1") "field") (Ret (CArray [ var "$q2", var "$q2" ])))
 
     it "P1(motion): a call embedded in a value used inside a lambda stays shared outside it" do
@@ -341,84 +341,84 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
       -- (inside l), which exceeds CapBranch, so `r` is shared *outside* the lambda. The call is bound
       -- once at the top (never duplicated, never moved into the closure — the ADR-0096 boundary).
       nbeFacts (Map.singleton "M.clean" cleanCallFact)
-        ( Let "x" (CApp (var "M.clean") [ var "a" ])
+        ( Let "x" (CApp unit (var "M.clean") [ var "a" ])
             ( Let "r" (CRecord [ { prop: "value", val: var "x" } ])
-                (Let "l" (CLam [ "u" ] (Ret (CAtom (var "r")))) (Ret (CArray [ var "l", var "l" ])))
+                (Let "l" (CLam unit [ "u" ] (Ret (CAtom (var "r")))) (Ret (CArray [ var "l", var "l" ])))
             )
         )
         `shouldEqual`
-          Let "$q1" (CApp (var "M.clean") [ var "a" ])
+          Let "$q1" (CApp unit (var "M.clean") [ var "a" ])
             ( Let "$q2" (CRecord [ { prop: "value", val: var "$q1" } ])
-                ( Let "$q4" (CLam [ "$q3" ] (Ret (CAtom (var "$q2"))))
-                    (Let "$q6" (CLam [ "$q5" ] (Ret (CAtom (var "$q2")))) (Ret (CArray [ var "$q4", var "$q6" ])))
+                ( Let "$q4" (CLam unit [ "$q3" ] (Ret (CAtom (var "$q2"))))
+                    (Let "$q6" (CLam unit [ "$q5" ] (Ret (CAtom (var "$q2")))) (Ret (CArray [ var "$q4", var "$q6" ])))
                 )
             )
 
   describe "GER run marker: CPerform (ADR-0099 slice 1)" do
     it "perform of a known unit-lambda β-reduces to the body in place" do
       -- let t = \$u -> 42 in perform t  ==>  42
-      nbe (Let "t" (CLam [ "$u" ] (Ret (CAtom (int 42)))) (Ret (CPerform (var "t"))))
+      nbe (Let "t" (CLam unit [ "$u" ] (Ret (CAtom (int 42)))) (Ret (CPerform unit (var "t"))))
         `shouldEqual` Ret (CAtom (int 42))
 
     it "perform of an unknown thunk stays a pinned CPerform marker" do
       -- \m -> perform m  stays  \m -> perform m  (never dissolved to `m unit`)
-      nbe (Ret (CLam [ "m" ] (Ret (CPerform (var "m")))))
-        `shouldEqual` Ret (CLam [ "$q1" ] (Ret (CPerform (var "$q1"))))
+      nbe (Ret (CLam unit [ "m" ] (Ret (CPerform unit (var "m")))))
+        `shouldEqual` Ret (CLam unit [ "$q1" ] (Ret (CPerform unit (var "$q1"))))
 
     it "a neutral perform is sequenced in place and its result is usable" do
       -- \m -> let r = perform m in r
-      nbe (Ret (CLam [ "m" ] (Let "r" (CPerform (var "m")) (Ret (CAtom (var "r"))))))
+      nbe (Ret (CLam unit [ "m" ] (Let "r" (CPerform unit (var "m")) (Ret (CAtom (var "r"))))))
         `shouldEqual`
-          Ret (CLam [ "$q1" ] (Let "$q2" (CPerform (var "$q1")) (Ret (CAtom (var "$q2")))))
+          Ret (CLam unit [ "$q1" ] (Let "$q2" (CPerform unit (var "$q1")) (Ret (CAtom (var "$q2")))))
 
     it "a dead neutral perform is kept (a pinned effect barrier, not dropped)" do
       -- let a = perform t in 1 — `a` is unused, but performing `t` is an effect that must run.
-      nbe (Let "a" (CPerform (var "t")) (Ret (CAtom (int 1))))
-        `shouldEqual` Let "$q1" (CPerform (var "t")) (Ret (CAtom (int 1)))
+      nbe (Let "a" (CPerform unit (var "t")) (Ret (CAtom (int 1))))
+        `shouldEqual` Let "$q1" (CPerform unit (var "t")) (Ret (CAtom (int 1)))
 
   describe "dead-drop with purity facts (ADR-0095 §3, the dead-only branch)" do
     it "fires: a dead pure call is dropped in place" do
       nbeEffects (Map.singleton "M.pureFn" { arity: 1, vsat: false, retVsat: false })
-        (Let "a" (CApp (var "M.pureFn") [ var "x" ]) (Ret (CAtom (int 1))))
+        (Let "a" (CApp unit (var "M.pureFn") [ var "x" ]) (Ret (CAtom (int 1))))
         `shouldEqual` Ret (CAtom (int 1))
 
     it "a dead Effect-thunk construction is dropped (I1: construction ≠ execution)" do
       -- let a = log s in 1 — builds the thunk, never forces it.
       nbeEffects (Map.singleton "M.log" { arity: 1, vsat: false, retVsat: true })
-        (Let "a" (CApp (var "M.log") [ var "s" ]) (Ret (CAtom (int 1))))
+        (Let "a" (CApp unit (var "M.log") [ var "s" ]) (Ret (CAtom (int 1))))
         `shouldEqual` Ret (CAtom (int 1))
 
     it "a dead effectful force is kept (the thunk's saturation may perform)" do
       -- let t = log s in let u = t unit in 1 — u's rhs forces the thunk (over-application of
       -- t's arity-0 summary → may-perform); t stays live through u.
       nbeEffects (Map.singleton "M.log" { arity: 1, vsat: false, retVsat: true })
-        ( Let "t" (CApp (var "M.log") [ var "s" ])
-            (Let "u" (CApp (var "t") [ int 0 ]) (Ret (CAtom (int 1))))
+        ( Let "t" (CApp unit (var "M.log") [ var "s" ])
+            (Let "u" (CApp unit (var "t") [ int 0 ]) (Ret (CAtom (int 1))))
         )
         `shouldEqual`
-          Let "$q1" (CApp (var "M.log") [ var "s" ])
-            (Let "$q2" (CApp (var "$q1") [ int 0 ]) (Ret (CAtom (int 1))))
+          Let "$q1" (CApp unit (var "M.log") [ var "s" ])
+            (Let "$q2" (CApp unit (var "$q1") [ int 0 ]) (Ret (CAtom (int 1))))
 
     it "a dead bare-EffectFnN saturation is kept (vsat: saturating it IS the effect)" do
       nbeEffects (Map.singleton "M.effectFn2" { arity: 2, vsat: true, retVsat: false })
-        (Let "a" (CApp (var "M.effectFn2") [ var "x", var "y" ]) (Ret (CAtom (int 1))))
+        (Let "a" (CApp unit (var "M.effectFn2") [ var "x", var "y" ]) (Ret (CAtom (int 1))))
         `shouldEqual`
-          Let "$q1" (CApp (var "M.effectFn2") [ var "x", var "y" ]) (Ret (CAtom (int 1)))
+          Let "$q1" (CApp unit (var "M.effectFn2") [ var "x", var "y" ]) (Ret (CAtom (int 1)))
 
     it "no-motion guard: a live single-use pure call never sinks, even across a SetArray" do
       -- let a = M.read arr in let w = SetArray arr 0 1 in a — sinking `a` past the write would
       -- read the mutated cell (ADR-0095 §3: vsat=false does not license motion).
       nbeEffects (Map.singleton "M.read" { arity: 1, vsat: false, retVsat: false })
-        ( Let "a" (CApp (var "M.read") [ var "arr" ])
+        ( Let "a" (CApp unit (var "M.read") [ var "arr" ])
             (Let "w" (CPrim SetArray [ var "arr", int 0, int 1 ]) (Ret (CAtom (var "a"))))
         )
         `shouldEqual`
-          Let "$q1" (CApp (var "M.read") [ var "arr" ])
+          Let "$q1" (CApp unit (var "M.read") [ var "arr" ])
             (Let "$q2" (CPrim SetArray [ var "arr", int 0, int 1 ]) (Ret (CAtom (var "$q1"))))
 
     it "the guard's dual: the same callee's *dead* call is dropped (nothing observes it)" do
       nbeEffects (Map.singleton "M.read" { arity: 1, vsat: false, retVsat: false })
-        ( Let "a" (CApp (var "M.read") [ var "arr" ])
+        ( Let "a" (CApp unit (var "M.read") [ var "arr" ])
             (Let "w" (CPrim SetArray [ var "arr", int 0, int 1 ]) (Ret (CAtom (int 1))))
         )
         `shouldEqual` Let "$q1" (CPrim SetArray [ var "arr", int 0, int 1 ]) (Ret (CAtom (int 1)))
@@ -439,14 +439,14 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
 
     it "fires (CapNone): a live single-use clean call sinks past a pinned call to its use site" do
       nbeFacts (Map.singleton "M.clean" cleanFact)
-        ( Let "x" (CApp (var "M.clean") [ var "a" ])
-            ( Let "z" (CApp (var "g") [ var "w" ])
+        ( Let "x" (CApp unit (var "M.clean") [ var "a" ])
+            ( Let "z" (CApp unit (var "g") [ var "w" ])
                 (Ret (CCtor "T" 2 [ var "x", var "z" ]))
             )
         )
         `shouldEqual`
-          Let "$q1" (CApp (var "g") [ var "w" ])
-            ( Let "$q2" (CApp (var "M.clean") [ var "a" ])
+          Let "$q1" (CApp unit (var "g") [ var "w" ])
+            ( Let "$q2" (CApp unit (var "M.clean") [ var "a" ])
                 (Ret (CCtor "T" 2 [ var "$q2", var "$q1" ]))
             )
 
@@ -454,62 +454,62 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
       -- the sole use is the arm's tail, so the sunk computation reifies as the arm's tail call —
       -- executed only on the path that uses it (the conditional-execution win).
       nbeFacts (Map.singleton "M.clean" cleanFact)
-        ( Let "x" (CApp (var "M.clean") [ var "a" ])
+        ( Let "x" (CApp unit (var "M.clean") [ var "a" ])
             (Ret (CIf (var "c") (Ret (CAtom (var "x"))) (Ret (CAtom (int 0)))))
         )
         `shouldEqual`
           Ret
             ( CIf (var "c")
-                (Ret (CApp (var "M.clean") [ var "a" ]))
+                (Ret (CApp unit (var "M.clean") [ var "a" ]))
                 (Ret (CAtom (int 0)))
             )
 
     it "multi-use stays pinned (duplication)" do
       let
         term =
-          Let "x" (CApp (var "M.clean") [ var "a" ])
+          Let "x" (CApp unit (var "M.clean") [ var "a" ])
             (Ret (CCtor "T" 2 [ var "x", var "x" ]))
       nbeFacts (Map.singleton "M.clean" cleanFact) term
         `shouldEqual`
-          Let "$q1" (CApp (var "M.clean") [ var "a" ])
+          Let "$q1" (CApp unit (var "M.clean") [ var "a" ])
             (Ret (CCtor "T" 2 [ var "$q1", var "$q1" ]))
 
     it "CapClosure stays pinned (multi-execution)" do
       let
         term =
-          Let "x" (CApp (var "M.clean") [ var "a" ])
-            (Ret (CLam [ "u" ] (Ret (CAtom (var "x")))))
+          Let "x" (CApp unit (var "M.clean") [ var "a" ])
+            (Ret (CLam unit [ "u" ] (Ret (CAtom (var "x")))))
       nbeFacts (Map.singleton "M.clean" cleanFact) term
         `shouldEqual`
-          Let "$q1" (CApp (var "M.clean") [ var "a" ])
-            (Ret (CLam [ "$q2" ] (Ret (CAtom (var "$q1")))))
+          Let "$q1" (CApp unit (var "M.clean") [ var "a" ])
+            (Ret (CLam unit [ "$q2" ] (Ret (CAtom (var "$q1")))))
 
     it "a store-reading callee never sinks, even live single-use across a SetArray" do
       let
         term =
-          Let "r" (CApp (var "M.reader") [ var "arr" ])
+          Let "r" (CApp unit (var "M.reader") [ var "arr" ])
             (Let "w" (CPrim SetArray [ var "arr", int 0, int 1 ]) (Ret (CAtom (var "r"))))
       nbeFacts (Map.singleton "M.reader" readerFact) term
         `shouldEqual`
-          Let "$q1" (CApp (var "M.reader") [ var "arr" ])
+          Let "$q1" (CApp unit (var "M.reader") [ var "arr" ])
             (Let "$q2" (CPrim SetArray [ var "arr", int 0, int 1 ]) (Ret (CAtom (var "$q1"))))
 
     it "PAP residual: the PAP construction is droppable when dead, its saturation never sinks" do
       -- dead PAP of a dirty callee: dropped (clean construction).
       nbeFacts (Map.singleton "M.dirty2" dirty2Fact)
-        (Let "g" (CApp (var "M.dirty2") [ var "a" ]) (Ret (CAtom (int 1))))
+        (Let "g" (CApp unit (var "M.dirty2") [ var "a" ]) (Ret (CAtom (int 1))))
         `shouldEqual` Ret (CAtom (int 1))
       -- live residual saturation: `g b` is exact on the PAP's summary and carries the callee's
       -- dirt — no sink even at single use under a branch.
       nbeFacts (Map.singleton "M.dirty2" dirty2Fact)
-        ( Let "g" (CApp (var "M.dirty2") [ var "a" ])
-            ( Let "x" (CApp (var "g") [ var "b" ])
+        ( Let "g" (CApp unit (var "M.dirty2") [ var "a" ])
+            ( Let "x" (CApp unit (var "g") [ var "b" ])
                 (Ret (CIf (var "c") (Ret (CAtom (var "x"))) (Ret (CAtom (int 0)))))
             )
         )
         `shouldEqual`
-          Let "$q1" (CApp (var "M.dirty2") [ var "a" ])
-            ( Let "$q2" (CApp (var "$q1") [ var "b" ])
+          Let "$q1" (CApp unit (var "M.dirty2") [ var "a" ])
+            ( Let "$q2" (CApp unit (var "$q1") [ var "b" ])
                 (Ret (CIf (var "c") (Ret (CAtom (var "$q2"))) (Ret (CAtom (int 0)))))
             )
 
@@ -521,8 +521,8 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
       -- `x` is never marked, and with the shift broken (retMtouch dropped) it would be.
       let
         term =
-          Let "r" (CApp (var "M.mkReader") [ var "arr" ])
-            ( Let "x" (CApp (var "r") [])
+          Let "r" (CApp unit (var "M.mkReader") [ var "arr" ])
+            ( Let "x" (CApp unit (var "r") [])
                 (Ret (CIf (var "c") (Ret (CAtom (var "x"))) (Ret (CAtom (int 0)))))
             )
         marksWith fact = inlineMarks (\k -> Map.lookup k (Map.singleton "M.mkReader" fact)) term
@@ -537,40 +537,40 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
       -- summary → pinned). The hazard shifted retMtouch → mtouch across the exact application.
       let
         term =
-          Let "r" (CApp (var "M.mkReader") [ var "arr" ])
-            ( Let "x" (CApp (var "r") [ int 0 ])
+          Let "r" (CApp unit (var "M.mkReader") [ var "arr" ])
+            ( Let "x" (CApp unit (var "r") [ int 0 ])
                 (Ret (CIf (var "c") (Ret (CAtom (var "x"))) (Ret (CAtom (int 0)))))
             )
       nbeFacts (Map.singleton "M.mkReader" mkReaderFact) term
         `shouldEqual`
-          Let "$q1" (CApp (var "M.mkReader") [ var "arr" ])
-            ( Let "$q2" (CApp (var "$q1") [ int 0 ])
+          Let "$q1" (CApp unit (var "M.mkReader") [ var "arr" ])
+            ( Let "$q2" (CApp unit (var "$q1") [ int 0 ])
                 (Ret (CIf (var "c") (Ret (CAtom (var "$q2"))) (Ret (CAtom (int 0)))))
             )
 
     it "a foreign-shaped pure callee never sinks (the dirty lift — ADR-0096 §1)" do
       let
         term =
-          Let "x" (CApp (var "M.pure") [ var "a" ])
+          Let "x" (CApp unit (var "M.pure") [ var "a" ])
             (Ret (CIf (var "c") (Ret (CAtom (var "x"))) (Ret (CAtom (int 0)))))
       nbeEffects (Map.singleton "M.pure" { arity: 1, vsat: false, retVsat: false }) term
         `shouldEqual`
-          Let "$q1" (CApp (var "M.pure") [ var "a" ])
+          Let "$q1" (CApp unit (var "M.pure") [ var "a" ])
             (Ret (CIf (var "c") (Ret (CAtom (var "$q1"))) (Ret (CAtom (int 0)))))
 
     it "a recursive group member is never unfolded (recursion stays a call)" do
       let
         loop =
-          LetRec [ { var: "go", rhs: Ret (CLam [ "i" ] (Ret (CApp (var "go") [ var "i" ]))) } ]
-            (Ret (CApp (var "go") [ int 0 ]))
+          LetRec [ { var: "go", rhs: Ret (CLam unit [ "i" ] (Ret (CApp unit (var "go") [ var "i" ]))) } ]
+            (Ret (CApp unit (var "go") [ int 0 ]))
       nbe loop `shouldEqual`
-        LetRec [ { var: "$q1", rhs: Ret (CLam [ "$q2" ] (Ret (CApp (var "$q1") [ var "$q2" ]))) } ]
-          (Ret (CApp (var "$q1") [ int 0 ]))
+        LetRec [ { var: "$q1", rhs: Ret (CLam unit [ "$q2" ] (Ret (CApp unit (var "$q1") [ var "$q2" ]))) } ]
+          (Ret (CApp unit (var "$q1") [ int 0 ]))
 
     it "a recursive sibling decl is never published for unfolding" do
       let
         recDecl = { recursive: true, members: [ "M.r" /\ Ret (CAtom (AtomForeign "Data.Semiring.intAdd")) ] }
-        call = Ret (CApp (var "M.r") [ var "p", var "q" ])
+        call = Ret (CApp unit (var "M.r") [ var "p", var "q" ])
       nbeWith [ recDecl ] call `shouldEqual` call
 
   describe "reductions" do
@@ -630,8 +630,8 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
 
     it "inlines a flat, parameter-closed callee at a fully-applied call (binding drops when dead)" do
       nbe
-        ( Let "f" (CLam [ "a", "b" ] (Ret (CPrim AddInt [ var "a", var "b" ])))
-            (Ret (CApp (var "f") [ var "p", var "q" ]))
+        ( Let "f" (CLam unit [ "a", "b" ] (Ret (CPrim AddInt [ var "a", var "b" ])))
+            (Ret (CApp unit (var "f") [ var "p", var "q" ]))
         )
         `shouldEqual` Ret (CPrim AddInt [ var "p", var "q" ])
 
@@ -639,18 +639,18 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
       -- the body was CAF-shaped, so the specialised lambda is re-shared under $q0 (the P1
       -- binding-surface guard: ExportKind must stay mode-stable).
       nbe
-        ( Let "f" (CLam [ "a", "b" ] (Ret (CPrim AddInt [ var "a", var "b" ])))
-            (Ret (CApp (var "f") [ var "p" ]))
+        ( Let "f" (CLam unit [ "a", "b" ] (Ret (CPrim AddInt [ var "a", var "b" ])))
+            (Ret (CApp unit (var "f") [ var "p" ]))
         )
         `shouldEqual`
-          Let "$q0" (CLam [ "$q1" ] (Ret (CPrim AddInt [ var "p", var "$q1" ])))
+          Let "$q0" (CLam unit [ "$q1" ] (Ret (CPrim AddInt [ var "p", var "$q1" ])))
             (Ret (CAtom (var "$q0")))
 
     it "inlines a non-flat callee (nested if) — the capability Simplify's flat gate could not express" do
       nbe
         ( Let "f"
-            (CLam [ "a" ] (Ret (CIf (var "a") (Ret (CAtom (int 1))) (Ret (CAtom (int 0))))))
-            (Ret (CApp (var "f") [ var "p" ]))
+            (CLam unit [ "a" ] (Ret (CIf (var "a") (Ret (CAtom (int 1))) (Ret (CAtom (int 0))))))
+            (Ret (CApp unit (var "f") [ var "p" ]))
         )
         `shouldEqual` Ret (CIf (var "p") (Ret (CAtom (int 1))) (Ret (CAtom (int 0))))
 
@@ -689,36 +689,36 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
         `shouldEqual` Ret (CAtom (var "s"))
 
     it "collapses an exactly-saturated intrinsic-foreign call to its primop (both spellings)" do
-      nbe (Ret (CApp (AtomForeign "Data.Semiring.intAdd") [ var "p", var "q" ]))
+      nbe (Ret (CApp unit (AtomForeign "Data.Semiring.intAdd") [ var "p", var "q" ]))
         `shouldEqual` Ret (CPrim AddInt [ var "p", var "q" ])
-      nbe (Ret (CApp (var "Data.Semiring.intAdd") [ var "p", var "q" ]))
+      nbe (Ret (CApp unit (var "Data.Semiring.intAdd") [ var "p", var "q" ]))
         `shouldEqual` Ret (CPrim AddInt [ var "p", var "q" ])
 
     it "saturates an intrinsic through a local alias spine" do
       nbe
         ( Let "f" (CAtom (AtomForeign "Data.Semiring.intAdd"))
-            (Ret (CApp (var "f") [ var "p", var "q" ]))
+            (Ret (CApp unit (var "f") [ var "p", var "q" ]))
         )
         `shouldEqual` Ret (CPrim AddInt [ var "p", var "q" ])
 
     it "leaves an under- or over-applied intrinsic call to the link-time closure" do
-      let under = Ret (CApp (AtomForeign "Data.Semiring.intAdd") [ var "p" ])
-      let over = Ret (CApp (AtomForeign "Data.Semiring.intAdd") [ var "p", var "q", var "r" ])
+      let under = Ret (CApp unit (AtomForeign "Data.Semiring.intAdd") [ var "p" ])
+      let over = Ret (CApp unit (AtomForeign "Data.Semiring.intAdd") [ var "p", var "q", var "r" ])
       nbe under `shouldEqual` under
       nbe over `shouldEqual` over
 
     it "leaves a non-intrinsic foreign call untouched" do
-      let e = Ret (CApp (AtomForeign "Effect.Console.log") [ var "p" ])
+      let e = Ret (CApp unit (AtomForeign "Effect.Console.log") [ var "p" ])
       nbe e `shouldEqual` e
 
     it "collapses a call through a sibling top-level alias (the floated dictionary application)" do
       nbeWith [ nonrec "M.add1" (Ret (CAtom (AtomForeign "Data.Semiring.intAdd"))) ]
-        (Ret (CApp (var "M.add1") [ var "p", var "q" ]))
+        (Ret (CApp unit (var "M.add1") [ var "p", var "q" ]))
         `shouldEqual` Ret (CPrim AddInt [ var "p", var "q" ])
 
     it "inlines a small sibling top-level function at a saturated call" do
-      nbeWith [ nonrec "M.f" (Ret (CLam [ "a", "b" ] (Ret (CPrim AddInt [ var "a", var "b" ])))) ]
-        (Ret (CApp (var "M.f") [ var "p", var "q" ]))
+      nbeWith [ nonrec "M.f" (Ret (CLam unit [ "a", "b" ] (Ret (CPrim AddInt [ var "a", var "b" ])))) ]
+        (Ret (CApp unit (var "M.f") [ var "p", var "q" ]))
         `shouldEqual` Ret (CPrim AddInt [ var "p", var "q" ])
 
   describe "review pins (P1/P2)" do
@@ -727,10 +727,10 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
       -- the reserved $q0 so classifyDecl/ExportKind (and the .pmi hash) match --no-opt.
       let
         caf =
-          Let "g" (CLam [ "x" ] (Ret (CAtom (var "x"))))
+          Let "g" (CLam unit [ "x" ] (Ret (CAtom (var "x"))))
             (Ret (CAtom (var "g")))
         wrapped =
-          Let "$q0" (CLam [ "$q1" ] (Ret (CAtom (var "$q1"))))
+          Let "$q0" (CLam unit [ "$q1" ] (Ret (CAtom (var "$q1"))))
             (Ret (CAtom (var "$q0")))
       nbe caf `shouldEqual` wrapped
       -- and the wrap is a fixpoint across driver rounds
@@ -745,56 +745,56 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
     it "a large multi-use lambda over globals is not 'closed' (no unconditional inline)" do
       let
         chain 0 = Ret (CAtom (var "v1"))
-        chain n = Let ("v" <> show n) (CApp (var "M.g") [ var "x" ]) (chain (n - 1))
+        chain n = Let ("v" <> show n) (CApp unit (var "M.g") [ var "x" ]) (chain (n - 1))
         e =
-          Let "f" (CLam [ "x" ] (chain 5))
+          Let "f" (CLam unit [ "x" ] (chain 5))
             (Ret (CRecord [ { prop: "a", val: var "f" }, { prop: "b", val: var "f" } ]))
         sharedLambda = case nbe e of
-          Let _ (CLam _ _) _ -> true
+          Let _ (CLam _ _ _) _ -> true
           _ -> false
       sharedLambda `shouldEqual` true
 
   describe "cross-module candidates (ADR-0089 slice 2)" do
     it "inlines a small dependency lambda at a saturated call" do
-      nbeCross [ nonrec "D.f" (Ret (CLam [ "a", "b" ] (Ret (CPrim AddInt [ var "a", var "b" ])))) ] []
-        (Ret (CApp (var "D.f") [ var "p", var "q" ]))
+      nbeCross [ nonrec "D.f" (Ret (CLam unit [ "a", "b" ] (Ret (CPrim AddInt [ var "a", var "b" ])))) ] []
+        (Ret (CApp unit (var "D.f") [ var "p", var "q" ]))
         `shouldEqual` Ret (CPrim AddInt [ var "p", var "q" ])
 
     it "publishes a strictly under-applied pure partial application with its residual arity" do
       -- D.add1 = intAdd(1): residual arity 1; a saturated call through it constant-folds.
-      nbeCross [ nonrec "D.add1" (Ret (CApp (AtomForeign "Data.Semiring.intAdd") [ int 1 ])) ] []
-        (Ret (CApp (var "D.add1") [ int 41 ]))
+      nbeCross [ nonrec "D.add1" (Ret (CApp unit (AtomForeign "Data.Semiring.intAdd") [ int 1 ])) ] []
+        (Ret (CApp unit (var "D.add1") [ int 41 ]))
         `shouldEqual` Ret (CAtom (int 42))
 
     it "never publishes a saturated CAF application (an init-once computation)" do
       -- D.x = D.g(1, 2) executes at init; inlining it would re-execute it per use site.
       let
         deps =
-          [ nonrec "D.g" (Ret (CLam [ "a", "b" ] (Ret (CPrim AddInt [ var "a", var "b" ]))))
-          , nonrec "D.x" (Ret (CApp (var "D.g") [ int 1, int 2 ]))
+          [ nonrec "D.g" (Ret (CLam unit [ "a", "b" ] (Ret (CPrim AddInt [ var "a", var "b" ]))))
+          , nonrec "D.x" (Ret (CApp unit (var "D.g") [ int 1, int 2 ]))
           ]
-        call = Ret (CApp (var "D.x") [ var "p" ])
+        call = Ret (CApp unit (var "D.x") [ var "p" ])
       nbeCross deps [] call `shouldEqual` call
 
     it "publishes the lambda inside a slice-1 binding-surface wrap" do
       nbeCross
         [ nonrec "D.w"
-            ( Let "$q0" (CLam [ "x" ] (Ret (CPrim AddInt [ var "x", int 1 ])))
+            ( Let "$q0" (CLam unit [ "x" ] (Ret (CPrim AddInt [ var "x", int 1 ])))
                 (Ret (CAtom (var "$q0")))
             )
         ]
         []
-        (Ret (CApp (var "D.w") [ int 41 ]))
+        (Ret (CApp unit (var "D.w") [ int 41 ]))
         `shouldEqual` Ret (CAtom (int 42))
 
     it "collapses a local partial-application CAF over a dependency target (the floated-wrapper shape)" do
       -- dep: D.lt = \d a b -> d(a, b); local sibling: L.lt1 = D.lt(L.cmp); the call saturates
       -- through both hops and lands on the (unknown) comparator.
       let
-        deps = [ nonrec "D.lt" (Ret (CLam [ "d", "a", "b" ] (Ret (CApp (var "d") [ var "a", var "b" ])))) ]
-        locals = [ nonrec "L.lt1" (Ret (CApp (var "D.lt") [ var "L.cmp" ])) ]
-      nbeCross deps locals (Ret (CApp (var "L.lt1") [ var "p", var "q" ]))
-        `shouldEqual` Ret (CApp (var "L.cmp") [ var "p", var "q" ])
+        deps = [ nonrec "D.lt" (Ret (CLam unit [ "d", "a", "b" ] (Ret (CApp unit (var "d") [ var "a", var "b" ])))) ]
+        locals = [ nonrec "L.lt1" (Ret (CApp unit (var "D.lt") [ var "L.cmp" ])) ]
+      nbeCross deps locals (Ret (CApp unit (var "L.lt1") [ var "p", var "q" ]))
+        `shouldEqual` Ret (CApp unit (var "L.cmp") [ var "p", var "q" ])
 
   describe "structural guest terms (compiler-global rung)" do
     -- ADR-0094: the `Data.Ord.*Impl` / `eqArrayImpl` / `arrayMap` guest terms are retired — the
@@ -802,25 +802,25 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
     -- E2E fold-parity harness (real `dist/ulib` artifacts). The retired keys must now be plain
     -- native-leaf-shaped: untouched by any compiler-global rung.
     it "a retired sliced key is no longer a structural rung (ADR-0094)" do
-      let e = Ret (CApp (AtomForeign "Data.Ord.ordIntImpl") [ var "l", var "e", var "g", int 1, int 2 ])
+      let e = Ret (CApp unit (AtomForeign "Data.Ord.ordIntImpl") [ var "l", var "e", var "g", int 1, int 2 ])
       nbe e `shouldEqual` e
 
     it "does NOT unfold a GER-owned Effect combinator: pureE left the structural rung (ADR-0099 §3)" do
       -- `Effect.pureE`/`bindE` are GER-owned — the structural rung no longer serves them (Impurify
       -- lowers them to `CPerform` ANF instead), so NbE leaves a saturated `Effect.pureE a u`
       -- untouched for GER, rather than unfolding the guest term to `a`.
-      let e = Ret (CApp (AtomForeign "Effect.pureE") [ var "a", var "u" ])
+      let e = Ret (CApp unit (AtomForeign "Effect.pureE") [ var "a", var "u" ])
       nbe e `shouldEqual` e
 
     it "resolves the literal builtins (Prim.undefined) so superclass forcing β-reduces" do
       nbe
-        ( Let "g" (CLam [ "$u" ] (Ret (CAtom (int 7))))
-            (Ret (CApp (var "g") [ var "Prim.undefined" ]))
+        ( Let "g" (CLam unit [ "$u" ] (Ret (CAtom (int 7))))
+            (Ret (CApp unit (var "g") [ var "Prim.undefined" ]))
         )
         `shouldEqual` Ret (CAtom (int 7))
 
     it "leaves a native leaf untouched (not in any compiler-global rung)" do
-      let e = Ret (CApp (AtomForeign "Data.Show.showIntImpl") [ var "p" ])
+      let e = Ret (CApp unit (AtomForeign "Data.Show.showIntImpl") [ var "p" ])
       nbe e `shouldEqual` e
 
   describe "let-wrapped value CAFs (publication through pure-value chains)" do
@@ -829,13 +829,13 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
       let
         deps =
           [ nonrec "D.ord"
-              ( Let "cmp" (CLam [ "x", "y" ] (Ret (CPrim LtInt [ var "x", var "y" ])))
+              ( Let "cmp" (CLam unit [ "x", "y" ] (Ret (CPrim LtInt [ var "x", var "y" ])))
                   (Ret (CRecord [ { prop: "compare", val: var "cmp" } ]))
               )
           ]
         consumer =
           Let "f" (CAccessor (var "D.ord") "compare")
-            (Ret (CApp (var "f") [ var "p", var "q" ]))
+            (Ret (CApp unit (var "f") [ var "p", var "q" ]))
       nbeCross deps [] consumer `shouldEqual` Ret (CPrim LtInt [ var "p", var "q" ])
 
     it "does not publish a chain containing a computation binding" do
@@ -843,7 +843,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
       let
         deps =
           [ nonrec "D.bad"
-              ( Let "r" (CApp (var "D.mk") [ int 1 ])
+              ( Let "r" (CApp unit (var "D.mk") [ int 1 ])
                   (Ret (CRecord [ { prop: "f", val: var "r" } ]))
               )
           ]
@@ -936,7 +936,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
       let
         -- pinned calls: never dropped or moved, so the RHS size is stable under the engine.
         chain 0 = Ret (CPrim AddInt [ var "a", var "big" ])
-        chain n = Let ("v" <> show n) (CApp (var "g") [ var "a" ]) (chain (n - 1))
+        chain n = Let ("v" <> show n) (CApp unit (var "g") [ var "a" ]) (chain (n - 1))
         e =
           Let "s"
             ( CCase [ var "c" ]
@@ -994,7 +994,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
                 ( CCase [ var "s" ]
                     [ { binders: [ BCtor "LT" [] ], result: Uncond (Ret (CAtom (AtomLit (LBool true)))) }
                     , { binders: [ BNull ]
-                      , result: Uncond (Let "eff" (CApp (var "f") [ var "y" ]) (Ret (CAtom (var "eff"))))
+                      , result: Uncond (Let "eff" (CApp unit (var "f") [ var "y" ]) (Ret (CAtom (var "eff"))))
                       }
                     ]
                 )
@@ -1004,7 +1004,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
           ( CCase [ var "c" ]
               [ { binders: [ BLit (LBool true) ], result: Uncond (Ret (CAtom (AtomLit (LBool true)))) }
               , { binders: [ BNull ]
-                , result: Uncond (Let "$q1" (CApp (var "f") [ var "y" ]) (Ret (CAtom (var "$q1"))))
+                , result: Uncond (Let "$q1" (CApp unit (var "f") [ var "y" ]) (Ret (CAtom (var "$q1"))))
                 }
               ]
           )
@@ -1108,19 +1108,19 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
     it "publishes only non-recursive value/lambda bodies" do
       let
         decls =
-          [ nonrec "M.lam" (Ret (CLam [ "x" ] (Ret (CAtom (var "x")))))
+          [ nonrec "M.lam" (Ret (CLam unit [ "x" ] (Ret (CAtom (var "x")))))
           , nonrec "M.alias" (Ret (CAtom (var "M.lam")))
-          , nonrec "M.caf" (Ret (CApp (var "M.lam") [ int 1 ]))
-          , { recursive: true, members: [ "M.rec" /\ Ret (CLam [ "x" ] (Ret (CAtom (var "x")))) ] }
+          , nonrec "M.caf" (Ret (CApp unit (var "M.lam") [ int 1 ]))
+          , { recursive: true, members: [ "M.rec" /\ Ret (CLam unit [ "x" ] (Ret (CAtom (var "x")))) ] }
           ]
         env = nbeEnvOf intrinsicPrim Map.empty decls
       -- membership probed through nbeBinding behaviour instead of map internals:
       -- the lambda inlines, the computation CAF and the recursive member stay calls.
-      nbeBinding env (const Nothing) "t" (Ret (CApp (var "M.lam") [ var "p" ])) `shouldEqual` Ret (CAtom (var "p"))
-      nbeBinding env (const Nothing) "t" (Ret (CApp (var "M.caf") [ var "p" ]))
-        `shouldEqual` Ret (CApp (var "M.caf") [ var "p" ])
-      nbeBinding env (const Nothing) "t" (Ret (CApp (var "M.rec") [ var "p" ]))
-        `shouldEqual` Ret (CApp (var "M.rec") [ var "p" ])
+      nbeBinding env (const Nothing) "t" (Ret (CApp unit (var "M.lam") [ var "p" ])) `shouldEqual` Ret (CAtom (var "p"))
+      nbeBinding env (const Nothing) "t" (Ret (CApp unit (var "M.caf") [ var "p" ]))
+        `shouldEqual` Ret (CApp unit (var "M.caf") [ var "p" ])
+      nbeBinding env (const Nothing) "t" (Ret (CApp unit (var "M.rec") [ var "p" ]))
+        `shouldEqual` Ret (CApp unit (var "M.rec") [ var "p" ])
 
   describe "parameterized-instance unfolding (ADR-0089 Accepted extension)" do
     let
@@ -1130,53 +1130,53 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
         [ { recursive: true
           , members:
               [ "M.b1" /\ Ret
-                  ( CLam [ "d" ]
-                      ( Let "f" (CLam [ "x" ] (Ret (CAtom (var "x"))))
-                          ( Let "t" (CLam [ "u" ] (Ret (CApp (var "M.b2") [ var "d" ])))
+                  ( CLam unit [ "d" ]
+                      ( Let "f" (CLam unit [ "x" ] (Ret (CAtom (var "x"))))
+                          ( Let "t" (CLam unit [ "u" ] (Ret (CApp unit (var "M.b2") [ var "d" ])))
                               (Ret (CRecord [ { prop: "bind", val: var "f" }, { prop: "Apply0", val: var "t" } ]))
                           )
                       )
                   )
               , "M.b2" /\ Ret
-                  ( CLam [ "d" ]
-                      ( Let "g" (CLam [ "y" ] (Ret (CApp (var "M.b1") [ var "d" ])))
+                  ( CLam unit [ "d" ]
+                      ( Let "g" (CLam unit [ "y" ] (Ret (CApp unit (var "M.b1") [ var "d" ])))
                           (Ret (CRecord [ { prop: "apply", val: var "g" } ]))
                       )
                   )
               ]
           }
         ]
-      idLam = Let "$q0" (CLam [ "$q1" ] (Ret (CAtom (var "$q1")))) (Ret (CAtom (var "$q0")))
+      idLam = Let "$q0" (CLam unit [ "$q1" ] (Ret (CAtom (var "$q1")))) (Ret (CAtom (var "$q0")))
 
     it "projecting a group-free field folds the builder application" do
       nbeCross groupDecls []
-        (Let "q" (CApp (var "M.b1") [ var "M.dict" ]) (Ret (CAccessor (var "q") "bind")))
+        (Let "q" (CApp unit (var "M.b1") [ var "M.dict" ]) (Ret (CAccessor (var "q") "bind")))
         `shouldEqual` idLam
 
     it "a selected field referencing a group sibling refuses the commit (term stable)" do
       let
-        stable = Let "$q1" (CApp (var "M.b1") [ var "M.dict" ]) (Ret (CAccessor (var "$q1") "Apply0"))
+        stable = Let "$q1" (CApp unit (var "M.b1") [ var "M.dict" ]) (Ret (CAccessor (var "$q1") "Apply0"))
       nbeCross groupDecls []
-        (Let "q" (CApp (var "M.b1") [ var "M.dict" ]) (Ret (CAccessor (var "q") "Apply0")))
+        (Let "q" (CApp unit (var "M.b1") [ var "M.dict" ]) (Ret (CAccessor (var "q") "Apply0")))
         `shouldEqual` stable
       nbeCross groupDecls [] stable `shouldEqual` stable
 
     it "a bare saturated application with no consuming projection is never deferred" do
       nbeCross groupDecls []
-        (Let "q" (CApp (var "M.b1") [ var "M.dict" ]) (Ret (CAtom (var "q"))))
-        `shouldEqual` Let "$q1" (CApp (var "M.b1") [ var "M.dict" ]) (Ret (CAtom (var "$q1")))
+        (Let "q" (CApp unit (var "M.b1") [ var "M.dict" ]) (Ret (CAtom (var "q"))))
+        `shouldEqual` Let "$q1" (CApp unit (var "M.b1") [ var "M.dict" ]) (Ret (CAtom (var "$q1")))
 
     it "a multi-use application keeps the single shared let (sharing never lost)" do
       nbeCross groupDecls []
-        ( Let "q" (CApp (var "M.b1") [ var "M.dict" ])
+        ( Let "q" (CApp unit (var "M.b1") [ var "M.dict" ])
             (Ret (CRecord [ { prop: "a", val: var "q" }, { prop: "b", val: var "q" } ]))
         )
         `shouldEqual`
-          Let "$q1" (CApp (var "M.b1") [ var "M.dict" ])
+          Let "$q1" (CApp unit (var "M.b1") [ var "M.dict" ])
             (Ret (CRecord [ { prop: "a", val: var "$q1" }, { prop: "b", val: var "$q1" } ]))
 
     it "the CAF-split alias spelling folds through the published saturated application" do
-      let deps = groupDecls <> [ nonrec "M.alias" (Ret (CApp (var "M.b1") [ var "M.dict" ])) ]
+      let deps = groupDecls <> [ nonrec "M.alias" (Ret (CApp unit (var "M.b1") [ var "M.dict" ])) ]
       nbeCross deps [] (Ret (CAccessor (var "M.alias") "bind")) `shouldEqual` idLam
 
     it "a projection inside a lambda never defers (refusal would move the pinned app inward)" do
@@ -1184,16 +1184,16 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
       -- Apply0 refusal, reify `M.b1(M.dict)` inside the lambda — re-materialising the pinned
       -- construction per call. The outer shared let must survive at its own level.
       nbeCross groupDecls []
-        ( Let "q" (CApp (var "M.b1") [ var "M.dict" ])
-            (Ret (CLam [ "k" ] (Ret (CAccessor (var "q") "Apply0"))))
+        ( Let "q" (CApp unit (var "M.b1") [ var "M.dict" ])
+            (Ret (CLam unit [ "k" ] (Ret (CAccessor (var "q") "Apply0"))))
         )
         `shouldEqual`
-          Let "$q1" (CApp (var "M.b1") [ var "M.dict" ])
-            (Ret (CLam [ "$q2" ] (Ret (CAccessor (var "$q1") "Apply0"))))
+          Let "$q1" (CApp unit (var "M.b1") [ var "M.dict" ])
+            (Ret (CLam unit [ "$q2" ] (Ret (CAccessor (var "$q1") "Apply0"))))
 
     it "a projection inside a case arm never defers" do
       let
-        e0 = Let "q" (CApp (var "M.b1") [ var "M.dict" ])
+        e0 = Let "q" (CApp unit (var "M.b1") [ var "M.dict" ])
           ( Ret
               ( CCase [ var "s" ]
                   [ { binders: [ BCtor "C" [] ], result: Uncond (Ret (CAccessor (var "q") "bind")) }
@@ -1201,7 +1201,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
                   ]
               )
           )
-        stable = Let "$q1" (CApp (var "M.b1") [ var "M.dict" ])
+        stable = Let "$q1" (CApp unit (var "M.b1") [ var "M.dict" ])
           ( Ret
               ( CCase [ var "s" ]
                   [ { binders: [ BCtor "C" [] ], result: Uncond (Ret (CAccessor (var "$q1") "bind")) }
@@ -1217,17 +1217,17 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
           [ { recursive: true
             , members:
                 [ "M.self" /\ Ret
-                    ( CLam [ "d" ]
-                        ( Let "s" (CLam [ "u" ] (Ret (CApp (var "M.self") [ var "d" ])))
+                    ( CLam unit [ "d" ]
+                        ( Let "s" (CLam unit [ "u" ] (Ret (CApp unit (var "M.self") [ var "d" ])))
                             (Ret (CRecord [ { prop: "go", val: var "s" } ]))
                         )
                     )
                 ]
             }
           ]
-        stable = Let "$q1" (CApp (var "M.self") [ var "d0" ]) (Ret (CAccessor (var "$q1") "go"))
+        stable = Let "$q1" (CApp unit (var "M.self") [ var "d0" ]) (Ret (CAccessor (var "$q1") "go"))
       nbeCross selfDecls []
-        (Let "q" (CApp (var "M.self") [ var "d0" ]) (Ret (CAccessor (var "q") "go")))
+        (Let "q" (CApp unit (var "M.self") [ var "d0" ]) (Ret (CAccessor (var "q") "go")))
         `shouldEqual` stable
 
   describe "nullary Rec-group dict CAF projection (ADR-0098)" do
@@ -1240,7 +1240,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
         [ { recursive: true
           , members:
               [ "M.bindD" /\
-                  Let "t" (CLam [ "u" ] (Ret (CAtom (var "M.applyD"))))
+                  Let "t" (CLam unit [ "u" ] (Ret (CAtom (var "M.applyD"))))
                     ( Ret
                         ( CRecord
                             [ { prop: "bind", val: AtomForeign "Effect.bindE" }
@@ -1259,7 +1259,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
         [ { recursive: true
           , members:
               [ "M.cbindD" /\
-                  Let "r" (CApp (var "M.eff") [ var "x" ])
+                  Let "r" (CApp unit (var "M.eff") [ var "x" ])
                     (Ret (CRecord [ { prop: "bind", val: AtomForeign "Effect.bindE" }, { prop: "self", val: var "M.cbindD" } ]))
               ]
           }
@@ -1275,8 +1275,8 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
       -- `bindE` is arity 3 (the structural guest term); an `Effect` do-block applies only 2, so the
       -- structural rung must NOT unfold it — the residual is the `Effect.bindE m k` node GER reads.
       nbeCross dictGroup []
-        (Let "f" (CAccessor (var "M.bindD") "bind") (Ret (CApp (var "f") [ var "m", var "k" ])))
-        `shouldEqual` Ret (CApp (AtomForeign "Effect.bindE") [ var "m", var "k" ])
+        (Let "f" (CAccessor (var "M.bindD") "bind") (Ret (CApp unit (var "f") [ var "m", var "k" ])))
+        `shouldEqual` Ret (CApp unit (AtomForeign "Effect.bindE") [ var "m", var "k" ])
 
     it "sibling-referencing field (Apply0) refuses the commit and stays the original projection" do
       let stable = Ret (CAccessor (var "M.bindD") "Apply0")
@@ -1284,7 +1284,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
       nbeCross dictGroup [] stable `shouldEqual` stable -- term stability on re-run
 
     it "whole-dict demand stays a reference (the record is never inlined)" do
-      let e = Ret (CApp (var "someConsumer") [ var "M.bindD" ])
+      let e = Ret (CApp unit (var "someConsumer") [ var "M.bindD" ])
       nbeCross dictGroup [] e `shouldEqual` e
 
     it "computation-let non-publication (the P1 predicate): a computation-chain CAF never folds" do
@@ -1306,10 +1306,10 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
         [ dictDecl
         , nonrec "M.b1"
             ( Ret
-                ( CLam [ "d" ]
+                ( CLam unit [ "d" ]
                     ( pad 8
                         ( Let "x" (CAccessor (var "d") "f")
-                            ( Let "fwd" (CApp (var "M.b2") [ var "d" ])
+                            ( Let "fwd" (CApp unit (var "M.b2") [ var "d" ])
                                 (Ret (CRecord [ { prop: "out", val: var "x" }, { prop: "next", val: var "fwd" } ]))
                             )
                         )
@@ -1318,7 +1318,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
             )
         , nonrec "M.b2"
             ( Ret
-                ( CLam [ "d" ]
+                ( CLam unit [ "d" ]
                     (pad 8 (Let "y" (CAccessor (var "d") "f") (Ret (CRecord [ { prop: "out", val: var "y" } ]))))
                 )
             )
@@ -1326,7 +1326,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
 
     it "positive: a known-record argument with a projected param folds (incl. the SRef peek and the forwarding chain)" do
       let
-        out = nbeCross builderChain [] (Ret (CApp (var "M.b1") [ var "M.dict" ]))
+        out = nbeCross builderChain [] (Ret (CApp unit (var "M.b1") [ var "M.dict" ]))
         expected =
           Let "$q1" (CRecord [ { prop: "out", val: int 1 } ])
             (Ret (CRecord [ { prop: "out", val: int 1 }, { prop: "next", val: var "$q1" } ]))
@@ -1334,8 +1334,8 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
 
     it "negative: a lambda argument never qualifies" do
       let
-        e0 = Let "l" (CLam [ "z" ] (Ret (CAtom (var "z"))))
-          (Ret (CApp (var "M.b1") [ var "l" ]))
+        e0 = Let "l" (CLam unit [ "z" ] (Ret (CAtom (var "z"))))
+          (Ret (CApp unit (var "M.b1") [ var "l" ]))
         out = nbeCross builderChain [] e0
       -- the call survives; run the output again to pin it as the fixpoint.
       nbeCross builderChain [] out `shouldEqual` out
@@ -1347,19 +1347,19 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Nbe" do
         mixed = builderChain <>
           [ nonrec "M.c"
               ( Ret
-                  ( CLam [ "cfg", "p" ]
+                  ( CLam unit [ "cfg", "p" ]
                       ( pad 8
                           ( Let "x" (CAccessor (var "cfg") "f")
-                              ( Let "s" (CApp (var "M.b2") [ var "cfg" ])
-                                  (Let "r" (CApp (var "p") [ var "x" ]) (Ret (CAtom (var "r"))))
+                              ( Let "s" (CApp unit (var "M.b2") [ var "cfg" ])
+                                  (Let "r" (CApp unit (var "p") [ var "x" ]) (Ret (CAtom (var "r"))))
                               )
                           )
                       )
                   )
               )
           ]
-        e0 = Let "l" (CLam [ "z" ] (Ret (CAtom (var "z"))))
-          (Ret (CApp (var "M.c") [ var "M.dict", var "l" ]))
+        e0 = Let "l" (CLam unit [ "z" ] (Ret (CAtom (var "z"))))
+          (Ret (CApp unit (var "M.c") [ var "M.dict", var "l" ]))
         out = nbeCross mixed [] e0
       -- the call survives (the universal appliedHead conjunct refuses); pin the fixpoint.
       nbeCross mixed [] out `shouldEqual` out

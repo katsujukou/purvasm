@@ -177,7 +177,7 @@ compileTree lw tail scruts alts = Array.concatMap scrutBind scrutBinds <> lower 
   leafBinds = Array.concatMap (\(name /\ occ) -> [ Load occ, Bind name ])
   extractsOf occ_c = Array.concatMap (\(o /\ pr) -> [ Load occ_c, projInstr pr, Bind o ])
 
-  lower :: DTree -> CodeBlock
+  lower :: DTree Unit Unit -> CodeBlock
   lower = case _ of
     Dfail msg -> [ Fail msg ]
     Dleaf binds e -> leafBinds binds <> lw.body tail e
@@ -200,7 +200,7 @@ compileTree lw tail scruts alts = Array.concatMap scrutBind scrutBinds <> lower 
       ]
     DexpandRecord occ_c extracts sub -> extractsOf occ_c extracts <> lower sub
 
-  emitArm :: String -> Arm -> CodeBlock
+  emitArm :: String -> Arm Unit Unit -> CodeBlock
   emitArm occ_c arm = extractsOf occ_c arm.extracts <> lower arm.sub
 
 -- --- naive matcher (per-alternative re-testing) -------------------------------------

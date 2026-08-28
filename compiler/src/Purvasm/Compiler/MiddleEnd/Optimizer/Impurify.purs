@@ -41,7 +41,7 @@ import Data.Traversable (traverse)
 import Data.Tuple (Tuple(..), fst)
 import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.Compiler.Literal (Literal(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..), Rhs, RhsF(..))
 import Purvasm.Compiler.MiddleEnd.Module (Decl)
 import Purvasm.Compiler.MiddleEnd.Optimizer.DictElim (DictMachinery)
 import Purvasm.Compiler.Primitive (PrimOp(..))
@@ -84,7 +84,7 @@ lowerPure :: Array Atom -> Fresh CExpr
 lowerPure = case _ of
   [ a ] -> do
     u <- fresh
-    pure (CLam [ u ] (Ret (CAtom a)))
+    pure (CLam unit [ u ] (Ret (CAtom a)))
   _ -> unsafeCrashWith "Impurify.lowerPure: expected exactly 1 argument"
 
 -- | `bindE m k → \$u -> let x = perform m in let kx = k x in perform kx` (ADR-0099 §5). The
@@ -95,14 +95,14 @@ lowerBind = case _ of
     u <- fresh
     x <- fresh
     kx <- fresh
-    pure (CLam [ u ] (Let x (CPerform m) (Let kx (CApp k [ AtomVar x ]) (Ret (CPerform (AtomVar kx))))))
+    pure (CLam unit [ u ] (Let x (CPerform unit m) (Let kx (CApp unit k [ AtomVar x ]) (Ret (CPerform unit (AtomVar kx))))))
   _ -> unsafeCrashWith "Impurify.lowerBind: expected exactly 2 arguments"
 
 -- | `unsafePerformEffect e → perform e` (ADR-0099 §5): the eliminator *runs* the thunk, so — unlike a
 -- | glue combinator — it is not wrapped in a `\$u`; it yields the performed value directly.
 lowerUnsafePerform :: Array Atom -> Fresh CExpr
 lowerUnsafePerform = case _ of
-  [ e ] -> pure (CPerform e)
+  [ e ] -> pure (CPerform unit e)
   _ -> unsafeCrashWith "Impurify.lowerUnsafePerform: expected exactly 1 argument"
 
 -- | `functorEffect.map f m → \$u -> let a = perform m in f a` (ADR-0099 §5(a), Slice 3).
@@ -111,7 +111,7 @@ lowerMap = case _ of
   [ f, m ] -> do
     u <- fresh
     a <- fresh
-    pure (CLam [ u ] (Let a (CPerform m) (Ret (CApp f [ AtomVar a ]))))
+    pure (CLam unit [ u ] (Let a (CPerform unit m) (Ret (CApp unit f [ AtomVar a ]))))
   _ -> unsafeCrashWith "Impurify.lowerMap: expected exactly 2 arguments"
 
 -- | `applyEffect.apply mf ma → \$u -> let f = perform mf in let a = perform ma in f a` (§5(a)).
@@ -121,7 +121,7 @@ lowerApply = case _ of
     u <- fresh
     f <- fresh
     a <- fresh
-    pure (CLam [ u ] (Let f (CPerform mf) (Let a (CPerform ma) (Ret (CApp (AtomVar f) [ AtomVar a ])))))
+    pure (CLam unit [ u ] (Let f (CPerform unit mf) (Let a (CPerform unit ma) (Ret (CApp unit (AtomVar f) [ AtomVar a ])))))
   _ -> unsafeCrashWith "Impurify.lowerApply: expected exactly 2 arguments"
 
 -- | The synthetic descriptors for the `Functor`/`Apply` methods, emitted by `recognize` when the
@@ -159,18 +159,18 @@ lowerUntil = case _ of
     g <- fresh
     b <- fresh
     pure
-      ( CLam [ u ]
+      ( CLam unit [ u ]
           ( LetRec
               [ { var: go
                 , rhs: Ret
-                    ( CLam [ g ]
-                        ( Let b (CPerform f)
-                            (Ret (CIf (AtomVar b) (Ret (CAtom unitAtom)) (Ret (CApp (AtomVar go) [ unitAtom ]))))
+                    ( CLam unit [ g ]
+                        ( Let b (CPerform unit f)
+                            (Ret (CIf (AtomVar b) (Ret (CAtom unitAtom)) (Ret (CApp unit (AtomVar go) [ unitAtom ]))))
                         )
                     )
                 }
               ]
-              (Ret (CApp (AtomVar go) [ unitAtom ]))
+              (Ret (CApp unit (AtomVar go) [ unitAtom ]))
           )
       )
   _ -> unsafeCrashWith "Impurify.lowerUntil: expected exactly 1 argument"
@@ -186,15 +186,15 @@ lowerWhile = case _ of
     b <- fresh
     dropv <- fresh
     pure
-      ( CLam [ u ]
+      ( CLam unit [ u ]
           ( LetRec
               [ { var: go
                 , rhs: Ret
-                    ( CLam [ g ]
-                        ( Let b (CPerform cond)
+                    ( CLam unit [ g ]
+                        ( Let b (CPerform unit cond)
                             ( Ret
                                 ( CIf (AtomVar b)
-                                    (Let dropv (CPerform body) (Ret (CApp (AtomVar go) [ unitAtom ])))
+                                    (Let dropv (CPerform unit body) (Ret (CApp unit (AtomVar go) [ unitAtom ])))
                                     (Ret (CAtom unitAtom))
                                 )
                             )
@@ -202,7 +202,7 @@ lowerWhile = case _ of
                     )
                 }
               ]
-              (Ret (CApp (AtomVar go) [ unitAtom ]))
+              (Ret (CApp unit (AtomVar go) [ unitAtom ]))
           )
       )
   _ -> unsafeCrashWith "Impurify.lowerWhile: expected exactly 2 arguments"
@@ -220,18 +220,18 @@ lowerFor = case _ of
     dropv <- fresh
     i1 <- fresh
     pure
-      ( CLam [ u ]
+      ( CLam unit [ u ]
           ( LetRec
               [ { var: go
                 , rhs: Ret
-                    ( CLam [ i ]
+                    ( CLam unit [ i ]
                         ( Let cmp (CPrim LtInt [ AtomVar i, hi ])
                             ( Ret
                                 ( CIf (AtomVar cmp)
-                                    ( Let fi (CApp f [ AtomVar i ])
-                                        ( Let dropv (CPerform (AtomVar fi))
+                                    ( Let fi (CApp unit f [ AtomVar i ])
+                                        ( Let dropv (CPerform unit (AtomVar fi))
                                             ( Let i1 (CPrim AddInt [ AtomVar i, AtomLit (LInt 1) ])
-                                                (Ret (CApp (AtomVar go) [ AtomVar i1 ]))
+                                                (Ret (CApp unit (AtomVar go) [ AtomVar i1 ]))
                                             )
                                         )
                                     )
@@ -242,7 +242,7 @@ lowerFor = case _ of
                     )
                 }
               ]
-              (Ret (CApp (AtomVar go) [ lo ]))
+              (Ret (CApp unit (AtomVar go) [ lo ]))
           )
       )
   _ -> unsafeCrashWith "Impurify.lowerFor: expected exactly 3 arguments"
@@ -262,20 +262,20 @@ lowerForeach = case _ of
     dropv <- fresh
     i1 <- fresh
     pure
-      ( CLam [ u ]
+      ( CLam unit [ u ]
           ( Let n (CPrim LengthArray [ as ])
               ( LetRec
                   [ { var: go
                     , rhs: Ret
-                        ( CLam [ i ]
+                        ( CLam unit [ i ]
                             ( Let cmp (CPrim LtInt [ AtomVar i, AtomVar n ])
                                 ( Ret
                                     ( CIf (AtomVar cmp)
                                         ( Let el (CPrim IndexArray [ as, AtomVar i ])
-                                            ( Let fi (CApp f [ AtomVar el ])
-                                                ( Let dropv (CPerform (AtomVar fi))
+                                            ( Let fi (CApp unit f [ AtomVar el ])
+                                                ( Let dropv (CPerform unit (AtomVar fi))
                                                     ( Let i1 (CPrim AddInt [ AtomVar i, AtomLit (LInt 1) ])
-                                                        (Ret (CApp (AtomVar go) [ AtomVar i1 ]))
+                                                        (Ret (CApp unit (AtomVar go) [ AtomVar i1 ]))
                                                     )
                                                 )
                                             )
@@ -287,7 +287,7 @@ lowerForeach = case _ of
                         )
                     }
                   ]
-                  (Ret (CApp (AtomVar go) [ AtomLit (LInt 0) ]))
+                  (Ret (CApp unit (AtomVar go) [ AtomLit (LInt 0) ]))
               )
           )
       )
@@ -300,7 +300,7 @@ lowerForeach = case _ of
 -- | fact alone — the `leavesRung` flag is not a semantic role (see `GerDescriptor`).
 lowerRun :: Array Atom -> Fresh CExpr
 lowerRun = case _ of
-  [ e ] -> pure (CPerform e)
+  [ e ] -> pure (CPerform unit e)
   _ -> unsafeCrashWith "Impurify.lowerRun: expected exactly 1 argument"
 
 -- | `ST` reference combinators (ADR-0099 §9, Slice 5) — the `STRef` cell is a one-element array (the
@@ -319,7 +319,7 @@ lowerNew = case _ of
   [ val ] -> do
     u <- fresh
     arr <- fresh
-    pure (CLam [ u ] (Let arr (CPrim NewArray [ AtomLit (LInt 1) ]) (Ret (CPrim SetArray [ AtomVar arr, AtomLit (LInt 0), val ]))))
+    pure (CLam unit [ u ] (Let arr (CPrim NewArray [ AtomLit (LInt 1) ]) (Ret (CPrim SetArray [ AtomVar arr, AtomLit (LInt 0), val ]))))
   _ -> unsafeCrashWith "Impurify.lowerNew: expected exactly 1 argument"
 
 -- | `read ref → \$u -> indexArray ref 0`.
@@ -327,7 +327,7 @@ lowerRead :: Array Atom -> Fresh CExpr
 lowerRead = case _ of
   [ ref ] -> do
     u <- fresh
-    pure (CLam [ u ] (Ret (CPrim IndexArray [ ref, AtomLit (LInt 0) ])))
+    pure (CLam unit [ u ] (Ret (CPrim IndexArray [ ref, AtomLit (LInt 0) ])))
   _ -> unsafeCrashWith "Impurify.lowerRead: expected exactly 1 argument"
 
 -- | `write val ref → \$u -> let _ = setArray ref 0 val in val` — the `ST` `write` returns the written
@@ -337,7 +337,7 @@ lowerWrite = case _ of
   [ val, ref ] -> do
     u <- fresh
     dropv <- fresh
-    pure (CLam [ u ] (Let dropv (CPrim SetArray [ ref, AtomLit (LInt 0), val ]) (Ret (CAtom val))))
+    pure (CLam unit [ u ] (Let dropv (CPrim SetArray [ ref, AtomLit (LInt 0), val ]) (Ret (CAtom val))))
   _ -> unsafeCrashWith "Impurify.lowerWrite: expected exactly 2 arguments"
 
 -- | `modifyImpl f ref → \$u -> let old = indexArray ref 0 in let t = f old in let s = t.state in
@@ -351,9 +351,9 @@ lowerModify = case _ of
     s <- fresh
     dropv <- fresh
     pure
-      ( CLam [ u ]
+      ( CLam unit [ u ]
           ( Let old (CPrim IndexArray [ ref, AtomLit (LInt 0) ])
-              ( Let t (CApp f [ AtomVar old ])
+              ( Let t (CApp unit f [ AtomVar old ])
                   ( Let s (CAccessor (AtomVar t) "state")
                       ( Let dropv (CPrim SetArray [ ref, AtomLit (LInt 0), AtomVar s ])
                           (Ret (CAccessor (AtomVar t) "value"))
@@ -514,11 +514,11 @@ applyGer desc args =
       LT -> do
         ps <- traverse (const fresh) (Array.range 1 (sa - n))
         comp <- desc.lowering (args <> map AtomVar ps)
-        pure { pre: [], comp: CLam ps (Ret comp) }
+        pure { pre: [], comp: CLam unit ps (Ret comp) }
       GT -> do
         thunk <- desc.lowering (Array.take sa args)
         t <- fresh
-        pure { pre: [ Tuple t thunk ], comp: CApp (AtomVar t) (Array.drop sa args) }
+        pure { pre: [ Tuple t thunk ], comp: CApp unit (AtomVar t) (Array.drop sa args) }
 
 -- | Impurify one binding body: raise every recognised `Effect` glue / eliminator to canonical
 -- | `CPerform` ANF — an *applied* GER key (recognised head), a *bare* GER key in value position
@@ -559,7 +559,7 @@ impurifyExpr machinery e0 = evalState (goE e0) (maxGe e0)
   goC c = case c of
     -- applied GER key (recognised head / dispatch); value arguments are still scanned (an argument
     -- may itself be a bare GER key, e.g. a continuation `Effect.pureE`).
-    CApp head args
+    CApp _ head args
       | Just (Tuple desc rest) <- recognize machinery head args -> do
           h <- hoistAtoms rest
           r <- applyGer desc h.atoms
@@ -569,9 +569,9 @@ impurifyExpr machinery e0 = evalState (goE e0) (maxGe e0)
     CAtom a
       | Just desc <- descriptorOf a -> applyGer desc []
     CAtom a -> pure { pre: [], comp: CAtom a }
-    CApp head args -> do
+    CApp _ head args -> do
       h <- hoistAtoms args
-      pure { pre: h.pre, comp: CApp head h.atoms }
+      pure { pre: h.pre, comp: CApp unit head h.atoms }
     CPrim op args -> do
       h <- hoistAtoms args
       pure { pre: h.pre, comp: CPrim op h.atoms }
@@ -599,12 +599,12 @@ impurifyExpr machinery e0 = evalState (goE e0) (maxGe e0)
       ha <- hoistAtom a
       hf <- hoistAtoms (map _.val fs)
       pure { pre: ha.pre <> hf.pre, comp: CUpdate ha.atom (Array.zipWith (\f a' -> f { val = a' }) fs hf.atoms) }
-    CPerform a -> do
+    CPerform _ a -> do
       h <- hoistAtom a
-      pure { pre: h.pre, comp: CPerform h.atom }
-    CLam ps body -> do
+      pure { pre: h.pre, comp: CPerform unit h.atom }
+    CLam _ ps body -> do
       body' <- goE body
-      pure { pre: [], comp: CLam ps body' }
+      pure { pre: [], comp: CLam unit ps body' }
     CIf a t e -> do
       h <- hoistAtom a
       t' <- goE t
@@ -656,8 +656,8 @@ maxGe = expr 0
 
   cexpr acc = case _ of
     CAtom a -> atom acc a
-    CLam ps body -> expr (Array.foldl (\a p -> max a (geNum p)) acc ps) body
-    CApp h as -> Array.foldl atom (atom acc h) as
+    CLam _ ps body -> expr (Array.foldl (\a p -> max a (geNum p)) acc ps) body
+    CApp _ h as -> Array.foldl atom (atom acc h) as
     CPrim _ as -> Array.foldl atom acc as
     CCtor _ _ as -> Array.foldl atom acc as
     CArray as -> Array.foldl atom acc as
@@ -666,7 +666,7 @@ maxGe = expr 0
     CUpdate a fs -> Array.foldl (\ac f -> atom ac f.val) (atom acc a) fs
     CIf a t e -> expr (expr (atom acc a) t) e
     CCase ss alts -> Array.foldl alt (Array.foldl atom acc ss) alts
-    CPerform a -> atom acc a
+    CPerform _ a -> atom acc a
 
   atom acc = case _ of
     AtomVar x -> max acc (geNum x)

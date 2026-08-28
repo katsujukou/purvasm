@@ -69,7 +69,7 @@ import Data.Map as Map
 import Data.Maybe (Maybe(..), fromMaybe)
 import Data.Tuple (Tuple(..))
 import Purvasm.Compiler.ForeignSig (ForeignShape)
-import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr, CExprF(..), Expr, ExprF(..), Rhs, RhsF(..))
 import Purvasm.Compiler.MiddleEnd.Module (Decl)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (pinnedPrim)
 import Purvasm.Compiler.Primitive (PrimOp(..))
@@ -166,7 +166,7 @@ vsumExpr env = case _ of
 vsumC :: EffectEnv -> CExpr -> EffectFact
 vsumC env = case _ of
   CAtom a -> atomSum env a
-  CLam ps body ->
+  CLam _ ps body ->
     let
       env' = bindUnknown ps env
       bodySum = vsumExpr env' body
@@ -177,7 +177,7 @@ vsumC env = case _ of
       , mtouch: mtouchExpr env' body -- saturating the closure may touch the store
       , retMtouch: bodySum.mtouch -- its result, when forced, may touch?
       }
-  CApp f args ->
+  CApp _ f args ->
     let
       sf = atomSum env f
       n = Array.length args
@@ -197,7 +197,7 @@ vsumC env = case _ of
   CRecord _ -> pureValue
   CUpdate _ _ -> pureValue
   CAccessor _ _ -> unknownValue -- a field may be any value, incl. an effectful function
-  CPerform _ -> unknownValue -- GER run point (ADR-0099): the performed result is opaque
+  CPerform _ _ -> unknownValue -- GER run point (ADR-0099): the performed result is opaque
   CIf _ t e -> joinSum (vsumExpr env t) (vsumExpr env e)
   CCase _ alts -> foldl (\acc a -> joinSum acc (altVsum env a)) pureValue alts
 
@@ -218,7 +218,7 @@ eperfC :: EffectEnv -> CExpr -> Boolean
 eperfC env = case _ of
   -- construction / projection is pure (I1)
   CAtom _ -> false
-  CLam _ _ -> false
+  CLam _ _ _ -> false
   CCtor _ _ _ -> false
   CArray _ -> false
   CRecord _ -> false
@@ -228,7 +228,7 @@ eperfC env = case _ of
     NewArray -> true
     SetArray -> true
     _ -> false
-  CApp f args ->
+  CApp _ f args ->
     let
       sf = atomSum env f
       n = Array.length args
@@ -240,7 +240,7 @@ eperfC env = case _ of
       -- over-application (e.g. `(log s) u` in one node): the extra arguments force the produced
       -- value, and a summary tracks only one level below — conservatively may-perform.
       else true
-  CPerform _ -> true -- GER run point (ADR-0099): performing a thunk always may-perform
+  CPerform _ _ -> true -- GER run point (ADR-0099): performing a thunk always may-perform
   CIf _ t e -> eperfExpr env t || eperfExpr env e
   CCase _ alts -> Array.any (altEperf env) alts
 
@@ -263,14 +263,14 @@ mtouchExpr env = case _ of
 mtouchC :: EffectEnv -> CExpr -> Boolean
 mtouchC env = case _ of
   CAtom _ -> false
-  CLam _ _ -> false
+  CLam _ _ _ -> false
   CCtor _ _ _ -> false
   CArray _ -> false
   CRecord _ -> false
   CAccessor _ _ -> false
   CUpdate _ _ -> false
   CPrim op _ -> pinnedPrim op
-  CApp f args ->
+  CApp _ f args ->
     let
       sf = atomSum env f
       n = Array.length args
@@ -278,7 +278,7 @@ mtouchC env = case _ of
       if n < sf.arity then false -- constructing a PAP is clean
       else if n == sf.arity then sf.mtouch
       else true -- over-application: a two-level summary cannot see deeper
-  CPerform _ -> true -- GER run point (ADR-0099): performing a thunk may touch the store
+  CPerform _ _ -> true -- GER run point (ADR-0099): performing a thunk may touch the store
   CIf _ t e -> mtouchExpr env t || mtouchExpr env e
   CCase _ alts -> Array.any (altMtouch env) alts
 
@@ -292,7 +292,7 @@ altMtouch env alt = case alt.result of
 -- | use, at most branch capture — is the mark walk's half of the clause.)
 sinkableCall :: EffectEnv -> CExpr -> Boolean
 sinkableCall env = case _ of
-  CApp f args ->
+  CApp _ f args ->
     let
       sf = atomSum env f
     in
@@ -304,7 +304,7 @@ sinkableCall env = case _ of
 -- | only makes applications look like over-applications (conservatively may-perform).
 rhsArity :: Expr -> Int
 rhsArity = case _ of
-  Ret (CLam ps _) -> Array.length ps
+  Ret (CLam _ ps _) -> Array.length ps
   Ret _ -> 0
   Let _ _ rest -> rhsArity rest
   LetRec _ rest -> rhsArity rest

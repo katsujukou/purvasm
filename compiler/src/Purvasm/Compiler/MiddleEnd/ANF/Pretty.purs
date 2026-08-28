@@ -21,7 +21,7 @@ import Data.String.Common (joinWith)
 import Data.Tuple.Nested ((/\))
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Literal (Literal(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr, CExprF(..), Expr, ExprF(..), Rhs, RhsF(..))
 import Purvasm.Compiler.MiddleEnd.Module (Decl)
 
 -- | Render a whole module's ANF: `module <name> where` then a blank-line-separated binding per decl.
@@ -68,14 +68,14 @@ printExprAt i = case _ of
 printCExprAt :: Int -> CExpr -> String
 printCExprAt i = case _ of
   CAtom a -> printAtom a
-  CLam ps body -> "\\" <> joinWith " " ps <> " -> " <> printExprAt i body
-  CApp f args -> printAtom f <> args' args
+  CLam _ ps body -> "\\" <> joinWith " " ps <> " -> " <> printExprAt i body
+  CApp _ f args -> printAtom f <> args' args
   CPrim op args -> show op <> args' args
   CCtor name _ args -> if null args then name else name <> args' args
   CArray args -> "[" <> joinWith ", " (map printAtom args) <> "]"
   CRecord fs -> record (fs <#> \f -> f.prop <> ": " <> printAtom f.val)
   CAccessor a p -> printAtom a <> "." <> p
-  CPerform a -> "perform(" <> printAtom a <> ")"
+  CPerform _ a -> "perform(" <> printAtom a <> ")"
   CUpdate a ups -> printAtom a <> " " <> record (ups <#> \u -> u.prop <> " = " <> printAtom u.val)
   CIf c t e ->
     "if " <> printAtom c <> " then\n"

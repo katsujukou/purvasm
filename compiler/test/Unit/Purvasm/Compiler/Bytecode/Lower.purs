@@ -10,7 +10,7 @@ import Data.Tuple.Nested ((/\))
 import Purvasm.Compiler.Bytecode.Instruction (Instruction(..))
 import Purvasm.Compiler.Bytecode.Lower (lowerAtom, lowerCexpr, lowerExpr, lowerValue)
 import Purvasm.Compiler.Literal (Literal(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..))
 import Purvasm.Compiler.Primitive (PrimOp(..))
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
@@ -28,18 +28,18 @@ spec = describe "Purvasm.Compiler.Bytecode.Lower" do
 
   describe "lowerCexpr / lowerValue" do
     it "pushes the function before its arguments, then Call with the arg count" do
-      lowerCexpr false (CApp (AtomVar "f") [ aInt 1, aInt 2 ])
+      lowerCexpr false (CApp unit (AtomVar "f") [ aInt 1, aInt 2 ])
         `shouldEqual` [ Load "f", PushInt 1, PushInt 2, Call 2 ]
 
     it "uses TailCall for a call in tail position" do
-      lowerCexpr true (CApp (AtomVar "f") [ aInt 1 ])
+      lowerCexpr true (CApp unit (AtomVar "f") [ aInt 1 ])
         `shouldEqual` [ Load "f", PushInt 1, TailCall 1 ]
 
     it "lowers a GER perform as a one-argument (unit) call, tail-aware (ADR-0099)" do
       -- perform f ≃ f unit; unit is the immediate 0 (ADR-0064).
-      lowerCexpr false (CPerform (AtomVar "f"))
+      lowerCexpr false (CPerform unit (AtomVar "f"))
         `shouldEqual` [ Load "f", PushInt 0, Call 1 ]
-      lowerCexpr true (CPerform (AtomVar "f"))
+      lowerCexpr true (CPerform unit (AtomVar "f"))
         `shouldEqual` [ Load "f", PushInt 0, TailCall 1 ]
 
     it "ends a tail value with Return, and a non-tail value without one" do

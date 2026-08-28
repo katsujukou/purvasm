@@ -51,7 +51,7 @@ import Data.Traversable (mapAccumL)
 import Data.Tuple (Tuple(..), fst, snd)
 import Purvasm.Compiler.Bytecode.Artifact (Summary)
 import Purvasm.Compiler.ForeignSig (ForeignShape)
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..))
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (cfExpr, fvExpr)
 import Purvasm.Compiler.Ffi (intrinsicPrim)
 import Purvasm.Compiler.MiddleEnd.Module (AnfModule, Decl, declKeys, mapDeclBodies)
@@ -104,14 +104,14 @@ type LocalFacts =
   , outerKinds :: Map String OuterKind
   }
 
--- | The **outer kind** of a top-level binding body: a syntactic lambda (`Ret (CLam …)`) or not.
+-- | The **outer kind** of a top-level binding body: a syntactic lambda (`Ret (CLam unit …)`) or not.
 data OuterKind = OKLambda | OKNonLambda
 
 derive instance Eq OuterKind
 
 outerKindOf :: Expr -> OuterKind
 outerKindOf = case _ of
-  Ret (CLam _ _) -> OKLambda
+  Ret (CLam _ _ _) -> OKLambda
   _ -> OKNonLambda
 
 -- | Enforce each binding's pre-optimisation outer kind on the optimised term (ADR-0099 §4a): a body
@@ -125,7 +125,7 @@ enforceOuterKinds :: Map String OuterKind -> Array Decl -> Array Decl
 enforceOuterKinds kinds = map \d -> d { members = map guard d.members }
   where
   guard (Tuple k body) = case Map.lookup k kinds, body of
-    Just OKNonLambda, Ret lam@(CLam _ _) -> Tuple k (Let "$q0" lam (Ret (CAtom (AtomVar "$q0"))))
+    Just OKNonLambda, Ret lam@(CLam _ _ _) -> Tuple k (Let "$q0" lam (Ret (CAtom (AtomVar "$q0"))))
     _, _ -> Tuple k body
 
 -- | What a compiled module contributes to its dependents' `BuildEnv`. Distinct from the persisted

@@ -1,7 +1,7 @@
 -- | `normalize`: the CESK AST (upper IR) → ANF (lower IR) bridge (ADR-0025/0037).
 -- | A-normalises (every argument an atom, every compound subexpression `let`-named so
 -- | evaluation order is explicit) and uncurries (a `\a -> \b -> …` spine becomes one
--- | `CLam [a, b] …`; an `((f a) b) c` spine becomes one `CApp f [a, b, c]`).
+-- | `CLam _ [a, b] …`; an `((f a) b) c` spine becomes one `CApp _ f [a, b, c]`).
 -- |
 -- | Ported from boot's `Middle_end.Transl.transl`. Boot walks in CPS where `k` builds the
 -- | surrounding `let`-sequence; a host-stack CPS is **not stack-safe** — one continuation
@@ -31,7 +31,7 @@ import Data.Maybe (Maybe(..))
 import Data.Tuple.Nested ((/\))
 import Purvasm.Compiler.CESK.AST (Alternative, Term(..))
 import Purvasm.Compiler.CESK.AST (Rhs(..)) as Cesk
-import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr, CExprF(..), Expr, ExprF(..), Rhs, RhsF(..))
 
 -- | Collect a curried lambda spine `\a -> \b -> body` into `{ params: [a, b], body }`.
 collectLam :: Term -> { params :: Array String, body :: Term }
@@ -95,7 +95,7 @@ normCe st t = case t of
       { params, body } = collectLam t
       rb = anfTail st.n body
     in
-      { st: st { n = rb.n }, ce: CLam params rb.expr }
+      { st: st { n = rb.n }, ce: CLam unit params rb.expr }
   TmApp _ _ ->
     let
       { head, args } = collectApp t
@@ -108,7 +108,7 @@ normCe st t = case t of
           let
             rh = normAtom ra.st head
           in
-            { st: rh.st, ce: CApp rh.atom ra.atoms }
+            { st: rh.st, ce: CApp unit rh.atom ra.atoms }
   TmPrim op args ->
     let
       ra = normAtoms st args

@@ -49,7 +49,7 @@ import Data.Map as Map
 import Data.Maybe (Maybe(..), fromMaybe)
 import Data.Set as Set
 import Purvasm.Compiler.Binder (Binder(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..), Rhs, RhsF(..))
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (fvExpr)
 import Purvasm.Compiler.Primitive (PrimOp(..))
 
@@ -159,7 +159,7 @@ factOfCExpr facts = case _ of
   CCtor _ _ _ -> NeverByNeed
   CArray _ -> NeverByNeed
   CRecord _ -> NeverByNeed
-  CLam _ _ -> NeverByNeed
+  CLam _ _ _ -> NeverByNeed
   CIf _ t e -> meet (factOfExpr facts t) (factOfExpr facts e)
   -- the §1 branch meet over every arm result. An EMPTY result set — no alternatives, or an
   -- alternative with no guarded clauses — is vacuous and falls to `May`: folding from `Never`

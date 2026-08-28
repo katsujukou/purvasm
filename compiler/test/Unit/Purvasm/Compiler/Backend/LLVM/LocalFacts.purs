@@ -19,6 +19,8 @@ import Data.Map as Map
 import Data.Foldable (for_)
 import Data.Tuple (Tuple(..))
 import Data.Maybe (Maybe(..), isJust)
+import Data.Tuple (Tuple(..), fst, snd)
+import Partial.Unsafe (unsafeCrashWith)
 import Data.String (Pattern(..))
 import Data.String as String
 import Data.Set as Set
@@ -26,10 +28,11 @@ import Purvasm.Compiler.Backend.LLVM.CallClass (CallEvent(..), MissReason(..))
 import Purvasm.Compiler.Backend.LLVM.ForeignRef (ForeignCallMode(..), ForeignClosureMode(..))
 import Purvasm.Compiler.Backend.LLVM.Monad (MakeCxOptions)
 import Purvasm.Compiler.Backend.LLVM.Program (moduleLlWithEvents)
-import Purvasm.Compiler.Backend.LLVM.Types (BindOrigin(..), CandidateKind(..), EnvSrc(..), FnInfo, Gdef(..), bindOriginName, bindOrigins, capturableFact, unFact)
+import Purvasm.Compiler.Backend.LLVM.Types (BindOrigin(..), BindingSite(..), CandidateKind(..), EnvSrc(..), FnInfo, Gdef(..), NonParamOrigin(..), ParamIndex, bindOriginName, bindOrigins, capturableFact, indexParams, mkEmissionSiteId, mkProofSiteId, originClass, proofKey, proofOf, siteKey, siteLabel, unFact)
 import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.Binder (Binder(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..), Rhs, RhsF(..))
+import Purvasm.Compiler.MiddleEnd.ANF.Occurrence (AnfFunctionId, AnfOccurrenceId, annotateObject)
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (fail, shouldEqual)
 
@@ -97,17 +100,17 @@ applyInstructions ir = Array.length (String.split (Pattern "call i64 @pv_apply("
 -- | `let f = \x -> x in <body>` — the canonical ACTIVE fact, used as the source every chain below
 -- | recovers from.
 letLambda :: String -> Expr -> Expr
-letLambda name = Let name (CLam [ "x" ] (Ret (CAtom (var "x"))))
+letLambda name = Let name (CLam unit [ "x" ] (Ret (CAtom (var "x"))))
 
 -- | A saturated call to `f`, in non-tail position so the form is `apply`.
 callOf :: String -> Expr
-callOf f = Let "r" (CApp (var f) [ int 1 ]) (Ret (CAtom (var "r")))
+callOf f = Let "r" (CApp unit (var f) [ int 1 ]) (Ret (CAtom (var "r")))
 
 -- | The same call in TAIL position, so the form is `tail` — a `pv_tailcall` store rather than a
 -- | `pv_apply` dispatch. The two forms are different emitted operations, so a candidate has to be
 -- | pinned deferred in BOTH (ADR-0113 §4: `apply` and `tail` are never summed together).
 tailCallOf :: String -> Expr
-tailCallOf f = Ret (CApp (var f) [ int 1 ])
+tailCallOf f = Ret (CApp unit (var f) [ int 1 ])
 
 -- | Whole-program events, keeping the form as well as the kind: the matrix below is over
 -- | `CandidateKind × Form`, and a row that lost the form would pass on the wrong operation.
@@ -119,6 +122,14 @@ deferredWithForm gkeys gdefs =
     LocalDeferredApply k -> Just (Tuple k "apply")
     LocalDeferredTail k -> Just (Tuple k "tail")
     _ -> Nothing
+
+-- | The n-th parameter of a list of that many parameters — through the shipped enumeration, which
+-- | is the only producer. A test that minted an index directly would be testing a constructor the
+-- | compiler cannot reach.
+nthParam :: Int -> ParamIndex
+nthParam n = case Array.index (indexParams (Array.replicate (n + 1) unit)) n of
+  Just (Tuple i _) -> i
+  Nothing -> unsafeCrashWith "nthParam: out of range"
 
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.Backend.LLVM.LocalFacts (ADR-0113 §3.1)" do
@@ -137,7 +148,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.LocalFacts (ADR-0113 §3.1)" do
               ( letLambda "x"
                   ( LetRec
                       [ { var: "x", rhs: Ret (CAtom (int 7)) }
-                      , { var: "g", rhs: Ret (CLam [ "u" ] (callOf "x")) }
+                      , { var: "g", rhs: Ret (CLam unit [ "u" ] (callOf "x")) }
                       ]
                       (Ret (CAtom (var "g")))
                   )
@@ -156,7 +167,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.LocalFacts (ADR-0113 §3.1)" do
           [ Gcaf "M.top"
               ( letLambda "x"
                   ( LetRec
-                      [ { var: "g", rhs: Ret (CLam [ "u" ] (callOf "x")) } ]
+                      [ { var: "g", rhs: Ret (CLam unit [ "u" ] (callOf "x")) } ]
                       (Ret (CAtom (var "g")))
                   )
               )
@@ -170,8 +181,8 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.LocalFacts (ADR-0113 §3.1)" do
         prog =
           [ Gcaf "M.top"
               ( LetRec
-                  [ { var: "f", rhs: Ret (CLam [ "x" ] (Ret (CAtom (var "x")))) }
-                  , { var: "g", rhs: Ret (CLam [ "u" ] (callOf "f")) }
+                  [ { var: "f", rhs: Ret (CLam unit [ "x" ] (Ret (CAtom (var "x")))) }
+                  , { var: "g", rhs: Ret (CLam unit [ "u" ] (callOf "f")) }
                   ]
                   (Ret (CAtom (var "g")))
               )
@@ -195,7 +206,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.LocalFacts (ADR-0113 §3.1)" do
           [ Gcaf "M.top"
               ( LetRec
                   [ { var: "v", rhs: Ret (CAtom (int 3)) }
-                  , { var: "g", rhs: Ret (CLam [ "u" ] (callOf "v")) }
+                  , { var: "g", rhs: Ret (CLam unit [ "u" ] (callOf "v")) }
                   ]
                   (Ret (CAtom (var "g")))
               )
@@ -210,7 +221,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.LocalFacts (ADR-0113 §3.1)" do
           [ Gcaf "M.top"
               ( letLambda "outer"
                   ( LetRec
-                      [ { var: "g", rhs: Ret (CLam [ "u" ] (callOf "outer")) } ]
+                      [ { var: "g", rhs: Ret (CLam unit [ "u" ] (callOf "outer")) } ]
                       (Ret (CAtom (var "g")))
                   )
               )
@@ -240,7 +251,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.LocalFacts (ADR-0113 §3.1)" do
           [ Gcaf "M.top"
               ( letLambda "f"
                   ( Let "a" (CAtom (var "f"))
-                      (Let "g" (CLam [ "u" ] (callOf "a")) (Ret (CAtom (var "g"))))
+                      (Let "g" (CLam unit [ "u" ] (callOf "a")) (Ret (CAtom (var "g"))))
                   )
               )
           ]
@@ -286,7 +297,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.LocalFacts (ADR-0113 §3.1)" do
         prog =
           [ Gcaf "M.top"
               ( letLambda "f"
-                  (Let "g" (CLam [ "u" ] (callOf "f")) (Ret (CAtom (var "g"))))
+                  (Let "g" (CLam unit [ "u" ] (callOf "f")) (Ret (CAtom (var "g"))))
               )
           ]
         got = localEvents [ "M.top" ] prog
@@ -303,7 +314,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.LocalFacts (ADR-0113 §3.1)" do
     -- one kind or one form alone could be passed by a path it never exercises.
     --
     -- Every shape puts the call inside a LIFTED LAMBDA, because that is the only tail context here:
-    -- a `Gcaf` body must produce a value to root, so `Ret (CApp …)` there is an `apply`, not a
+    -- a `Gcaf` body must produce a value to root, so `Ret (CApp unit …)` there is an `apply`, not a
     -- `tail` (ADR-0109). Building the tail rows in the `Gcaf` body instead would have silently
     -- measured the apply form twice.
     let
@@ -311,12 +322,12 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.LocalFacts (ADR-0113 §3.1)" do
       -- each shape binds a candidate of its kind and hands its callee NAME to the call builder
       shapes =
         [ Tuple Capture \call ->
-            letLambda "f" (Let "g" (CLam [ "u" ] (call "f")) (Ret (CAtom (var "g"))))
+            letLambda "f" (Let "g" (CLam unit [ "u" ] (call "f")) (Ret (CAtom (var "g"))))
         , Tuple AliasLocal \call ->
             letLambda "f"
-              (Let "g" (CLam [ "u" ] (Let "a" (CAtom (var "f")) (call "a"))) (Ret (CAtom (var "g"))))
+              (Let "g" (CLam unit [ "u" ] (Let "a" (CAtom (var "f")) (call "a"))) (Ret (CAtom (var "g"))))
         , Tuple AliasGlobal \call ->
-            Let "g" (CLam [ "u" ] (Let "a" (CAtom (var "M.known")) (call "a"))) (Ret (CAtom (var "g")))
+            Let "g" (CLam unit [ "u" ] (Let "a" (CAtom (var "M.known")) (call "a"))) (Ret (CAtom (var "g")))
         ]
       -- the global the AliasGlobal row aliases: a top-level function, so `gfns` carries its fact
       withKnown gdefs = Array.cons (Gfun "M.known" [ "x" ] (Ret (CAtom (var "x")))) gdefs
@@ -352,9 +363,9 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.LocalFacts (ADR-0113 §3.1)" do
           [ Gcaf "M.top"
               ( letLambda "lam"
                   ( LetRec
-                      [ { var: "rec", rhs: Ret (CLam [ "x" ] (Ret (CAtom (var "x")))) } ]
+                      [ { var: "rec", rhs: Ret (CLam unit [ "x" ] (Ret (CAtom (var "x")))) } ]
                       -- call both, so the sites exist and are classified
-                      (Let "a" (CApp (var "lam") [ int 1 ]) (callOf "rec"))
+                      (Let "a" (CApp unit (var "lam") [ int 1 ]) (callOf "rec"))
                   )
               )
           ]
@@ -368,7 +379,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.LocalFacts (ADR-0113 §3.1)" do
     it "does classify the other origins as opaque when nothing is derivable" do
       -- the discriminating counterpart: same emitter, origins that legitimately have no fact.
       let
-        prog = [ Gfun "M.f" [ "k" ] (Let "v" (CAtom (int 1)) (Let "r" (CApp (var "k") [ int 1 ]) (callOf "v"))) ]
+        prog = [ Gfun "M.f" [ "k" ] (Let "v" (CAtom (int 1)) (Let "r" (CApp unit (var "k") [ int 1 ]) (callOf "v"))) ]
         got = localEvents [ "M.f" ] prog
       Array.sort (Array.nub got.opaque) `shouldEqual` Array.sort [ OParam, OLetValue ]
 
@@ -429,8 +440,8 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.LocalFacts (ADR-0113 §3.1)" do
           [ Gcaf "M.top"
               ( letLambda "f"
                   ( Let "outer"
-                      ( CLam [ "u" ]
-                          (Let "inner" (CLam [ "w" ] (callOf "f")) (Ret (CAtom (var "inner"))))
+                      ( CLam unit [ "u" ]
+                          (Let "inner" (CLam unit [ "w" ] (callOf "f")) (Ret (CAtom (var "inner"))))
                       )
                       (Ret (CAtom (var "outer")))
                   )
@@ -439,3 +450,115 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.LocalFacts (ADR-0113 §3.1)" do
         got = localEvents [ "M.top" ] prog
       got.deferred `shouldEqual` [ Capture ]
       got.opaque `shouldEqual` []
+
+  describe "ADR-0114 §1: the site identity layers, and the finite class they project to" do
+    -- `BindOrigin` must stay enumerable: ADR-0113's census identities, `allMissReasons` and the
+    -- diagnostic-zero rows are all stated over `bindOrigins`, and a constructor carrying a
+    -- `ParamIndex` would make that array impossible to write.
+    it "originClass is total and lands inside the finite enumeration" do
+      let
+        sites =
+          [ ParamBinding (nthParam 0)
+          , ParamBinding (nthParam 7)
+          , OtherBinding NCapture
+          , OtherBinding NLetLambda
+          , OtherBinding NLetValue
+          , OtherBinding NGrecLambda
+          , OtherBinding NGrecValue
+          , OtherBinding NMatchBinder
+          ]
+      for_ sites \s -> Array.elem (originClass s) bindOrigins `shouldEqual` true
+      -- every non-parameter origin is reachable, so the projection covers the enumeration exactly
+      Array.nub (map originClass sites) `shouldEqual` bindOrigins
+
+    it "every parameter index projects to the SAME finite class" do
+      -- the index rides on the binding and is projected away for the census: two different
+      -- parameters are one reason column, which is what keeps the column count finite.
+      originClass (ParamBinding (nthParam 0)) `shouldEqual` originClass (ParamBinding (nthParam 9))
+
+  describe "ProofSiteId / EmissionSiteId (ADR-0114 amendment)" do
+    -- The ids below are NOT hand-made. They come out of `annotateObject` on the fixture, which
+    -- is the only way to obtain one now that the supply is private — so these rows exercise the
+    -- producer as well as the identity, which the versions that called a public `freshOccurrence`
+    -- did not.
+
+    it "is distinguished by EACH of its four components" do
+      let
+        ids = fixtureIds
+        base = mkProofSiteId { object: "A", sourceFn: ids.fnA, param: nthParam 0, callOcc: ids.occA }
+        others =
+          [ mkProofSiteId { object: "B", sourceFn: ids.fnA, param: nthParam 0, callOcc: ids.occA }
+          , mkProofSiteId { object: "A", sourceFn: ids.fnB, param: nthParam 0, callOcc: ids.occA }
+          , mkProofSiteId { object: "A", sourceFn: ids.fnA, param: nthParam 1, callOcc: ids.occA }
+          , mkProofSiteId { object: "A", sourceFn: ids.fnA, param: nthParam 0, callOcc: ids.occB }
+          ]
+      -- vary one component at a time: each must move the identity, or two distinct sites would
+      -- collapse into one row of the drill and their counts would silently add together.
+      for_ others \o -> (o == base) `shouldEqual` false
+      -- and the key is faithful to the identity, not merely correlated with it
+      Array.length (Array.nub (map proofKey (Array.cons base others))) `shouldEqual` 5
+
+    it "gives duplicated emissions ONE proof and separate emission identities" do
+      -- match compilation copies a row into several arms, so one source-level call is emitted more
+      -- than once. ADR-0114 keys a PROOF by what an optimiser rewrites (the ANF occurrence) and an
+      -- EMISSION by what executes: the copies must agree on the former and differ on the latter.
+      let
+        ids = fixtureIds
+        proof = mkProofSiteId { object: "A", sourceFn: ids.fnA, param: nthParam 0, callOcc: ids.occA }
+        e0 = mkEmissionSiteId proof 0
+        e1 = mkEmissionSiteId proof 1
+      proofOf e0 `shouldEqual` proofOf e1
+      (siteKey e0 == siteKey e1) `shouldEqual` false
+      -- the shared proof is recoverable from either, which is what lets the drill fold copies back
+      proofKey (proofOf e1) `shouldEqual` proofKey proof
+
+    it "separates two STRUCTURALLY IDENTICAL top-level bodies of one object" do
+      -- The identity the drill keys by is (object, sourceFn, param, callOcc). `object` is the only
+      -- component naming anything outside the term, so everything inside an object has to be
+      -- separated by the other three — which holds only because the id supply spans the OBJECT.
+      -- Annotated per term it would not: both bodies would carry root `fnsrc0` and `occ0`, these
+      -- two proofs would be equal, and their execution counts would add together into one row that
+      -- is indistinguishable from a genuinely hot site.
+      let
+        twins = twinIds
+        a = mkProofSiteId { object: "M", sourceFn: twins.fnA, param: nthParam 0, callOcc: twins.occA }
+        b = mkProofSiteId { object: "M", sourceFn: twins.fnB, param: nthParam 0, callOcc: twins.occB }
+      (a == b) `shouldEqual` false
+      (proofKey a == proofKey b) `shouldEqual` false
+
+    it "keeps the canonical key apart from the human label" do
+      -- `siteKey` is parsed by the drill tooling and `siteLabel` is not; a report is free to
+      -- reformat the label, and this row is what stops the two from quietly becoming the same
+      -- string and the label from acquiring parsers.
+      let
+        ids = fixtureIds
+        e = mkEmissionSiteId (mkProofSiteId { object: "A", sourceFn: ids.fnA, param: nthParam 0, callOcc: ids.occA }) 0
+      (siteKey e == siteLabel e) `shouldEqual` false
+
+-- | The SAME body twice in one object. Its whole purpose is that the two results must differ, so
+-- | it is built from one `body` value rather than two look-alike literals — a fixture that could
+-- | drift apart would pass this row for the wrong reason.
+twinIds :: { fnA :: AnfFunctionId, fnB :: AnfFunctionId, occA :: AnfOccurrenceId, occB :: AnfOccurrenceId }
+twinIds =
+  case annotateObject [ Tuple "x" body, Tuple "y" body ] of
+    [ Tuple _ { root: fnA, expr: Ret (CApp occA _ _) }, Tuple _ { root: fnB, expr: Ret (CApp occB _ _) } ] ->
+      { fnA, fnB, occA, occB }
+    _ -> unsafeCrashWith "LocalFacts.twinIds: annotateObject did not annotate both bodies"
+  where
+  body :: Expr
+  body = Ret (CApp unit (AtomVar "f") [ AtomVar "x" ])
+
+-- | Two function identities and two call-occurrence identities, obtained the ONLY legitimate way:
+-- | by annotating a term. The shape is fixed here, so the match below is total in practice and its
+-- | failure would mean `annotateObject` stopped annotating what this fixture contains.
+fixtureIds :: { fnA :: AnfFunctionId, fnB :: AnfFunctionId, occA :: AnfOccurrenceId, occB :: AnfOccurrenceId }
+fixtureIds =
+  case annotateObject [ Tuple "obj" fixture ] of
+    [ Tuple _ { expr: Let _ (CLam fnA _ (Ret (CApp occA _ _))) (Ret (CLam fnB _ (Ret (CApp occB _ _)))) } ] ->
+      { fnA, fnB, occA, occB }
+    _ -> unsafeCrashWith "LocalFacts.fixtureIds: annotateObject did not annotate the fixture"
+  where
+  fixture :: Expr
+  fixture =
+    Let "a" (CLam unit [ "x" ] (Ret (CApp unit (AtomVar "f") [ AtomVar "x" ])))
+      (Ret (CLam unit [ "y" ] (Ret (CApp unit (AtomVar "g") [ AtomVar "y" ]))))

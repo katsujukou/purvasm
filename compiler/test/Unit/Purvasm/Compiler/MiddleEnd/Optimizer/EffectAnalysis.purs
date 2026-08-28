@@ -10,7 +10,7 @@ import Data.Maybe (Maybe(..))
 import Data.Tuple.Nested ((/\))
 import Purvasm.Compiler.ForeignSig (ForeignShape)
 import Purvasm.Compiler.Literal (Literal(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..))
 import Data.Lazy (defer)
 import Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis (EffectEnv, EffectFact, bindFact, emptyEffectEnv, eperfC, liftShape, moduleEffects, mtouchC, sinkableCall, vsumC, vsumExpr)
 import Purvasm.Compiler.Primitive (PrimOp(..))
@@ -61,26 +61,26 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis" do
   describe "eperfC (the dead-drop predicate)" do
     it "construction is pure (I1): building an Effect thunk does not perform" do
       -- log "x" saturates log — it only *builds* the Effect value.
-      eperfC env0 (CApp (AtomForeign "Effect.Console.log") [ var "s" ]) `shouldEqual` false
+      eperfC env0 (CApp unit (AtomForeign "Effect.Console.log") [ var "s" ]) `shouldEqual` false
 
     it "the saturating force performs: (log s) applied again is over-application → may-perform" do
       -- let t = log s in t unit — t's summary is one level deep; forcing it performs.
       let
         env' = envOf sigs
-        tSum = vsumC env' (CApp (AtomForeign "Effect.Console.log") [ var "s" ])
-      eperfC (bindFact "t" (defer \_ -> tSum) env') (CApp (var "t") [ unit_ ]) `shouldEqual` true
+        tSum = vsumC env' (CApp unit (AtomForeign "Effect.Console.log") [ var "s" ])
+      eperfC (bindFact "t" (defer \_ -> tSum) env') (CApp unit (var "t") [ unit_ ]) `shouldEqual` true
 
     it "a pure leaf's exact saturation does not perform" do
-      eperfC env0 (CApp (AtomForeign "Data.Show.showIntImpl") [ var "n" ]) `shouldEqual` false
+      eperfC env0 (CApp unit (AtomForeign "Data.Show.showIntImpl") [ var "n" ]) `shouldEqual` false
 
     it "a bare EffectFnN leaf performs at its own saturation (vsat)" do
       -- partial application builds a PAP:
-      eperfC env0 (CApp (AtomForeign "M.effectFn2") [ var "a" ]) `shouldEqual` false
+      eperfC env0 (CApp unit (AtomForeign "M.effectFn2") [ var "a" ]) `shouldEqual` false
       -- exact saturation runs the effect:
-      eperfC env0 (CApp (AtomForeign "M.effectFn2") [ var "a", var "b" ]) `shouldEqual` true
+      eperfC env0 (CApp unit (AtomForeign "M.effectFn2") [ var "a", var "b" ]) `shouldEqual` true
 
     it "an unknown callee is conservatively may-perform" do
-      eperfC env0 (CApp (var "opaque") [ var "a" ]) `shouldEqual` true
+      eperfC env0 (CApp unit (var "opaque") [ var "a" ]) `shouldEqual` true
 
     it "mutation primops perform; reads and pure primops do not" do
       eperfC env0 (CPrim SetArray [ var "a", int 0, int 1 ]) `shouldEqual` true
@@ -91,30 +91,30 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis" do
     it "a lambda wrapping a mutable read is vsat=false but mtouch=true (droppable when dead, never movable)" do
       -- read = \a -> IndexArray a 0 — the ADR-0095 §3 example, now carried by the fact itself:
       -- pure by the perform bit (elimination allowed), dirty by the store bit (motion denied).
-      let readLam = CLam [ "a" ] (Ret (CPrim IndexArray [ var "a", int 0 ]))
+      let readLam = CLam unit [ "a" ] (Ret (CPrim IndexArray [ var "a", int 0 ]))
       (vsumC env0 readLam).vsat `shouldEqual` false
       (vsumC env0 readLam).mtouch `shouldEqual` true
 
   describe "vsumC / vsumExpr (the two-level summary; foreign shapes lift dirty)" do
     it "a perform-leaf saturation yields an effect thunk (retVsat one level down)" do
-      vsumC env0 (CApp (AtomForeign "Effect.Console.log") [ var "s" ])
+      vsumC env0 (CApp unit (AtomForeign "Effect.Console.log") [ var "s" ])
         `shouldEqual` { arity: 0, vsat: true, retVsat: true, mtouch: true, retMtouch: true }
 
     it "a partial application keeps the callee's bits with the residual arity" do
-      vsumC env0 (CApp (AtomForeign "M.effectFn2") [ var "a" ])
+      vsumC env0 (CApp unit (AtomForeign "M.effectFn2") [ var "a" ])
         `shouldEqual` { arity: 1, vsat: true, retVsat: false, mtouch: true, retMtouch: true }
 
     it "a lambda's vsat is its body's eperf; its retVsat is the body value's vsat" do
       -- \s -> log s : saturating runs the body (pure — it builds the thunk); the *result* is
       -- the effect thunk. The classic `Effect`-returning function shape. (The store bits are
       -- dirty here because the leaf lifted dirty.)
-      vsumC env0 (CLam [ "s" ] (Ret (CApp (AtomForeign "Effect.Console.log") [ var "s" ])))
+      vsumC env0 (CLam unit [ "s" ] (Ret (CApp unit (AtomForeign "Effect.Console.log") [ var "s" ])))
         `shouldEqual` { arity: 1, vsat: false, retVsat: true, mtouch: true, retMtouch: true }
 
     it "a let-chained body threads local facts (vsumExpr)" do
       -- let t = log s in t — the binding's value is the effect thunk.
       ( vsumExpr env0
-          ( Let "t" (CApp (AtomForeign "Effect.Console.log") [ var "s" ])
+          ( Let "t" (CApp unit (AtomForeign "Effect.Console.log") [ var "s" ])
               (Ret (CAtom (var "t")))
           )
       ).vsat `shouldEqual` true
@@ -142,54 +142,54 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis" do
 
     it "PAP: construction is clean, but the summary carries the callee's bits verbatim" do
       let dirtyFacts = Map.fromFoldable [ "M.dirty2" /\ { arity: 2, vsat: false, retVsat: false, mtouch: true, retMtouch: true } ]
-      mtouchC (envOfFacts dirtyFacts) (CApp (var "M.dirty2") [ var "a" ]) `shouldEqual` false
-      vsumC (envOfFacts dirtyFacts) (CApp (var "M.dirty2") [ var "a" ])
+      mtouchC (envOfFacts dirtyFacts) (CApp unit (var "M.dirty2") [ var "a" ]) `shouldEqual` false
+      vsumC (envOfFacts dirtyFacts) (CApp unit (var "M.dirty2") [ var "a" ])
         `shouldEqual` { arity: 1, vsat: false, retVsat: false, mtouch: true, retMtouch: true }
 
     it "exact saturation: the predicate reads mtouch; the result summary shifts retMtouch down" do
-      mtouchC envF (CApp (var "M.reader") [ var "a" ]) `shouldEqual` true
-      mtouchC envF (CApp (var "M.clean") [ var "a", var "b" ]) `shouldEqual` false
+      mtouchC envF (CApp unit (var "M.reader") [ var "a" ]) `shouldEqual` true
+      mtouchC envF (CApp unit (var "M.clean") [ var "a", var "b" ]) `shouldEqual` false
       -- mkReader's own saturation is clean, but its result's saturation is dirty:
-      mtouchC envF (CApp (var "M.mkReader") [ var "a" ]) `shouldEqual` false
-      (vsumC envF (CApp (var "M.mkReader") [ var "a" ])).mtouch `shouldEqual` true
+      mtouchC envF (CApp unit (var "M.mkReader") [ var "a" ]) `shouldEqual` false
+      (vsumC envF (CApp unit (var "M.mkReader") [ var "a" ])).mtouch `shouldEqual` true
 
     it "over-application is dirty" do
-      mtouchC envF (CApp (var "M.clean") [ var "a", var "b", var "c" ]) `shouldEqual` true
+      mtouchC envF (CApp unit (var "M.clean") [ var "a", var "b", var "c" ]) `shouldEqual` true
 
     it "the let-returned reader lambda: mtouch=false, retMtouch=true (the ADR fixture shape)" do
       -- outer = \a -> let reader = \u -> IndexArray a 0 in reader — the curried spelling would
-      -- uncurry to CLam [a, u] (ADR-0025), so the fixture is pinned to this let-returned form.
+      -- uncurry to CLam _ [a, u] (ADR-0025), so the fixture is pinned to this let-returned form.
       let
-        outer = CLam [ "a" ]
-          ( Let "reader" (CLam [ "u" ] (Ret (CPrim IndexArray [ var "a", int 0 ])))
+        outer = CLam unit [ "a" ]
+          ( Let "reader" (CLam unit [ "u" ] (Ret (CPrim IndexArray [ var "a", int 0 ])))
               (Ret (CAtom (var "reader")))
           )
       vsumC env0 outer
         `shouldEqual` { arity: 1, vsat: false, retVsat: false, mtouch: false, retMtouch: true }
 
     it "sinkableCall: exact-saturated clean calls only" do
-      sinkableCall envF (CApp (var "M.clean") [ var "a", var "b" ]) `shouldEqual` true
-      sinkableCall envF (CApp (var "M.reader") [ var "a" ]) `shouldEqual` false -- dirty
-      sinkableCall envF (CApp (var "M.clean") [ var "a" ]) `shouldEqual` false -- PAP, not exact
-      sinkableCall envF (CApp (var "opaque") [ var "a" ]) `shouldEqual` false -- unknown
-      sinkableCall env0 (CApp (AtomForeign "Data.Show.showIntImpl") [ var "n" ]) `shouldEqual` false -- foreign: dirty lift
+      sinkableCall envF (CApp unit (var "M.clean") [ var "a", var "b" ]) `shouldEqual` true
+      sinkableCall envF (CApp unit (var "M.reader") [ var "a" ]) `shouldEqual` false -- dirty
+      sinkableCall envF (CApp unit (var "M.clean") [ var "a" ]) `shouldEqual` false -- PAP, not exact
+      sinkableCall envF (CApp unit (var "opaque") [ var "a" ]) `shouldEqual` false -- unknown
+      sinkableCall env0 (CApp unit (AtomForeign "Data.Show.showIntImpl") [ var "n" ]) `shouldEqual` false -- foreign: dirty lift
 
   describe "CPerform run-marker equations (ADR-0099 §2, fully conservative initial slice)" do
     it "eperfC / mtouchC are always true (performing a thunk may perform and may touch the store)" do
-      eperfC env0 (CPerform (var "t")) `shouldEqual` true
-      mtouchC env0 (CPerform (var "t")) `shouldEqual` true
+      eperfC env0 (CPerform unit (var "t")) `shouldEqual` true
+      mtouchC env0 (CPerform unit (var "t")) `shouldEqual` true
 
     it "vsumC is the opaque unknownValue" do
-      vsumC env0 (CPerform (var "t"))
+      vsumC env0 (CPerform unit (var "t"))
         `shouldEqual` { arity: 0, vsat: true, retVsat: true, mtouch: true, retMtouch: true }
 
     it "sinkableCall is false (a run point never sinks)" do
-      sinkableCall env0 (CPerform (var "t")) `shouldEqual` false
+      sinkableCall env0 (CPerform unit (var "t")) `shouldEqual` false
 
     it "a \\$u -> perform m thunk has vsat = true (saturating it performs)" do
       -- the load-bearing case: were `eperfC (CPerform _)` false, this lambda's vsat would read
       -- false and the existing dead-drop could delete a live effect.
-      (vsumC env0 (CLam [ "$u" ] (Ret (CPerform (var "m"))))).vsat `shouldEqual` true
+      (vsumC env0 (CLam unit [ "$u" ] (Ret (CPerform unit (var "m"))))).vsat `shouldEqual` true
 
   describe "moduleEffects (mtouch propagation)" do
     it "a point-free alias chain preserves the dirt" do
@@ -197,7 +197,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis" do
         decls =
           [ { recursive: false
             , members:
-                [ "M.reader" /\ Ret (CLam [ "a" ] (Ret (CPrim IndexArray [ var "a", int 0 ]))) ]
+                [ "M.reader" /\ Ret (CLam unit [ "a" ] (Ret (CPrim IndexArray [ var "a", int 0 ]))) ]
             }
           , { recursive: false
             , members: [ "M.alias" /\ Ret (CAtom (var "M.reader")) ]
@@ -211,8 +211,8 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis" do
         decls =
           [ { recursive: true
             , members:
-                [ "M.f" /\ Ret (CLam [ "x" ] (Ret (CApp (var "M.g") [ var "x" ])))
-                , "M.g" /\ Ret (CLam [ "y" ] (Ret (CPrim IndexArray [ var "y", int 0 ])))
+                [ "M.f" /\ Ret (CLam unit [ "x" ] (Ret (CApp unit (var "M.g") [ var "x" ])))
+                , "M.g" /\ Ret (CLam unit [ "y" ] (Ret (CPrim IndexArray [ var "y", int 0 ])))
                 ]
             }
           ]
@@ -223,7 +223,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis" do
       let
         decls =
           [ { recursive: false
-            , members: [ "M.show5" /\ Ret (CApp (AtomForeign "Data.Show.showIntImpl") [ int 5 ]) ]
+            , members: [ "M.show5" /\ Ret (CApp unit (AtomForeign "Data.Show.showIntImpl") [ int 5 ]) ]
             }
           , { recursive: false
             , members: [ "M.alias" /\ Ret (CAtom (var "M.show5")) ]
@@ -240,10 +240,10 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis" do
           [ { recursive: true
             , members:
                 [ "M.go" /\ Ret
-                    ( CLam [ "n" ]
-                        ( Let "t" (CApp (AtomForeign "Effect.Console.log") [ var "n" ])
-                            ( Let "u" (CApp (var "t") [ unit_ ])
-                                (Ret (CApp (var "M.go") [ var "n" ]))
+                    ( CLam unit [ "n" ]
+                        ( Let "t" (CApp unit (AtomForeign "Effect.Console.log") [ var "n" ])
+                            ( Let "u" (CApp unit (var "t") [ unit_ ])
+                                (Ret (CApp unit (var "M.go") [ var "n" ]))
                             )
                         )
                     )
@@ -260,7 +260,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis" do
         decls =
           [ { recursive: true
             , members:
-                [ "M.go" /\ Ret (CLam [ "n" ] (Ret (CApp (var "M.go") [ var "n" ]))) ]
+                [ "M.go" /\ Ret (CLam unit [ "n" ] (Ret (CApp unit (var "M.go") [ var "n" ]))) ]
             }
           ]
         facts = moduleEffects (\k -> liftShape <$> Map.lookup k sigs) decls
@@ -272,7 +272,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis" do
         decls =
           [ { recursive: true
             , members:
-                [ "M.f" /\ Ret (CLam [ "x", "y" ] (Ret (CApp (var "M.g") [ var "x", var "y" ])))
+                [ "M.f" /\ Ret (CLam unit [ "x", "y" ] (Ret (CApp unit (var "M.g") [ var "x", var "y" ])))
                 , "M.g" /\ Ret (CAtom (var "M.f"))
                 ]
             }

@@ -68,7 +68,7 @@ data RefTarget
 
 -- | A module sibling published for gate-site-A unfolding (ADR-0089 §4): its gate facts (computed
 -- | from the binding's post-DictElim body each `optimizeModule` round) and its lazily-evaluated
--- | semantic value. `arity` is `Just` for a `Ret (CLam …)` body (unfold at saturation), `Nothing`
+-- | semantic value. `arity` is `Just` for a `Ret (CLam unit …)` body (unfold at saturation), `Nothing`
 -- | for a value body (an alias / data CAF — unfold on demand, size-gated).
 -- | Per-parameter consumption facts of a lambda candidate (the scrutinised-known-arg 64-tier,
 -- | ADR-0089 self-compile extension): `projected` counts projection/match-scrutinee positions,

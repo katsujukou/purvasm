@@ -37,7 +37,7 @@ import Data.String as String
 import Data.Traversable (traverse)
 import Data.Tuple (Tuple(..))
 import Data.Tuple.Nested (type (/\), (/\))
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..), Rhs, RhsF(..))
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (InlineCandidate)
 
 type Decl = { recursive :: Boolean, members :: Array (String /\ Expr) }
@@ -89,10 +89,10 @@ specializeModule modName localKeys cands decls =
 
   goC :: CExpr -> State SpecState CExpr
   goC = case _ of
-    c@(CApp h args) -> case discover h args of
+    c@(CApp _ h args) -> case discover h args of
       Just site -> rewrite site
       Nothing -> pure c
-    CLam ps b -> CLam ps <$> goExpr b
+    CLam _ ps b -> CLam unit ps <$> goExpr b
     CIf a t e -> CIf a <$> goExpr t <*> goExpr e
     CCase ss alts -> CCase ss <$> traverse goAlt alts
     c -> pure c
@@ -110,7 +110,7 @@ specializeModule modName localKeys cands decls =
       | Just c <- Map.lookup t cands
       , Set.isEmpty c.group
       , c.arity == Just (Array.length args)
-      , Ret (CLam ps inner) <- c.body ->
+      , Ret (CLam _ ps inner) <- c.body ->
           let
             mask = Array.catMaybes
               ( Array.mapWithIndex
@@ -158,10 +158,10 @@ specializeModule modName localKeys cands decls =
       bound = Array.foldr (\m acc -> Let m.param (CAtom m.atom) acc) site.inner site.mask
       cloneExpr =
         if Array.null remainingPs then bound
-        else Ret (CLam remainingPs bound)
+        else Ret (CLam unit remainingPs bound)
     known <- gets \st -> Set.member cloneKey st.existing || Map.member cloneKey st.emitted
     when (not known) do
       modify_ \st -> st { emitted = Map.insert cloneKey cloneExpr st.emitted }
     pure $
       if Array.null remainingArgs then CAtom (AtomVar cloneKey)
-      else CApp (AtomVar cloneKey) remainingArgs
+      else CApp unit (AtomVar cloneKey) remainingArgs

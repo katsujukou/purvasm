@@ -71,7 +71,7 @@ import Purvasm.Compiler.Backend.LLVM.Mangle (sortRecordFields)
 import Purvasm.Compiler.Backend.LLVM.Safepoint (RtOp(..), guestCallSafepoint, rootedReadSafepoint, rtSafepoint)
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Literal (Literal(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr, CExprF(..), Expr, ExprF(..), Rhs, RhsF(..))
 import Purvasm.Compiler.Primitive (PrimOp)
 
 -- | One activation's rootable-name context: its parameters and captures (rooted today at the
@@ -177,10 +177,10 @@ cexprCanSafepoint :: ForeignClosureMode -> FactMap -> CExpr -> Boolean
 cexprCanSafepoint mode facts = case _ of
   CAtom a -> atomCanSafepoint mode a
   -- calls run guest code (force + call + settle)
-  CApp _ _ -> guestCallSafepoint
-  CPerform _ -> guestCallSafepoint
+  CApp _ _ _ -> guestCallSafepoint
+  CPerform _ _ -> guestCallSafepoint
   -- closure construction allocates
-  CLam _ _ -> rtSafepoint RtMakeClosure
+  CLam _ _ _ -> rtSafepoint RtMakeClosure
   -- CPrim forces every operand, then runs the op
   CPrim op args -> Array.any (forcedAtomCanSafepoint mode facts) args || primOpSafepoint op
   -- saturated non-nullary ctor allocates; nullary is an immediate tag; unsaturated builds a
@@ -231,10 +231,10 @@ cexprMayRootLocally :: ForeignClosureMode -> FactMap -> CExpr -> Boolean
 cexprMayRootLocally mode facts = case _ of
   CAtom _ -> false
   -- args may be rooted by evalAtoms; an SForceCell/SClosureEnv target roots its callee/operands
-  CApp _ _ -> true
-  CPerform _ -> true
+  CApp _ _ _ -> true
+  CPerform _ _ -> true
   -- makeClosure evaluates captures (evalAtoms-shaped); conservative when any exist
-  CLam _ _ -> true
+  CLam _ _ _ -> true
   CPrim _ args -> operandsMayRoot mode facts true args
   CCtor _ arity args
     -- unsaturated with supplied fields roots the builder across their evaluation
@@ -405,13 +405,13 @@ preReadHazards cfg = case _ of
   CAtom _ -> Set.empty
   -- reads run L→R over (f : args); the self-call's `%env` word is read AFTER the args, so it
   -- is hazarded by any argument materialisation (the SSelf row).
-  CApp f args ->
+  CApp _ f args ->
     prefixHazards cfg false (Array.cons f args)
       <> case f of
         AtomVar x
           | cfg.selfName == Just x, Array.any (atomCanSafepoint cfg.foreignClosure) args -> Set.singleton envPseudo
         _ -> Set.empty
-  CPerform t -> preReadHazards cfg (CApp t [ AtomLit (LInt 0) ])
+  CPerform unit t -> preReadHazards cfg (CApp unit t [ AtomLit (LInt 0) ])
   CPrim _ args -> prefixHazards cfg true args
   CCtor _ arity args
     -- the unsaturated builder closure is BUILT before the supplied args are read.
@@ -426,7 +426,7 @@ preReadHazards cfg = case _ of
   -- base read first (no hazard); every update value is read after a `record_set` — and the
   -- first-value refinement is DELIBERATELY not taken (§6.3 table note).
   CUpdate _ ups -> usesOf cfg (map _.val ups)
-  CLam _ _ -> Set.empty
+  CLam _ _ _ -> Set.empty
   CIf _ _ _ -> Set.empty
   CCase _ _ -> Set.empty
 
@@ -466,7 +466,7 @@ goC cfg c k = case c of
       , mayRoot: true
       , anySafepoint: true
       }
-  CLam ps body ->
+  CLam _ ps body ->
     let
       -- closure opacity: the body is walked for free names only (the captures, consumed at
       -- `pv_make_closure`); its crossings belong to the lifted function's own plan.
@@ -556,15 +556,15 @@ guardResultForced facts e
 cexprUses :: Ctx -> CExpr -> Set String
 cexprUses cfg = case _ of
   CAtom a -> atomUses cfg a
-  CApp f args -> atomUses cfg f <> usesOf cfg args
-  CPerform t -> atomUses cfg t
+  CApp _ f args -> atomUses cfg f <> usesOf cfg args
+  CPerform _ t -> atomUses cfg t
   CPrim _ args -> usesOf cfg args
   CCtor _ _ args -> usesOf cfg args
   CArray elems -> usesOf cfg elems
   CRecord fields -> usesOf cfg (map _.val fields)
   CAccessor a _ -> atomUses cfg a
   CUpdate a ups -> atomUses cfg a <> usesOf cfg (map _.val ups)
-  CLam _ _ -> Set.empty
+  CLam _ _ _ -> Set.empty
   CIf _ _ _ -> Set.empty
   CCase _ _ -> Set.empty
 

@@ -71,7 +71,7 @@ import Purvasm.Compiler.Backend.LLVM.Types (BindOrigin(..), BindingV(..), Candid
 import Purvasm.Compiler.Backend.LLVM.Value (Val, rootedVal, vImm, vRootedGlobal)
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Literal (Literal(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..))
 import Purvasm.Compiler.MiddleEnd.MatchCompile (DTree(..), Proj(..)) as MC
 import Purvasm.Compiler.MiddleEnd.MatchCompile (compile) as MatchCompile
 import Purvasm.Compiler.Primitive (PrimOp(..))
@@ -348,14 +348,18 @@ aliasCandidate env y = case lookupEnv y env of
       gfns <- gets _.gfns
       xfns <- gets _.xfns
       -- own-module facts win over the interface, mirroring `directTarget`'s order.
-      pure case (case Map.lookup y gfns of
-        Just i -> Just i
-        Nothing -> Map.lookup y xfns) of
-        -- a published/own-module fact is `SSentinel`/`SForceCell` by construction, so a refusal
-        -- here is a compiler bug and takes the same fail-closed path as every other KNOWN fact —
-        -- silently demoting it to `FNone` would move the binding into the opaque population.
-        Just info -> FCandidate { fact: requireCapturableFact "aliasCandidate/global" info, kind: AliasGlobal }
-        Nothing -> FNone
+      pure
+        case
+          ( case Map.lookup y gfns of
+              Just i -> Just i
+              Nothing -> Map.lookup y xfns
+          )
+          of
+          -- a published/own-module fact is `SSentinel`/`SForceCell` by construction, so a refusal
+          -- here is a compiler bug and takes the same fail-closed path as every other KNOWN fact —
+          -- silently demoting it to `FNone` would move the binding into the opaque population.
+          Just info -> FCandidate { fact: requireCapturableFact "aliasCandidate/global" info, kind: AliasGlobal }
+          Nothing -> FNone
 
 directTarget :: Env -> Atom -> Int -> Codegen CallTarget
 directTarget env f nargs = case f of
@@ -424,9 +428,9 @@ directTarget env f nargs = case f of
 cexpr :: Maybe FrameToken -> Env -> Boolean -> CExpr -> Codegen (Maybe Val)
 cexpr frame env tail = case _ of
   CAtom a -> atom env a >>= finish frame tail
-  -- GER run point (ADR-0099): `perform t ≃ t unit`. Delegate to the `CApp` path so the direct /
-  -- `musttail` / generic `pv_apply` machinery (and tail position) is reused unchanged.
-  CPerform t -> cexpr frame env tail (CApp t [ AtomLit (LInt 0) ])
+  -- GER run point (ADR-0099): `perform t ≃ t unit`. It routes into the SAME lowering entry as
+  -- `CApp` — it does not rebuild one (see `lowerCall`).
+  CPerform _ t -> lowerCall frame env tail t [ AtomLit (LInt 0) ]
   CPrim op args -> do
     -- A primop consumes its operands' *values* (e.g. `RecordGet` on a by-need dict), so force them.
     ops <- evalAtoms frame true env args
@@ -470,123 +474,10 @@ cexpr frame env tail = case _ of
       emitAnfLabel snap lend
       r <- fresh
       Just <$> emitPhi r [ inT, inE ]
-  CLam ps body -> do
+  CLam _ ps body -> do
     l <- lift env ps body
     makeClosure env l >>= finish frame tail
-  CApp f args -> do
-    -- ADR-0109 §1.2: the classifier answers ELIGIBILITY, the `tail`/`inDirect` branch supplies the
-    -- FORM, and `decide` closes the two over the §5.2 knob. Every arm below emits its decision's own
-    -- event (`eventOf`), so a decision and its record cannot disagree.
-    target <- directTarget env f (Array.length args)
-    inDir0 <- gets _.inDirect
-    callMode <- gets _.foreignCall
-    let
-      -- ONE derivation, target-aware, pure and unit-tested (`CallClass.callForm`), and it is the
-      -- DECISION's form that drives every recipe below — never the raw `tail` Boolean.
-      form = callForm { tail, inDirect: inDir0 } target
-    case decide callMode form target of
-      EmitGuestDirect info guestForm -> do
-        -- Direct known-arity call (ADR-0076 §2/§3): the env word is derived per the callee's shape;
-        -- a cell force is a safepoint (the suspension may run guest code), so operands are re-read
-        -- from their roots after it.
-        Tuple envOp ops <- case info.src of
-          SSelf -> do
-            sc <- gets _.selfCtx
-            s <- case sc of
-              Just s -> pure s
-              Nothing -> unsafeCrashWith "Backend.LLVM.Emit.cexpr: self-call outside a self context"
-            ops <- evalAtoms frame false env args
-            let
-              envOp = case s.envBind of
-                DirectV v -> v
-                RootedV rv -> rootedVal rv
-            pure (Tuple envOp ops)
-          SSentinel -> do
-            ops <- evalAtoms frame false env args
-            pure (Tuple (vImm immUnit) ops)
-          SClosureEnv -> do
-            all <- evalAtoms frame false env (Array.cons f args)
-            case Array.uncons all of
-              Just { head: fv, tail: ops } -> do
-                e <- rtCall RtReadField [ V fv, I64 "2" ]
-                pure (Tuple e ops)
-              Nothing -> unsafeCrashWith "Backend.LLVM.Emit.cexpr: empty CApp operand list"
-          SForceCell -> do
-            fh <- atom env f >>= ensureRooted frame
-            argHs <- forA args (\a -> atom env a >>= ensureRooted frame)
-            forcedVal <- rtCall RtForceIfByneed [ V (rootedVal fh) ]
-            e <- rtCall RtReadField [ V forcedVal, I64 "2" ]
-            pure (Tuple e (map rootedVal argHs))
-        if guestForm == FTail then do
-          -- musttail (ADR-0076 §3): the fused pop+musttail+ret — every operand (env word
-          -- included) is computed before the pop; no safepoint in between.
-          noteCall (DirectMusttail info)
-          musttailWith frame { dsym: info.dsym, env: envOp, args: ops }
-          pure Nothing
-        else do
-          noteCall (DirectNonTail info)
-          r <- guestDirect { dsym: info.dsym, env: envOp, args: ops }
-          -- Settle (ADR-0076 §3): the callee may have stashed a generic tail bounce no enclosing
-          -- `pv_apply` loop will take on this direct path — run it to a real value.
-          r' <- abiSettle r
-          if tail then do
-            emitRet frame r'
-            pure Nothing
-          else pure (Just r')
-      -- ADR-0109 §2/§3: a saturated native leaf, called through its own `AbiCodeFn` entry. The
-      -- argument buffer is unchanged (that is the leaf ABI); what goes away is the closure the old
-      -- path rebuilt per call (slice A already did) and the `pv_apply` boundary.
-      --
-      -- The TAIL form is a direct call, the frame pop, and `ret` — NOT a trampoline (§3): a leaf is
-      -- first-order host code that returns to its caller, so there is no chain to bound, and
-      -- `musttail` is not available anyway (`ccc` vs `tailcc`, different signature). No `pv_settle`
-      -- either: a `pvf_` entry never leaves a pending tail (§3 clause 1).
-      EmitForeignDirect ref fform -> do
-        clo <- atom env f
-        ops <- evalAtoms frame false env args
-        Tuple bp bn <- argBuffer ops
-        noteCall (eventOf (EmitForeignDirect ref fform))
-        noteForeignDrill f (Array.length args) (show fform)
-        r <- foreignDirect { fsym: refSym ref, clo, argp: bp, nargs: bn }
-        if tail then do
-          emitRet frame r
-          pure Nothing
-        else pure (Just r)
-      -- ELIGIBLE, but the §5.2 knob is off: lower exactly as the generic path does, and record it as
-      -- its OWN class so the residue counter does not change meaning between the legs.
-      EmitForeignDeferred ref fform -> genericCall fform (eventOf (EmitForeignDeferred ref fform))
-      -- ADR-0113: a candidate the knob left alone. Byte-for-byte the generic path — only the event
-      -- differs, which is what lets slices 1–2 name this population without moving emission.
-      EmitLocalDeferred k lform -> genericCall lform (eventOf (EmitLocalDeferred k lform))
-      EmitGeneric reason gform -> genericCall gform (eventOf (EmitGeneric reason gform))
-    where
-    genericCall gform ev = do
-      -- `f` and the args are mutually protected: a foreign callee or a `String` arg may allocate.
-      all <- evalAtoms frame false env (Array.cons f args)
-      case Array.uncons all of
-        Just { head: fv, tail: ops } ->
-          -- the DECISION's form, never the raw `tail`: the two must not be able to disagree.
-          if gform == FTail then do
-            -- Trampoline tail call (ADR-0071 §4): stash the pending tail, pop this frame, return.
-            -- NOTE (ADR-0108 §2): this is a `pv_tailcall` STORE, not a `pv_apply` — the generic
-            -- tail class is invisible in `pv_apply` counts, which is why it has its own column.
-            --
-            -- `noteCall` sits AFTER operand materialisation, immediately before the dispatch:
-            -- the counter it emits (§3) counts DISPATCHES, and `evalAtoms`/`argBuffer` can force
-            -- a by-need cell or allocate. Announcing the dispatch before the work that might not
-            -- reach it would make the dynamic count a count of intentions.
-            Tuple p n <- argBuffer ops
-            noteCall ev
-            noteForeignDrill f (Array.length args) (show FTail)
-            tailcallWith frame { fv, argp: p, nargs: n }
-            pure Nothing
-          else do
-            Tuple p n <- argBuffer ops
-            noteCall ev
-            noteForeignDrill f (Array.length args) (show FApply)
-            t <- rtCall RtApply [ V fv, Ptr p, I64 (show n) ]
-            pure (Just t)
-        Nothing -> unsafeCrashWith "Backend.LLVM.Emit.cexpr: empty CApp operand list"
+  CApp _ f args -> lowerCall frame env tail f args
   CCtor name arity args ->
     let
       nargs = Array.length args
@@ -877,6 +768,135 @@ cexpr frame env tail = case _ of
       r <- fresh
       Just <$> emitPhi r (Array.reverse phis)
 
+-- | The ONE call-lowering entry: a callee atom, its operands, and the position it is in.
+-- |
+-- | `CApp` and `CPerform` both route here rather than `CPerform` rebuilding a `CApp` node and
+-- | re-entering `cexpr`, which is what it used to do (ADR-0114 Slice 1). Rebuilding was harmless
+-- | while the ANF carried no annotation, but it stops being harmless the moment a call occurrence
+-- | has an identity: a reconstructed `CApp` needs an occurrence id, and the only ways to get one
+-- | are to invent it — which ADR-0114 forbids, since a drill keyed by an invented id reports a site
+-- | that does not exist — or to copy the `CPerform`'s, which is what routing here does for free.
+-- | The performed thunk's dispatch is then attributed to the `CPerform` the programmer wrote,
+-- | which is also the site an optimiser would rewrite.
+-- |
+-- | Splitting it out changes no emission: the old path reached these very lines through one extra
+-- | `case` dispatch, and `adr114-identity.sh` holds the LLVM corpus byte-identical across it.
+lowerCall :: Maybe FrameToken -> Env -> Boolean -> Atom -> Array Atom -> Codegen (Maybe Val)
+lowerCall frame env tail f args = do
+  -- ADR-0109 §1.2: the classifier answers ELIGIBILITY, the `tail`/`inDirect` branch supplies the
+  -- FORM, and `decide` closes the two over the §5.2 knob. Every arm below emits its decision's own
+  -- event (`eventOf`), so a decision and its record cannot disagree.
+  target <- directTarget env f (Array.length args)
+  inDir0 <- gets _.inDirect
+  callMode <- gets _.foreignCall
+  let
+    -- ONE derivation, target-aware, pure and unit-tested (`CallClass.callForm`), and it is the
+    -- DECISION's form that drives every recipe below — never the raw `tail` Boolean.
+    form = callForm { tail, inDirect: inDir0 } target
+  case decide callMode form target of
+    EmitGuestDirect info guestForm -> do
+      -- Direct known-arity call (ADR-0076 §2/§3): the env word is derived per the callee's shape;
+      -- a cell force is a safepoint (the suspension may run guest code), so operands are re-read
+      -- from their roots after it.
+      Tuple envOp ops <- case info.src of
+        SSelf -> do
+          sc <- gets _.selfCtx
+          s <- case sc of
+            Just s -> pure s
+            Nothing -> unsafeCrashWith "Backend.LLVM.Emit.cexpr: self-call outside a self context"
+          ops <- evalAtoms frame false env args
+          let
+            envOp = case s.envBind of
+              DirectV v -> v
+              RootedV rv -> rootedVal rv
+          pure (Tuple envOp ops)
+        SSentinel -> do
+          ops <- evalAtoms frame false env args
+          pure (Tuple (vImm immUnit) ops)
+        SClosureEnv -> do
+          all <- evalAtoms frame false env (Array.cons f args)
+          case Array.uncons all of
+            Just { head: fv, tail: ops } -> do
+              e <- rtCall RtReadField [ V fv, I64 "2" ]
+              pure (Tuple e ops)
+            Nothing -> unsafeCrashWith "Backend.LLVM.Emit.cexpr: empty CApp operand list"
+        SForceCell -> do
+          fh <- atom env f >>= ensureRooted frame
+          argHs <- forA args (\a -> atom env a >>= ensureRooted frame)
+          forcedVal <- rtCall RtForceIfByneed [ V (rootedVal fh) ]
+          e <- rtCall RtReadField [ V forcedVal, I64 "2" ]
+          pure (Tuple e (map rootedVal argHs))
+      if guestForm == FTail then do
+        -- musttail (ADR-0076 §3): the fused pop+musttail+ret — every operand (env word
+        -- included) is computed before the pop; no safepoint in between.
+        noteCall (DirectMusttail info)
+        musttailWith frame { dsym: info.dsym, env: envOp, args: ops }
+        pure Nothing
+      else do
+        noteCall (DirectNonTail info)
+        r <- guestDirect { dsym: info.dsym, env: envOp, args: ops }
+        -- Settle (ADR-0076 §3): the callee may have stashed a generic tail bounce no enclosing
+        -- `pv_apply` loop will take on this direct path — run it to a real value.
+        r' <- abiSettle r
+        if tail then do
+          emitRet frame r'
+          pure Nothing
+        else pure (Just r')
+    -- ADR-0109 §2/§3: a saturated native leaf, called through its own `AbiCodeFn` entry. The
+    -- argument buffer is unchanged (that is the leaf ABI); what goes away is the closure the old
+    -- path rebuilt per call (slice A already did) and the `pv_apply` boundary.
+    --
+    -- The TAIL form is a direct call, the frame pop, and `ret` — NOT a trampoline (§3): a leaf is
+    -- first-order host code that returns to its caller, so there is no chain to bound, and
+    -- `musttail` is not available anyway (`ccc` vs `tailcc`, different signature). No `pv_settle`
+    -- either: a `pvf_` entry never leaves a pending tail (§3 clause 1).
+    EmitForeignDirect ref fform -> do
+      clo <- atom env f
+      ops <- evalAtoms frame false env args
+      Tuple bp bn <- argBuffer ops
+      noteCall (eventOf (EmitForeignDirect ref fform))
+      noteForeignDrill f (Array.length args) (show fform)
+      r <- foreignDirect { fsym: refSym ref, clo, argp: bp, nargs: bn }
+      if tail then do
+        emitRet frame r
+        pure Nothing
+      else pure (Just r)
+    -- ELIGIBLE, but the §5.2 knob is off: lower exactly as the generic path does, and record it as
+    -- its OWN class so the residue counter does not change meaning between the legs.
+    EmitForeignDeferred ref fform -> genericCall fform (eventOf (EmitForeignDeferred ref fform))
+    -- ADR-0113: a candidate the knob left alone. Byte-for-byte the generic path — only the event
+    -- differs, which is what lets slices 1–2 name this population without moving emission.
+    EmitLocalDeferred k lform -> genericCall lform (eventOf (EmitLocalDeferred k lform))
+    EmitGeneric reason gform -> genericCall gform (eventOf (EmitGeneric reason gform))
+  where
+  genericCall gform ev = do
+    -- `f` and the args are mutually protected: a foreign callee or a `String` arg may allocate.
+    all <- evalAtoms frame false env (Array.cons f args)
+    case Array.uncons all of
+      Just { head: fv, tail: ops } ->
+        -- the DECISION's form, never the raw `tail`: the two must not be able to disagree.
+        if gform == FTail then do
+          -- Trampoline tail call (ADR-0071 §4): stash the pending tail, pop this frame, return.
+          -- NOTE (ADR-0108 §2): this is a `pv_tailcall` STORE, not a `pv_apply` — the generic
+          -- tail class is invisible in `pv_apply` counts, which is why it has its own column.
+          --
+          -- `noteCall` sits AFTER operand materialisation, immediately before the dispatch:
+          -- the counter it emits (§3) counts DISPATCHES, and `evalAtoms`/`argBuffer` can force
+          -- a by-need cell or allocate. Announcing the dispatch before the work that might not
+          -- reach it would make the dynamic count a count of intentions.
+          Tuple p n <- argBuffer ops
+          noteCall ev
+          noteForeignDrill f (Array.length args) (show FTail)
+          tailcallWith frame { fv, argp: p, nargs: n }
+          pure Nothing
+        else do
+          Tuple p n <- argBuffer ops
+          noteCall ev
+          noteForeignDrill f (Array.length args) (show FApply)
+          t <- rtCall RtApply [ V fv, Ptr p, I64 (show n) ]
+          pure (Just t)
+      Nothing -> unsafeCrashWith "Backend.LLVM.Emit.cexpr: empty CApp operand list"
+
 -- | Emit a `Gcaf`'s `$init` — the FIXED-SHAPE public surface (ADR-0106 slice 2): callers
 -- | supply DATA only (the key and the body `Expr`); the activation plan decides the frame
 -- | and drives the body's rooting exactly as `emitFunction` drives an `LBody` (a `Gcaf`
@@ -934,7 +954,7 @@ buildGrec frame named env binds = do
   xfns <- gets _.xfns
   memberFns0 <- map Array.catMaybes $ flip forA
     ( \(Tuple m rhs) -> case rhs of
-        Ret (CLam ps b) -> do
+        Ret (CLam unit ps b) -> do
           Tuple name top <- case named m of
             Just n -> pure (Tuple n true)
             Nothing -> do
@@ -1071,7 +1091,7 @@ expr frame env0 tail = tailRecM step <<< Tuple env0
     Let x c body -> case c of
       -- A let-bound lambda is a direct-call candidate (ADR-0076 §2): keep its lifted identity on the
       -- binding so saturated calls skip the generic dispatch. Non-recursive, so no self.
-      CLam ps lbody -> do
+      CLam _ ps lbody -> do
         l <- lift env ps lbody
         let Lifted lr = l
         v <- makeClosure env l

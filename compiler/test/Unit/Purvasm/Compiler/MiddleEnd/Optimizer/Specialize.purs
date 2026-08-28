@@ -13,7 +13,7 @@ import Data.Set as Set
 import Data.Tuple (Tuple(..))
 import Data.Tuple.Nested ((/\))
 import Purvasm.Compiler.Literal (Literal(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..))
 import Purvasm.Compiler.Ffi (intrinsicPrim)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe (candidatesOf)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (InlineCandidate)
@@ -41,8 +41,8 @@ deps = Map.fromFoldable
   [ Tuple "Dep.builder"
       ( cand (Just 1)
           ( Ret
-              ( CLam [ "d" ]
-                  ( Let "q" (CApp (var "Dep.fwd") [ var "d" ])
+              ( CLam unit [ "d" ]
+                  ( Let "q" (CApp unit (var "Dep.fwd") [ var "d" ])
                       (Ret (CRecord [ { prop: "out", val: var "q" } ]))
                   )
               )
@@ -53,17 +53,17 @@ deps = Map.fromFoldable
   , Tuple "Dep.binop"
       ( cand (Just 2)
           ( Ret
-              ( CLam [ "a", "b" ]
+              ( CLam unit [ "a", "b" ]
                   (Ret (CRecord [ { prop: "x", val: var "a" }, { prop: "y", val: var "b" } ]))
               )
           )
       )
   , Tuple "Dep.grouped"
-      ( (cand (Just 1) (Ret (CLam [ "d" ] (Ret (CRecord [])))))
+      ( (cand (Just 1) (Ret (CLam unit [ "d" ] (Ret (CRecord [])))))
           { group = Set.fromFoldable [ "Dep.grouped", "Dep.grouped2" ] }
       )
   , Tuple "Dep.groupedAlias"
-      ((cand Nothing (Ret (CApp (var "Dep.grouped") [ var "Dep.dict" ]))) { group = Set.singleton "Dep.grouped" })
+      ((cand Nothing (Ret (CApp unit (var "Dep.grouped") [ var "Dep.dict" ]))) { group = Set.singleton "Dep.grouped" })
   ]
 
 run :: Array { recursive :: Boolean, members :: Array (Tuple String Expr) } -> Array { recursive :: Boolean, members :: Array (Tuple String Expr) }
@@ -77,11 +77,11 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Specialize" do
   describe "specializeModule (ADR-0093)" do
     it "clones a fully-masked callee as a CAF and rewrites the site to the clone reference" do
       let
-        out = run [ nonrec "M.use" (Ret (CApp (var "Dep.builder") [ var "Dep.dict" ])) ]
+        out = run [ nonrec "M.use" (Ret (CApp unit (var "Dep.builder") [ var "Dep.dict" ])) ]
       map _.members out `shouldEqual`
         [ [ cloneKey /\
               Let "d" (CAtom (var "Dep.dict"))
-                ( Let "q" (CApp (var "Dep.fwd") [ var "d" ])
+                ( Let "q" (CApp unit (var "Dep.fwd") [ var "d" ])
                     (Ret (CRecord [ { prop: "out", val: var "q" } ]))
                 )
           ]
@@ -90,8 +90,8 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Specialize" do
 
     it "dedups two sites of one instantiation into one clone, and is stable on its own output" do
       let
-        e = Let "a" (CApp (var "Dep.builder") [ var "Dep.dict" ])
-          ( Let "b" (CApp (var "Dep.builder") [ var "Dep.dict" ])
+        e = Let "a" (CApp unit (var "Dep.builder") [ var "Dep.dict" ])
+          ( Let "b" (CApp unit (var "Dep.builder") [ var "Dep.dict" ])
               (Ret (CRecord [ { prop: "l", val: var "a" }, { prop: "r", val: var "b" } ]))
           )
         out = run [ nonrec "M.use" e ]
@@ -103,8 +103,8 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Specialize" do
     it "the same dictionary at a different parameter index is a distinct clone (positional key)" do
       let
         out = run
-          [ nonrec "M.u1" (Ret (CApp (var "Dep.binop") [ var "Dep.dict", var "M.x" ]))
-          , nonrec "M.u2" (Ret (CApp (var "Dep.binop") [ var "M.x", var "Dep.dict" ]))
+          [ nonrec "M.u1" (Ret (CApp unit (var "Dep.binop") [ var "Dep.dict", var "M.x" ]))
+          , nonrec "M.u2" (Ret (CApp unit (var "Dep.binop") [ var "M.x", var "Dep.dict" ]))
           ]
         keys = out >>= \d -> Array.mapMaybe (\(Tuple k _) -> if isSpecKey k then Just k else Nothing) d.members
       keys `shouldEqual`
@@ -112,28 +112,28 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Specialize" do
 
     it "a partially-masked callee keeps its remaining parameters and arguments in order" do
       let
-        out = run [ nonrec "M.use" (Ret (CApp (var "Dep.binop") [ var "Dep.dict", var "M.x" ])) ]
+        out = run [ nonrec "M.use" (Ret (CApp unit (var "Dep.binop") [ var "Dep.dict", var "M.x" ])) ]
         clone = out >>= \d -> Array.mapMaybe (\(Tuple k e) -> if isSpecKey k then Just e else Nothing) d.members
       clone `shouldEqual`
         [ Ret
-            ( CLam [ "b" ]
+            ( CLam unit [ "b" ]
                 ( Let "a" (CAtom (var "Dep.dict"))
                     (Ret (CRecord [ { prop: "x", val: var "a" }, { prop: "y", val: var "b" } ]))
                 )
             )
         ]
       (out >>= \d -> Array.mapMaybe (\(Tuple k e) -> if k == "M.use" then Just e else Nothing) d.members)
-        `shouldEqual` [ Ret (CApp (var "M.$spec$Dep$_binop$0_Dep$_dict") [ var "M.x" ]) ]
+        `shouldEqual` [ Ret (CApp unit (var "M.$spec$Dep$_binop$0_Dep$_dict") [ var "M.x" ]) ]
 
     it "a non-dictionary argument alone never specializes" do
       let
-        e0 = [ nonrec "M.use" (Ret (CApp (var "Dep.builder") [ var "Dep.plain" ])) ]
+        e0 = [ nonrec "M.use" (Ret (CApp unit (var "Dep.builder") [ var "Dep.plain" ])) ]
       run e0 `shouldEqual` e0
 
     it "a Rec-group member callee is refused; a grouped alias argument is accepted" do
       let
-        asCallee = [ nonrec "M.use" (Ret (CApp (var "Dep.grouped") [ var "Dep.dict" ])) ]
-        asArg = [ nonrec "M.use" (Ret (CApp (var "Dep.builder") [ var "Dep.groupedAlias" ])) ]
+        asCallee = [ nonrec "M.use" (Ret (CApp unit (var "Dep.grouped") [ var "Dep.dict" ])) ]
+        asArg = [ nonrec "M.use" (Ret (CApp unit (var "Dep.builder") [ var "Dep.groupedAlias" ])) ]
       run asCallee `shouldEqual` asCallee
       ( Array.length
           ( run asArg >>= \d ->
@@ -144,7 +144,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Specialize" do
     it "a local dictionary never masks in v1 (CAF-clone init order)" do
       let
         -- "M.use" is in localKeys: a would-be dictionary argument that is module-local.
-        e0 = [ nonrec "M.caller" (Ret (CApp (var "Dep.builder") [ var "M.use" ])) ]
+        e0 = [ nonrec "M.caller" (Ret (CApp unit (var "Dep.builder") [ var "M.use" ])) ]
       specializeModule "M" (Set.fromFoldable [ "M.use", "M.caller" ])
         (Map.insert "M.use" (cand Nothing (Ret (CRecord []))) deps)
         e0 `shouldEqual` e0
@@ -154,7 +154,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Specialize" do
         preexisting = nonrec cloneKey (Ret (CAtom (int 9)))
         out = run
           [ preexisting
-          , nonrec "M.use" (Ret (CApp (var "Dep.builder") [ var "Dep.dict" ]))
+          , nonrec "M.use" (Ret (CApp unit (var "Dep.builder") [ var "Dep.dict" ]))
           ]
       out `shouldEqual`
         [ preexisting
@@ -163,7 +163,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Specialize" do
 
     it "a wrapper referencing a clone never publishes as a candidate (no cross-module clone leak)" do
       let
-        out = run [ nonrec "M.use" (Ret (CApp (var "Dep.builder") [ var "Dep.dict" ])) ]
+        out = run [ nonrec "M.use" (Ret (CApp unit (var "Dep.builder") [ var "Dep.dict" ])) ]
         -- the post-specialize summary derivation: neither the clone itself nor the rewritten
         -- wrapper (whose body now references the module-private clone) may travel.
         published = candidatesOf intrinsicPrim Map.empty out

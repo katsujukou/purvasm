@@ -28,7 +28,7 @@ import Data.Traversable (traverse)
 import Data.Tuple (Tuple(..))
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Literal (Literal(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr, CExprF(..), Expr, ExprF(..), Rhs, RhsF(..))
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (cfExpr, fvExpr)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Quote (quote)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (ArgUse, Comp(..), EvalEnv, NRhs(..), RefTarget(..), Sem(..), binderVarsOrdered)
@@ -67,7 +67,7 @@ evalExpr env = case _ of
   -- parameterized-instance extension) binds the *deferred saturated ref* instead of a pinned
   -- computation: the marked projection then sees the ref and judges the fold. Single-use (checked
   -- at discovery) is what makes this sharing-safe.
-  Let x (CApp h args) rest
+  Let x (CApp _ h args) rest
     | Set.member x env.defers
     , Just d <- deferredOf env h args -> evalExpr (bindLocal env x d) rest
   Let x c rest ->
@@ -85,8 +85,8 @@ evalExpr env = case _ of
 evalC :: EvalEnv -> CExpr -> Sem
 evalC env = case _ of
   CAtom a -> evalAtom env a
-  CLam ps body -> SLam ps (\args -> evalExpr (bindLocals env ps args) body)
-  CApp h args -> applySem (evalAtom env h) (map (evalAtom env) args)
+  CLam _ ps body -> SLam ps (\args -> evalExpr (bindLocals env ps args) body)
+  CApp _ h args -> applySem (evalAtom env h) (map (evalAtom env) args)
   CPrim op args -> evalPrim op (map (evalAtom env) args)
   CCtor t n args -> SCtor t n (map (evalAtom env) args)
   CArray args -> SArr (map (evalAtom env) args)
@@ -97,7 +97,7 @@ evalC env = case _ of
     SLit (LBool b) -> evalExpr env (if b then t else e)
     s -> SComp (NIf s (evalExpr env t) (evalExpr env e))
   CCase scruts alts -> evalCase env (map (evalAtom env) scruts) alts
-  CPerform a -> performSem (evalAtom env a)
+  CPerform _ a -> performSem (evalAtom env a)
 
 -- | Run an `Effect`/`ST` thunk (GER, ADR-0099). β fires **only** on a known unit-lambda
 -- | (`perform (\$u -> body) → body`, in place); a stuck computation is sequenced first (mirroring

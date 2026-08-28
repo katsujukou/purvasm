@@ -32,6 +32,22 @@ module Purvasm.Compiler.Backend.LLVM.Types
   , BindOrigin(..)
   , bindOrigins
   , bindOriginName
+  -- ADR-0114 §1: the parameter index rides on the BINDING; the finite class is a projection
+  , ParamIndex
+  , indexParams
+  , paramIndexInt
+  , BindingSite(..)
+  , NonParamOrigin(..)
+  , originClass
+  -- the two site-identity layers, opaque: a key cannot be assembled by hand
+  , ProofSiteId
+  , EmissionSiteId
+  , mkProofSiteId
+  , mkEmissionSiteId
+  , proofOf
+  , siteKey
+  , siteLabel
+  , proofKey
   , LocalFact(..)
   , EnvEntry
   , activeFn
@@ -54,7 +70,9 @@ import Data.Maybe (Maybe(..))
 import Data.Set (Set)
 import Data.Tuple (Tuple(..), snd)
 import Purvasm.Compiler.Backend.LLVM.Value (RootedVal, Val, keyOf, rootedVal)
+import Data.Array as Array
 import Purvasm.Compiler.MiddleEnd.ANF (Expr)
+import Purvasm.Compiler.MiddleEnd.ANF.Occurrence (AnfFunctionId, AnfOccurrenceId)
 
 -- | How a direct call site obtains the callee's env word (ADR-0076 §2).
 data EnvSrc
@@ -212,7 +230,7 @@ data BindingV
 data BindOrigin
   = OParam -- ^ `emitFunction`'s parameter prologue
   | OCapture -- ^ `emitFunction`'s positional `%env` reads
-  | OLetLambda -- ^ `expr`'s `Let x (CLam …)` arm
+  | OLetLambda -- ^ `expr`'s `Let x (CLam unit …)` arm
   | OLetValue -- ^ `expr`'s other `Let` arm
   | OGrecLambda -- ^ `buildGrec`, member whose RHS is a lambda
   | OGrecValue -- ^ `buildGrec`, member whose RHS is not
@@ -230,6 +248,73 @@ instance showBindOrigin :: Show BindOrigin where
     OGrecLambda -> "OGrecLambda"
     OGrecValue -> "OGrecValue"
     OMatchBinder -> "OMatchBinder"
+
+-- | A parameter's POSITION in its function's parameter list (ADR-0114 §1). Opaque, because the
+-- | caller-side drill this feeds asks about "the n-th parameter" and an off-by-one there is
+-- | undetectable downstream — so there is one producer, at the prologue that binds the list.
+newtype ParamIndex = ParamIndex Int
+
+derive instance eqParamIndex :: Eq ParamIndex
+derive instance ordParamIndex :: Ord ParamIndex
+
+instance showParamIndex :: Show ParamIndex where
+  show (ParamIndex i) = "p" <> show i
+
+-- | The ONLY producer, and it is an ENUMERATION rather than an injection: a caller pairs a
+-- | parameter LIST with its indices and cannot choose the numbers.
+-- |
+-- | An `Int -> ParamIndex` producer would let any module mint a negative index, an off-by-one, or an
+-- | index for a function with fewer parameters — and none of those is detectable downstream, since
+-- | the drill's whole output is "the n-th parameter of this function". Enumerating the list the
+-- | prologue is already walking makes the index a property OF that list.
+indexParams :: forall a. Array a -> Array (Tuple ParamIndex a)
+indexParams = Array.mapWithIndex (\i a -> Tuple (ParamIndex i) a)
+
+paramIndexInt :: ParamIndex -> Int
+paramIndexInt (ParamIndex i) = i
+
+-- | The six origins that are NOT a parameter. Kept as its own closed enumeration so that
+-- | [`BindOrigin`] can stay finite while a parameter binding carries its index (ADR-0114 §1): a
+-- | `ParamIndex` inside `BindOrigin` would make `bindOrigins` unenumerable, and ADR-0113's census
+-- | identities are all stated over that enumeration.
+data NonParamOrigin
+  = NCapture
+  | NLetLambda
+  | NLetValue
+  | NGrecLambda
+  | NGrecValue
+  | NMatchBinder
+
+derive instance eqNonParamOrigin :: Eq NonParamOrigin
+derive instance ordNonParamOrigin :: Ord NonParamOrigin
+
+instance showNonParamOrigin :: Show NonParamOrigin where
+  show = show <<< originClass <<< OtherBinding
+
+-- | What an environment entry records about WHERE it was bound. The parameter case carries its
+-- | index inseparably; every other case carries none, and neither state can be built the other way
+-- | round (a `{ origin, index :: Maybe ParamIndex }` record would allow both).
+data BindingSite
+  = ParamBinding ParamIndex
+  | OtherBinding NonParamOrigin
+
+derive instance eqBindingSite :: Eq BindingSite
+
+instance showBindingSite :: Show BindingSite where
+  show = case _ of
+    ParamBinding i -> "ParamBinding " <> show i
+    OtherBinding o -> "OtherBinding " <> show (originClass (OtherBinding o))
+
+-- | The FINITE report class. Total, and the only way a [`BindingSite`] becomes a census column.
+originClass :: BindingSite -> BindOrigin
+originClass = case _ of
+  ParamBinding _ -> OParam
+  OtherBinding NCapture -> OCapture
+  OtherBinding NLetLambda -> OLetLambda
+  OtherBinding NLetValue -> OLetValue
+  OtherBinding NGrecLambda -> OGrecLambda
+  OtherBinding NGrecValue -> OGrecValue
+  OtherBinding NMatchBinder -> OMatchBinder
 
 -- | Every [`BindOrigin`], in report order — the census's reason columns are stated over this array.
 bindOrigins :: Array BindOrigin
@@ -294,6 +379,87 @@ candidateOf e = case e.fact of
   FActive f -> Just f
   FCandidate c -> Just c.fact
   FNone -> Nothing
+
+-- | WHAT AN OPTIMISATION WOULD ACT ON (ADR-0114 §1): one call occurrence in the ANF term, bound to
+-- | the function and parameter it belongs to. Opaque — `mkProofSiteId` is the only producer, so a
+-- | key cannot be assembled by hand and the census and the drill cannot drift into two spellings.
+newtype ProofSiteId = ProofSiteId
+  { object :: String
+  -- ^ the SOURCE function, not the lifted one: match compilation duplicates a wildcard RHS into
+  -- several leaves, and a `CLam` inside it is lifted separately at each — so `Lifted.name` would
+  -- split one source function across several proofs (ADR-0114 amendment). The lifted name is
+  -- reporting metadata on the EMISSION layer instead.
+  , sourceFn :: AnfFunctionId
+  , param :: ParamIndex
+  , callOcc :: AnfOccurrenceId
+  }
+
+derive instance eqProofSiteId :: Eq ProofSiteId
+derive instance ordProofSiteId :: Ord ProofSiteId
+
+-- for test diagnostics: two site ids that differ must print WHICH component differs
+instance showProofSiteId :: Show ProofSiteId where
+  show = proofKey
+
+-- | WHAT EXECUTES AND IS COUNTED: one emitted call site. Match compilation can duplicate a single
+-- | ANF occurrence into several, so many `EmissionSiteId`s may share one [`ProofSiteId`] — which is
+-- | the relation the report prints rather than collapses.
+newtype EmissionSiteId = EmissionSiteId
+  { proof :: ProofSiteId
+  , dup :: Int
+  }
+
+derive instance eqEmissionSiteId :: Eq EmissionSiteId
+derive instance ordEmissionSiteId :: Ord EmissionSiteId
+
+instance showEmissionSiteId :: Show EmissionSiteId where
+  show = siteKey
+
+mkProofSiteId
+  :: { object :: String, sourceFn :: AnfFunctionId, param :: ParamIndex, callOcc :: AnfOccurrenceId }
+  -> ProofSiteId
+mkProofSiteId = ProofSiteId
+
+-- | `dup` is a deterministic per-proof ordinal: the n-th emitted copy of that ANF occurrence.
+-- |
+-- | **PROVISIONAL — this producer is weaker than the invariant it is supposed to carry, and the gap
+-- | is open on purpose rather than unnoticed** (ADR-0114 Slice 1). The intended rule is that the
+-- | emitter hands out CONSECUTIVE ordinals from a per-proof counter, so the copies of one occurrence
+-- | are `#0, #1, #2 …` with none skipped and none issued twice. A raw `Int` enforces none of that:
+-- | it admits a negative ordinal, a gap, and — the one that actually corrupts a drill — the same
+-- | ordinal twice, which makes two distinct emissions share an `EmissionSiteId` and silently sum
+-- | their counts.
+-- |
+-- | It stays raw only because there is nothing to allocate from yet: the emission wiring, which owns
+-- | the per-proof map, is the next slice. When it lands the allocator becomes the sole producer and
+-- | this constructor goes back inside the module — the same treatment `freshOccurrence` and
+-- | `ParamIndex` already got. Until then the ordinal is a convention, not a guarantee, and the
+-- | restored identity rows exercise hand-built ids rather than real emissions.
+mkEmissionSiteId :: ProofSiteId -> Int -> EmissionSiteId
+mkEmissionSiteId proof dup = EmissionSiteId { proof, dup }
+
+-- | Total, and the ONLY relation between the two layers.
+proofOf :: EmissionSiteId -> ProofSiteId
+proofOf (EmissionSiteId e) = e.proof
+
+-- | The CANONICAL key: what the LLVM string constant carries and the runtime uses as a map key.
+-- | Stable and parseable; distinct from [`siteLabel`], which a report may reformat freely. The two
+-- | are separate functions because the LLVM constant IS a rendering and it happens at emission, not
+-- | at the report boundary.
+siteKey :: EmissionSiteId -> String
+siteKey (EmissionSiteId e) = proofKey e.proof <> "#" <> show e.dup
+
+-- | The key of the PROOF layer alone — what the report aggregates duplicates onto.
+proofKey :: ProofSiteId -> String
+proofKey (ProofSiteId p) =
+  p.object <> "|" <> show p.sourceFn <> "|" <> show p.param <> "|" <> show p.callOcc
+
+-- | For humans. Never parsed.
+siteLabel :: EmissionSiteId -> String
+siteLabel (EmissionSiteId e) = case e.proof of
+  ProofSiteId p ->
+    show p.sourceFn <> " (" <> p.object <> ") " <> show p.param <> " occ " <> show p.callOcc
+      <> (if e.dup == 0 then "" else " dup " <> show e.dup)
 
 -- | The local scope: an assoc list, most-recent binding first (`List.lookup` finds it first), matching
 -- | boot's `(string * env_entry) list` with `List.assoc_opt`.

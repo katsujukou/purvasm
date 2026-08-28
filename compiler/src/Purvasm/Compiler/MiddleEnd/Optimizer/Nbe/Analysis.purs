@@ -39,7 +39,7 @@ import Data.Map as Map
 import Data.Maybe (Maybe(..), fromMaybe, maybe)
 import Data.Set (Set)
 import Data.Set as Set
-import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr, CExprF(..), Expr, ExprF(..), Rhs, RhsF(..))
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (cfExpr, fvExpr)
 import Purvasm.Compiler.MiddleEnd.Optimizer.EffectAnalysis (EffectEnv, EffectGlobals, bindFact, bindUnknown, emptyEffectEnv, eperfC, extendGroupVars, sinkableCall, vsumC)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (binderVarsOrdered, pinnedPrim)
@@ -103,7 +103,7 @@ type RhsFacts = { cx :: Cx, isAbs :: Boolean, closedParams :: Boolean }
 classifyRhs :: CExpr -> Maybe RhsFacts
 classifyRhs = case _ of
   CAtom _ -> Just { cx: Trivial, isAbs: false, closedParams: false }
-  CLam ps b -> Just
+  CLam _ ps b -> Just
     { cx: KnownSize
     , isAbs: true
     -- closed-but-for-params: **no free references at all** — no `$q` locals, no top-level globals,
@@ -259,9 +259,9 @@ auditStrip markUsages term marks = Set.difference marks (auditE Map.empty term).
   auditC env = case _ of
     CAtom a -> atom env a
     -- a call owns `CapBranch`; everything else owns `CapClosure` and inherits its operands' caps.
-    CApp h as -> atomsFrom env CapBranch 1 (Array.cons h as)
+    CApp _ h as -> atomsFrom env CapBranch 1 (Array.cons h as)
     -- a run point performs — treated like a call for motion (`CapBranch`).
-    CPerform a -> atomsFrom env CapBranch 1 [ a ]
+    CPerform _ a -> atomsFrom env CapBranch 1 [ a ]
     CPrim _ as -> atomsFrom env CapClosure 1 as
     CCtor _ _ as -> atomsFrom env CapClosure 1 as
     CArray as -> atomsFrom env CapClosure 1 as
@@ -270,7 +270,7 @@ auditStrip markUsages term marks = Set.difference marks (auditE Map.empty term).
     CUpdate a ups -> atomsFrom env CapClosure 1 (Array.cons a (map _.val ups))
     -- a closure is pure to build, hence re-materialisable anywhere (`CapClosure`); its body's own
     -- motion-constrained refs are stripped by their use-capture before they reach here.
-    CLam _ b -> let r = auditE env b in { size: 1 + r.size, stripped: r.stripped, motionCap: CapClosure }
+    CLam _ _ b -> let r = auditE env b in { size: 1 + r.size, stripped: r.stripped, motionCap: CapClosure }
     CIf a t e ->
       let
         ai = atom env a
@@ -320,7 +320,7 @@ auditStrip markUsages term marks = Set.difference marks (auditE Map.empty term).
     CAtom _ -> Unbounded
     CAccessor _ _ -> Bounded derefSizeBound
     CPrim _ _ -> Bounded derefSizeBound
-    CLam ps body -> if closed ps body then Unbounded else Bounded lambdaSizeBound
+    CLam _ ps body -> if closed ps body then Unbounded else Bounded lambdaSizeBound
     -- `CRecord`/`CCtor`/`CArray`/`CUpdate` (KnownSize) and `CApp` (a call): share-only.
     _ -> ShareOnly
     where
@@ -350,8 +350,8 @@ infoExpr env = case _ of
         -- The call branch: usage first. Dead pure → drop (ADR-0095 §3); live single-use,
         -- at most branch-captured, exact-saturated and store-clean → sink (ADR-0096 §2).
         Nothing -> case c, usage of
-          CApp _ _, Nothing | not (eperfC env c) -> marked
-          CApp _ _, Just u
+          CApp _ _ _, Nothing | not (eperfC env c) -> marked
+          CApp _ _ _, Just u
             | u.total == 1
             , u.capture <= CapBranch
             , sinkableCall env c -> marked
@@ -376,8 +376,8 @@ infoExpr env = case _ of
 infoC :: EffectEnv -> CExpr -> Info
 infoC env = case _ of
   CAtom a -> useAtom a
-  CLam ps body -> bump (dropVars ps (capAt CapClosure (infoExpr (bindUnknown ps env) body)))
-  CApp h args -> bump (mergeI (useAtom h) (useAtoms args))
+  CLam _ ps body -> bump (dropVars ps (capAt CapClosure (infoExpr (bindUnknown ps env) body)))
+  CApp _ h args -> bump (mergeI (useAtom h) (useAtoms args))
   CPrim _ args -> bump (useAtoms args)
   CCtor _ _ args -> bump (useAtoms args)
   CArray args -> bump (useAtoms args)
@@ -386,7 +386,7 @@ infoC env = case _ of
   CUpdate a ups -> bump (mergeI (useAtom a) (useAtoms (map _.val ups)))
   CIf a t e -> bump (mergeI (useAtom a) (capAt CapBranch (mergeI (infoExpr env t) (infoExpr env e))))
   CCase scruts alts -> bump (mergeI (useAtoms scruts) (capAt CapBranch (foldl (\i alt -> mergeI i (infoAlt env alt)) emptyI alts)))
-  CPerform a -> bump (useAtom a)
+  CPerform _ a -> bump (useAtom a)
   where
   bump i = i { size = i.size + 1 }
 

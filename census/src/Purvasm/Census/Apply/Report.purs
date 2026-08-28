@@ -163,9 +163,10 @@ checkIdentities object lines =
   where
   parsed = map (\l -> Tuple l (parseRow l)) (Array.filter (\l -> l /= "" && not (String.take 1 l == "#")) lines)
   parseFailures = Array.mapMaybe
-    (\(Tuple l m) -> case m of
+    ( \(Tuple l m) -> case m of
         Nothing -> Just ("unparsable row: " <> l)
-        Just _ -> Nothing)
+        Just _ -> Nothing
+    )
     parsed
   good = Array.mapMaybe (\(Tuple _ m) -> m) parsed
 
@@ -216,8 +217,10 @@ checkIdentities object lines =
       Left' e, _ -> [ label <> ": " <> e ]
       _, Left' e -> [ label <> ": " <> e ]
       Right' total, Right' parts ->
-        let sum = foldl (+) 0 parts
-        in if total == sum then [] else [ label <> ": class " <> show total <> " /= Σ parts " <> show sum ]
+        let
+          sum = foldl (+) 0 parts
+        in
+          if total == sum then [] else [ label <> ": class " <> show total <> " /= Σ parts " <> show sum ]
 
   traverseParts = foldl
     ( \acc k -> case acc, need k of

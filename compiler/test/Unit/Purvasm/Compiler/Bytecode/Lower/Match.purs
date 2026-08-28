@@ -18,7 +18,7 @@ import Purvasm.Compiler.Bytecode.Lower (lowerAtom, lowerExpr)
 import Purvasm.Compiler.Bytecode.Lower.Match (Lowerers, compileNaive, compileTree)
 import Purvasm.Compiler.Literal (Literal(..))
 import Purvasm.Compiler.Bytecode.Linearise (linearise)
-import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr(..), Expr(..), Rhs)
+import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr, CExprF(..), Expr, ExprF(..), Rhs)
 import Purvasm.Compiler.MiddleEnd.ANF as ANF
 import Purvasm.Compiler.Primitive (PrimOp(LtInt))
 import Test.Spec (Spec, describe, it)

@@ -21,6 +21,7 @@ import Test.Unit.Purvasm.Compiler.Backend.LLVM.LocalFacts as Backend.LLVM.LocalF
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Driver as Backend.LLVM.Driver
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Emit as Backend.LLVM.Emit
 import Test.Unit.Purvasm.Compiler.MiddleEnd.ANF.FreeVars as MiddleEnd.ANF.FreeVars
+import Test.Unit.Purvasm.Compiler.MiddleEnd.ANF.Occurrence as MiddleEnd.ANF.Occurrence
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.ForeignRef as Backend.LLVM.ForeignRef
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Interface as Backend.LLVM.Interface
 import Test.Unit.Purvasm.Compiler.Backend.LLVM.Liveness as Backend.LLVM.Liveness
@@ -76,6 +77,7 @@ main = runSpecAndExitProcess [ consoleReporter ] do
   Backend.LLVM.Prim.spec
   Backend.LLVM.Program.spec
   MiddleEnd.ANF.FreeVars.spec
+  MiddleEnd.ANF.Occurrence.spec
   Backend.LLVM.ForeignRef.spec
   Backend.LLVM.Interface.spec
   Backend.LLVM.Emit.spec

@@ -19,7 +19,7 @@ import Data.Tuple (Tuple(..))
 import Purvasm.Compiler.Backend.LLVM.ByNeed (ByNeedFact(..), activationFacts, elidesForce, elidesForcedValue, factOfAtom, factOfExpr, meet, noFacts)
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Literal (Literal(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..), Rhs, RhsF(..))
 import Purvasm.Compiler.Primitive (PrimOp(..))
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
@@ -62,7 +62,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.ByNeed" do
           , Tuple "saturated ctor" (CCtor "Just" 1 [ var "p" ])
           , Tuple "array" (CArray [ var "p" ])
           , Tuple "record" (CRecord [ { prop: "a", val: var "p" } ])
-          , Tuple "lambda" (CLam [ "u" ] (Ret (CAtom (var "u"))))
+          , Tuple "lambda" (CLam unit [ "u" ] (Ret (CAtom (var "u"))))
           , Tuple "scalar prim" (CPrim AddInt [ var "p", int 1 ])
           ]
       for_ producers \(Tuple label c) -> do
@@ -75,8 +75,8 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.ByNeed" do
     it "falls to May over every non-producer constructor (totality)" do
       let
         nonProducers =
-          [ Tuple "CApp" (CApp (var "f") [ var "p" ])
-          , Tuple "CPerform" (CPerform (var "t"))
+          [ Tuple "CApp unit" (CApp unit (var "f") [ var "p" ])
+          , Tuple "CPerform unit" (CPerform unit (var "t"))
           , Tuple "CAccessor" (CAccessor (var "p") "field")
           , Tuple "CUpdate" (CUpdate (var "p") [ { prop: "a", val: int 1 } ])
           , Tuple "CPrim RecordGet" (CPrim RecordGet [ var "p", int 0 ])
@@ -125,7 +125,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.ByNeed" do
       -- let x = 1 in let y = (let x = <call> in x) in x — the OUTER x is provable in isolation,
       -- but the name is rebound, so BOTH occurrences read May and no site elides on `x`.
       let
-        inner = Let "x" (CApp (var "f") [ int 0 ]) (Ret (CAtom (var "x")))
+        inner = Let "x" (CApp unit (var "f") [ int 0 ]) (Ret (CAtom (var "x")))
         body = Let "x" (CAtom (int 1)) (Let "y" (CIf (var "p") inner (Ret (CAtom (int 0)))) (Ret (CAtom (var "x"))))
       factIn [ "p" ] body "x" `shouldEqual` MayBeByNeed
 
@@ -158,7 +158,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.ByNeed" do
       factIn [] body "x" `shouldEqual` MayBeByNeed
 
     it "leaves distinct names alone" do
-      let body = Let "x" (CAtom (int 1)) (Let "z" (CApp (var "f") [ int 0 ]) (Ret (CAtom (var "x"))))
+      let body = Let "x" (CAtom (int 1)) (Let "z" (CApp unit (var "f") [ int 0 ]) (Ret (CAtom (var "x"))))
       factIn [] body "x" `shouldEqual` NeverByNeed
       factIn [] body "z" `shouldEqual` MayBeByNeed
 
@@ -167,7 +167,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.ByNeed" do
       -- the lambda's own activation binds only its params; `a` arrives through `%env` ⇒ May.
       let
         inner = Ret (CPrim AddInt [ var "a", var "u" ])
-        outer = Let "a" (CAtom (int 1)) (Ret (CLam [ "u" ] inner))
+        outer = Let "a" (CAtom (int 1)) (Ret (CLam unit [ "u" ] inner))
       factIn [] outer "a" `shouldEqual` NeverByNeed
       factOfAtom (activationFacts [ "u" ] inner) (var "a")
         `shouldEqual` MayBeByNeed
@@ -176,8 +176,8 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.ByNeed" do
       -- an inner binder of the same name is a different activation's, so it must not poison the
       -- outer one.
       let
-        inner = Let "a" (CApp (var "f") [ int 0 ]) (Ret (CAtom (var "a")))
-        outer = Let "a" (CAtom (int 1)) (Let "g" (CLam [ "u" ] inner) (Ret (CAtom (var "a"))))
+        inner = Let "a" (CApp unit (var "f") [ int 0 ]) (Ret (CAtom (var "a")))
+        outer = Let "a" (CAtom (int 1)) (Let "g" (CLam unit [ "u" ] inner) (Ret (CAtom (var "a"))))
       factIn [] outer "a" `shouldEqual` NeverByNeed
 
   describe "the decision" do
@@ -199,7 +199,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.ByNeed" do
       let facts = activationFacts [ "p" ] (Ret (CAtom (var "p")))
       elidesForcedValue facts (Ret (CPrim EqInt [ var "p", int 1 ])) `shouldEqual` true
       elidesForcedValue facts (Ret (CAtom (var "p"))) `shouldEqual` false
-      elidesForcedValue facts (Ret (CApp (var "f") [ var "p" ])) `shouldEqual` false
+      elidesForcedValue facts (Ret (CApp unit (var "f") [ var "p" ])) `shouldEqual` false
 
     -- The counterfactual is a state of the DECISION SET, not of either consumer: with the set
     -- disabled nothing elides, including the fact-independent producers (a scalar-primitive result

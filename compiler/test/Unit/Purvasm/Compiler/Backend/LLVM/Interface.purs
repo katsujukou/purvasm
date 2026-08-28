@@ -24,7 +24,7 @@ import Purvasm.Compiler.Backend.LLVM.Interface (gdefKindMap, interfaceOfAnf)
 import Purvasm.Compiler.Backend.LLVM.Types (Gdef(..))
 import Purvasm.Compiler.Bytecode.Artifact (interfaceOf, interfaceToString, kindToTag)
 import Purvasm.Compiler.Compile (compileModule)
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..))
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (fail, shouldEqual)
 
@@ -44,7 +44,7 @@ spec = describe "Purvasm.Compiler.Backend.LLVM.Interface" do
           [ Gfun "M.f" [ "a", "b" ] body
           , Gcaf "M.x" body
           , Grec
-              [ Tuple "M.g" (Ret (CLam [ "y" ] body)) -- lambda member → recfn
+              [ Tuple "M.g" (Ret (CLam unit [ "y" ] body)) -- lambda member → recfn
               , Tuple "M.dict" body -- value member → rec (NOT caf)
               ]
           ]

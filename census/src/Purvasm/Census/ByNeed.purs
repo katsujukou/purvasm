@@ -12,7 +12,7 @@
 -- | it is why `CCase` is walked through the SHARED `MatchCompile` tree rather than the raw
 -- | alternatives.
 -- |
--- | The walk crosses activation boundaries exactly where the emitter does: a `CLam` body and a
+-- | The walk crosses activation boundaries exactly where the emitter does: a `CLam unit` body and a
 -- | `LetRec` member right-hand side are their own activations, so each gets its OWN fact set from
 -- | `activationFacts`, as `emitFunction` gets its own plan.
 module Purvasm.Census.ByNeed
@@ -43,7 +43,7 @@ import Data.Tuple (Tuple(..), fst)
 import Data.Tuple.Nested ((/\))
 import Purvasm.Compiler.Backend.LLVM.ByNeed (FactMap, activationFacts, elidesForce, elidesForcedValue, noFacts)
 import Purvasm.Compiler.Backend.LLVM.Types (Gdef(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..), Rhs, RhsF(..))
 import Purvasm.Compiler.MiddleEnd.MatchCompile (DTree(..))
 import Purvasm.Compiler.MiddleEnd.MatchCompile (compile) as MatchCompile
 
@@ -112,7 +112,7 @@ bump cls elided = Map.alter (Just <<< add <<< fromMaybe { elided: 0, emitted: 0 
 -- | guard fall-through chains recurse on the host stack.
 data Work
   = WExpr FactMap Expr
-  | WTree FactMap DTree
+  | WTree FactMap (DTree Unit Unit)
 
 -- | Walk one activation body under its OWN fact set, counting every demand-site occurrence and
 -- | whether the compiler elides it.
@@ -155,9 +155,9 @@ censusOf facts0 e0 acc0 = tailRec go { work: WExpr facts0 e0 : Nil, acc: acc0 }
       in
         { work: WTree facts tree : rest, acc: acc' }
     -- a nested lambda is lambda-lifted: its own activation, its own facts.
-    CLam ps body -> { work: WExpr (activationFacts ps body) body : rest, acc: acc }
-    CApp _ _ -> { work: rest, acc: acc }
-    CPerform _ -> { work: rest, acc: acc }
+    CLam unit ps body -> { work: WExpr (activationFacts ps body) body : rest, acc: acc }
+    CApp _ _ _ -> { work: rest, acc: acc }
+    CPerform _ _ -> { work: rest, acc: acc }
     CAtom _ -> { work: rest, acc: acc }
     CCtor _ _ _ -> { work: rest, acc: acc }
     CArray _ -> { work: rest, acc: acc }

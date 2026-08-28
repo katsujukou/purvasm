@@ -19,7 +19,7 @@ import Data.List (List(..), (:))
 import Data.List as List
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Literal (Literal(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..), foldAtoms, mapAtoms)
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..), foldAtoms, mapAtoms, Rhs, RhsF(..))
 import Purvasm.Compiler.Primitive (PrimOp(..))
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
@@ -37,10 +37,10 @@ matrix :: Expr
 matrix =
   Let "l0" (CAtom (v "a.atom"))
     ( LetRec
-        [ { var: "r0", rhs: Ret (CApp (v "a.recFn") [ v "a.recArg" ]) }
-        , { var: "r1", rhs: Ret (CPerform (v "a.recPerform")) }
+        [ { var: "r0", rhs: Ret (CApp unit (v "a.recFn") [ v "a.recArg" ]) }
+        , { var: "r1", rhs: Ret (CPerform unit (v "a.recPerform")) }
         ]
-        ( Let "l1" (CLam [ "p" ] (Ret (CAtom (v "a.lamBody"))))
+        ( Let "l1" (CLam unit [ "p" ] (Ret (CAtom (v "a.lamBody"))))
             ( Let "l2" (CPrim AddInt [ v "a.prim0", v "a.prim1" ])
                 ( Let "l3" (CCtor "C" 2 [ v "a.ctor0", v "a.ctor1" ])
                     ( Let "l4" (CArray [ v "a.arr0", v "a.arr1" ])

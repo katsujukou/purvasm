@@ -13,7 +13,7 @@ import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.CESK.AST (Term(..))
 import Purvasm.Compiler.CESK.AST as Cesk
 import Purvasm.Compiler.Literal (Literal(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..), Rhs, RhsF(..))
 import Purvasm.Compiler.MiddleEnd.Normalize (collectApp, collectLam, normalize)
 import Purvasm.Compiler.Primitive (PrimOp(..))
 import Test.Spec (Spec, describe, it)
@@ -47,17 +47,17 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Normalize" do
     it "names a nested call before its enclosing call: f (g x)" do
       normalize (TmApp (TmVar "f") (TmApp (TmVar "g") (TmVar "x")))
         `shouldEqual`
-          Let "$a1" (CApp (AtomVar "g") [ AtomVar "x" ])
-            (Ret (CApp (AtomVar "f") [ AtomVar "$a1" ]))
+          Let "$a1" (CApp unit (AtomVar "g") [ AtomVar "x" ])
+            (Ret (CApp unit (AtomVar "f") [ AtomVar "$a1" ]))
 
     it "uncurries a curried application spine into one call: f 1 2" do
       normalize (TmApp (TmApp (TmVar "f") (num 1)) (num 2))
-        `shouldEqual` Ret (CApp (AtomVar "f") [ aInt 1, aInt 2 ])
+        `shouldEqual` Ret (CApp unit (AtomVar "f") [ aInt 1, aInt 2 ])
 
     it "uncurries a curried lambda spine into one lambda" do
       normalize (TmLam "x" (TmLam "y" (add (TmVar "x") (TmVar "y"))))
         `shouldEqual`
-          Ret (CLam [ "x", "y" ] (Ret (CPrim AddInt [ AtomVar "x", AtomVar "y" ])))
+          Ret (CLam unit [ "x", "y" ] (Ret (CPrim AddInt [ AtomVar "x", AtomVar "y" ])))
 
     it "keeps a constructor application as a CCtor node (not a generic call): Just 5" do
       normalize (TmApp (TmCtor "Just" 1) (num 5))
@@ -150,6 +150,6 @@ stackSafetySpec = describe "stack safety (data-sized spines on the default host 
       app = Array.foldl TmApp (TmVar "f") (Array.replicate 50000 (num 1))
       r = normalize app
       len = case r of
-        Ret (CApp _ args) -> Array.length args
+        Ret (CApp _ _ args) -> Array.length args
         _ -> -1
     len `shouldEqual` 50000

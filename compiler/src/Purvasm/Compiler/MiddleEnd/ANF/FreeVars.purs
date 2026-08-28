@@ -30,7 +30,7 @@ import Data.List (List(..), (:))
 import Data.Set (Set)
 import Data.Set as Set
 import Purvasm.Compiler.Binder (Binder(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr, CExprF(..), Expr, ExprF(..), Rhs, RhsF(..))
 
 -- | The variables a binder introduces (ADR-0011/0012).
 binderVars :: Binder -> Set String
@@ -88,8 +88,8 @@ fvExpr bound0 e0 =
 fvCexpr :: Set String -> CExpr -> Set String
 fvCexpr bound = case _ of
   CAtom a -> fvAtom bound a
-  CLam ps b -> fvExpr (foldl (\s p -> Set.insert p s) bound ps) b
-  CApp f args -> Set.union (fvAtom bound f) (fvAtoms bound args)
+  CLam _ ps b -> fvExpr (foldl (\s p -> Set.insert p s) bound ps) b
+  CApp _ f args -> Set.union (fvAtom bound f) (fvAtoms bound args)
   CPrim _ args -> fvAtoms bound args
   CArray args -> fvAtoms bound args
   CCtor _ _ args -> fvAtoms bound args
@@ -97,7 +97,7 @@ fvCexpr bound = case _ of
   CAccessor a _ -> fvAtom bound a
   CUpdate a fs -> Set.union (fvAtom bound a) (fvAtoms bound (map _.val fs))
   CIf a t e -> Set.union (fvAtom bound a) (Set.union (fvExpr bound t) (fvExpr bound e))
-  CPerform a -> fvAtom bound a
+  CPerform _ a -> fvAtom bound a
   CCase scruts alts ->
     foldl (\acc alt -> Set.union acc (fvAlt bound alt)) (fvAtoms bound scruts) alts
 
@@ -140,8 +140,8 @@ cfExpr e0 =
 cfCexpr :: CExpr -> Set String
 cfCexpr = case _ of
   CAtom a -> cfAtom a
-  CLam _ b -> cfExpr b
-  CApp f args -> foldl (\s a -> Set.union s (cfAtom a)) (cfAtom f) args
+  CLam _ _ b -> cfExpr b
+  CApp _ f args -> foldl (\s a -> Set.union s (cfAtom a)) (cfAtom f) args
   CPrim _ args -> cfAtoms args
   CArray args -> cfAtoms args
   CCtor _ _ args -> cfAtoms args
@@ -149,7 +149,7 @@ cfCexpr = case _ of
   CUpdate a0 fs -> foldl (\s f -> Set.union s (cfAtom f.val)) (cfAtom a0) fs
   CAccessor a _ -> cfAtom a
   CIf a t e -> Set.union (cfAtom a) (Set.union (cfExpr t) (cfExpr e))
-  CPerform a -> cfAtom a
+  CPerform _ a -> cfAtom a
   CCase scruts alts -> foldl (\s alt -> Set.union s (cfAlt alt)) (cfAtoms scruts) alts
 
 cfAtom :: Atom -> Set String

@@ -29,7 +29,7 @@ import Purvasm.Compiler.Backend.LLVM.Program (gdefKeys, moduleLl)
 import Purvasm.Compiler.Backend.LLVM.Types (Gdef(..))
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Literal (Literal(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..), Rhs, RhsF(..))
 import Purvasm.Compiler.Primitive (PrimOp(..))
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
@@ -110,7 +110,7 @@ spec = describe "Purvasm.Census.ByNeed" do
     it "gives a nested lambda its own activation (no outer Never leaks into a capture)" do
       let
         inner = Ret (CPrim AddInt [ var "a", var "u" ])
-        body = Let "a" (CAtom (int 1)) (Ret (CLam [ "u" ] inner))
+        body = Let "a" (CAtom (int 1)) (Ret (CLam unit [ "u" ] inner))
       classCount [] body SPrimOperand `shouldEqual` { elided: 0, emitted: 2 }
 
     it "leaves the entry stub un-elided (it has no plan, so its facts are empty)" do
@@ -138,19 +138,19 @@ spec = describe "Purvasm.Census.ByNeed" do
         , Tuple "shadowed name (poisoned)"
             ( Gfun "M.f" [ "p" ]
                 ( Let "x" (CAtom (int 1))
-                    ( Let "y" (CIf (var "p") (Let "x" (CApp (var "M.sibling") [ int 0 ]) (Ret (CAtom (var "x")))) (Ret (CAtom (int 0))))
+                    ( Let "y" (CIf (var "p") (Let "x" (CApp unit (var "M.sibling") [ int 0 ]) (Ret (CAtom (var "x")))) (Ret (CAtom (int 0))))
                         (Ret (CPrim AddInt [ var "x", var "y" ]))
                     )
                 )
             )
         , Tuple "nested lambda body"
-            (Gfun "M.f" [ "p" ] (Ret (CLam [ "u" ] (Ret (CPrim AddInt [ var "p", var "u" ])))))
+            (Gfun "M.f" [ "p" ] (Ret (CLam unit [ "u" ] (Ret (CPrim AddInt [ var "p", var "u" ])))))
         , Tuple "letrec member"
             ( Gfun "M.f" [ "p" ]
-                (LetRec [ { var: "r", rhs: Ret (CLam [ "u" ] (Ret (CAccessor (var "u") "f"))) } ] (Ret (CAtom (var "r"))))
+                (LetRec [ { var: "r", rhs: Ret (CLam unit [ "u" ] (Ret (CAccessor (var "u") "f"))) } ] (Ret (CAtom (var "r"))))
             )
         , Tuple "grec group member"
-            (Grec [ Tuple "M.r" (Ret (CLam [ "u" ] (Ret (CAccessor (var "u") "f")))) ])
+            (Grec [ Tuple "M.r" (Ret (CLam unit [ "u" ] (Ret (CAccessor (var "u") "f")))) ])
         , Tuple "case: ctor row and wildcard row"
             ( Gfun "M.f" [ "p", "q" ]
                 ( Ret

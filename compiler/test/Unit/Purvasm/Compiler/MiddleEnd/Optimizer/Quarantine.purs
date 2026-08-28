@@ -8,7 +8,7 @@ import Prelude
 import Data.Map as Map
 import Data.Maybe (Maybe(..))
 import Data.Set as Set
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..))
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (InlineCandidate)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Quarantine (relevantFactsOf)
 import Test.Spec (Spec, describe, it)
@@ -59,6 +59,6 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer.Quarantine" do
     it "records both atom spellings, keys without facts included (retry-biased misses)" do
       let
         lookups = { candidate: const Nothing, effect: const Nothing }
-        facts = relevantFactsOf lookups (Ret (CApp (AtomForeign "X.f") [ AtomVar "Y.g" ]))
+        facts = relevantFactsOf lookups (Ret (CApp unit (AtomForeign "X.f") [ AtomVar "Y.g" ]))
       Set.fromFoldable (Map.keys facts) `shouldEqual` Set.fromFoldable [ "X.f", "Y.g" ]
       Map.lookup "X.f" facts `shouldEqual` Just { candidate: Nothing, effect: Nothing }

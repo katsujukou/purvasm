@@ -42,7 +42,7 @@ import Data.Maybe (Maybe(..))
 import Data.Set as Set
 import Data.Traversable (traverse)
 import Purvasm.Compiler.Binder (Binder(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr, CExprF(..), Expr, ExprF(..), Rhs, RhsF(..))
 import Purvasm.Compiler.MiddleEnd.ANF.FreeVars (fvAlt, fvExpr)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Analysis (sizeExpr)
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (binderVarsOrdered)
@@ -82,7 +82,7 @@ distributeCases = goExpr
 
   goC :: CExpr -> CExpr
   goC = case _ of
-    CLam ps b -> CLam ps (goExpr b)
+    CLam a ps b -> CLam a ps (goExpr b)
     CIf a t e -> CIf a (goExpr t) (goExpr e)
     CCase ss alts -> CCase ss (map goAlt alts)
     c -> c

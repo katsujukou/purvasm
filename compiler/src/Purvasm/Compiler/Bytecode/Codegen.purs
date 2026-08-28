@@ -17,7 +17,7 @@ import Data.Show.Generic (genericShow)
 import Data.Tuple.Nested (type (/\), (/\))
 import Purvasm.Compiler.Bytecode.Instruction (CodeBlock)
 import Purvasm.Compiler.Bytecode.Lower (fnChunk, lowerExpr)
-import Purvasm.Compiler.MiddleEnd.ANF (CExpr(..), Expr(..))
+import Purvasm.Compiler.MiddleEnd.ANF (CExpr, CExprF(..), Expr, ExprF(..))
 
 -- | A top-level binding: a function (params + body chunk), a strict CAF, or a member of a
 -- | by-need recursive group.
@@ -33,7 +33,7 @@ instance Show Gdef where
 
 gdefOfExpr :: Boolean -> Expr -> Gdef
 gdefOfExpr recursive = case _ of
-  Ret (CLam ps b) -> Gfun ps (fnChunk b)
+  Ret (CLam _ ps b) -> Gfun ps (fnChunk b)
   e -> let chunk = lowerExpr true e in if recursive then Grec chunk else Gcaf chunk
 
 -- | Split a whole-program ANF spine (the linked term, ADR-0016) into its global

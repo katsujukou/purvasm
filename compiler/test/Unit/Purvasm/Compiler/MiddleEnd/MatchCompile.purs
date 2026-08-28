@@ -11,7 +11,7 @@ import Data.Tuple (fst)
 import Data.Tuple.Nested ((/\))
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Literal (Literal(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr, CExprF(..), Expr, ExprF(..), Rhs, RhsF(..))
 import Purvasm.Compiler.MiddleEnd.MatchCompile (DTree(..), Proj(..), compile)
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (fail, shouldEqual)
@@ -22,7 +22,7 @@ bdy n = Uncond (Ret (CAtom (AtomLit (LInt n))))
 alt :: Array Binder -> Rhs -> Alt
 alt binders result = { binders, result }
 
-treeOf :: Array Atom -> Array Alt -> DTree
+treeOf :: Array Atom -> Array Alt -> DTree Unit Unit
 treeOf scruts alts = (compile scruts alts).tree
 
 spec :: Spec Unit

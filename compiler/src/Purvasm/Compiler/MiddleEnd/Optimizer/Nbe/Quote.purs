@@ -33,7 +33,7 @@ import Data.Map (Map)
 import Data.Map as Map
 import Data.Maybe (Maybe(..), fromMaybe)
 import Purvasm.Compiler.Binder (Binder(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..), Rhs, RhsF(..))
 import Purvasm.Compiler.MiddleEnd.Optimizer.Nbe.Types (Comp(..), NRhs(..), Sem(..))
 
 -- | One deferred wrapper of the eventual tail expression (the defunctionalised continuation).
@@ -115,7 +115,7 @@ quoteC st s = case s of
         Just _ -> let fr = fresh n in go fr.n (fr.name : acc) (i + 1)
       body = tailQ ps.n (f (map SVar ps.ps))
     in
-      { st: st { n = body.n }, ce: CLam ps.ps body.expr }
+      { st: st { n = body.n }, ce: CLam unit ps.ps body.expr }
   SCtor t n args ->
     let
       r = quoteAtoms st args
@@ -137,14 +137,14 @@ quoteC st s = case s of
       let
         ra = quoteAtoms st sp
       in
-        { st: ra.st, ce: CApp r.atom ra.atoms }
+        { st: ra.st, ce: CApp unit r.atom ra.atoms }
   SComp c -> case c of
     NApp h args ->
       let
         rh = quoteAtom st h
         ra = quoteAtoms rh.st args
       in
-        { st: ra.st, ce: CApp rh.atom ra.atoms }
+        { st: ra.st, ce: CApp unit rh.atom ra.atoms }
     NPrim op args ->
       let
         ra = quoteAtoms st args
@@ -159,7 +159,7 @@ quoteC st s = case s of
       let
         r = quoteAtom st v
       in
-        { st: r.st, ce: CPerform r.atom }
+        { st: r.st, ce: CPerform unit r.atom }
     NUpd v ups ->
       let
         rv = quoteAtom st v

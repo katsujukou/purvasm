@@ -12,7 +12,7 @@ import Prelude
 
 import Data.Map as Map
 import Data.Tuple.Nested ((/\))
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..))
 import Purvasm.Compiler.NativeLeaf (leafClosureArity, nativeLeafArities, resolveNativeForeigns)
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual)
@@ -76,9 +76,9 @@ spec = describe "Purvasm.Compiler.NativeLeaf" do
       -- A leaf usually appears as a call operand, not as a whole body; a rewrite that only looked at
       -- the tail would leave those as unbound loads and fail only at run time.
       resolveNativeForeigns (Map.fromFoldable [ "M.leaf" /\ 1 ])
-        (Let "x" (CApp (AtomVar "M.leaf") [ AtomVar "y" ]) (Ret (CAtom (AtomVar "x"))))
+        (Let "x" (CApp unit (AtomVar "M.leaf") [ AtomVar "y" ]) (Ret (CAtom (AtomVar "x"))))
         `shouldEqual`
-          Let "x" (CApp (AtomForeign "M.leaf") [ AtomVar "y" ]) (Ret (CAtom (AtomVar "x")))
+          Let "x" (CApp unit (AtomForeign "M.leaf") [ AtomVar "y" ]) (Ret (CAtom (AtomVar "x")))
 
     it "does not touch a local variable that shadows nothing" do
       resolveNativeForeigns Map.empty (Ret (CAtom (AtomVar "x")))

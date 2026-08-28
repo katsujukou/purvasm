@@ -29,61 +29,79 @@ instance Show Atom where
 
 -- | A computation - a single step that produces a value
 -- | Its operants are atoms; its sub-*expressions* (`CIf`/`CCase` branches, `CLam` body) are full `Expr`s.
-data CExpr
+-- |
+-- | **Parameterised over two annotations** (ADR-0114 amendment). `f` rides on the FUNCTION boundary
+-- | (`CLam`) and `c` on the CALL occurrences (`CApp`, `CPerform`). Everything upstream of the LLVM
+-- | backend — the optimiser, the bytecode lowering — works at `f = c = Unit` and is unaffected in
+-- | meaning; the LLVM backend converts to real identities post-optimiser.
+-- |
+-- | Both annotations exist because match compilation duplicates rows: it copies a wildcard row's RHS
+-- | into every arm AND the default, so a `CLam` inside that RHS is lifted more than once under
+-- | different names. A call identity alone would then split one source function across several
+-- | "proof" sites, which is the contract ADR-0114 §1 needs to hold.
+data CExprF f c
   = CAtom Atom
-  | CLam (Array String) Expr
-  | CApp Atom (Array Atom)
+  | CLam f (Array String) (ExprF f c)
+  | CApp c Atom (Array Atom)
   | CPrim PrimOp (Array Atom)
   | CCtor String Int (Array Atom) -- name of constructor, arity, args 
   | CArray (Array Atom)
   | CRecord (Array { prop :: String, val :: Atom })
   | CAccessor Atom String
   | CUpdate Atom (Array { prop :: String, val :: Atom })
-  | CIf Atom Expr Expr
-  | CCase (Array Atom) (Array Alt)
-  -- | Run an `Effect`/`ST` thunk (GER, ADR-0099): `CPerform t ≃ CApp t [unit]`, but kept
+  | CIf Atom (ExprF f c) (ExprF f c)
+  | CCase (Array Atom) (Array (AltF f c))
+  -- | Run an `Effect`/`ST` thunk (GER, ADR-0099): `CPerform c t ≃ CApp c t [unit]`, but kept
   -- | **distinct** on the optimiser seam as an explicit run marker so the head-based purity
   -- | analysis never loses which thunk gets performed. Backends lower it to the unit application.
-  | CPerform Atom
+  | CPerform c Atom
 
 -- | A let-sequence ending in a tail computation.
 -- | `Let` binds a (non-recursive) computation;
 -- | `LetRec` a recursive group (each rhs a full `Expr`,
 -- | since its internal bindings may reference the group and cannot bt hoisted
-data Expr
-  = Ret CExpr
-  | Let String CExpr Expr
-  | LetRec (Array { var :: String, rhs :: Expr }) Expr
+data ExprF f c
+  = Ret (CExprF f c)
+  | Let String (CExprF f c) (ExprF f c)
+  | LetRec (Array { var :: String, rhs :: ExprF f c }) (ExprF f c)
 
-type Alt =
+type AltF f c =
   { binders :: Array Binder
-  , result :: Rhs
+  , result :: RhsF f c
   }
 
-data Rhs
-  = Uncond Expr
-  | Guarded (Array { guard :: Expr, rhs :: Expr })
+-- | The UNANNOTATED term: what the front end builds, the optimiser rewrites and the bytecode
+-- | backend lowers. These aliases keep every such consumer reading `Expr`/`CExpr`/`Alt`/`Rhs` as
+-- | before — only the two call constructors and `CLam` gained a field.
+type Expr = ExprF Unit Unit
+type CExpr = CExprF Unit Unit
+type Alt = AltF Unit Unit
+type Rhs = RhsF Unit Unit
 
-derive instance Eq CExpr
-derive instance Generic CExpr _
-instance Show CExpr where
+data RhsF f c
+  = Uncond (ExprF f c)
+  | Guarded (Array { guard :: ExprF f c, rhs :: ExprF f c })
+
+derive instance (Eq f, Eq c) => Eq (CExprF f c)
+derive instance Generic (CExprF f c) _
+instance (Show f, Show c) => Show (CExprF f c) where
   show c = genericShow c
 
-derive instance Eq Expr
-derive instance Generic Expr _
-instance Show Expr where
+derive instance (Eq f, Eq c) => Eq (ExprF f c)
+derive instance Generic (ExprF f c) _
+instance (Show f, Show c) => Show (ExprF f c) where
   show e = genericShow e
 
-derive instance Eq Rhs
-derive instance Generic Rhs _
-instance Show Rhs where
+derive instance (Eq f, Eq c) => Eq (RhsF f c)
+derive instance Generic (RhsF f c) _
+instance (Show f, Show c) => Show (RhsF f c) where
   show r = genericShow r
 
 -- | One item of [`foldAtoms`]' explicit work stack — the three node kinds its walk descends into.
-data AtomWork
-  = WkE Expr
-  | WkC CExpr
-  | WkR Rhs
+data AtomWork f c
+  = WkE (ExprF f c)
+  | WkC (CExprF f c)
+  | WkR (RhsF f c)
 
 -- | Fold over every `Atom` occurrence, in source order (operands, scrutinees, ctor/record/array
 -- | fields, and through every nested `Expr`).
@@ -98,7 +116,7 @@ data AtomWork
 -- | stack-safe. The two are held in agreement by the per-node fidelity matrix in the unit tests
 -- | (every constructor, a distinct atom in every atom position, an exact expected list) — a field
 -- | dropped from one tree and not the other is what that matrix exists to catch.
-foldAtoms :: forall a. (a -> Atom -> a) -> a -> Expr -> a
+foldAtoms :: forall a f c. (a -> Atom -> a) -> a -> ExprF f c -> a
 foldAtoms f z0 e0 = tailRec step { acc: z0, work: WkE e0 : Nil }
   where
   -- children are pushed onto the FRONT in source order, so the walk stays left-to-right
@@ -106,7 +124,7 @@ foldAtoms f z0 e0 = tailRec step { acc: z0, work: WkE e0 : Nil }
   -- Stack-safe in WIDTH as well as depth: `Data.Foldable.foldl` over an `Array` is the FFI loop,
   -- so a 100k-binding `LetRec`, a 100k-arm `CCase` or a 100k-clause guard pushes without touching
   -- the host stack. (Reversed first, so the items still land in source order at the front.)
-  push :: Array AtomWork -> List AtomWork -> List AtomWork
+  push :: Array (AtomWork f c) -> List (AtomWork f c) -> List (AtomWork f c)
   push items rest = foldl (flip Cons) rest (Array.reverse items)
 
   step st = case st.work of
@@ -117,8 +135,8 @@ foldAtoms f z0 e0 = tailRec step { acc: z0, work: WkE e0 : Nil }
       WkE (LetRec bs b) -> Loop { acc: st.acc, work: push (map (\bd -> WkE bd.rhs) bs) (WkE b : rest) }
       WkC c -> case c of
         CAtom a -> Loop { acc: f st.acc a, work: rest }
-        CLam _ e -> Loop { acc: st.acc, work: WkE e : rest }
-        CApp a as -> Loop { acc: foldl f (f st.acc a) as, work: rest }
+        CLam _ _ e -> Loop { acc: st.acc, work: WkE e : rest }
+        CApp _ a as -> Loop { acc: foldl f (f st.acc a) as, work: rest }
         CPrim _ as -> Loop { acc: foldl f st.acc as, work: rest }
         CCtor _ _ as -> Loop { acc: foldl f st.acc as, work: rest }
         CArray as -> Loop { acc: foldl f st.acc as, work: rest }
@@ -127,7 +145,7 @@ foldAtoms f z0 e0 = tailRec step { acc: z0, work: WkE e0 : Nil }
         CUpdate a ups -> Loop { acc: foldl (\a' r -> f a' r.val) (f st.acc a) ups, work: rest }
         CIf a t e -> Loop { acc: f st.acc a, work: WkE t : WkE e : rest }
         CCase as alts -> Loop { acc: foldl f st.acc as, work: push (map (WkR <<< _.result) alts) rest }
-        CPerform a -> Loop { acc: f st.acc a, work: rest }
+        CPerform _ a -> Loop { acc: f st.acc a, work: rest }
       WkR (Uncond e) -> Loop { acc: st.acc, work: WkE e : rest }
       WkR (Guarded gs) -> Loop { acc: st.acc, work: push (gs >>= \g -> [ WkE g.guard, WkE g.rhs ]) rest }
 
@@ -135,7 +153,7 @@ foldAtoms f z0 e0 = tailRec step { acc: z0, work: WkE e0 : Nil }
 -- | recursing through nested `Expr`s (`CLam`/`CIf`/`CCase` bodies, the `Let`/`LetRec` spine, guard/rhs
 -- | clauses). A structure-preserving map: the shape is untouched, only atoms are transformed. Tree
 -- | recursion, bounded by control-flow/binding nesting (like the middle-end passes).
-mapAtoms :: (Atom -> Atom) -> Expr -> Expr
+mapAtoms :: forall f c. (Atom -> Atom) -> ExprF f c -> ExprF f c
 mapAtoms f = goE
   where
   goE = case _ of
@@ -145,8 +163,8 @@ mapAtoms f = goE
 
   goC = case _ of
     CAtom a -> CAtom (f a)
-    CLam ps e -> CLam ps (goE e)
-    CApp a as -> CApp (f a) (map f as)
+    CLam fa ps e -> CLam fa ps (goE e)
+    CApp ca a as -> CApp ca (f a) (map f as)
     CPrim op as -> CPrim op (map f as)
     CCtor n ar as -> CCtor n ar (map f as)
     CArray as -> CArray (map f as)
@@ -155,7 +173,7 @@ mapAtoms f = goE
     CUpdate a ups -> CUpdate (f a) (map (\r -> r { val = f r.val }) ups)
     CIf a t e -> CIf (f a) (goE t) (goE e)
     CCase as alts -> CCase (map f as) (map goAlt alts)
-    CPerform a -> CPerform (f a)
+    CPerform ca a -> CPerform ca (f a)
 
   goAlt alt = alt { result = goRhs alt.result }
 

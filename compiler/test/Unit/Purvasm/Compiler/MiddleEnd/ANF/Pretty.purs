@@ -8,7 +8,7 @@ import Prelude
 import Data.Tuple.Nested ((/\))
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Literal (Literal(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..), Rhs, RhsF(..))
 import Purvasm.Compiler.MiddleEnd.ANF.Pretty (printExpr, printModuleAnf)
 import Purvasm.Compiler.Primitive (PrimOp(..))
 import Test.Spec (Spec, describe, it)
@@ -21,9 +21,9 @@ spec = describe "Purvasm.Compiler.MiddleEnd.ANF.Pretty" do
       let
         term =
           Ret
-            ( CLam [ "x" ]
+            ( CLam unit [ "x" ]
                 ( Let "y" (CPrim AddInt [ AtomVar "x", AtomLit (LInt 1) ])
-                    (Ret (CApp (AtomVar "f") [ AtomVar "y" ]))
+                    (Ret (CApp unit (AtomVar "f") [ AtomVar "y" ]))
                 )
             )
       printExpr term `shouldEqual`
@@ -36,7 +36,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.ANF.Pretty" do
             ( CCase [ AtomVar "xs" ]
                 [ { binders: [ BCtor "Nil" [] ], result: Uncond (Ret (CAtom (AtomLit (LInt 0)))) }
                 , { binders: [ BCtor "Cons" [ BVar "h", BVar "t" ] ]
-                  , result: Uncond (Ret (CApp (AtomVar "sum") [ AtomVar "t" ]))
+                  , result: Uncond (Ret (CApp unit (AtomVar "sum") [ AtomVar "t" ]))
                   }
                 ]
             )
@@ -52,7 +52,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.ANF.Pretty" do
             }
           , { recursive: true
             , members:
-                [ "M.loop" /\ Ret (CLam [ "n" ] (Ret (CApp (AtomVar "M.loop") [ AtomVar "n" ]))) ]
+                [ "M.loop" /\ Ret (CLam unit [ "n" ] (Ret (CApp unit (AtomVar "M.loop") [ AtomVar "n" ]))) ]
             }
           ]
       printModuleAnf "M" decls `shouldEqual`

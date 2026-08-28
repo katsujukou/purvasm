@@ -17,7 +17,7 @@ import Partial.Unsafe (unsafeCrashWith)
 import Purvasm.Compiler.Bytecode.Instruction (CodeBlock, Instruction(..))
 import Purvasm.Compiler.Bytecode.Lower.Match (compileTree)
 import Purvasm.Compiler.Literal (Literal(LInt, LNumber, LBool, LString)) as L
-import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr(..), Expr(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Alt, Atom(..), CExpr, CExprF(..), Expr, ExprF(..))
 
 lowerAtom :: Atom -> Instruction
 lowerAtom = case _ of
@@ -62,7 +62,7 @@ lowerValue = Array.fromFoldable <<< lowerValue'
 -- | one value, followed by `Return` when in tail position.
 lowerCexpr' :: Boolean -> CExpr -> List Instruction
 lowerCexpr' tail = case _ of
-  CApp h args ->
+  CApp _ h args ->
     (lowerAtom h : List.fromFoldable (map lowerAtom args))
       <> List.singleton (if tail then TailCall (Array.length args) else Call (Array.length args))
   CIf a t e ->
@@ -78,7 +78,7 @@ lowerCexpr' tail = case _ of
   CCase scruts alts -> List.fromFoldable (lowerCase tail scruts alts)
   -- GER run point (ADR-0099): `perform t ≃ t unit` — a one-argument (unit) call, tail-aware so a
   -- self-tail `perform` still loops.
-  CPerform t ->
+  CPerform _ t ->
     (lowerAtom t : List.singleton (lowerAtom (AtomLit (L.LInt 0))))
       <> List.singleton (if tail then TailCall 1 else Call 1)
   c -> let v = lowerValue' c in if tail then v <> List.singleton Return else v
@@ -94,7 +94,7 @@ lowerValue' = case _ of
   CAccessor a label -> lowerAtom a : List.singleton (GetField label)
   CUpdate a ups ->
     (lowerAtom a : List.fromFoldable (map (\u -> lowerAtom u.val) ups)) <> List.singleton (Update (map _.prop ups))
-  CLam ps b -> List.singleton (Closure ps (fnChunk b))
+  CLam _ ps b -> List.singleton (Closure ps (fnChunk b))
   _ -> unsafeCrashWith "lowerValue': control computation handled in lowerCexpr'"
 
 -- | A `case`, compiled to a decision tree (ADR-0031) by `Lower.Match`, given this module's

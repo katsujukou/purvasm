@@ -16,7 +16,7 @@ import Data.Maybe (Maybe(..), isNothing)
 import Data.Tuple.Nested ((/\))
 import Purvasm.Compiler.Binder (Binder(..))
 import Purvasm.Compiler.Literal (Literal(..))
-import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr(..), Expr(..), Rhs(..))
+import Purvasm.Compiler.MiddleEnd.ANF (Atom(..), CExpr, CExprF(..), Expr, ExprF(..), Rhs, RhsF(..))
 import Purvasm.Compiler.MiddleEnd.Module (AnfModule, Decl)
 import Data.Map as Map
 import Purvasm.Compiler.Backend.LLVM.Interface (gdefKindMap)
@@ -43,7 +43,7 @@ nonrec k e = { recursive: false, members: [ k /\ e ] }
 accessorDecl :: String -> Decl
 accessorDecl k = nonrec k
   ( Ret
-      ( CLam [ "d" ]
+      ( CLam unit [ "d" ]
           ( Ret
               ( CCase [ var "d" ]
                   [ { binders: [ BVar "v" ]
@@ -62,7 +62,7 @@ instanceDecl k = nonrec k
 -- A method call `add semiringInt 1 2` against the given accessor/instance keys.
 useDecl :: String -> String -> String -> Decl
 useDecl k acc inst = nonrec k
-  (Ret (CApp (var acc) [ var inst, AtomLit (LInt 1), AtomLit (LInt 2) ]))
+  (Ret (CApp unit (var acc) [ var inst, AtomLit (LInt 1), AtomLit (LInt 2) ]))
 
 -- `AddInt(1, 2)` constant-folds under the NbE pass (VM-exact folding, ADR-0089 §5).
 collapsed :: Expr
@@ -71,7 +71,7 @@ collapsed = Ret (CAtom (AtomLit (LInt 3)))
 -- The accessor after normalisation: the irrefutable single-`BVar` case folds and the param is
 -- `$q`-renamed.
 accessorOpt :: Expr
-accessorOpt = Ret (CLam [ "$q1" ] (Ret (CAccessor (var "$q1") "add")))
+accessorOpt = Ret (CLam unit [ "$q1" ] (Ret (CAccessor (var "$q1") "add")))
 
 spec :: Spec Unit
 spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
@@ -110,9 +110,9 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
               [ accessorDecl "Test.M.add"
               , instanceDecl "Test.M.semiringInt"
               , nonrec "Test.M.add1"
-                  (Ret (CApp (var "Test.M.add") [ var "Test.M.semiringInt" ]))
+                  (Ret (CApp unit (var "Test.M.add") [ var "Test.M.semiringInt" ]))
               , nonrec "Test.M.three"
-                  (Ret (CApp (var "Test.M.add1") [ AtomLit (LInt 1), AtomLit (LInt 2) ]))
+                  (Ret (CApp unit (var "Test.M.add1") [ AtomLit (LInt 1), AtomLit (LInt 2) ]))
               ]
           }
         r = optimizeModule emptyBuildEnv (localFactsOf emptyBuildEnv am) emptyQuarantine am
@@ -133,8 +133,8 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
           , decls:
               [ nonrec "Test.M.f"
                   ( Ret
-                      ( CLam [ "x" ]
-                          ( Let "dead" (CApp (AtomForeign "Test.M.pureImpl") [ var "x" ])
+                      ( CLam unit [ "x" ]
+                          ( Let "dead" (CApp unit (AtomForeign "Test.M.pureImpl") [ var "x" ])
                               (Ret (CAtom (var "x")))
                           )
                       )
@@ -145,7 +145,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
           { foreignSigs = Map.singleton "Test.M.pureImpl" { arity: 1, vsat: false, retVsat: false } }
         r = optimizeModule emptyBuildEnv lf emptyQuarantine am
       map _.members r.module.decls `shouldEqual`
-        [ [ "Test.M.f" /\ Ret (CLam [ "$q1" ] (Ret (CAtom (var "$q1")))) ] ]
+        [ [ "Test.M.f" /\ Ret (CLam unit [ "$q1" ] (Ret (CAtom (var "$q1")))) ] ]
 
     it "keeps the same dead call when no fact is available (the conservative default end-to-end)" do
       let
@@ -155,8 +155,8 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
           , decls:
               [ nonrec "Test.M.f"
                   ( Ret
-                      ( CLam [ "x" ]
-                          ( Let "dead" (CApp (AtomForeign "Test.M.pureImpl") [ var "x" ])
+                      ( CLam unit [ "x" ]
+                          ( Let "dead" (CApp unit (AtomForeign "Test.M.pureImpl") [ var "x" ])
                               (Ret (CAtom (var "x")))
                           )
                       )
@@ -166,8 +166,8 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
         r = optimizeModule emptyBuildEnv (localFactsOf emptyBuildEnv am) emptyQuarantine am
       map _.members r.module.decls `shouldEqual`
         [ [ "Test.M.f" /\ Ret
-              ( CLam [ "$q1" ]
-                  ( Let "$q2" (CApp (AtomForeign "Test.M.pureImpl") [ var "$q1" ])
+              ( CLam unit [ "$q1" ]
+                  ( Let "$q2" (CApp unit (AtomForeign "Test.M.pureImpl") [ var "$q1" ])
                       (Ret (CAtom (var "$q1")))
                   )
               )
@@ -184,7 +184,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
         chain n = Let ("v" <> show n) (CPrim AddInt [ var "x", var "x" ]) (chain (n - 1))
 
         dep :: AnfModule
-        dep = { name: "Test.Dep", decls: [ nonrec "Test.Dep.big" (Ret (CLam [ "x" ] (chain 20))) ] }
+        dep = { name: "Test.Dep", decls: [ nonrec "Test.Dep.big" (Ret (CLam unit [ "x" ] (chain 20))) ] }
         depResult = optimizeModule emptyBuildEnv (localFactsOf emptyBuildEnv dep) emptyQuarantine dep
         env = extendSummary emptyBuildEnv depResult.summary
 
@@ -194,8 +194,8 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
           , decls:
               [ nonrec "Test.User.g"
                   ( Ret
-                      ( CLam [ "y" ]
-                          ( Let "dead" (CApp (var "Test.Dep.big") [ var "y" ])
+                      ( CLam unit [ "y" ]
+                          ( Let "dead" (CApp unit (var "Test.Dep.big") [ var "y" ])
                               (Ret (CAtom (var "y")))
                           )
                       )
@@ -204,7 +204,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
           }
         r = optimizeModule env (localFactsOf env user) emptyQuarantine user
       map _.members r.module.decls `shouldEqual`
-        [ [ "Test.User.g" /\ Ret (CLam [ "$q1" ] (Ret (CAtom (var "$q1")))) ] ]
+        [ [ "Test.User.g" /\ Ret (CLam unit [ "$q1" ] (Ret (CAtom (var "$q1")))) ] ]
 
     it "sinks a live single-use cross-module clean call via the dependency's published effects (ADR-0096)" do
       -- Test.Dep.big is pure arithmetic and too large to publish as an inline candidate, so the
@@ -223,7 +223,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
             (liveChain (n - 1) ("v" <> show n))
 
         dep :: AnfModule
-        dep = { name: "Test.Dep", decls: [ nonrec "Test.Dep.big" (Ret (CLam [ "x" ] (liveChain 20 "x"))) ] }
+        dep = { name: "Test.Dep", decls: [ nonrec "Test.Dep.big" (Ret (CLam unit [ "x" ] (liveChain 20 "x"))) ] }
         depResult = optimizeModule emptyBuildEnv (localFactsOf emptyBuildEnv dep) emptyQuarantine dep
         env = extendSummary emptyBuildEnv depResult.summary
 
@@ -233,9 +233,9 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
           , decls:
               [ nonrec "Test.User.h"
                   ( Ret
-                      ( CLam [ "y" ]
-                          ( Let "x" (CApp (var "Test.Dep.big") [ var "y" ])
-                              ( Let "z" (CApp (var "g") [ var "y" ])
+                      ( CLam unit [ "y" ]
+                          ( Let "x" (CApp unit (var "Test.Dep.big") [ var "y" ])
+                              ( Let "z" (CApp unit (var "g") [ var "y" ])
                                   (Ret (CCtor "T" 2 [ var "x", var "z" ]))
                               )
                           )
@@ -246,9 +246,9 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
         r = optimizeModule env (localFactsOf env user) emptyQuarantine user
       map _.members r.module.decls `shouldEqual`
         [ [ "Test.User.h" /\ Ret
-              ( CLam [ "$q1" ]
-                  ( Let "$q2" (CApp (var "g") [ var "$q1" ])
-                      ( Let "$q3" (CApp (var "Test.Dep.big") [ var "$q1" ])
+              ( CLam unit [ "$q1" ]
+                  ( Let "$q2" (CApp unit (var "g") [ var "$q1" ])
+                      ( Let "$q3" (CApp unit (var "Test.Dep.big") [ var "$q1" ])
                           (Ret (CCtor "T" 2 [ var "$q3", var "$q2" ]))
                       )
                   )
@@ -264,9 +264,9 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
           , decls:
               [ nonrec "Test.M.f"
                   ( Ret
-                      ( CLam [ "x" ]
-                          ( Let "a" (CApp (AtomForeign "Test.M.pureImpl") [ var "x" ])
-                              ( Let "z" (CApp (var "g") [ var "x" ])
+                      ( CLam unit [ "x" ]
+                          ( Let "a" (CApp unit (AtomForeign "Test.M.pureImpl") [ var "x" ])
+                              ( Let "z" (CApp unit (var "g") [ var "x" ])
                                   (Ret (CCtor "T" 2 [ var "a", var "z" ]))
                               )
                           )
@@ -279,9 +279,9 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
         r = optimizeModule emptyBuildEnv lf emptyQuarantine am
       map _.members r.module.decls `shouldEqual`
         [ [ "Test.M.f" /\ Ret
-              ( CLam [ "$q1" ]
-                  ( Let "$q2" (CApp (AtomForeign "Test.M.pureImpl") [ var "$q1" ])
-                      ( Let "$q3" (CApp (var "g") [ var "$q1" ])
+              ( CLam unit [ "$q1" ]
+                  ( Let "$q2" (CApp unit (AtomForeign "Test.M.pureImpl") [ var "$q1" ])
+                      ( Let "$q3" (CApp unit (var "g") [ var "$q1" ])
                           (Ret (CCtor "T" 2 [ var "$q2", var "$q3" ]))
                       )
                   )
@@ -316,7 +316,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
           { name: "Test.Dep"
           , decls:
               [ nonrec "Test.Dep.inc"
-                  (Ret (CLam [ "x" ] (Ret (CPrim AddInt [ var "x", AtomLit (LInt 1) ]))))
+                  (Ret (CLam unit [ "x" ] (Ret (CPrim AddInt [ var "x", AtomLit (LInt 1) ]))))
               ]
           }
         depResult = optimizeModule emptyBuildEnv (localFactsOf emptyBuildEnv dep) emptyQuarantine dep
@@ -325,7 +325,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
         user :: AnfModule
         user =
           { name: "Test.User"
-          , decls: [ nonrec "Test.User.two" (Ret (CApp (var "Test.Dep.inc") [ AtomLit (LInt 1) ])) ]
+          , decls: [ nonrec "Test.User.two" (Ret (CApp unit (var "Test.Dep.inc") [ AtomLit (LInt 1) ])) ]
           }
         r = optimizeModule env (localFactsOf env user) emptyQuarantine user
       map _.members r.module.decls `shouldEqual`
@@ -342,7 +342,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
           { name: "Test.Dep"
           , decls:
               [ nonrec "Test.Dep.wrap"
-                  (Ret (CLam [ "x" ] (Ret (CApp (AtomForeign "Test.Dep.privImpl") [ var "x" ]))))
+                  (Ret (CLam unit [ "x" ] (Ret (CApp unit (AtomForeign "Test.Dep.privImpl") [ var "x" ]))))
               ]
           }
         lf = (localFactsOf emptyBuildEnv dep)
@@ -367,13 +367,13 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
       -- Slice 2, where `Impurify` turns a non-lambda CAF into this lambda *before* NbE, so
       -- `nbeBinding`'s own guard sees a lambda input and does not fire; only the module-level
       -- `enforceOuterKinds`, keyed on the pre-opt kind, catches it. (Deleting `enforceOuterKinds`
-      -- fails this test: the output stays a bare `Ret (CLam …)`.)
+      -- fails this test: the output stays a bare `Ret (CLam unit …)`.)
       let
         am :: AnfModule
-        am = { name: "Test.M", decls: [ nonrec "Test.M.f" (Ret (CLam [ "$u" ] (Ret (CAtom (AtomLit (LInt 1)))))) ] }
+        am = { name: "Test.M", decls: [ nonrec "Test.M.f" (Ret (CLam unit [ "$u" ] (Ret (CAtom (AtomLit (LInt 1)))))) ] }
         lf = (localFactsOf emptyBuildEnv am) { outerKinds = Map.singleton "Test.M.f" OKNonLambda }
         r = optimizeModule emptyBuildEnv lf emptyQuarantine am
-        wrapped = Let "$q0" (CLam [ "$q1" ] (Ret (CAtom (AtomLit (LInt 1))))) (Ret (CAtom (var "$q0")))
+        wrapped = Let "$q0" (CLam unit [ "$q1" ] (Ret (CAtom (AtomLit (LInt 1))))) (Ret (CAtom (var "$q0")))
       map _.members r.module.decls `shouldEqual` [ [ "Test.M.f" /\ wrapped ] ]
 
     it "keeps the .pmi ExportKind mode-stable: a CAF that optimises to a lambda stays Ecaf" do
@@ -385,7 +385,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
         am :: AnfModule
         am =
           { name: "Test.M"
-          , decls: [ nonrec "Test.M.f" (Let "g" (CLam [ "x" ] (Ret (CAtom (var "x")))) (Ret (CAtom (var "g")))) ]
+          , decls: [ nonrec "Test.M.f" (Let "g" (CLam unit [ "x" ] (Ret (CAtom (var "x")))) (Ret (CAtom (var "g")))) ]
           }
         optDecls = (optimizeModule emptyBuildEnv (localFactsOf emptyBuildEnv am) emptyQuarantine am).module.decls
         kindTags decls =
@@ -400,7 +400,7 @@ spec = describe "Purvasm.Compiler.MiddleEnd.Optimizer" do
 -- | re-materialises the whole thing) that qualifies for the scrutinised-known-arg tier: the dict
 -- | parameter is projected, nothing is applied in head position.
 bigBuilderDecl :: String -> Decl
-bigBuilderDecl k = nonrec k (Ret (CLam [ "d" ] (body 12)))
+bigBuilderDecl k = nonrec k (Ret (CLam unit [ "d" ] (body 12)))
   where
   body :: Int -> Expr
   body 0 =
@@ -425,7 +425,7 @@ backstopSpec = describe "round-growth backstop (ADR-0089 self-compile extension)
         where
         calls :: Int -> Expr
         calls 0 = Ret (CRecord (map (\i -> { prop: "r" <> show i, val: var ("r" <> show i) }) (Array.range 1 10)))
-        calls n = Let ("r" <> show n) (CApp (var "Test.M.b") [ var "Test.M.dict" ]) (calls (n - 1))
+        calls n = Let ("r" <> show n) (CApp unit (var "Test.M.b") [ var "Test.M.dict" ]) (calls (n - 1))
 
       am :: AnfModule
       am =
@@ -446,7 +446,7 @@ backstopSpec = describe "round-growth backstop (ADR-0089 self-compile extension)
 -- | `bigBuilderDecl`, parameterised by its padding depth — a different depth is a structurally
 -- | different candidate body (the "reachable candidate changed" lever).
 bigBuilderDeclN :: Int -> String -> Decl
-bigBuilderDeclN pads k = nonrec k (Ret (CLam [ "d" ] (body pads)))
+bigBuilderDeclN pads k = nonrec k (Ret (CLam unit [ "d" ] (body pads)))
   where
   body :: Int -> Expr
   body 0 =
@@ -465,7 +465,7 @@ bigBuilderDeclN pads k = nonrec k (Ret (CLam [ "d" ] (body pads)))
 -- | `Test.M.eff` (the effect-fact-only lever).
 quarantineBigBody :: Int -> Boolean -> Expr
 quarantineBigBody n0 withEff =
-  if withEff then Let "e0" (CApp (var "Test.M.eff") [ AtomLit (LInt 0) ]) (calls n0)
+  if withEff then Let "e0" (CApp unit (var "Test.M.eff") [ AtomLit (LInt 0) ]) (calls n0)
   else calls n0
   where
   calls :: Int -> Expr
@@ -475,13 +475,13 @@ quarantineBigBody n0 withEff =
             <> map (\i -> { prop: "r" <> show i, val: var ("r" <> show i) }) (Array.range 1 n0)
         )
     )
-  calls n = Let ("r" <> show n) (CApp (var "Test.M.b") [ var "Test.M.dict" ]) (calls (n - 1))
+  calls n = Let ("r" <> show n) (CApp unit (var "Test.M.b") [ var "Test.M.dict" ]) (calls (n - 1))
 
 -- | A >64-node padding chain — size-bounded out of candidate publication in **both** spellings —
 -- | as a lambda (effect arity 1) or a bare value chain (effect arity 0): at the `RelevantFacts`
 -- | level the two differ *only* in their effect fact.
 effDecl :: Boolean -> Decl
-effDecl asLambda = nonrec "Test.M.eff" (if asLambda then Ret (CLam [ "x" ] chain) else chain)
+effDecl asLambda = nonrec "Test.M.eff" (if asLambda then Ret (CLam unit [ "x" ] chain) else chain)
   where
   chain = pad 20
 
@@ -618,7 +618,7 @@ specializeRetrySpec = describe "quarantine × Specialize (real body-rewrite inva
             [ nonrec "TP.dictS" (Ret (CRecord [ { prop: "f", val: AtomLit (LInt 1) } ]))
             , nonrec "TP.f"
                 ( Ret
-                    ( CLam [ "d", "x" ]
+                    ( CLam unit [ "d", "x" ]
                         ( Let "p0" (CAccessor (var "d") "f")
                             (Ret (CRecord [ { prop: "p", val: var "p0" }, { prop: "q", val: var "x" } ]))
                         )
@@ -640,7 +640,7 @@ specializeRetrySpec = describe "quarantine × Specialize (real body-rewrite inva
             ]
         }
       bigWithSpecSite =
-        Let "s0" (CApp (var "TP.f") [ var "TP.dictS", AtomLit (LInt 7) ])
+        Let "s0" (CApp unit (var "TP.f") [ var "TP.dictS", AtomLit (LInt 7) ])
           (calls 10)
         where
         calls :: Int -> Expr
@@ -650,7 +650,7 @@ specializeRetrySpec = describe "quarantine × Specialize (real body-rewrite inva
                   <> map (\i -> { prop: "r" <> show i, val: var ("r" <> show i) }) (Array.range 1 10)
               )
           )
-        calls n = Let ("r" <> show n) (CApp (var "TS.b") [ var "TS.dict" ]) (calls (n - 1))
+        calls n = Let ("r" <> show n) (CApp unit (var "TS.b") [ var "TS.dict" ]) (calls (n - 1))
 
       lf = localFactsOf env am
       r1 = optimizeModule env lf emptyQuarantine am
