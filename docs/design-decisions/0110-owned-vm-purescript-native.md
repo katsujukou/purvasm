@@ -139,7 +139,8 @@ first slice ships.
 > two with `PURVM` and `PURVASM_VM` rather than by path.
 
 > **Progress (2026-08-17):** §2's claim is measured, on **both** paths and with the same result
-> (`result: 55`, `instructions: 134`, from a tail-recursive guest loop run through `vm/src/Main.purs`):
+> (`result: 55`, `instructions: 134`, from a tail-recursive guest loop run through the VM's entry,
+> then at `vm/src/Main.purs` and since renamed `Purvasm.VM.Main`):
 >
 > - via **boot** — `purvm native --backend llvm --corefn-dir output --ulib ./purvasm_lib -m Main`,
 >   a 929K executable;
@@ -443,8 +444,9 @@ Each slice ships with its gates; none of them requires boot to change.
 >   hands over. An image referencing a leaf those shapes do not describe is **refused, naming every
 >   such key**, rather than written with a guessed arity.
 >
-> - **Both forms come out of one compilation** (`app.pvm` v3, `app.v4.pvm` v4 — renamed `app.owned.pvm`
->   and bumped to version 5 by step D below) for as long as the two
+> - **Both forms come out of one compilation** (`app.pvm` v3, `app.v4.pvm` v4 — version 5 by step D
+>   below, and the two names swapped by step E: the owned image is `app.pvm` and boot's is
+>   `app.boot.pvm`) for as long as the two
 >   runners coexist. The reader accepts both versions and refuses to read v4 syntax under a v3 stamp:
 >   a stamp a reader overrides is not a stamp.
 >
@@ -593,7 +595,8 @@ Each slice ships with its gates; none of them requires boot to change.
 >
 > - **Version 5** is the owned VM's format: arities (§4(a)) *and* tree `case`s (§4(b)). It does not
 >   redefine version 4, which is no longer produced — the calibration it existed for is taken and
->   recorded. The owned image's filename is now `app.owned.pvm`: the stamp inside says which format it
+>   recorded. The owned image's filename is `app.owned.pvm` at this point — step E swaps it with
+>   boot's, leaving the owned image as `app.pvm` — and the stamp inside says which format it
 >   is, and a name repeating the number would need renaming at every bump.
 >
 > - **Answering the pinned question about dates.** The reader takes **version 5 only**, from this step.
@@ -633,6 +636,59 @@ Each slice ships with its gates; none of them requires boot to change.
 >   that would otherwise parse. `legacy-image` flipped from "still decodes" to "refused, naming
 >   `purvm`". The benchmark leg compares **output** and now *reports* the owned VM's own counts as the
 >   measurement field's new baseline.
+
+> **Progress (2026-08-27): step E — the CLI wiring.** `purvasm run` compiles, links, packages and
+> **runs** the program on the owned VM.
+>
+> - **The names swapped, as pinned.** `app.pvm` is the owned VM's image (version 5) and boot's is
+>   `app.boot.pvm`. boot's copy is still emitted from the same compilation, because §6's terms hold the
+>   two runners to the same *output* and that needs one compilation to produce something each can run.
+>   The reuse is safe because the **stamp** protects it: boot handed a version-5 image refuses it by
+>   number.
+>
+> - **`-m`/`--main` names the module whose `main` is the entry point**, replacing `--entry` on this
+>   command. A module without one is refused after linking but *before execution* — reachability starts
+>   at the entry, so its absence from the linked definitions is exactly the question — rather than
+>   surfacing as a stuck run with a mangled key in it. The flag lifts to a later `-p` unchanged. (`build` keeps `--entry`;
+>   only `run` moved.)
+>
+> - **Guest arguments come from after `--`.** The VM's flags are the VM's; a program's arguments are
+>   never guessed out of what is left over.
+>
+> - **`--build-only` stops after the artifacts.** Adding a run to `run` removed the way to ask for the
+>   image alone, which a harness and a build system both want; it is the sibling of the `--no-build`
+>   axis a later increment adds.
+>
+> - **The provider is passed, never discovered.** [0111](0111-vm-dynamic-native-ffi.md) §4 makes
+>   loading an explicit act and that is unchanged: what moved is *who* is explicit — the launcher,
+>   which built the provider a moment ago, instead of a person retyping its path. The `Maybe` comes
+>   from the packaging step, never from whether a file happens to sit in the output directory, so a
+>   reused outdir cannot hand the VM a stale module.
+>
+> - **Finding the VM: `$PURVASM_VM`, and nothing else.** No conventional path is searched. Where an
+>   installation puts its executables is the open `dist`-layout question, and guessing here would
+>   answer it by accident; unset is refused by name. The intended destination is `$PURVASM_LIB/purvm`,
+>   which this record notes as the direction rather than implements.
+>
+> - **Packaging.** A ulib native leaf is shipped as `.c` and *linked* into a compiled program
+>   ([0073](0073-ulib-shipped-native-foreign-and-link-time-resolution.md) §2 — an object is
+>   target-specific, so source is the distributed form). A hosted guest has no such link, so the build
+>   compiles the sources providing the keys the image **references** into one loadable provider and
+>   writes the manifest beside it. Every referenced leaf must be runtime-defined or library-mapped, or
+>   the build stops and names it: the quiet failure that motivated this is a library whose `foreign`
+>   map cannot be read being taken for "the workspace provides nothing".
+>
+> - **The guest's status reaches the caller** (closed in its own increment, 2026-08-27). It did not
+>   at first: the process effect collapsed a run to success-or-failure, so a program exiting 42 made
+>   `purvasm run` exit 1 — which makes a runner's shell contract useless, since every failure looks
+>   alike. `Proc.execStatus` now reports the child's code, every command answers with the status the
+>   process should end with (only `run` has anything but 0 to say), and the exit happens where the
+>   CLI's other exits already do. `Left` is reserved for *not running* — the VM could not be spawned,
+>   or was killed — which is this command's failure rather than the program's. A signal is reported by
+>   name rather than encoded as 128+n: that mapping is a shell convention and this is not a shell.
+>
+>   Gated on three codes, not one: 0 must stay 0, and only a non-1 code separates a real propagation
+>   from the old behaviour.
 
 ### 7. What this does not change
 

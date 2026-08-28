@@ -29,7 +29,7 @@ command =
         "Build and execute program with purvasm bytecode compiler/interpreter"
         ((Run <$> Run.options) <* ArgParser.flagHelp)
     , ArgParser.command [ "foreign-sigs" ]
-        "Dump the closure's reconstructed foreign signatures as JSON (ADR-0080). \
+        "Dump the closure's reconstructed foreign signatures as JSON. \
         \Transitional: the Level-2 half of the boot-vs-Lv2 consistency differential, \
         \removed once the native-codegen port retires boot."
         ((ForeignSigs <$> ForeignSigsCmd.options) <* ArgParser.flagHelp)

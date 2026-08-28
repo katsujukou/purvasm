@@ -9,7 +9,7 @@
 # and every assertion below with it, while the loader gate will not notice.
 #
 # The build is shared rather than duplicated: `tools/vm-e2e.sh` builds the VM once and passes
-# `$PURVASM_VM_DIR` to both gates. Run alone, this script builds its own.
+# `$PURVASM_VM_DIR` to all three gates. Run alone, this script builds its own.
 #
 # Usage (from the repo root, inside `nix develop`):
 #   tools/vm-image-e2e.sh
@@ -34,7 +34,7 @@ FIX="$ROOT/vm/test/fixtures/image"
 : "${BOOT_VM:=$ROOT/boot/_build/default/bin/main.exe}"
 export PURVASM_RT_A PURVASM_LIB PURVASM_INCLUDE
 
-for f in "$PURVASM_RT_A" "$PURVASM_LIB" "$COREFN_DIR/Main/corefn.json"; do
+for f in "$PURVASM_RT_A" "$PURVASM_LIB" "$COREFN_DIR/Purvasm.VM.Main/corefn.json"; do
   [ -e "$f" ] || { echo "missing prerequisite: $f" >&2; exit 2; }
 done
 
@@ -48,7 +48,7 @@ if [ -n "${PURVASM_VM_DIR:-}" ]; then
 else
   VMDIR="$WORK/vm"
   echo "== building the VM =="
-  if ! node "$ROOT/cli/index.node.js" build --entry Main --corefn-dir "$COREFN_DIR" \
+  if ! node "$ROOT/cli/index.node.js" build --entry Purvasm.VM.Main --corefn-dir "$COREFN_DIR" \
          --outdir "$VMDIR" --host-foreign-api >"$WORK/build.log" 2>&1; then
     echo "  the VM build failed — see $WORK/build.log" >&2
     tail -20 "$WORK/build.log" >&2
@@ -106,8 +106,8 @@ echo "== a real image, produced by \`purvasm run\` (§6 slice 2, step A) =="
 # compiles, links and runs it exactly as it would any program. Step A's scope is a program with no
 # native leaf, and this is what that looks like end to end.
 if node "$ROOT/cli/index.node.js" run --corefn-dir "$COREFN_DIR" --outdir "$WORK/img" \
-     --entry VMGate.Quiet >"$WORK/run.log" 2>&1; then
-  if "$VM" --image "$WORK/img/app.owned.pvm" >"$WORK/real.out" 2>"$WORK/real.err"; then
+     --build-only -m VMGate.Quiet >"$WORK/run.log" 2>&1; then
+  if "$VM" --image "$WORK/img/app.pvm" >"$WORK/real.out" 2>"$WORK/real.err"; then
     printf '  %-24s -> the owned VM ran a linked image OK\n' real-image
   else
     printf '  %-24s -> the owned VM could not run it FAIL\n' real-image; rc=1
@@ -117,7 +117,7 @@ if node "$ROOT/cli/index.node.js" run --corefn-dir "$COREFN_DIR" --outdir "$WORK
   # one version; a bare "unsupported version 3" would leave someone holding boot's image with
   # nothing to do about it. The image is still emitted — boot runs it, and the two runners are still
   # held to the same output — so what is asserted here is the handoff, not the absence.
-  if "$VM" --image "$WORK/img/app.pvm" >/dev/null 2>"$WORK/legacy.err"; then
+  if "$VM" --image "$WORK/img/app.boot.pvm" >/dev/null 2>"$WORK/legacy.err"; then
     printf '  %-24s -> the reader accepted a version-3 image FAIL\n' legacy-image; rc=1
   elif grep -q boot "$WORK/legacy.err" && grep -q purvm "$WORK/legacy.err"; then
     printf '  %-24s -> a version-3 image is refused, naming purvm as its runner OK\n' legacy-image
@@ -135,9 +135,9 @@ echo "== the guest's own argv (ADR-0075 §4, step C) =="
 # argv and sees `--image` where its first argument belongs — not a crash but a different input, so
 # nothing else here would notice: the corpus would simply run at its default size.
 if node "$ROOT/cli/index.node.js" run --corefn-dir "$COREFN_DIR" --outdir "$WORK/img2" \
-     --entry VMGate.Argv >"$WORK/run2.log" 2>&1; then
-  got="$("$VM" --image "$WORK/img2/app.owned.pvm" -- alpha beta 2>"$WORK/argv.err")"
-  want="$WORK/img2/app.owned.pvm|alpha|beta"
+     --build-only -m VMGate.Argv >"$WORK/run2.log" 2>&1; then
+  got="$("$VM" --image "$WORK/img2/app.pvm" -- alpha beta 2>"$WORK/argv.err")"
+  want="$WORK/img2/app.pvm|alpha|beta"
   if [ "$got" = "$want" ]; then
     printf '  %-24s -> the guest sees [image] ++ its own arguments OK\n' guest-argv
   else
@@ -146,8 +146,8 @@ if node "$ROOT/cli/index.node.js" run --corefn-dir "$COREFN_DIR" --outdir "$WORK
   fi
   # The VM's own flags are the VM's. A guest that could see them would change behaviour when the VM
   # grew a flag, and the `--` separator is what makes that impossible rather than unlikely.
-  got_bare="$("$VM" --image "$WORK/img2/app.owned.pvm" --count 2>/dev/null)"
-  if [ "$got_bare" = "$WORK/img2/app.owned.pvm" ]; then
+  got_bare="$("$VM" --image "$WORK/img2/app.pvm" --count 2>/dev/null)"
+  if [ "$got_bare" = "$WORK/img2/app.pvm" ]; then
     printf '  %-24s -> the VM'"'"'s own flags never reach the guest OK\n' guest-argv-flags
   else
     printf '  %-24s -> saw %s FAIL\n' guest-argv-flags "$got_bare"; rc=1
@@ -177,7 +177,7 @@ echo "== a program with native leaves (§4(a), step B) =="
 # (3) Its output equals boot's on the legacy image built by the SAME compilation — the two forms carry
 # the same instruction sequence, so a disagreement is a leaf being called wrongly, not a format bug.
 if node "$ROOT/cli/index.node.js" run --corefn-dir "$COREFN_DIR" --outdir "$WORK/leafimg" \
-     --entry Gate.GcChurn >"$WORK/leafrun.log" 2>&1; then
+     --build-only -m Gate.GcChurn >"$WORK/leafrun.log" 2>&1; then
   if node -e '
       const fs = require("fs");
       const img = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
@@ -203,17 +203,17 @@ if node "$ROOT/cli/index.node.js" run --corefn-dir "$COREFN_DIR" --outdir "$WORK
       if (/\\["sc",\\[\\["[^"]*",\\d+\\]/.test(flat) || /\\["sn",\\[\\[\\d+,\\d+\\]/.test(flat)) {
         console.error("a switch arm carries an offset, not a block"); process.exit(1);
       }
-    ' "$WORK/leafimg/app.owned.pvm" 2>"$WORK/emit.err"; then
+    ' "$WORK/leafimg/app.pvm" 2>"$WORK/emit.err"; then
     printf '  %-24s -> leaves emitted as ForeignRef key arity OK\n' leaf-emission
   else
     printf '  %-24s -> FAIL\n' leaf-emission; rc=1
     sed 's/^/      /' "$WORK/emit.err" >&2
   fi
 
-  if "$VM" --image "$WORK/leafimg/app.owned.pvm" >"$WORK/leaf.out" 2>"$WORK/leaf.err"; then
+  if "$VM" --image "$WORK/leafimg/app.pvm" >"$WORK/leaf.out" 2>"$WORK/leaf.err"; then
     printf '  %-24s -> the owned VM ran a program with native leaves OK\n' leaf-run
     if [ -x "$BOOT_VM" ]; then
-      if "$BOOT_VM" run "$WORK/leafimg/app.pvm" >"$WORK/leaf.boot" 2>/dev/null \
+      if "$BOOT_VM" run "$WORK/leafimg/app.boot.pvm" >"$WORK/leaf.boot" 2>/dev/null \
          && diff -q "$WORK/leaf.out" "$WORK/leaf.boot" >/dev/null; then
         printf '  %-24s -> same output as boot on the legacy image OK\n' leaf-agreement
       else
@@ -231,9 +231,9 @@ if node "$ROOT/cli/index.node.js" run --corefn-dir "$COREFN_DIR" --outdir "$WORK
 
   # The legacy form is still produced, and still boot's: step C compares the two runners on ONE
   # compilation, so losing either form silently would take the calibration with it.
-  if [ -s "$WORK/leafimg/app.pvm" ] && ! grep -q '"version":3' "$WORK/leafimg/app.pvm"; then
+  if [ -s "$WORK/leafimg/app.boot.pvm" ] && ! grep -q '"version":3' "$WORK/leafimg/app.boot.pvm"; then
     printf '  %-24s -> the legacy image is no longer version 3 FAIL\n' dual-emission; rc=1
-  elif grep -q '\["fr","Purvasm.Stdio.writeLineImpl"\]' "$WORK/leafimg/app.pvm"; then
+  elif grep -q '\["fr","Purvasm.Stdio.writeLineImpl"\]' "$WORK/leafimg/app.boot.pvm"; then
     printf '  %-24s -> both forms written from one compilation OK\n' dual-emission
   else
     printf '  %-24s -> the legacy image lost its arity-free ForeignRef FAIL\n' dual-emission; rc=1

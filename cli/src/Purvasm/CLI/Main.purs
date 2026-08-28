@@ -22,14 +22,18 @@ main = do
   case Options.parse cliArgs of
     Left err -> Console.error (ArgParser.printArgError err) *> Process.exit' 1
     Right cmd -> runNode case cmd of
-      Options.Compile opts -> Compile.cmd opts
-      Options.Build opts -> Build.cmd opts
+      -- Every command answers with the status the process should end with. Only `run` has anything
+      -- but 0 to say — it hands back what the program it launched reported — and routing that through
+      -- the same place the other exits already happen keeps one exit path rather than two.
+      Options.Compile opts -> 0 <$ Compile.cmd opts
+      Options.Build opts -> 0 <$ Build.cmd opts
       Options.Run opts -> Run.cmd opts
-      Options.ForeignSigs opts -> ForeignSigsCmd.cmd opts
+      Options.ForeignSigs opts -> 0 <$ ForeignSigsCmd.cmd opts
 
   where
   runNode program = do
     res <- Node.runNode program
     case res of
-      Right a -> pure a
+      Right 0 -> pure unit
+      Right code -> Process.exit' code
       Left err -> Console.error (Fmt.fmt @"purvasm: {err}" { err }) *> Process.exit' 1

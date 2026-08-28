@@ -53,15 +53,19 @@ main = do
   case Options.parse cliArgs of
     Left err -> Console.error (ArgParser.printArgError err) *> void (Sys.exit 1)
     Right cmd -> runPvm case cmd of
-      Options.Compile opts -> Compile.cmd opts
-      Options.Build opts -> Build.cmd opts
+      -- Every command answers with the status the process should end with. Only `run` has anything
+      -- but 0 to say — it hands back what the program it launched reported — and routing that through
+      -- the same place the other exits already happen keeps one exit path rather than two.
+      Options.Compile opts -> 0 <$ Compile.cmd opts
+      Options.Build opts -> 0 <$ Build.cmd opts
       Options.Run opts -> Run.cmd opts
-      Options.ForeignSigs opts -> ForeignSigsCmd.cmd opts
+      Options.ForeignSigs opts -> 0 <$ ForeignSigsCmd.cmd opts
   where
   runPvm program = do
     res <- runPurvasmNative program
     case res of
-      Right a -> pure a
+      Right 0 -> pure unit
+      Right code -> void (Sys.exit code)
       Left err -> Console.error (Fmt.fmt @"purvasm: {err}" { err }) *> void (Sys.exit 1)
 
 -- | Run a CLI program against the purvasm-native backend: the same effect row as `runNode`, with
@@ -85,8 +89,9 @@ nativeProcHandler = case _ of
   ExecCapture _ _ _ -> unsafeCrashWith notYet
   ExecCaptureQuiet _ _ _ -> unsafeCrashWith notYet
   ExecInput _ _ _ _ -> unsafeCrashWith notYet
+  ExecStatus _ _ _ -> unsafeCrashWith notYet
   where
-  notYet = "Process: exec not yet available on the purvasm-native CLI (ADR-0045); use the Node CLI for `build`."
+  notYet = "Process: exec is not available on the purvasm-native CLI yet; use the Node CLI for `build`."
 
 -- | Discharge `Env` to `Purvasm.System.Env` (an unset/empty variable is `Nothing`).
 nativeEnvHandler :: forall r. Env ~> Run (EFFECT + r)
@@ -113,4 +118,4 @@ nativeFsHandler = case _ of
   FileSize _ _ -> unsafeCrashWith notYet
   ResolvePath _ _ _ -> unsafeCrashWith notYet
   where
-  notYet = "Filesystem: action not yet implemented on the purvasm-native backend (ADR-0045)"
+  notYet = "Filesystem: this action is not implemented on the purvasm-native backend yet"

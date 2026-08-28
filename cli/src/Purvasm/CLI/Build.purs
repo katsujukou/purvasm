@@ -113,31 +113,28 @@ options = fromRecord
   , checkForeignSigs:
       ArgParser.flag [ "--check-foreign-sigs" ]
         "Extra diagnostic: reconstruct every module's foreign signatures up front and\n\
-        \log the resolved count (ADR-0080). The build itself already reconstructs them\n\
-        \per module (ADR-0090); this is an eager whole-closure sweep for the standing\n\
-        \`foreign-sigs` command and tools/foreign-sigs-diff.sh. Off by default:\n\
-        \source-channel lexing is expensive on the native backend."
+        \log the resolved count. The build reconstructs them per module anyway; this is\n\
+        \an eager whole-closure sweep. Off by default: reading the sources to do it is\n\
+        \expensive on the native backend."
         # ArgParser.boolean
   , noOpt:
       ArgParser.flag [ "--no-opt" ]
-        "Disable the optimiser (the DictElim + NbE-inliner fixpoint, ADR-0086/0089); the shared\n\
-        \driver is then the identity (normalise-only) and dictionaries stay dynamically\n\
-        \dispatched (ADR-0104 §3). The un-optimised native path is the optimiser-free reference\n\
-        \lowering — a bisection aid separating a codegen bug from an optimiser bug."
+        "Disable the optimiser; the build then only normalises, and dictionaries stay\n\
+        \dynamically dispatched. A bisection aid: it separates a codegen bug from an\n\
+        \optimiser bug."
         # ArgParser.boolean
   , emitLlvm:
       ArgParser.flag [ "--emit-llvm" ]
-        "Stop after emitting the `.ll` objects (no clang/link). Useful for `.ll`-level\n\
-        \differentials (e.g. the stage fixpoint, ADR-0104 §2); a full build otherwise links\n\
-        \a native executable."
+        "Stop after emitting the `.ll` objects (no clang, no link). Useful for comparing\n\
+        \generated code; a full build otherwise links a native executable."
         # ArgParser.boolean
   , hostForeignApi:
       ArgParser.flag [ "--host-foreign-api" ]
-        "Retain and export the whole foreign-author ABI — the `pv_*` surface of purvasm.h plus every\n\
-        \`pvf_*` the runtime defines — so a provider loaded at run time with `dlopen` can resolve\n\
-        \against this executable (ADR-0111 §1.1). Without it the linker drops what this program does\n\
-        \not itself call, and a provider fails to load over a symbol that was never in the binary.\n\
-        \Needed by a program that hosts dynamically loaded native providers — the owned VM."
+        "Retain and export the whole foreign-author ABI — the `pv_*` surface of purvasm.h plus\n\
+        \every `pvf_*` the runtime defines — so a provider loaded at run time can resolve against\n\
+        \this executable. Without it the linker drops what this program does not itself call, and\n\
+        \a provider fails to load over a symbol that was never in the binary. Needed by a program\n\
+        \that hosts dynamically loaded native providers."
         # ArgParser.boolean
   , emitIr:
       ArgParser.argument [ "--emit-ir" ]

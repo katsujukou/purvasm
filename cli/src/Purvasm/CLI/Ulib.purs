@@ -54,9 +54,8 @@ requireUlibDir :: forall r. Run (ENV + FS + EXCEPT String + r) FilePath
 requireUlibDir = resolveUlibDir >>= case _ of
   Just dir -> pure dir
   Nothing -> throw
-    "PURVASM_LIB is not set and no ulib overlay was found (looked for $PURVASM_LIB, \
-    \./purvasm_lib, ./dist/ulib). Run purvasm via its launcher, set PURVASM_LIB, or stage a \
-    \dev ulib (e.g. `sh ulib-tools/prepare-release.sh`)."
+    "no purvasm library was found (looked for $PURVASM_LIB, ./purvasm_lib, ./dist/ulib). Run \
+    \purvasm via its launcher, which points at the library shipped with it, or set $PURVASM_LIB."
 
 -- | The `corefn.json` path for `moduleName`, preferring the `ulib` patch over the stock
 -- | `--corefn-dir` when one is present (presence-driven, last-wins) — exactly boot's
