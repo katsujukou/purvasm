@@ -214,7 +214,9 @@ what a later specialisation would rewrite.
 -- 1. minted by the post-opt, pre-MatchCompile annotation pass. Backend-neutral: it names a node in
 --    the ANF term and knows nothing about LLVM.
 newtype AnfOccurrenceId
-annotateOccurrences :: Expr -> AnnotatedExpr        -- the ONLY producer
+newtype AnfFunctionId
+-- the ONLY producer, and it takes the OBJECT's bodies together, never one term (see below)
+annotateObject :: Array (key /\ Expr) -> Array (key /\ Annotated)
 
 -- 2. what an optimisation would act on: the occurrence bound to its function and parameter
 newtype ProofSiteId
@@ -230,12 +232,24 @@ siteKey  :: EmissionSiteId -> String   -- CANONICAL: what the LLVM string consta
 siteLabel :: EmissionSiteId -> String  -- human: what the report prints
 ```
 
+**An id is unique within a MODULE OBJECT, and the producer must take the object, not a term.** This
+is normative, and it is the correction of an earlier draft of this record that specified a per-term
+`annotateOccurrences :: Expr -> AnnotatedExpr`. `ProofSiteId`'s only component naming anything
+outside the term is `object`; everything within one object has to be told apart by `sourceFn` and
+`callOcc` alone. A per-term producer restarts both supplies, so two top-level bodies of one object
+each come back as root `fnsrc0` holding `occ0` — two different sites building ONE key, whose
+execution counts then add together into a row indistinguishable from a genuinely hot site. Nothing
+downstream can detect that. So: one supply pair per object, threaded across its bodies, and **no
+single-term entry point is exported** — a caller holding one body passes a one-element object, which
+is what it actually has. (Found in review 2026-08-29, before any production wiring existed.)
+
 **The plumbing, stated because a type without a route is a wish.** Each hand-off is named, with the
 producer and the consumer:
 
 | step | produced by | carried on | consumed by |
 | --- | --- | --- | --- |
-| `AnfOccurrenceId` | `annotateOccurrences`, post-opt / pre-`MatchCompile` | the annotated `CApp` AND `CPerform` nodes | the emitter |
+| `AnfFunctionId` | `annotateObject`, ONE supply per OBJECT | the annotated `CLam` nodes and each body's root | the emitter |
+| `AnfOccurrenceId` | `annotateObject`, post-opt / pre-`MatchCompile`, ONE supply per OBJECT | the annotated `CApp` AND `CPerform` nodes | the emitter |
 | …across DTree duplication | `MatchCompile` COPIES it | every duplicated leaf AND guard arm | the emitter |
 | `ParamIndex` | `emitFunction`'s parameter prologue | the `EnvEntry`'s `BindingSite` | `directTarget` |
 | …out of the classifier | `directTarget` | `ParamTarget`, a `CallTarget` arm (below) | the emitter |
@@ -549,7 +563,7 @@ FUNCTION BOUNDARY that owns it.
 
 ```text
 Expr Unit Unit
-  ── annotateOccurrences ──▶  Expr AnfFunctionId AnfOccurrenceId
+  ── annotateObject (ONE supply pair per OBJECT) ──▶  Expr AnfFunctionId AnfOccurrenceId
   ── MatchCompile (COPIES both) ──▶  DTree AnfFunctionId AnfOccurrenceId
   ── ParamTarget ──▶  ProofSiteId { object, sourceFn, param, callOcc }
   ── per-proof ordinal ──▶  EmissionSiteId  (+ the lifted fn_N as metadata)
@@ -581,7 +595,7 @@ function that contains no `CLam` would have no source-function identity at all.
   `CApp` and `CPerform` and `fnAnn` reaching `CLam`;
 - the optimiser and the bytecode backend work at `ann = Unit` and are unaffected in meaning;
 - the LLVM backend converts to `ann = AnfOccurrenceId` post-optimiser, which is where
-  `annotateOccurrences` runs;
+  `annotateObject` runs;
 - **`MatchCompile` is polymorphic in BOTH annotations and COPIES them** into every leaf, guard and
   fallthrough it produces — including the copies `goCtor`/`goLit` make of a wildcard row. Re-minting
   either would make the proof layer a second emission layer wearing a different name;
@@ -608,19 +622,99 @@ the medium the id travels in.
    must aggregate onto ONE `sourceFn`. This is the row that fails if `ProofSiteId` is ever keyed by
    the lifted name again;
 2. **totality over call occurrences**: every `CApp` AND every `CPerform` carries an annotation after
-   `annotateOccurrences`, checked by a traversal that fails on an unannotated node;
+   `annotateObject`, checked by a traversal that fails on an unannotated node;
 3. **stack safety at 100k call occurrences** — the annotator uses an explicit work stack, as
    `foldAtoms` does, and is fixture-tested at that width;
 4. **bytecode byte-identity**: the bytecode backend's output is unchanged, since `ann = Unit` there;
 5. **LLVM byte-identity with instrumentation OFF**: the annotation changes no emitted code;
 6. **`Σ keyed bumps == the two `OParam` slots`, per form** — §1's cross-mechanism identity, which
-   is what would fail first if `CPerform` were left unannotated.
+   is what would fail first if `CPerform` were left unannotated;
+7. **object-scoped identity**: two STRUCTURALLY IDENTICAL top-level bodies of one object build
+   DIFFERENT `ProofSiteId`s. This is the row that fails if the producer is ever made per-term again,
+   and it must be asserted on `ProofSiteId`s, not only on raw ids — the merge happens at the key.
 
 **Already landed under this amendment** (668/668 compiler unit): the type layer —
 `ParamIndex` (produced ONLY by `indexParams`, an enumeration over the parameter list, so an
 off-by-one or a negative index is unconstructible), `BindingSite`/`NonParamOrigin`/`originClass`
 keeping `BindOrigin` finite, `AnfOccurrenceId` in the middle end, and the opaque
 `ProofSiteId`/`EmissionSiteId` with `siteKey`/`proofKey`/`siteLabel`.
+
+**Landed 2026-08-29 — the type layer, with one producer still open (below).** Compiler 683/683 unit + 11/11 E2E, census 46/46,
+`cli`/`vm` build clean, and `adr114-identity.sh check` green against the frozen corpus (provenance
+verified: LLVM **311/311** and bytecode **8/8** byte-identical). Conditions 3, 4 and 5 above are
+therefore met; 1, 1b, 2 and 6 belong to the emission step and remain open.
+
+**One producer is deliberately still weaker than its invariant**, and the type layer is not closed
+until it is fixed: `mkEmissionSiteId` takes a raw `Int` ordinal, so it admits a negative, a gap, or
+the SAME ordinal twice — the last of which merges two distinct emissions and sums their counts. The
+rule it should carry is that the emitter allocates consecutive ordinals from a per-proof map, and
+there is no such map until the emission wiring lands. It becomes the sole producer then, and the raw
+constructor is internalised, as `freshOccurrence` and `ParamIndex` already are. Note also that the
+restored identity rows below check hand-built ids, not real emissions; conditions 1 and 1b, which
+assert on emitted events, are what actually test the allocator.
+
+- **ANF is parameterised over BOTH annotations** — `ExprF f c`, with `f` on `CLam` and `c` on
+  `CApp`/`CPerform`. `Expr`/`CExpr`/`Alt`/`Rhs` are now aliases at `Unit Unit`, so the optimiser and
+  the bytecode backend are untouched.
+- **`annotateObject`** (`MiddleEnd.ANF.Occurrence`) mints both supplies; neither supply nor any
+  `Int -> Id` producer is exported, so annotating is the only way an id comes into being. It takes
+  **the object's bodies together and threads ONE pair of supplies across them**, and no single-term
+  entry point is exported. That is forced by what `ProofSiteId` keys by: `object` is its only
+  component naming anything outside the term, so everything within an object must be separated by
+  `sourceFn`/`callOcc` alone. A per-term producer resets both counters, so two top-level bodies of
+  one object would each come back as root `fnsrc0` holding `occ0` — two different sites building one
+  key, and two execution counts adding into a row indistinguishable from a genuinely hot site. This
+  was caught in review before any production wiring existed; the rows pinning it are the
+  twin-identical-bodies cases in `ANF.Occurrence` and `LLVM.LocalFacts`.
+- **`MatchCompile` is parameterised, not annotated.** With `f` and `c` abstract, the builder has no
+  producer for either id in scope, so the copies it makes — `goCtor` into every arm and the default,
+  `Dguard` into its fall-through — can only carry the identities they were handed. The invariant
+  behind condition 1b is a type error to violate rather than a thing to remember.
+- **`CPerform` and `CApp` now share one lowering entry** (`Emit.lowerCall`). `CPerform` used to
+  rebuild a `CApp` node and re-enter `cexpr`; at the annotated stage that reconstruction would need
+  an occurrence id, and the only sources are inventing one (forbidden — a drill keyed by an invented
+  id reports a site that does not exist) or copying the one the `CPerform` already carries. Routing
+  both to a common entry takes the second for free. Byte-identity across the refactor is the check
+  above, and it is the condition that mattered most here: the change touches the hottest arm of the
+  emitter.
+
+**Two findings from the implementation, both recorded because the numbers depend on them:**
+
+- **The annotator numbered `Let` spines backwards.** Ids were minted during the spine REBUILD, and
+  the rebuild reverses the peel — so a `Let` spine was numbered inner-to-outer while `LetRec`,
+  `CIf` and `CCase` were numbered forwards. Dense, unique and deterministic, so the drill would
+  still have worked; but the order was an artifact of the rebuild rather than a property of the
+  term, and `occ7` did not name the eighth call. Minting moved to the forward peel. It was caught
+  by a helper walking the term INDEPENDENTLY of the annotator — one that reused the annotator's own
+  traversal would have agreed with it and reported nothing.
+- **A width row was written believing it policed complexity, and it does not.** The object fold
+  originally accumulated with `Array.snoc`, which is quadratic in the object's body count — the one
+  dimension the object-wide supply added. It was rewritten to prepend-and-reverse, and a 20k-body
+  row was added alongside. Measured afterwards, the quadratic version ran the whole suite in 7.15 s
+  against 6.43 s: it failed nothing, so the row pins the fold's RESULT (completeness, numbering that
+  runs across bodies, key pairing) and NOT its cost. Making it decisive would need ~200k bodies and
+  a wall-clock assertion, which is a flaky test rather than a guard. Recorded because the comment
+  claiming otherwise would have been read later as coverage that exists.
+
+- **The first stack-safety row measured the measuring device.** The 100k fixture overflowed inside
+  the TEST helper's recursion, before the annotator could be judged, which left condition 3
+  unverified while looking like a failure of the code under test. The helper is now an explicit work
+  stack too. The wide row asserts only what width is for — completion, an exact call count, no
+  duplicate id, a contiguous range, and one unswitched root function identity — with traversal
+  fidelity left to the small fixtures, so the row cannot fail for reasons of its own size.
+
+**Two harness notes from the same stretch**, kept because both cost a re-run:
+
+- `toolchain_prepare` earned its place immediately: the first prepared build failed on an
+  unresolved `Purvasm.Int.rem`, which the previous mtime-based check had been reporting as `ok`
+  against a `dist/ulib` six weeks stale. A measurement taken against that tree would have been
+  attributed to the compiler.
+- A bulk text substitution across the tree, used to rename the ANF constructors' annotation
+  argument, also rewrote prose inside doc comments and two `unsafeCrashWith` strings, and turned
+  several PATTERNS into bindings of a variable literally named `unit` — which compiles, shadows
+  `Prelude.unit`, and reads as the annotation being matched rather than ignored. All were cleaned;
+  the lesson is that a sweep over a term that appears in both code and prose needs the two
+  separated before it runs, not after.
 
 
 ## Consequences

@@ -47,6 +47,39 @@ byte identity.* (Originally phrased as "the CESK oracle"; the 2026-07-18 §2 ame
 oracle as the frozen boot VM + fixture-owned expected traces and retires the CESK-leg
 requirement.)
 
+> **Calibration record (2026-08-29) — the owned VM against the boot VM.** A record of what has
+> been measured, not a change to anything decided below. The role of "oracle" has NOT moved yet;
+> the conditions under which it will are stated at the end.
+>
+> Measured on `feat/vm-run@f6aa330` (the CLI wiring is **not merged to `main`**):
+>
+> - **38/38 fixtures matching, 0 differences**, over **stdout, exit status and argv handling**.
+> - The owned VM's own suites at that commit: unit 83/83, image gate 13/13, packaging 17/17,
+>   loader/FFI 25/25.
+> - **stderr was NOT among the compared channels.** The runner currently writes its own diagnostics
+>   to the same stream as the guest, so guest-observable stderr cannot be separated from harness
+>   noise and was excluded wholesale. A fixture whose only divergence is on stderr would have passed
+>   this calibration.
+>
+> So "38/38" is agreement on three channels, not on all observable behaviour, and it should not be
+> read as the latter. Recording it any other way would let a later measurement inherit a confidence
+> the calibration did not establish.
+>
+> **What changes, and when.** On the merge of the CLI wiring AND a stderr calibration that separates
+> guest output from runner diagnostics, the following take effect; until both hold, "the VM oracle"
+> continues to mean the frozen boot VM as the 2026-07-18 amendment above defines it:
+>
+> - **VM oracle = the owned VM**, and any later record saying a backend "agrees with the VM" means
+>   the owned VM path explicitly.
+> - **The boot VM becomes the bootstrap seed and a historical calibration leg, not the authority.**
+>   Its agreement with the owned VM is what licenses the switch; it is not what licenses results
+>   measured after it.
+>
+> **What does not change either way**: the final semantic anchor is not a VM at all — it is the
+> fixture-owned expected trace plus the language specification. A VM is a mechanism for producing an
+> answer to compare against; it is not what makes the answer right. That was already the substance
+> of the 2026-07-18 amendment, and it is why the anchor survives an oracle being replaced.
+
 ## Decision
 
 ### 1. The ADR-0082 byte-identity objective is declared achieved and the gate is retired
